@@ -154,9 +154,9 @@ class InstallHelpersTest(unittest.TestCase):
         layout = InstallLayout(
             mode="system",
             state_dir=Path("/var/lib/llamacpp"),
-            bin_dir=Path("/opt/llamacpp-stack/bin"),
-            install_root=Path("/opt/llamacpp-stack"),
-            cuda_root=Path("/opt/llamacpp-stack/cuda"),
+            bin_dir=Path("/opt/llm/bin"),
+            install_root=Path("/opt/llm"),
+            cuda_root=Path("/opt/llm/cuda"),
             models_dir=Path("/var/llamacpp_models"),
             config_dir=Path("/etc/llamacpp"),
             run_dir=Path("/run/llamacpp"),
@@ -165,8 +165,8 @@ class InstallHelpersTest(unittest.TestCase):
             public_host="127.0.0.1",
             public_port=11435,
             manager_socket=Path("/run/llamacpp/manager.sock"),
-            python_root=Path("/opt/llamacpp-stack/python"),
-            runtime_venv=Path("/opt/llamacpp-stack/venv"),
+            python_root=Path("/opt/llm/python"),
+            runtime_venv=Path("/opt/llm/venv"),
         )
         self.assertEqual(desired_models_dir_owner(layout), (DEFAULT_SERVICE_USER, DEFAULT_SERVICE_USER))
 

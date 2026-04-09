@@ -505,7 +505,7 @@ def choose_layout(mode: str | None, public_host: str, public_port: int | None, m
     ollama_models = detect_ollama_models_dir()
     resolved_models_dir = models_dir or existing_models_dir(resolved_mode) or derive_models_dir(ollama_models, resolved_mode)
     if resolved_mode == "system":
-        install_root = Path("/opt/llamacpp-stack")
+        install_root = Path("/opt/llm")
         state_dir = Path("/var/lib/llamacpp")
         config_dir = Path("/etc/llamacpp")
         run_dir = Path("/run/llamacpp")
@@ -957,6 +957,8 @@ def build_llama_cpp_from_source(
         "-DCMAKE_BUILD_TYPE=Release",
         "-DGGML_NATIVE=ON",
     ]
+    if source_tree_supports_flag(src_dir, "GGML_LTO"):
+        cmake_args.append("-DGGML_LTO=ON")
     if enable_cuda:
         cmake_args.append("-DGGML_CUDA=ON")
     else:
