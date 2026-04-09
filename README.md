@@ -4,7 +4,7 @@ Manager for a local llama.cpp / llama-swap stack.
 
 It provides:
 
-- `llamacpp-server`, a Python control CLI and API shim.
+- `llamacpp-superserver`, a Python control CLI and API shim.
 - install/uninstall entry points for the full stack.
 - a bundled shell installer in `llamacpp_stack/bundle/`.
 - helpers for Hugging Face GGUF downloads, model cataloguing, runtime validation, llama-swap config rendering, and Ollama-compatible endpoints.
@@ -20,7 +20,7 @@ pip install -e .
 ## Run
 
 ```bash
-llamacpp-server --help
+llamacpp-superserver --help
 llamacpp-stack-install --help
 ```
 
@@ -35,4 +35,3 @@ The standalone bundle can be run directly:
 ```bash
 python -m pytest -q
 ```
-

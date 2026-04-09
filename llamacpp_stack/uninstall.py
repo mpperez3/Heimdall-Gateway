@@ -5,7 +5,20 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .install import InstallLayout, choose_layout, detect_existing_mode, prompt_bool
+from .install import (
+    CLI_COMMAND,
+    LEGACY_CLI_COMMAND,
+    LEGACY_MANAGER_SERVICE_NAME,
+    LEGACY_SWAP_SERVICE_NAME,
+    MANAGER_SERVICE_NAME,
+    MANAGER_WRAPPER_NAME,
+    SWAP_SERVICE_NAME,
+    SWAP_WRAPPER_NAME,
+    InstallLayout,
+    choose_layout,
+    detect_existing_mode,
+    prompt_bool,
+)
 
 
 def _run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -31,11 +44,11 @@ def uninstall_systemd_units(layout: InstallLayout, dry_run: bool) -> None:
         return
     if layout.mode == "system":
         reload_cmd = ["systemctl", "daemon-reload"]
-        stop_cmd = ["systemctl", "disable", "--now", "llamacpp-manager.service", "llamaswap.service"]
+        stop_cmd = ["systemctl", "disable", "--now", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME]
         unit_dir = Path("/etc/systemd/system")
     else:
         reload_cmd = ["systemctl", "--user", "daemon-reload"]
-        stop_cmd = ["systemctl", "--user", "disable", "--now", "llamacpp-manager.service", "llamaswap.service"]
+        stop_cmd = ["systemctl", "--user", "disable", "--now", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME]
         unit_dir = Path.home() / ".config/systemd/user"
 
     if dry_run:
@@ -44,12 +57,18 @@ def uninstall_systemd_units(layout: InstallLayout, dry_run: bool) -> None:
         _run(stop_cmd, check=False)
 
     for path in (
-        unit_dir / "llamacpp-manager.service",
-        unit_dir / "llamaswap.service",
-        unit_dir / "default.target.wants" / "llamacpp-manager.service",
-        unit_dir / "default.target.wants" / "llamaswap.service",
-        unit_dir / "multi-user.target.wants" / "llamacpp-manager.service",
-        unit_dir / "multi-user.target.wants" / "llamaswap.service",
+        unit_dir / MANAGER_SERVICE_NAME,
+        unit_dir / SWAP_SERVICE_NAME,
+        unit_dir / LEGACY_MANAGER_SERVICE_NAME,
+        unit_dir / LEGACY_SWAP_SERVICE_NAME,
+        unit_dir / "default.target.wants" / MANAGER_SERVICE_NAME,
+        unit_dir / "default.target.wants" / SWAP_SERVICE_NAME,
+        unit_dir / "default.target.wants" / LEGACY_MANAGER_SERVICE_NAME,
+        unit_dir / "default.target.wants" / LEGACY_SWAP_SERVICE_NAME,
+        unit_dir / "multi-user.target.wants" / MANAGER_SERVICE_NAME,
+        unit_dir / "multi-user.target.wants" / SWAP_SERVICE_NAME,
+        unit_dir / "multi-user.target.wants" / LEGACY_MANAGER_SERVICE_NAME,
+        unit_dir / "multi-user.target.wants" / LEGACY_SWAP_SERVICE_NAME,
     ):
         _remove_path(path, dry_run)
 
@@ -73,9 +92,10 @@ def uninstall_stack(args: argparse.Namespace) -> int:
         layout.state_dir,
         layout.run_dir,
         layout.install_root,
-        layout.bin_dir / "llamacpp-manager-start",
-        layout.bin_dir / "llamaswap-start",
-        layout.bin_dir / "llamacpp-server",
+        layout.bin_dir / MANAGER_WRAPPER_NAME,
+        layout.bin_dir / SWAP_WRAPPER_NAME,
+        layout.bin_dir / CLI_COMMAND,
+        layout.bin_dir / LEGACY_CLI_COMMAND,
     ]
     if remove_models:
         targets.append(layout.models_dir)

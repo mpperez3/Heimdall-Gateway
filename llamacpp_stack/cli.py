@@ -78,15 +78,21 @@ def _env_path(name: str, default: str) -> Path:
     return Path(os.environ.get(name, default)).expanduser()
 
 
-SOCKET_PATH = os.environ.get("LLAMACPP_MANAGER_SOCKET", "/run/llamaswap/manager.sock")
+SOCKET_PATH = os.environ.get("LLAMACPP_MANAGER_SOCKET", "/run/llamacpp/manager.sock")
 DEFAULT_MODELS_DIR = _env_path("LLAMACPP_MODELS", "/workvols/data3/LLAMACPP_MODELS")
-DEFAULT_CONFIG_PATH = _env_path("LLAMACPP_CONFIG", "/var/lib/llamaswap/config.yaml")
-DEFAULT_CATALOG_PATH = _env_path("LLAMACPP_CATALOG", "/var/lib/llamaswap/catalog.json")
+DEFAULT_CONFIG_PATH = _env_path("LLAMACPP_CONFIG", "/var/lib/llamacpp/config.yaml")
+DEFAULT_CATALOG_PATH = _env_path("LLAMACPP_CATALOG", "/var/lib/llamacpp/catalog.json")
 DEFAULT_SERVER_CONFIG_PATH = _env_path(
     "LLAMACPP_SERVER_CONFIG",
-    "/etc/llamacpp/llamacpp-server.json" if os.geteuid() == 0 else str(Path.home() / ".config/llamacpp/llamacpp-server.json"),
+    "/etc/llamacpp/llamacpp-superserver.json"
+    if os.geteuid() == 0
+    else str(Path.home() / ".config/llamacpp/llamacpp-superserver.json"),
 )
 DEFAULT_SERVICE_NAME = os.environ.get("LLAMACPP_SERVICE_NAME", "llamaswap")
+CLI_COMMAND = "llamacpp-superserver"
+LEGACY_CLI_COMMAND = "llamacpp-server"
+MANAGER_SERVICE_NAME = "llamacpp-superserver-manager"
+SWAP_SERVICE_NAME = "llamacpp-superserver-swap"
 DEFAULT_LLAMA_SERVER = _env_path("LLAMA_SERVER_BIN", "/opt/llm/llama.cpp/build/bin/llama-server")
 
 DEFAULT_CTX_SIZE = 8192
@@ -122,11 +128,15 @@ DEFAULT_PUBLIC_PORT = int(os.environ.get("LLAMACPP_PUBLIC_PORT", "11437"))
 DEFAULT_API_PORT = int(os.environ.get("LLAMACPP_API_PORT", str(DEFAULT_PUBLIC_PORT - 1)))
 DEFAULT_REQUESTS_LOG_PATH = _env_path(
     "LLAMACPP_REQUESTS_LOG",
-    "/var/lib/llamaswap/api-requests.log" if os.geteuid() == 0 else str(Path.home() / ".local/state/llamacpp/api-requests.log"),
+    "/var/lib/llamacpp/api-requests.log" if os.geteuid() == 0 else str(Path.home() / ".local/state/llamacpp/api-requests.log"),
 )
 MODEL_ACTIVITY_LOCK = threading.Lock()
 MODEL_ACTIVITY: dict[str, dict[str, float | str]] = {}
 LAST_ACTIVITY_MODEL_ID = ""
+
+def manager_unavailable_error(exc: Exception) -> RuntimeError:
+    return RuntimeError(f"Could not connect to manager: {exc}. Is {MANAGER_SERVICE_NAME} running?")
+
 
 class Spinner:
     """Universal ASCII Spinner for maximum terminal compatibility."""
@@ -1011,12 +1021,12 @@ def run_manager_command(command: str, args):
 
 def manager_hint() -> str:
     user_mode_commands = (
-        "systemctl --user start llamacpp-manager llamaswap",
-        "systemctl --user status llamacpp-manager llamaswap",
+        f"systemctl --user start {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
+        f"systemctl --user status {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
     )
     system_mode_commands = (
-        "sudo systemctl start llamacpp-manager llamaswap",
-        "sudo systemctl status llamacpp-manager llamaswap",
+        f"sudo systemctl start {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
+        f"sudo systemctl status {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
     )
     return (
         "Could not connect to the background manager.\n"
@@ -1106,7 +1116,7 @@ def ensure_model_available(args, progress_callback = None):
         except RuntimeError as e:
             raise e
         except Exception as e:
-            raise RuntimeError(f"Could not connect to manager: {e}. Is llamacpp-manager running?")
+            raise manager_unavailable_error(e)
 
     # MANAGER MODE
     catalog = load_catalog(args.catalog)
@@ -1449,7 +1459,7 @@ def remove_model(args, progress_callback = None):
         except RuntimeError as e:
             raise e
         except Exception as e:
-            raise RuntimeError(f"Could not connect to manager: {e}. Is llamacpp-manager running?")
+            raise manager_unavailable_error(e)
 
     catalog = load_catalog(args.catalog)
     model = resolve_catalog_model(catalog, target=args.repo, repo_ref=args.hf, model_id=args.model_id, filename=args.file)
@@ -3522,7 +3532,7 @@ def update_config(args, progress_callback = None):
         except RuntimeError as e:
             raise e
         except Exception as e:
-            raise RuntimeError(f"Could not connect to manager: {e}. Is llamacpp-manager running?")
+            raise manager_unavailable_error(e)
 
     catalog = load_catalog(args.catalog)
     target = getattr(args, "repo", None)
@@ -3858,7 +3868,7 @@ def main():
         pass
 
     parser = argparse.ArgumentParser(
-        prog="llamacpp_server",
+        prog=CLI_COMMAND,
         description="Manage GGUF models for llama-swap + llama-server.",
         epilog=build_help_epilog(),
         formatter_class=HelpFormatter,

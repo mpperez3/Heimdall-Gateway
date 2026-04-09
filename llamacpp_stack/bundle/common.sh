@@ -132,11 +132,11 @@ prompt_yes_no() {
     suffix="[y/N]"
   fi
   while true; do
-    if [ -r "${tty_in}" ]; then
+    if [ -t 0 ] && [ -r "${tty_in}" ] && [ -w "${tty_in}" ]; then
       printf "%s %s " "${prompt}" "${suffix}" >"${tty_in}"
       read -r answer <"${tty_in}" || answer=""
     else
-      read -r -p "${prompt} ${suffix} " answer || answer=""
+      answer="${default}"
     fi
     answer="${answer:-$default}"
     case "${answer,,}" in

@@ -21,6 +21,18 @@ from pathlib import Path
 DEFAULT_LLAMA_CPP_REPO = "ggml-org/llama.cpp"
 DEFAULT_LLAMASWAP_REPO = "mostlygeek/llama-swap"
 DEFAULT_IDLE_TTL = 300
+DEFAULT_SERVICE_USER = "llamaswap"
+MANAGER_SERVICE_NAME = "llamacpp-superserver-manager.service"
+SWAP_SERVICE_NAME = "llamacpp-superserver-swap.service"
+LEGACY_MANAGER_SERVICE_NAME = "llamacpp-manager.service"
+LEGACY_SWAP_SERVICE_NAME = "llamaswap.service"
+CLI_COMMAND = "llamacpp-superserver"
+LEGACY_CLI_COMMAND = "llamacpp-server"
+MANAGER_WRAPPER_NAME = "llamacpp-superserver-manager-start"
+SWAP_WRAPPER_NAME = "llamacpp-superserver-swap-start"
+OLLAMA_DEFAULT_PORT = 11434
+SERVER_CONFIG_BASENAME = "llamacpp-superserver.json"
+LEGACY_SERVER_CONFIG_BASENAME = "llamacpp-server.json"
 
 
 @dataclass
@@ -64,6 +76,19 @@ def prompt_path(message: str, default: Path) -> Path:
     return Path(raw).expanduser() if raw else default
 
 
+def resolve_install_mode(requested_mode: str | None) -> str:
+    if requested_mode:
+        return requested_mode
+    if existing := detect_existing_mode():
+        return existing
+    default_mode = "system" if os.geteuid() == 0 else "user"
+    if not sys.stdin.isatty():
+        return default_mode
+    if prompt_bool("Install for all users?", default=(default_mode == "system")):
+        return "system"
+    return "user"
+
+
 def find_next_free_port(host: str = "127.0.0.1", start: int = 11437, limit: int = 11550) -> int:
     for port in range(start, limit + 1):
         with socket.socket() as sock:
@@ -71,6 +96,49 @@ def find_next_free_port(host: str = "127.0.0.1", start: int = 11437, limit: int 
             if sock.connect_ex((host, port)) != 0:
                 return port
     raise RuntimeError(f"No free port found between {start} and {limit}.")
+
+
+def _port_is_free(host: str, port: int) -> bool:
+    try:
+        with socket.socket() as sock:
+            sock.settimeout(0.2)
+            return sock.connect_ex((host, port)) != 0
+    except OSError:
+        return True
+
+
+def detect_ollama_port(default: int = OLLAMA_DEFAULT_PORT) -> int:
+    raw_env = os.environ.get("OLLAMA_HOST", "").strip()
+    if raw_env:
+        match = re.search(r":(\d+)(?:/)?$", raw_env)
+        if match:
+            return int(match.group(1))
+    try:
+        result = subprocess.run(
+            ["systemctl", "cat", "ollama"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        match = re.search(r"OLLAMA_HOST=[^\"\n:]+:(\d+)", result.stdout)
+        if match:
+            return int(match.group(1))
+    except Exception:
+        pass
+    return default
+
+
+def choose_default_swap_port(host: str, mode: str, explicit_public_port: int | None) -> int:
+    if explicit_public_port:
+        return explicit_public_port
+    if existing := existing_public_port(mode):
+        return existing
+    ollama_port = detect_ollama_port()
+    api_port = ollama_port + 1
+    swap_port = ollama_port + 2
+    if _port_is_free(host, api_port) and _port_is_free(host, swap_port):
+        return swap_port
+    return find_next_free_port(host, start=swap_port)
 
 
 def _fetch_json(url: str) -> dict:
@@ -94,6 +162,12 @@ def _download(url: str, dest: Path) -> None:
 
 def latest_release(repo: str) -> dict:
     return _fetch_json(f"https://api.github.com/repos/{repo}/releases/latest")
+
+
+def dry_run_release_placeholder(repo: str) -> dict:
+    if repo == DEFAULT_LLAMA_CPP_REPO:
+        return {"tag_name": "dry-run", "assets": [{"name": "llama-dry-run-bin-ubuntu-x64.tar.gz", "browser_download_url": "https://example.invalid/llama.cpp.tar.gz"}]}
+    return {"tag_name": "dry-run", "assets": [{"name": "llama-swap_dry-run_linux_amd64.tar.gz", "browser_download_url": "https://example.invalid/llama-swap.tar.gz"}]}
 
 
 def detect_nvidia_gpu() -> bool:
@@ -373,8 +447,11 @@ def detect_ollama_models_dir() -> Path | None:
         Path("/usr/share/ollama/.ollama/models"),
         Path.home() / ".ollama" / "models",
     ):
-        if candidate.exists():
-            return candidate
+        try:
+            if candidate.exists():
+                return candidate
+        except PermissionError:
+            continue
     return None
 
 
@@ -424,7 +501,7 @@ def derive_models_dir(base: Path | None, mode: str) -> Path:
 
 def choose_layout(mode: str | None, public_host: str, public_port: int | None, models_dir: Path | None = None) -> InstallLayout:
     resolved_mode = mode or detect_existing_mode() or ("system" if os.geteuid() == 0 else "user")
-    resolved_port = public_port or existing_public_port(resolved_mode) or find_next_free_port(public_host)
+    resolved_port = choose_default_swap_port(public_host, resolved_mode, public_port)
     ollama_models = detect_ollama_models_dir()
     resolved_models_dir = models_dir or existing_models_dir(resolved_mode) or derive_models_dir(ollama_models, resolved_mode)
     if resolved_mode == "system":
@@ -432,9 +509,9 @@ def choose_layout(mode: str | None, public_host: str, public_port: int | None, m
         state_dir = Path("/var/lib/llamacpp")
         config_dir = Path("/etc/llamacpp")
         run_dir = Path("/run/llamacpp")
-        user = "ollama" if shutil.which("ollama") and _user_exists("ollama") else "llm"
+        user = DEFAULT_SERVICE_USER
         group = user
-        bin_dir = install_root / "bin"
+        bin_dir = Path("/usr/local/bin")
     else:
         install_root = Path.home() / ".local/opt/llamacpp-stack"
         state_dir = Path.home() / ".local/state/llamacpp"
@@ -470,6 +547,25 @@ def _user_exists(name: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def ensure_system_identity(layout: InstallLayout, dry_run: bool) -> None:
+    if layout.mode != "system" or _user_exists(layout.service_user):
+        return
+    cmd = [
+        "useradd",
+        "--system",
+        "--user-group",
+        "--home-dir",
+        str(layout.state_dir),
+        "--shell",
+        "/usr/sbin/nologin",
+        layout.service_user,
+    ]
+    if dry_run:
+        print(f"[dry-run] would create service user: {' '.join(_sudo_prefix() + cmd)}")
+        return
+    _run(_sudo_prefix() + cmd)
 
 
 def choose_llamaswap_asset(release: dict) -> dict:
@@ -534,7 +630,7 @@ def _render_env(
         LLAMACPP_MODELS={layout.models_dir}
         LLAMACPP_CONFIG={layout.state_dir / 'config.yaml'}
         LLAMACPP_CATALOG={layout.state_dir / 'catalog.json'}
-        LLAMACPP_SERVER_CONFIG={layout.config_dir / 'llamacpp-server.json'}
+        LLAMACPP_SERVER_CONFIG={layout.config_dir / SERVER_CONFIG_BASENAME}
         LLAMACPP_MANAGER_SOCKET={layout.manager_socket}
         LLAMA_SERVER_BIN={llama_server}
         LLAMASWAP_BIN={llamaswap}
@@ -542,6 +638,7 @@ def _render_env(
         LLAMACPP_PUBLIC_PORT={layout.public_port}
         LLAMACPP_API_PORT={layout.public_port - 1}
         LLAMACPP_IDLE_TTL={idle_ttl}
+        LLAMACPP_SERVICE_NAME={SWAP_SERVICE_NAME}
         PYTHON_BIN={python_exec}
         LLAMACPP_PYTHONPATH={python_path}
         {extra}"""
@@ -555,13 +652,13 @@ def render_manager_service(layout: InstallLayout) -> str:
         identity_lines = [f"User={layout.service_user}", f"Group={layout.service_group}"]
     service_lines = [
         "[Unit]",
-        "Description=llamacpp manager",
+        "Description=llamacpp superserver manager",
         "After=network-online.target",
         "",
         "[Service]",
         "Type=simple",
         *identity_lines,
-        f"ExecStart={layout.bin_dir / 'llamacpp-manager-start'}",
+        f"ExecStart={layout.bin_dir / MANAGER_WRAPPER_NAME}",
         "Restart=always",
         "RestartSec=2",
         "",
@@ -578,13 +675,13 @@ def render_llamaswap_service(layout: InstallLayout) -> str:
         identity_lines = [f"User={layout.service_user}", f"Group={layout.service_group}"]
     service_lines = [
         "[Unit]",
-        "Description=llama-swap",
-        "After=network-online.target llamacpp-manager.service",
+        "Description=llamacpp superserver llama-swap backend",
+        f"After=network-online.target {MANAGER_SERVICE_NAME}",
         "",
         "[Service]",
         "Type=simple",
         *identity_lines,
-        f"ExecStart={layout.bin_dir / 'llamaswap-start'}",
+        f"ExecStart={layout.bin_dir / SWAP_WRAPPER_NAME}",
         "Restart=always",
         "RestartSec=2",
         "",
@@ -670,6 +767,33 @@ def ensure_dirs(layout: InstallLayout) -> None:
         layout.python_root,
     ):
         path.mkdir(parents=True, exist_ok=True)
+
+
+def chown_tree(path: Path, user: str, group: str) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    shutil.chown(path, user=user, group=group)
+    if path.is_dir() and not path.is_symlink():
+        for item in path.rglob("*"):
+            try:
+                shutil.chown(item, user=user, group=group)
+            except FileNotFoundError:
+                pass
+
+
+def ensure_service_writable_dirs(layout: InstallLayout, dry_run: bool) -> None:
+    if layout.mode != "system":
+        return
+    targets = [layout.state_dir, layout.run_dir]
+    if dry_run:
+        print(
+            "[dry-run] would chown service-writable dirs to "
+            f"{layout.service_user}:{layout.service_group}: {', '.join(str(path) for path in targets)}"
+        )
+        return
+    for path in targets:
+        path.mkdir(parents=True, exist_ok=True)
+        chown_tree(path, layout.service_user, layout.service_group)
 
 
 def desired_models_dir_owner(layout: InstallLayout) -> tuple[str, str]:
@@ -913,17 +1037,13 @@ def install_systemd_units(layout: InstallLayout, dry_run: bool) -> None:
     if layout.mode == "system":
         systemd_dir = Path("/etc/systemd/system")
         env_dir = layout.config_dir
-        manager_name = "llamacpp-manager.service"
-        swap_name = "llamaswap.service"
         reload_cmd = ["systemctl", "daemon-reload"]
-        enable_cmd = ["systemctl", "enable", "--now", manager_name, swap_name]
+        enable_cmd = ["systemctl", "enable", "--now", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME]
     else:
         systemd_dir = Path.home() / ".config/systemd/user"
         env_dir = layout.config_dir
-        manager_name = "llamacpp-manager.service"
-        swap_name = "llamaswap.service"
         reload_cmd = ["systemctl", "--user", "daemon-reload"]
-        enable_cmd = ["systemctl", "--user", "enable", "--now", manager_name, swap_name]
+        enable_cmd = ["systemctl", "--user", "enable", "--now", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME]
 
     if dry_run:
         print(f"[dry-run] would write units to {systemd_dir} and run: {' '.join(reload_cmd)} && {' '.join(enable_cmd)}")
@@ -931,8 +1051,8 @@ def install_systemd_units(layout: InstallLayout, dry_run: bool) -> None:
 
     systemd_dir.mkdir(parents=True, exist_ok=True)
     env_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(layout.config_dir / "systemd" / manager_name, systemd_dir / manager_name)
-    shutil.copy2(layout.config_dir / "systemd" / swap_name, systemd_dir / swap_name)
+    shutil.copy2(layout.config_dir / "systemd" / MANAGER_SERVICE_NAME, systemd_dir / MANAGER_SERVICE_NAME)
+    shutil.copy2(layout.config_dir / "systemd" / SWAP_SERVICE_NAME, systemd_dir / SWAP_SERVICE_NAME)
     _run(reload_cmd)
     _run(enable_cmd)
 
@@ -942,19 +1062,19 @@ def print_install_summary(layout: InstallLayout, install_services: bool) -> None
     api_url = f"http://{layout.public_host}:{layout.public_port - 1}"
     ui_url = f"{ui_base_url}/ui/#/activity"
     if layout.mode == "system":
-        start_cmd = "sudo systemctl start llamacpp-manager llamaswap"
-        status_cmd = "sudo systemctl status llamacpp-manager llamaswap"
+        start_cmd = f"sudo systemctl start {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}"
+        status_cmd = f"sudo systemctl status {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}"
     else:
-        start_cmd = "systemctl --user start llamacpp-manager llamaswap"
-        status_cmd = "systemctl --user status llamacpp-manager llamaswap"
+        start_cmd = f"systemctl --user start {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}"
+        status_cmd = f"systemctl --user status {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}"
 
     print("\nInstallation complete.")
     print("Use:")
-    print("  llamacpp-server --help")
-    print("  llamacpp-server ps")
-    print("  llamacpp-server list")
-    print("  llamacpp-server run <repo-or-hf-ref>")
-    print(f"API endpoint: {api_url}")
+    print(f"  {CLI_COMMAND} --help")
+    print(f"  {CLI_COMMAND} ps")
+    print(f"  {CLI_COMMAND} list")
+    print(f"  {CLI_COMMAND} run <repo-or-hf-ref>")
+    print(f"Superserver API endpoint: {api_url}")
     print(f"UI activity:  {ui_url}")
     print(f"llama-swap UI/backend: {ui_base_url}")
     if install_services:
@@ -966,7 +1086,7 @@ def print_install_summary(layout: InstallLayout, install_services: bool) -> None
 
 
 def install_stack(args: argparse.Namespace) -> int:
-    pre_mode = args.mode or detect_existing_mode() or ("system" if os.geteuid() == 0 else "user")
+    pre_mode = resolve_install_mode(args.mode)
     suggested_models_dir = existing_models_dir(pre_mode) or derive_models_dir(detect_ollama_models_dir(), pre_mode)
     chosen_models_dir = Path(args.models_dir).expanduser() if args.models_dir else prompt_path("Models directory", suggested_models_dir)
     layout = choose_layout(pre_mode, args.public_host, args.public_port, chosen_models_dir)
@@ -976,11 +1096,17 @@ def install_stack(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(f"[dry-run] would ensure directories under {layout.install_root}, {layout.state_dir}, {layout.models_dir}")
     else:
+        ensure_system_identity(layout, args.dry_run)
         ensure_dirs(layout)
     ensure_models_dir_ready(layout, args.dry_run)
+    ensure_service_writable_dirs(layout, args.dry_run)
 
-    llama_cpp_release = latest_release(DEFAULT_LLAMA_CPP_REPO)
-    llamaswap_release = latest_release(DEFAULT_LLAMASWAP_REPO)
+    if args.dry_run:
+        llama_cpp_release = dry_run_release_placeholder(DEFAULT_LLAMA_CPP_REPO)
+        llamaswap_release = dry_run_release_placeholder(DEFAULT_LLAMASWAP_REPO)
+    else:
+        llama_cpp_release = latest_release(DEFAULT_LLAMA_CPP_REPO)
+        llamaswap_release = latest_release(DEFAULT_LLAMASWAP_REPO)
     llamaswap_asset = choose_llamaswap_asset(llamaswap_release)
     llama_cpp_asset = choose_llamacpp_linux_asset(llama_cpp_release)
 
@@ -1079,10 +1205,15 @@ def install_stack(args: argparse.Namespace) -> int:
         print(swap_unit)
     else:
         (layout.config_dir / "llamacpp-stack.env").write_text(env_text, encoding="utf-8")
-        (layout.config_dir / "llamacpp-server.json").write_text(
-            json.dumps({"idle_ttl": args.idle_ttl, "api_port": layout.public_port - 1}, indent=2) + "\n",
+        server_config_payload = json.dumps({"idle_ttl": args.idle_ttl, "api_port": layout.public_port - 1}, indent=2) + "\n"
+        server_config_path = layout.config_dir / SERVER_CONFIG_BASENAME
+        server_config_path.write_text(
+            server_config_payload,
             encoding="utf-8",
         )
+        legacy_server_config_path = layout.config_dir / LEGACY_SERVER_CONFIG_BASENAME
+        if not legacy_server_config_path.exists():
+            legacy_server_config_path.write_text(server_config_payload, encoding="utf-8")
         config_path = layout.state_dir / "config.yaml"
         catalog_path = layout.state_dir / "catalog.json"
         if not config_path.exists():
@@ -1091,15 +1222,15 @@ def install_stack(args: argparse.Namespace) -> int:
             catalog_path.write_text("[]\n", encoding="utf-8")
         systemd_dir = layout.config_dir / "systemd"
         systemd_dir.mkdir(parents=True, exist_ok=True)
-        (systemd_dir / "llamacpp-manager.service").write_text(manager_unit, encoding="utf-8")
-        (systemd_dir / "llamaswap.service").write_text(swap_unit, encoding="utf-8")
-        manager_wrapper = layout.bin_dir / "llamacpp-manager-start"
+        (systemd_dir / MANAGER_SERVICE_NAME).write_text(manager_unit, encoding="utf-8")
+        (systemd_dir / SWAP_SERVICE_NAME).write_text(swap_unit, encoding="utf-8")
+        manager_wrapper = layout.bin_dir / MANAGER_WRAPPER_NAME
         manager_wrapper.write_text(render_manager_wrapper(layout), encoding="utf-8")
         manager_wrapper.chmod(0o755)
-        swap_wrapper = layout.bin_dir / "llamaswap-start"
+        swap_wrapper = layout.bin_dir / SWAP_WRAPPER_NAME
         swap_wrapper.write_text(render_llamaswap_wrapper(layout), encoding="utf-8")
         swap_wrapper.chmod(0o755)
-        target_wrapper = layout.bin_dir / "llamacpp-server"
+        target_wrapper = layout.bin_dir / CLI_COMMAND
         target_wrapper.write_text(
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
@@ -1115,6 +1246,10 @@ def install_stack(args: argparse.Namespace) -> int:
             encoding="utf-8",
         )
         target_wrapper.chmod(0o755)
+        legacy_wrapper = layout.bin_dir / LEGACY_CLI_COMMAND
+        if not legacy_wrapper.exists() and not legacy_wrapper.is_symlink():
+            legacy_wrapper.symlink_to(target_wrapper)
+        ensure_service_writable_dirs(layout, args.dry_run)
 
     write_manifest(layout, llama_cpp_release, llamaswap_release, strategy, args.dry_run)
     if args.install_services:
@@ -1128,7 +1263,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Install llama.cpp + llama-swap stack.")
     parser.add_argument("--mode", choices=("system", "user"))
     parser.add_argument("--public-host", default="127.0.0.1")
-    parser.add_argument("--public-port", type=int, help="Original llama-swap port. Defaults to the next free port from 11437.")
+    parser.add_argument(
+        "--public-port",
+        type=int,
+        help="llama-swap backend port. By default new installs use ollama_port+2 and reserve ollama_port+1 for the superserver API.",
+    )
     parser.add_argument("--models-dir", help="Models directory. If omitted, the installer asks interactively.")
     parser.add_argument("--idle-ttl", type=int, default=DEFAULT_IDLE_TTL, help="Global idle timeout in seconds before llama-swap unloads a model.")
     parser.add_argument("--enable-tls", action="store_true", help="Try to enable extra HTTP/TLS related llama.cpp flags when supported.")

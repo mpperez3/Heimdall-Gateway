@@ -16,7 +16,12 @@ from llamacpp_stack.cli import (
     stop_running_ollama_models,
 )
 from llamacpp_stack.install import (
+    CLI_COMMAND,
+    DEFAULT_SERVICE_USER,
+    SERVER_CONFIG_BASENAME,
     build_parser,
+    choose_default_swap_port,
+    choose_layout,
     choose_llamacpp_linux_asset,
     choose_llamaswap_asset,
     locate_cuda_root_for_python,
@@ -125,6 +130,26 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertFalse(args.prefer_source_cuda)
         self.assertFalse(args.prefer_binary)
 
+    def test_choose_default_swap_port_prefers_ollama_plus_two(self) -> None:
+        with (
+            mock.patch("llamacpp_stack.install.existing_public_port", return_value=None),
+            mock.patch("llamacpp_stack.install.detect_ollama_port", return_value=11434),
+            mock.patch("llamacpp_stack.install._port_is_free", return_value=True),
+        ):
+            self.assertEqual(choose_default_swap_port("127.0.0.1", "system", None), 11436)
+
+    def test_choose_layout_system_uses_llamaswap_identity_and_global_bin(self) -> None:
+        with (
+            mock.patch("llamacpp_stack.install.detect_existing_mode", return_value="system"),
+            mock.patch("llamacpp_stack.install.existing_public_port", return_value=11436),
+            mock.patch("llamacpp_stack.install.detect_ollama_models_dir", return_value=Path("/var/lib/ollama/models")),
+        ):
+            layout = choose_layout("system", "127.0.0.1", None, None)
+        self.assertEqual(layout.service_user, DEFAULT_SERVICE_USER)
+        self.assertEqual(layout.service_group, DEFAULT_SERVICE_USER)
+        self.assertEqual(layout.bin_dir, Path("/usr/local/bin"))
+        self.assertEqual(layout.public_port, 11436)
+
     def test_desired_models_dir_owner_uses_service_identity_for_system_mode(self) -> None:
         layout = InstallLayout(
             mode="system",
@@ -135,15 +160,15 @@ class InstallHelpersTest(unittest.TestCase):
             models_dir=Path("/var/llamacpp_models"),
             config_dir=Path("/etc/llamacpp"),
             run_dir=Path("/run/llamacpp"),
-            service_user="ollama",
-            service_group="ollama",
+            service_user=DEFAULT_SERVICE_USER,
+            service_group=DEFAULT_SERVICE_USER,
             public_host="127.0.0.1",
             public_port=11435,
             manager_socket=Path("/run/llamacpp/manager.sock"),
             python_root=Path("/opt/llamacpp-stack/python"),
             runtime_venv=Path("/opt/llamacpp-stack/venv"),
         )
-        self.assertEqual(desired_models_dir_owner(layout), ("ollama", "ollama"))
+        self.assertEqual(desired_models_dir_owner(layout), (DEFAULT_SERVICE_USER, DEFAULT_SERVICE_USER))
 
     def test_existing_model_updates_runtime_settings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -237,7 +262,7 @@ class InstallHelpersTest(unittest.TestCase):
     def test_resolve_idle_ttl_reads_server_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            server_config = root / "llamacpp-server.json"
+            server_config = root / SERVER_CONFIG_BASENAME
             server_config.write_text('{"idle_ttl": 42}\n', encoding="utf-8")
             args = Namespace(server_config=server_config, idle_ttl=None)
             self.assertEqual(resolve_idle_ttl(args), 42)

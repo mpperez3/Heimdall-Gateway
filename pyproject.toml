@@ -12,6 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
+llamacpp-superserver = "llamacpp_stack.llamacpp_api_install:main"
 llamacpp-server = "llamacpp_stack.llamacpp_api_install:main"
 llamacpp-stack-install = "llamacpp_stack.install:main"
 llamacpp-stack-uninstall = "llamacpp_stack.uninstall:main"
@@ -29,4 +30,3 @@ packages = ["llamacpp_stack", "llamacpp_stack.bundle"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
-
