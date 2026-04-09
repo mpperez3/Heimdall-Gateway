@@ -556,8 +556,9 @@ def ensure_system_identity(layout: InstallLayout, dry_run: bool) -> None:
         "useradd",
         "--system",
         "--user-group",
+        "--no-create-home",
         "--home-dir",
-        str(layout.state_dir),
+        "/nonexistent",
         "--shell",
         "/usr/sbin/nologin",
         layout.service_user,
@@ -701,6 +702,9 @@ def render_manager_wrapper(layout: InstallLayout) -> str:
         source {env_file}
         set +a
         export PYTHONPATH="$LLAMACPP_PYTHONPATH${{PYTHONPATH:+:$PYTHONPATH}}"
+        LLAMA_SERVER_REAL="$(readlink -f "$LLAMA_SERVER_BIN")"
+        LLAMA_SERVER_LIB_DIR="$(dirname "$LLAMA_SERVER_REAL")"
+        export LD_LIBRARY_PATH="$LLAMA_SERVER_LIB_DIR${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
         if [[ -n "${{LLAMACPP_CUDA_ROOT:-}}" ]]; then
           export CUDA_PATH="$LLAMACPP_CUDA_ROOT"
           export LD_LIBRARY_PATH="$LLAMACPP_CUDA_ROOT/lib64:$LLAMACPP_CUDA_ROOT/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
@@ -927,6 +931,7 @@ def build_llama_cpp_from_source(
     enable_tls: bool,
     dry_run: bool,
     python_exec: str,
+    enable_cuda: bool,
 ) -> Path:
     tag = release["tag_name"]
     source_url = f"https://github.com/{DEFAULT_LLAMA_CPP_REPO}/archive/refs/tags/{tag}.tar.gz"
@@ -948,25 +953,29 @@ def build_llama_cpp_from_source(
         str(src_dir),
         "-B",
         str(build_dir),
-        "-DGGML_CUDA=ON",
         "-DLLAMA_BUILD_SERVER=ON",
         "-DCMAKE_BUILD_TYPE=Release",
         "-DGGML_NATIVE=ON",
     ]
+    if enable_cuda:
+        cmake_args.append("-DGGML_CUDA=ON")
+    else:
+        cmake_args.append("-DGGML_CUDA=OFF")
     if shutil.which("ninja"):
         cmake_args.extend(["-G", "Ninja"])
-    if arch := detect_cuda_arch():
+    if enable_cuda and (arch := detect_cuda_arch()):
         cmake_args.append(f"-DCMAKE_CUDA_ARCHITECTURES={arch}")
     build_env = os.environ.copy()
     cuda_root = Path(build_env["CUDAToolkit_ROOT"]) if build_env.get("CUDAToolkit_ROOT") else locate_cuda_root_for_python(python_exec)
-    if cuda_root:
+    if enable_cuda and cuda_root:
         normalize_python_cuda_layout(cuda_root)
         _export_cuda_root(cuda_root)
         build_env = os.environ.copy()
         cmake_args.append(f"-DCUDAToolkit_ROOT={cuda_root}")
-    for flag in ("GGML_CUDA_GRAPHS", "GGML_CUDA_FA_ALL_QUANTS"):
-        if source_tree_supports_flag(src_dir, flag):
-            cmake_args.append(f"-D{flag}=ON")
+    if enable_cuda:
+        for flag in ("GGML_CUDA_GRAPHS", "GGML_CUDA_FA_ALL_QUANTS"):
+            if source_tree_supports_flag(src_dir, flag):
+                cmake_args.append(f"-D{flag}=ON")
     if enable_tls:
         for flag in ("LLAMA_CURL", "LLAMA_HTTP_SERVER"):
             if source_tree_supports_flag(src_dir, flag):
@@ -1153,6 +1162,7 @@ def install_stack(args: argparse.Namespace) -> int:
                 args.enable_tls,
                 args.dry_run,
                 sys.executable,
+                enable_cuda=True,
             )
         else:
             llama_server_real = layout.install_root / "llama-server"
@@ -1177,6 +1187,7 @@ def install_stack(args: argparse.Namespace) -> int:
                 args.enable_tls,
                 args.dry_run,
                 sys.executable,
+                enable_cuda=cuda_toolkit_present and gpu_present,
             )
         else:
             llama_server_real = layout.install_root / "llama-server"

@@ -265,12 +265,6 @@ collect_missing_apt_packages() {
   if ! command -v cc >/dev/null 2>&1 || ! command -v c++ >/dev/null 2>&1; then
     missing+=("build-essential")
   fi
-  if ! command -v cmake >/dev/null 2>&1; then
-    missing+=("cmake")
-  fi
-  if ! command -v ninja >/dev/null 2>&1; then
-    missing+=("ninja-build")
-  fi
 
   if ! dpkg-query -W -f='${Status}\n' ca-certificates 2>/dev/null | grep -qx 'install ok installed'; then
     missing+=("ca-certificates")
@@ -321,7 +315,7 @@ ensure_full_install_prereqs() {
   local pkg
   for pkg in "${missing[@]}"; do
     case "${pkg}" in
-      git|build-essential|cmake|ninja-build)
+      git|build-essential)
         build_missing+=("${pkg}")
         ;;
     esac
@@ -333,7 +327,7 @@ ensure_full_install_prereqs() {
   build_missing=()
   for pkg in "${missing[@]}"; do
     case "${pkg}" in
-      git|build-essential|cmake|ninja-build)
+      git|build-essential)
         build_missing+=("${pkg}")
         ;;
     esac
@@ -379,7 +373,7 @@ ensure_bootstrap_venv() {
   fi
 
   ensure_uv_if_missing
-  uv pip install --python "${BOOTSTRAP_VENV}/bin/python" requests pyyaml huggingface_hub hf_transfer >/dev/null
+  uv pip install --python "${BOOTSTRAP_VENV}/bin/python" requests pyyaml huggingface_hub hf_transfer cmake ninja >/dev/null
   BOOTSTRAP_PYTHON="${BOOTSTRAP_VENV}/bin/python"
 }
 
@@ -390,6 +384,7 @@ run_bundle_module() {
   shift
   ensure_bootstrap_venv "${prereq_mode}"
   announce_python_runtime
+  export PATH="${BOOTSTRAP_VENV}/bin:${PATH}"
   export PYTHONPATH="${STACK_PARENT}${PYTHONPATH:+:${PYTHONPATH}}"
   exec "${BOOTSTRAP_PYTHON}" -m "${module}" "$@"
 }
