@@ -122,6 +122,14 @@ sudo_cmd() {
   sudo "$@"
 }
 
+sudo_apt() {
+  if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+    DEBIAN_FRONTEND=noninteractive "$@"
+    return
+  fi
+  sudo DEBIAN_FRONTEND=noninteractive "$@"
+}
+
 prompt_yes_no() {
   local prompt="$1"
   local default="${2:-y}"
@@ -172,8 +180,8 @@ apt_install_if_missing() {
   fi
 
   echo "Installing system packages: ${approved[*]}"
-  sudo_cmd apt-get update
-  sudo_cmd apt-get install -y "${approved[@]}"
+  sudo_apt apt-get update
+  sudo_apt apt-get install -y "${approved[@]}"
 }
 
 detect_base_python() {
@@ -280,65 +288,29 @@ ensure_min_runtime_prereqs() {
     exit 1
   fi
 
-  mapfile -t missing < <(collect_missing_apt_packages)
+  local pass=0
+  local missing=()
   local runtime_missing=()
-  local pkg
-  for pkg in "${missing[@]}"; do
-    case "${pkg}" in
-      python3|curl|ca-certificates|python3.[0-9]-venv|python3.[0-9][0-9]-venv)
-        runtime_missing+=("${pkg}")
-        ;;
-    esac
-  done
-  if [ "${#runtime_missing[@]}" -gt 0 ]; then
+  local pkg=""
+  while [ "${pass}" -lt 3 ]; do
+    mapfile -t missing < <(collect_missing_apt_packages)
+    runtime_missing=()
+    for pkg in "${missing[@]}"; do
+      case "${pkg}" in
+        python3|curl|ca-certificates|python3.[0-9]-venv|python3.[0-9][0-9]-venv)
+          runtime_missing+=("${pkg}")
+          ;;
+      esac
+    done
+    if [ "${#runtime_missing[@]}" -eq 0 ]; then
+      return 0
+    fi
     apt_install_if_missing "${runtime_missing[@]}"
-  fi
-  mapfile -t missing < <(collect_missing_apt_packages)
-  runtime_missing=()
-  for pkg in "${missing[@]}"; do
-    case "${pkg}" in
-      python3|curl|ca-certificates|python3.[0-9]-venv|python3.[0-9][0-9]-venv)
-        runtime_missing+=("${pkg}")
-        ;;
-    esac
+    pass=$((pass + 1))
   done
-  if [ "${#runtime_missing[@]}" -gt 0 ]; then
-    echo "Missing runtime prerequisites remain: ${runtime_missing[*]}"
-    return 1
-  fi
-}
 
-ensure_full_install_prereqs() {
-  ensure_min_runtime_prereqs
-  mapfile -t missing < <(collect_missing_apt_packages)
-  local build_missing=()
-  local pkg
-  for pkg in "${missing[@]}"; do
-    case "${pkg}" in
-      git|build-essential)
-        build_missing+=("${pkg}")
-        ;;
-    esac
-  done
-  if [ "${#build_missing[@]}" -gt 0 ]; then
-    apt_install_if_missing "${build_missing[@]}"
-  fi
-  mapfile -t missing < <(collect_missing_apt_packages)
-  build_missing=()
-  for pkg in "${missing[@]}"; do
-    case "${pkg}" in
-      git|build-essential)
-        build_missing+=("${pkg}")
-        ;;
-    esac
-  done
-  if [ "${#build_missing[@]}" -gt 0 ]; then
-    echo "Missing build prerequisites remain: ${build_missing[*]}"
-    echo "These are required to compile llama.cpp from source."
-    echo "The bootstrap environment already installs Python-side helpers with uv (cmake, ninja, compiletools),"
-    echo "but they do not replace a native C/C++ toolchain."
-    return 1
-  fi
+  echo "Missing runtime prerequisites remain: ${runtime_missing[*]}"
+  return 1
 }
 
 ensure_uv_if_missing() {
@@ -351,17 +323,9 @@ ensure_uv_if_missing() {
 }
 
 ensure_bootstrap_venv() {
-  local prereq_mode="${1:-minimal}"
-  if [ "${prereq_mode}" = "full" ]; then
-    if ! ensure_full_install_prereqs; then
-      echo "Cannot continue: bootstrap venv or llama.cpp build prerequisites are still missing."
-      return 1
-    fi
-  else
-    if ! ensure_min_runtime_prereqs; then
-      echo "Cannot continue: runtime prerequisites for the bootstrap venv are still missing."
-      return 1
-    fi
+  if ! ensure_min_runtime_prereqs; then
+    echo "Cannot continue: runtime prerequisites for the bootstrap venv are still missing."
+    return 1
   fi
 
   clear_stale_bootstrap_venv
@@ -382,9 +346,7 @@ ensure_bootstrap_venv() {
 run_bundle_module() {
   local module="$1"
   shift
-  local prereq_mode="${1:-minimal}"
-  shift
-  ensure_bootstrap_venv "${prereq_mode}"
+  ensure_bootstrap_venv
   announce_python_runtime
   export PATH="${BOOTSTRAP_VENV}/bin:${PATH}"
   export PYTHONPATH="${STACK_PARENT}${PYTHONPATH:+:${PYTHONPATH}}"

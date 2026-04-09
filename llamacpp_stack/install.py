@@ -81,11 +81,9 @@ def prompt_choice(message: str, options: list[tuple[str, str]], default: str) ->
     if not sys.stdin.isatty():
         return default
     labels = {key: label for key, label in options}
-    rendered = ", ".join(
-        f"{key}={label}{' (default)' if key == default else ''}" for key, label in options
-    )
+    rendered = ", ".join(f"{key}={label}" for key, label in options)
     while True:
-        raw = input(f"{message} [{rendered}] ").strip().lower()
+        raw = input(f"{message} [{rendered}; default: {default}] ").strip().lower()
         choice = raw or default
         if choice in labels:
             return choice
@@ -429,6 +427,38 @@ def maybe_install_cuda_toolkit(gpu_present: bool, dry_run: bool, prefer_source_c
     subprocess.run(_sudo_prefix() + ["apt-get", "update"], check=True)
     subprocess.run(_sudo_prefix() + ["apt-get", "install", "-y", package], check=True)
     return locate_nvcc() is not None
+
+
+def missing_source_build_packages() -> list[str]:
+    missing: list[str] = []
+    if shutil.which("git") is None:
+        missing.append("git")
+    if shutil.which("cc") is None or shutil.which("c++") is None:
+        missing.append("build-essential")
+    return missing
+
+
+def maybe_install_source_build_prereqs(dry_run: bool) -> None:
+    missing = missing_source_build_packages()
+    if not missing:
+        return
+    if dry_run:
+        print(f"[dry-run] would offer source-build prerequisites via: {' '.join(_sudo_prefix() + ['apt-get', 'install', '-y'] + missing)}")
+        return
+    approved: list[str] = []
+    for package in missing:
+        if prompt_bool(f"Install source-build prerequisite '{package}' with sudo apt now?", default=True):
+            approved.append(package)
+    if approved:
+        subprocess.run(_sudo_prefix() + ["apt-get", "update"], check=True)
+        subprocess.run(_sudo_prefix() + ["apt-get", "install", "-y", *approved], check=True)
+    remaining = missing_source_build_packages()
+    if remaining:
+        raise RuntimeError(
+            "Missing native build prerequisites remain: "
+            + ", ".join(remaining)
+            + ". The bootstrap environment already provides cmake/ninja/compiletools via uv, but source builds still need a real host compiler toolchain."
+        )
 
 
 def source_tree_supports_flag(src_dir: Path, flag_name: str) -> bool:
@@ -1220,6 +1250,8 @@ def install_stack(args: argparse.Namespace) -> int:
             python_exec=sys.executable,
         )
         nvcc_path = locate_nvcc()
+    if llama_cpp_mode == "source" and update_binaries:
+        maybe_install_source_build_prereqs(args.dry_run)
 
     print(f"llama.cpp latest: {llama_cpp_release['tag_name']}")
     print(f"llama-swap latest: {llamaswap_release['tag_name']}")
@@ -1255,7 +1287,8 @@ def install_stack(args: argparse.Namespace) -> int:
                 native_llama_server = Path("/usr/bin/llama-server")
             else:
                 raise RuntimeError(
-                    "Native llama.cpp mode was selected, but no system llama-server binary was found and no native package could be installed."
+                    "Native llama.cpp mode was selected, but no system llama-server binary was found and no native package could be installed. "
+                    "Retry with llama.cpp mode 'prebuilt' or 'source', or install a native llama.cpp package first."
                 )
         llama_server_bin = native_llama_server
     elif prefer_cuda_build:
