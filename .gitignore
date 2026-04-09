@@ -1,0 +1,11 @@
+__pycache__/
+*.py[oc]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.bootstrap-venv/
+*.egg-info/
+build/
+dist/
+wheels/
+

@@ -1,0 +1,32 @@
+[project]
+name = "llamacpp-superserver"
+version = "0.1.0"
+description = "llama.cpp and llama-swap manager with an Ollama-compatible API shim."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "hf-transfer>=0.1.9",
+    "huggingface-hub>=0.31.1",
+    "pyyaml>=6.0.2",
+    "requests>=2.32.3",
+]
+
+[project.scripts]
+llamacpp-server = "llamacpp_stack.llamacpp_api_install:main"
+llamacpp-stack-install = "llamacpp_stack.install:main"
+llamacpp-stack-uninstall = "llamacpp_stack.uninstall:main"
+
+[build-system]
+requires = ["setuptools>=80.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["llamacpp_stack", "llamacpp_stack.bundle"]
+
+[tool.setuptools.package-data]
+"llamacpp_stack.bundle" = ["*.sh"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
