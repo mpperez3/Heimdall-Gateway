@@ -335,6 +335,8 @@ ensure_full_install_prereqs() {
   if [ "${#build_missing[@]}" -gt 0 ]; then
     echo "Missing build prerequisites remain: ${build_missing[*]}"
     echo "These are required to compile llama.cpp from source."
+    echo "The bootstrap environment already installs Python-side helpers with uv (cmake, ninja, compiletools),"
+    echo "but they do not replace a native C/C++ toolchain."
     return 1
   fi
 }
@@ -373,7 +375,7 @@ ensure_bootstrap_venv() {
   fi
 
   ensure_uv_if_missing
-  uv pip install --python "${BOOTSTRAP_VENV}/bin/python" requests pyyaml huggingface_hub hf_transfer cmake ninja >/dev/null
+  uv pip install --python "${BOOTSTRAP_VENV}/bin/python" requests pyyaml huggingface_hub hf_transfer cmake ninja compiletools >/dev/null
   BOOTSTRAP_PYTHON="${BOOTSTRAP_VENV}/bin/python"
 }
 
