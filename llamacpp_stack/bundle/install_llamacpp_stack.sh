@@ -6,37 +6,26 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh"
 
 should_use_full_prereqs() {
-  local arg=""
-  local prefer_source_cuda="auto"
-  local prefer_binary="auto"
-  for arg in "$@"; do
-    case "${arg}" in
+  local llama_cpp_mode="source"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
       -h|--help|--dry-run)
         return 1
         ;;
-      --no-prefer-source-cuda)
-        prefer_source_cuda="no"
+      --llama-cpp-mode=*)
+        llama_cpp_mode="${1#*=}"
         ;;
-      --prefer-source-cuda)
-        prefer_source_cuda="yes"
-        ;;
-      --no-prefer-binary)
-        prefer_binary="no"
-        ;;
-      --prefer-binary)
-        prefer_binary="yes"
+      --llama-cpp-mode)
+        shift
+        llama_cpp_mode="${1:-source}"
         ;;
     esac
+    shift
   done
 
-  if [ "${prefer_binary}" = "no" ]; then
+  if [ "${llama_cpp_mode}" = "source" ]; then
     return 0
   fi
-
-  if [ "${prefer_source_cuda}" = "yes" ] && command -v nvidia-smi >/dev/null 2>&1; then
-    return 0
-  fi
-
   return 1
 }
 

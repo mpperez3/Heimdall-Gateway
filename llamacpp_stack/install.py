@@ -33,6 +33,7 @@ SWAP_WRAPPER_NAME = "llamacpp-superserver-swap-start"
 OLLAMA_DEFAULT_PORT = 11434
 SERVER_CONFIG_BASENAME = "llamacpp-superserver.json"
 LEGACY_SERVER_CONFIG_BASENAME = "llamacpp-server.json"
+LLAMA_CPP_MODES = ("native", "prebuilt", "source")
 
 
 @dataclass
@@ -76,6 +77,21 @@ def prompt_path(message: str, default: Path) -> Path:
     return Path(raw).expanduser() if raw else default
 
 
+def prompt_choice(message: str, options: list[tuple[str, str]], default: str) -> str:
+    if not sys.stdin.isatty():
+        return default
+    labels = {key: label for key, label in options}
+    rendered = ", ".join(
+        f"{key}={label}{' (default)' if key == default else ''}" for key, label in options
+    )
+    while True:
+        raw = input(f"{message} [{rendered}] ").strip().lower()
+        choice = raw or default
+        if choice in labels:
+            return choice
+        print(f"Choose one of: {', '.join(labels)}")
+
+
 def resolve_install_mode(requested_mode: str | None) -> str:
     if requested_mode:
         return requested_mode
@@ -87,6 +103,20 @@ def resolve_install_mode(requested_mode: str | None) -> str:
     if prompt_bool("Install for all users?", default=(default_mode == "system")):
         return "system"
     return "user"
+
+
+def resolve_llama_cpp_mode(requested_mode: str | None) -> str:
+    if requested_mode:
+        return requested_mode
+    return prompt_choice(
+        "How should llama.cpp be provided?",
+        [
+            ("source", "build-from-source"),
+            ("prebuilt", "precompiled-binary"),
+            ("native", "system-native"),
+        ],
+        default="source",
+    )
 
 
 def find_next_free_port(host: str = "127.0.0.1", start: int = 11437, limit: int = 11550) -> int:
@@ -583,6 +613,60 @@ def choose_llamacpp_linux_asset(release: dict) -> dict | None:
         if "ubuntu-x64" in name and name.endswith(".tar.gz"):
             candidates.append(asset)
     return candidates[0] if candidates else None
+
+
+def detect_native_llama_server() -> Path | None:
+    candidates = [
+        shutil.which("llama-server"),
+        "/usr/bin/llama-server",
+        "/usr/local/bin/llama-server",
+        "/opt/homebrew/bin/llama-server",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return Path(candidate)
+    return None
+
+
+def detect_native_llama_cpp_package() -> str | None:
+    if shutil.which("apt-cache") is None:
+        return None
+    patterns = ("^llama", "llama.cpp", "llama-cpp", "llamacpp")
+    for pattern in patterns:
+        try:
+            result = subprocess.run(
+                ["apt-cache", "search", pattern],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:
+            continue
+        for line in result.stdout.splitlines():
+            package = line.split(" ", 1)[0].strip()
+            if package and ("llama" in package or "ggml" in package):
+                return package
+    return None
+
+
+def maybe_install_native_llama_cpp(dry_run: bool) -> Path | None:
+    existing = detect_native_llama_server()
+    if existing:
+        return existing
+    package = detect_native_llama_cpp_package()
+    if package is None:
+        return None
+    if dry_run:
+        print(f"[dry-run] would offer native llama.cpp package install via: {' '.join(_sudo_prefix() + ['apt-get', 'install', '-y', package])}")
+        return Path("/usr/bin/llama-server")
+    if not prompt_bool(
+        f"Install native llama.cpp package '{package}' with sudo apt now?",
+        default=True,
+    ):
+        return None
+    subprocess.run(_sudo_prefix() + ["apt-get", "update"], check=True)
+    subprocess.run(_sudo_prefix() + ["apt-get", "install", "-y", package], check=True)
+    return detect_native_llama_server()
 
 
 def _extract_tarball(archive: Path, dest: Path) -> None:
@@ -1098,12 +1182,16 @@ def print_install_summary(layout: InstallLayout, install_services: bool) -> None
 
 def install_stack(args: argparse.Namespace) -> int:
     pre_mode = resolve_install_mode(args.mode)
+    llama_cpp_mode = resolve_llama_cpp_mode(args.llama_cpp_mode)
     suggested_models_dir = existing_models_dir(pre_mode) or derive_models_dir(detect_ollama_models_dir(), pre_mode)
     chosen_models_dir = Path(args.models_dir).expanduser() if args.models_dir else prompt_path("Models directory", suggested_models_dir)
     layout = choose_layout(pre_mode, args.public_host, args.public_port, chosen_models_dir)
     update_binaries = True
     if is_existing_install(layout):
-        update_binaries = prompt_bool("Existing installation detected. Update llama.cpp and llama-swap binaries?", default=True)
+        if llama_cpp_mode == "native":
+            update_binaries = prompt_bool("Existing installation detected. Refresh llama-swap and re-check native llama.cpp?", default=True)
+        else:
+            update_binaries = prompt_bool("Existing installation detected. Update llama.cpp and llama-swap binaries?", default=True)
     if args.dry_run:
         print(f"[dry-run] would ensure directories under {layout.install_root}, {layout.state_dir}, {layout.models_dir}")
     else:
@@ -1124,7 +1212,7 @@ def install_stack(args: argparse.Namespace) -> int:
     gpu_present = detect_nvidia_gpu()
     nvcc_path = locate_nvcc()
     cuda_toolkit_present = nvcc_path is not None
-    if update_binaries and gpu_present and not cuda_toolkit_present:
+    if llama_cpp_mode == "source" and update_binaries and gpu_present and not cuda_toolkit_present:
         cuda_toolkit_present = maybe_install_cuda_toolkit(
             gpu_present=gpu_present,
             dry_run=args.dry_run,
@@ -1139,7 +1227,8 @@ def install_stack(args: argparse.Namespace) -> int:
     print(f"models directory: {layout.models_dir}")
     print(f"llama-swap UI/backend: http://{layout.public_host}:{layout.public_port}")
     print(f"OpenAI/Ollama API:   http://{layout.public_host}:{layout.public_port - 1}")
-    if update_binaries and gpu_present and not cuda_toolkit_present:
+    print(f"llama.cpp mode: {llama_cpp_mode}")
+    if llama_cpp_mode == "source" and update_binaries and gpu_present and not cuda_toolkit_present:
         print("NVIDIA GPU detected but no nvcc/CUDA toolkit was found; falling back to prebuilt llama.cpp binary.")
 
     if update_binaries:
@@ -1152,10 +1241,24 @@ def install_stack(args: argparse.Namespace) -> int:
         llamaswap_real = _find_executable(llamaswap_root, "llama-swap")
         llamaswap_bin = _link_stable_binary(llamaswap_real, layout.install_root / "llama-swap", args.dry_run)
 
-    prefer_cuda_build = sys.platform.startswith("linux") and gpu_present and cuda_toolkit_present and args.prefer_source_cuda
+    prefer_cuda_build = llama_cpp_mode == "source" and sys.platform.startswith("linux") and gpu_present and cuda_toolkit_present and args.prefer_source_cuda
 
     strategy = "binary"
-    if prefer_cuda_build:
+    if llama_cpp_mode == "native":
+        strategy = "native"
+        native_llama_server = detect_native_llama_server()
+        if update_binaries and native_llama_server is None:
+            native_llama_server = maybe_install_native_llama_cpp(args.dry_run)
+        if native_llama_server is None:
+            if args.dry_run:
+                print("[dry-run] no native llama-server binary or apt package detected on this machine; using /usr/bin/llama-server as placeholder.")
+                native_llama_server = Path("/usr/bin/llama-server")
+            else:
+                raise RuntimeError(
+                    "Native llama.cpp mode was selected, but no system llama-server binary was found and no native package could be installed."
+                )
+        llama_server_bin = native_llama_server
+    elif prefer_cuda_build:
         strategy = "source-build-cuda"
         if update_binaries:
             llama_server_real = build_llama_cpp_from_source(
@@ -1173,7 +1276,7 @@ def install_stack(args: argparse.Namespace) -> int:
             if args.dry_run
             else _link_stable_binary(llama_server_real, layout.install_root / "llama-server", args.dry_run)
         )
-    elif llama_cpp_asset and args.prefer_binary:
+    elif llama_cpp_mode == "prebuilt" and llama_cpp_asset:
         cpp_root = install_release_asset(llama_cpp_asset, layout.install_root, args.dry_run) if update_binaries else layout.install_root / f"{llama_cpp_asset['name']}.d"
         if args.dry_run:
             llama_server_bin = layout.install_root / "llama-server"
@@ -1275,6 +1378,11 @@ def install_stack(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Install llama.cpp + llama-swap stack.")
     parser.add_argument("--mode", choices=("system", "user"))
+    parser.add_argument(
+        "--llama-cpp-mode",
+        choices=LLAMA_CPP_MODES,
+        help="How to provide llama.cpp: native system package, prebuilt binary, or build from source.",
+    )
     parser.add_argument("--public-host", default="127.0.0.1")
     parser.add_argument(
         "--public-port",
