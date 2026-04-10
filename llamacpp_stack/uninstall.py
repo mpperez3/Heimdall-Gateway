@@ -79,7 +79,7 @@ def uninstall_systemd_units(layout: InstallLayout, dry_run: bool) -> None:
 
 
 def uninstall_stack(args: argparse.Namespace) -> int:
-    resolved_mode = args.mode or detect_existing_mode() or ("system" if Path("/etc/llamacpp").exists() else "user")
+    resolved_mode = args.mode or detect_existing_mode() or ("system" if Path("/etc/llamacpp-superserver").exists() else "user")
     layout = choose_layout(resolved_mode, args.public_host, args.public_port)
     uninstall_systemd_units(layout, args.dry_run)
 
@@ -101,6 +101,19 @@ def uninstall_stack(args: argparse.Namespace) -> int:
         targets.append(layout.models_dir)
 
     for target in targets:
+        _remove_path(target, args.dry_run)
+
+    legacy_targets = [
+        Path("/opt/llm"),
+        Path("/etc/llamacpp"),
+        Path("/var/lib/llamacpp"),
+        Path("/run/llamacpp"),
+        Path.home() / ".local/opt/llamacpp-stack",
+        Path.home() / ".config/llamacpp",
+        Path.home() / ".local/state/llamacpp",
+        Path.home() / ".local/run/llamacpp",
+    ]
+    for target in legacy_targets:
         _remove_path(target, args.dry_run)
 
     print("llamacpp stack uninstalled.")

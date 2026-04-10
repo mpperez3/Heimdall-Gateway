@@ -1,15 +1,24 @@
+import os
+import sys
 import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 from llamacpp_stack.cli import (
     ManagedModel,
+    build_llama_server_command,
+    build_help_epilog,
     ensure_model_available,
+    get_gpu_conflict_message,
     list_running_ollama_models,
     load_catalog,
+    normalize_server_overrides,
     render_llamaswap_config,
+    resolve_llama_server_defaults,
     resolve_idle_ttl,
     save_catalog,
     should_reload_after_unexpected_unload,
@@ -18,12 +27,17 @@ from llamacpp_stack.cli import (
 from llamacpp_stack.install import (
     CLI_COMMAND,
     DEFAULT_SERVICE_USER,
+    ELEVATED_INSTALL_ENV,
     SERVER_CONFIG_BASENAME,
+    _export_nvcc_path,
+    determine_build_jobs,
     build_parser,
+    build_llama_cpp_from_source,
     choose_default_swap_port,
     choose_layout,
     choose_llamacpp_linux_asset,
     choose_llamaswap_asset,
+    detect_existing_llama_cpp_mode,
     locate_cuda_root_for_python,
     normalize_python_cuda_layout,
     detect_cuda_toolkit_package,
@@ -32,7 +46,14 @@ from llamacpp_stack.install import (
     detect_cuda_toolkit,
     derive_models_dir,
     InstallLayout,
+    maybe_reexec_system_install,
+    maybe_migrate_existing_install,
     parse_ollama_models_from_systemctl,
+    print_install_summary,
+    prompt_choice,
+    resolve_public_host,
+    resolve_uv_executable,
+    resolve_install_mode,
 )
 
 
@@ -76,12 +97,92 @@ class InstallHelpersTest(unittest.TestCase):
             mock.patch("llamacpp_stack.install.locate_nvcc", return_value=None),
             mock.patch("llamacpp_stack.install.locate_nvcc_for_python", return_value="/tmp/nvcc"),
             mock.patch("llamacpp_stack.install.locate_cuda_root_for_python", return_value=Path("/tmp/cuda")),
+            mock.patch("llamacpp_stack.install.resolve_uv_executable", return_value="/tmp/bootstrap/bin/uv"),
         ):
             self.assertTrue(maybe_install_cuda_toolkit_via_uv("/usr/bin/python3", dry_run=False))
         run_mock.assert_called_once_with(
-            ["uv", "pip", "install", "--python", "/usr/bin/python3", "cuda-toolkit[all]"],
+            ["/tmp/bootstrap/bin/uv", "pip", "install", "--python", "/usr/bin/python3", "cuda-toolkit[all]"],
             check=True,
         )
+
+    def test_resolve_uv_executable_falls_back_to_bootstrap_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            python_bin = Path(tmp) / "bin" / "python"
+            uv_bin = Path(tmp) / "bin" / "uv"
+            python_bin.parent.mkdir(parents=True)
+            python_bin.write_text("", encoding="utf-8")
+            uv_bin.write_text("", encoding="utf-8")
+            with (
+                mock.patch("llamacpp_stack.install.shutil.which", return_value=None),
+                mock.patch("llamacpp_stack.install.sys.executable", str(python_bin)),
+            ):
+                self.assertEqual(resolve_uv_executable(), str(uv_bin))
+
+    def test_resolve_uv_executable_prefers_bootstrap_env_var(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            uv_bin = Path(tmp) / "uv"
+            uv_bin.write_text("", encoding="utf-8")
+            with (
+                mock.patch.dict("os.environ", {"LLAMACPP_BOOTSTRAP_UV": str(uv_bin)}, clear=True),
+                mock.patch("llamacpp_stack.install.shutil.which", return_value=None),
+            ):
+                self.assertEqual(resolve_uv_executable(), str(uv_bin))
+
+    def test_export_nvcc_path_sets_cudacxx(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            nvcc = Path(tmp) / "bin" / "nvcc"
+            nvcc.parent.mkdir(parents=True)
+            nvcc.write_text("", encoding="utf-8")
+            with mock.patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True):
+                self.assertTrue(_export_nvcc_path(str(nvcc)))
+                self.assertEqual(Path(os.environ["CUDACXX"]), nvcc.resolve())
+                self.assertTrue(os.environ["PATH"].startswith(str(nvcc.parent.resolve())))
+
+    def test_build_llama_cpp_from_source_passes_cuda_compiler(self) -> None:
+        release = {"tag_name": "b9999"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src_dir = root / "llama.cpp-b9999"
+            build_dir = src_dir / "build"
+            archive = root / "b9999.tar.gz"
+            nvcc = root / "cuda" / "bin" / "nvcc"
+            cuda_root = root / "cuda"
+            nvcc.parent.mkdir(parents=True)
+            nvcc.write_text("", encoding="utf-8")
+            (cuda_root / "include").mkdir(parents=True)
+            (cuda_root / "lib64").mkdir(parents=True)
+            commands: list[list[str]] = []
+
+            def fake_run(cmd, cwd=None, env=None):
+                commands.append(cmd)
+
+            with (
+                mock.patch("llamacpp_stack.install._download"),
+                mock.patch("llamacpp_stack.install._extract_tarball", side_effect=lambda archive_path, dest: src_dir.mkdir(parents=True, exist_ok=True)),
+                mock.patch("llamacpp_stack.install.shutil.rmtree"),
+                mock.patch("llamacpp_stack.install.shutil.which", side_effect=lambda name: "/usr/bin/ninja" if name == "ninja" else None),
+                mock.patch("llamacpp_stack.install.source_tree_supports_flag", return_value=True),
+                mock.patch("llamacpp_stack.install.detect_cuda_arch", return_value="86"),
+                mock.patch("llamacpp_stack.install.locate_nvcc", return_value=str(nvcc)),
+                mock.patch("llamacpp_stack.install.locate_cuda_root_for_python", return_value=cuda_root),
+                mock.patch("llamacpp_stack.install.normalize_python_cuda_layout"),
+                mock.patch("llamacpp_stack.install.determine_build_jobs", return_value=12),
+                mock.patch("llamacpp_stack.install._run", side_effect=fake_run),
+                mock.patch.dict("os.environ", {}, clear=True),
+            ):
+                result = build_llama_cpp_from_source(release, root, False, False, sys.executable, enable_cuda=True)
+
+            self.assertEqual(result, build_dir / "bin/llama-server")
+            self.assertGreaterEqual(len(commands), 2)
+            cmake_cmd = commands[0]
+            build_cmd = commands[1]
+            self.assertIn(f"-DCMAKE_CUDA_COMPILER={nvcc.resolve()}", cmake_cmd)
+            self.assertIn(f"-DCUDAToolkit_ROOT={cuda_root}", cmake_cmd)
+            self.assertEqual(build_cmd[-2:], ["-j", "12"])
+
+    def test_determine_build_jobs_uses_all_available_cpus(self) -> None:
+        with mock.patch("llamacpp_stack.install.os.cpu_count", return_value=32):
+            self.assertEqual(determine_build_jobs(), 32)
 
     def test_locate_cuda_root_for_python_from_venv_nvcc_path(self) -> None:
         with mock.patch(
@@ -126,9 +227,150 @@ class InstallHelpersTest(unittest.TestCase):
         args = build_parser().parse_args([])
         self.assertTrue(args.prefer_source_cuda)
         self.assertTrue(args.prefer_binary)
+        self.assertIsNone(args.public_host)
         args = build_parser().parse_args(["--no-prefer-source-cuda", "--no-prefer-binary"])
         self.assertFalse(args.prefer_source_cuda)
         self.assertFalse(args.prefer_binary)
+
+    def test_resolve_llama_cpp_mode_prompt_is_human_readable(self) -> None:
+        parser = build_parser()
+        help_text = parser.format_help()
+        self.assertIn("build from source", help_text.lower())
+
+    def test_prompt_choice_renders_multiline_options(self) -> None:
+        prompts: list[str] = []
+
+        def fake_input(prompt: str) -> str:
+            prompts.append(prompt)
+            return ""
+
+        with (
+            mock.patch("sys.stdin.isatty", return_value=True),
+            mock.patch("builtins.input", side_effect=fake_input),
+        ):
+            value = prompt_choice(
+                "How should llama.cpp be installed?",
+                [
+                    ("source", "build locally from source"),
+                    ("prebuilt", "download a precompiled binary"),
+                    ("native", "use a system-wide llama.cpp"),
+                ],
+                default="source",
+            )
+        self.assertEqual(value, "source")
+        rendered = prompts[0]
+        self.assertIn("How should llama.cpp be installed?\n", rendered)
+        self.assertIn("  1. Source [default]\n", rendered)
+        self.assertIn("     build locally from source\n", rendered)
+        self.assertIn("  2. Prebuilt\n", rendered)
+        self.assertIn("     download a precompiled binary\n", rendered)
+        self.assertIn("  3. Native\n", rendered)
+        self.assertIn("     use a system-wide llama.cpp\n", rendered)
+        self.assertTrue(rendered.endswith("Choice [source]: "))
+
+    def test_prompt_choice_accepts_numeric_selection(self) -> None:
+        with (
+            mock.patch("sys.stdin.isatty", return_value=True),
+            mock.patch("builtins.input", return_value="2"),
+        ):
+            value = prompt_choice(
+                "How should llama.cpp be installed?",
+                [
+                    ("source", "build locally from source"),
+                    ("prebuilt", "download a precompiled binary"),
+                    ("native", "use a system-wide llama.cpp"),
+                ],
+                default="source",
+            )
+        self.assertEqual(value, "prebuilt")
+
+    def test_resolve_install_mode_prompts_even_when_existing_install_is_detected(self) -> None:
+        with (
+            mock.patch("llamacpp_stack.install.detect_existing_mode", return_value="user"),
+            mock.patch("sys.stdin.isatty", return_value=True),
+            mock.patch("llamacpp_stack.install.prompt_bool", return_value=True),
+        ):
+            self.assertEqual(resolve_install_mode(None), "system")
+
+    def test_resolve_public_host_can_expose_all_interfaces(self) -> None:
+        with (
+            mock.patch("sys.stdin.isatty", return_value=True),
+            mock.patch("llamacpp_stack.install.prompt_bool", return_value=True),
+        ):
+            self.assertEqual(resolve_public_host("127.0.0.1"), "0.0.0.0")
+
+    def test_resolve_public_host_keeps_explicit_value(self) -> None:
+        self.assertEqual(resolve_public_host("192.168.110.50"), "192.168.110.50")
+
+    def test_maybe_migrate_existing_install_uninstalls_previous_mode_and_keeps_models(self) -> None:
+        with (
+            mock.patch("llamacpp_stack.install.detect_existing_mode", return_value="user"),
+            mock.patch("llamacpp_stack.uninstall.uninstall_stack") as uninstall_mock,
+        ):
+            maybe_migrate_existing_install("system", "127.0.0.1", 11436, False)
+        uninstall_args = uninstall_mock.call_args.args[0]
+        self.assertEqual(uninstall_args.mode, "user")
+        self.assertTrue(uninstall_args.keep_models)
+
+    def test_maybe_migrate_existing_install_skips_when_mode_matches(self) -> None:
+        with (
+            mock.patch("llamacpp_stack.install.detect_existing_mode", return_value="system"),
+            mock.patch("llamacpp_stack.uninstall.uninstall_stack") as uninstall_mock,
+        ):
+            maybe_migrate_existing_install("system", "127.0.0.1", 11436, False)
+        uninstall_mock.assert_not_called()
+
+    def test_maybe_reexec_system_install_uses_sudo_and_resolved_args(self) -> None:
+        args = Namespace(
+            public_host="127.0.0.1",
+            public_port=11436,
+            idle_ttl=300,
+            enable_tls=False,
+            prefer_source_cuda=True,
+            prefer_binary=True,
+            install_services=True,
+            dry_run=False,
+        )
+        with (
+            mock.patch("llamacpp_stack.install.os.geteuid", return_value=1000),
+            mock.patch.dict("os.environ", {}, clear=True),
+            mock.patch("llamacpp_stack.install.subprocess.run") as run_mock,
+        ):
+            result = maybe_reexec_system_install(args, "system", "source", Path("/var/llamacpp_models"))
+        self.assertEqual(result, 0)
+        cmd = run_mock.call_args.args[0]
+        self.assertEqual(cmd[:3], ["sudo", "-E", sys.executable])
+        self.assertIn("--mode", cmd)
+        self.assertIn("system", cmd)
+        self.assertIn("--llama-cpp-mode", cmd)
+        self.assertIn("source", cmd)
+        self.assertIn("--models-dir", cmd)
+        self.assertIn("/var/llamacpp_models", cmd)
+        env = run_mock.call_args.kwargs["env"]
+        self.assertEqual(env[ELEVATED_INSTALL_ENV], "1")
+
+    def test_maybe_reexec_system_install_skips_when_already_root(self) -> None:
+        args = Namespace(
+            public_host="127.0.0.1",
+            public_port=None,
+            idle_ttl=300,
+            enable_tls=False,
+            prefer_source_cuda=True,
+            prefer_binary=True,
+            install_services=True,
+            dry_run=False,
+        )
+        with mock.patch("llamacpp_stack.install.os.geteuid", return_value=0):
+            self.assertIsNone(maybe_reexec_system_install(args, "system", "source", Path("/var/llamacpp_models")))
+
+    def test_build_help_epilog_mentions_paths_and_override_locations(self) -> None:
+        help_text = build_help_epilog()
+        self.assertIn("Models dir", help_text)
+        self.assertIn("llama_server_defaults", help_text)
+        self.assertIn("server_overrides", help_text)
+        self.assertIn("Superserver API", help_text)
+        self.assertIn("llama-swap UI/backend", help_text)
+        self.assertNotIn("Wrapper API", help_text)
 
     def test_choose_default_swap_port_prefers_ollama_plus_two(self) -> None:
         with (
@@ -150,23 +392,71 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertEqual(layout.bin_dir, Path("/usr/local/bin"))
         self.assertEqual(layout.public_port, 11436)
 
+    def test_detect_existing_llama_cpp_mode_maps_manifest_strategy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            layout = InstallLayout(
+                mode="system",
+                state_dir=Path(tmp),
+                bin_dir=Path("/usr/local/bin"),
+                install_root=Path("/opt/llamacpp-superserver"),
+                models_dir=Path("/var/lib/llamacpp-superserver/models"),
+                config_dir=Path("/etc/llamacpp-superserver"),
+                run_dir=Path("/run/llamacpp-superserver"),
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=Path("/run/llamacpp-superserver/manager.sock"),
+                python_root=Path("/opt/llamacpp-superserver/python"),
+                runtime_venv=Path("/opt/llamacpp-superserver/venv"),
+                cuda_root=Path("/opt/llamacpp-superserver/cuda"),
+            )
+            (layout.state_dir / "install-manifest.json").write_text('{"llama_cpp_strategy":"binary"}\n', encoding="utf-8")
+            self.assertEqual(detect_existing_llama_cpp_mode(layout), "prebuilt")
+
+    def test_print_install_summary_invokes_help_when_command_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            help_cmd = root / CLI_COMMAND
+            help_cmd.write_text("", encoding="utf-8")
+            layout = InstallLayout(
+                mode="user",
+                state_dir=root / "state",
+                bin_dir=root,
+                install_root=root / "install",
+                models_dir=root / "models",
+                config_dir=root / "config",
+                run_dir=root / "run",
+                service_user="test",
+                service_group="test",
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+            with mock.patch("llamacpp_stack.install.subprocess.run") as run_mock:
+                print_install_summary(layout, install_services=True)
+            run_mock.assert_called_once_with([str(help_cmd), "--help"], check=False)
+
     def test_desired_models_dir_owner_uses_service_identity_for_system_mode(self) -> None:
         layout = InstallLayout(
             mode="system",
-            state_dir=Path("/var/lib/llamacpp"),
-            bin_dir=Path("/opt/llm/bin"),
-            install_root=Path("/opt/llm"),
-            cuda_root=Path("/opt/llm/cuda"),
+            state_dir=Path("/var/lib/llamacpp-superserver"),
+            bin_dir=Path("/opt/llamacpp-superserver/bin"),
+            install_root=Path("/opt/llamacpp-superserver"),
+            cuda_root=Path("/opt/llamacpp-superserver/cuda"),
             models_dir=Path("/var/llamacpp_models"),
-            config_dir=Path("/etc/llamacpp"),
-            run_dir=Path("/run/llamacpp"),
+            config_dir=Path("/etc/llamacpp-superserver"),
+            run_dir=Path("/run/llamacpp-superserver"),
             service_user=DEFAULT_SERVICE_USER,
             service_group=DEFAULT_SERVICE_USER,
             public_host="127.0.0.1",
             public_port=11435,
-            manager_socket=Path("/run/llamacpp/manager.sock"),
-            python_root=Path("/opt/llm/python"),
-            runtime_venv=Path("/opt/llm/venv"),
+            manager_socket=Path("/run/llamacpp-superserver/manager.sock"),
+            python_root=Path("/opt/llamacpp-superserver/python"),
+            runtime_venv=Path("/opt/llamacpp-superserver/venv"),
         )
         self.assertEqual(desired_models_dir_owner(layout), (DEFAULT_SERVICE_USER, DEFAULT_SERVICE_USER))
 
@@ -258,6 +548,193 @@ class InstallHelpersTest(unittest.TestCase):
                 idle_ttl=10,
             )
             self.assertIn("ttl: 10", config_path.read_text(encoding="utf-8"))
+
+    def test_load_catalog_normalizes_server_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog_path = Path(tmp) / "catalog.json"
+            catalog_path.write_text(
+                """
+[
+  {
+    "model_id": "repo-q4",
+    "repo_id": "org/repo",
+    "quant": "Q4",
+    "filename": "model-q4.gguf",
+    "local_path": "/tmp/model-q4.gguf",
+    "server_overrides": {
+      "split_mode": "layer",
+      "mmap": true,
+      "flash-attn": "on",
+      "batch_size": "1024"
+    }
+  }
+]
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            model = load_catalog(catalog_path)[0]
+            self.assertEqual(model.server_overrides, {"flash_attn": True, "batch_size": 1024})
+
+    def test_render_config_applies_global_defaults_and_model_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server_config = root / SERVER_CONFIG_BASENAME
+            server_config.write_text(
+                """
+{
+  "idle_ttl": 42,
+  "api_port": 11436,
+  "llama_server_defaults": {
+    "flash_attn": true,
+    "threads": 32,
+    "numa": "distribute",
+    "mmap": true
+  }
+}
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch("llamacpp_stack.cli.DEFAULT_SERVER_CONFIG_PATH", server_config):
+                config_path = root / "config.yaml"
+                render_llamaswap_config(
+                    [
+                        ManagedModel(
+                            model_id="repo-q4",
+                            repo_id="org/repo",
+                            quant="Q4",
+                            filename="model-q4.gguf",
+                            local_path="/tmp/model-q4.gguf",
+                            server_overrides={
+                                "batch_size": 1024,
+                                "mmap": False,
+                                "split_mode": "row",
+                            },
+                        )
+                    ],
+                    config_path,
+                    root / "llama-server",
+                    18080,
+                    idle_ttl=10,
+                )
+            rendered = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            cmd = rendered["models"]["repo-q4"]["cmd"]
+            self.assertIn("--flash-attn", cmd)
+            self.assertIn("--threads", cmd)
+            self.assertIn("32", cmd)
+            self.assertIn("--numa", cmd)
+            self.assertIn("distribute", cmd)
+            self.assertIn("--batch-size", cmd)
+            self.assertIn("1024", cmd)
+            self.assertIn("--split-mode", cmd)
+            self.assertIn("row", cmd)
+            self.assertIn("--no-mmap", cmd)
+            self.assertNotIn("--split-mode layer", cmd)
+
+    def test_resolve_llama_server_defaults_reads_server_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server_config = Path(tmp) / SERVER_CONFIG_BASENAME
+            server_config.write_text(
+                '{"llama_server_defaults":{"flash_attn":true,"mmap":true,"threads":32,"split_mode":"layer"}}\n',
+                encoding="utf-8",
+            )
+            args = Namespace(server_config=server_config)
+            self.assertEqual(resolve_llama_server_defaults(args), {"flash_attn": True, "threads": 32})
+
+    def test_build_llama_server_command_uses_alias_and_defaults(self) -> None:
+        model = ManagedModel(
+            model_id="repo-q4",
+            repo_id="org/repo",
+            quant="Q4",
+            filename="model-q4.gguf",
+            local_path="/tmp/model-q4.gguf",
+            server_overrides={"gpu_layers": "all", "cache_type_k": "q8_0"},
+        )
+        cmd = build_llama_server_command(
+            model,
+            Path("/tmp/llama-server"),
+            port="12345",
+            server_defaults={"threads": 32, "mmap": True},
+        )
+        rendered = " ".join(cmd)
+        self.assertIn("--threads 32", rendered)
+        self.assertIn("--cache-type-k q8_0", rendered)
+        self.assertNotIn("--gpu-layers all", rendered)
+        self.assertNotIn("--no-mmap", rendered)
+
+
+    def test_get_gpu_conflict_message_ignores_target_when_already_published(self) -> None:
+        model = ManagedModel(
+            model_id="repo-q4",
+            repo_id="org/repo",
+            quant="Q4",
+            filename="model-q4.gguf",
+            local_path="/tmp/model-q4.gguf",
+        )
+        with (
+            mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value={"repo-q4"}),
+            mock.patch("llamacpp_stack.cli.get_gpu_process_map", return_value={123: "4000"}),
+        ):
+            self.assertIsNone(get_gpu_conflict_message("repo-q4", [model]))
+
+    def test_get_gpu_conflict_message_reports_other_llamacpp_model(self) -> None:
+        model_a = ManagedModel(
+            model_id="model-a",
+            repo_id="org/a",
+            quant="Q4",
+            filename="a.gguf",
+            local_path="/tmp/a.gguf",
+        )
+        model_b = ManagedModel(
+            model_id="model-b",
+            repo_id="org/b",
+            quant="Q4",
+            filename="b.gguf",
+            local_path="/tmp/b.gguf",
+        )
+        with (
+            mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value=set()),
+            mock.patch("llamacpp_stack.cli.get_llama_server_processes", return_value=[{"pid": 123, "model_path": "/tmp/a.gguf"}]),
+            mock.patch("llamacpp_stack.cli.get_gpu_process_map", return_value={123: "4096"}),
+        ):
+            message = get_gpu_conflict_message("model-b", [model_a, model_b])
+        self.assertIn("Cannot load model 'model-b'", message)
+        self.assertIn("model-a (pid 123, 4096 MiB)", message)
+
+    def test_get_gpu_conflict_message_reports_foreign_process(self) -> None:
+        model = ManagedModel(
+            model_id="model-b",
+            repo_id="org/b",
+            quant="Q4",
+            filename="b.gguf",
+            local_path="/tmp/b.gguf",
+        )
+        with (
+            mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value=set()),
+            mock.patch("llamacpp_stack.cli.get_llama_server_processes", return_value=[]),
+            mock.patch("llamacpp_stack.cli.get_gpu_process_map", return_value={999: "2048"}),
+            mock.patch("llamacpp_stack.cli._describe_pid", return_value="python train.py"),
+        ):
+            message = get_gpu_conflict_message("model-b", [model])
+        self.assertIn("python train.py (pid 999, 2048 MiB)", message)
+
+    def test_get_gpu_conflict_message_ignores_ollama_processes(self) -> None:
+        model = ManagedModel(
+            model_id="model-b",
+            repo_id="org/b",
+            quant="Q4",
+            filename="b.gguf",
+            local_path="/tmp/b.gguf",
+        )
+        with (
+            mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value=set()),
+            mock.patch("llamacpp_stack.cli.get_llama_server_processes", return_value=[]),
+            mock.patch("llamacpp_stack.cli.get_gpu_process_map", return_value={999: "2048"}),
+            mock.patch("llamacpp_stack.cli._describe_pid", return_value="ollama runner --model qwen2.5"),
+        ):
+            message = get_gpu_conflict_message("model-b", [model])
+        self.assertIsNone(message)
 
     def test_resolve_idle_ttl_reads_server_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

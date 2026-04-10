@@ -7,6 +7,72 @@ STACK_PARENT="$(cd "${PACKAGE_DIR}/.." && pwd)"
 BOOTSTRAP_VENV="${BUNDLE_DIR}/.bootstrap-venv"
 BOOTSTRAP_PYTHON=""
 BASE_PYTHON_BIN=""
+STACK_ROOT=""
+STACK_LAYOUT="nested"
+STACK_MODULE_PREFIX="llamacpp_stack"
+BOOTSTRAP_UV_BIN=""
+
+detect_stack_root() {
+  if [ -n "${STACK_ROOT}" ]; then
+    return
+  fi
+  local candidates=(
+    "${STACK_PARENT}"
+    "${PACKAGE_DIR}"
+    "${BUNDLE_DIR}/.."
+    "${BUNDLE_DIR}/../.."
+  )
+  local candidate=""
+  for candidate in "${candidates[@]}"; do
+    candidate="$(cd "${candidate}" 2>/dev/null && pwd || true)"
+    if [ -n "${candidate}" ] && [ -f "${candidate}/llamacpp_stack/__init__.py" ]; then
+      STACK_ROOT="${candidate}"
+      STACK_LAYOUT="nested"
+      STACK_MODULE_PREFIX="llamacpp_stack"
+      return
+    fi
+    if [ -n "${candidate}" ] && [ -f "${candidate}/__init__.py" ] && [ -f "${candidate}/install.py" ] && [ -f "${candidate}/cli.py" ]; then
+      local base_name
+      base_name="$(basename "${candidate}")"
+      if [[ "${base_name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        STACK_ROOT="${candidate}"
+        STACK_LAYOUT="flat"
+        STACK_MODULE_PREFIX="${base_name}"
+        return
+      fi
+    fi
+    if [ -n "${candidate}" ] && [ -f "${candidate}/install.py" ] && [ -f "${candidate}/cli.py" ]; then
+      STACK_ROOT="${candidate}"
+      STACK_LAYOUT="script"
+      STACK_MODULE_PREFIX=""
+      return
+    fi
+  done
+  echo "Could not find the stack package next to this bundle."
+  echo "Expected one of these layouts:"
+  echo "  <root>/bundle + <root>/llamacpp_stack"
+  echo "  <root>/llamacpp_stack/bundle"
+  echo "  <root>/bundle + <root>/install.py + <root>/cli.py + <root>/__init__.py"
+  return 1
+}
+
+resolve_bundle_module() {
+  local module="$1"
+  case "${STACK_LAYOUT}" in
+    nested)
+      printf '%s\n' "${module}"
+      ;;
+    flat)
+      printf '%s\n' "${module/llamacpp_stack/${STACK_MODULE_PREFIX}}"
+      ;;
+    script)
+      printf '%s\n' "${module#llamacpp_stack.}"
+      ;;
+    *)
+      printf '%s\n' "${module}"
+      ;;
+  esac
+}
 
 iter_python_candidates() {
   local home_dir="${HOME:-}"
@@ -99,27 +165,17 @@ iter_python_candidates() {
   fi
 }
 
-detect_path_python() {
-  local candidate=""
-  for candidate in python3.13 python3.12 python3.11 python3.10 python3.9 python3 python; do
-    if command -v "${candidate}" >/dev/null 2>&1; then
-      command -v "${candidate}"
-      return
-    fi
-  done
-  true
-}
-
-detect_current_python() {
-  iter_python_candidates | awk '!seen[$0]++' | head -n 1
-}
-
-sudo_cmd() {
-  if [ "${EUID:-$(id -u)}" -eq 0 ]; then
-    "$@"
+detect_base_python() {
+  if [ -n "${BASE_PYTHON_BIN}" ] && [ -x "${BASE_PYTHON_BIN}" ]; then
     return
   fi
-  sudo "$@"
+  local candidate=""
+  while IFS= read -r candidate; do
+    if [ -n "${candidate}" ] && [ -x "${candidate}" ]; then
+      BASE_PYTHON_BIN="${candidate}"
+      return
+    fi
+  done < <(iter_python_candidates | awk '!seen[$0]++')
 }
 
 sudo_apt() {
@@ -154,49 +210,6 @@ prompt_yes_no() {
   done
 }
 
-apt_install_if_missing() {
-  local missing=()
-  local approved=()
-  while [ "$#" -gt 0 ]; do
-    if ! dpkg-query -W -f='${Status}\n' "$1" 2>/dev/null | grep -qx 'install ok installed'; then
-      missing+=("$1")
-    fi
-    shift
-  done
-
-  if [ "${#missing[@]}" -eq 0 ]; then
-    return
-  fi
-
-  local pkg
-  for pkg in "${missing[@]}"; do
-    if prompt_yes_no "Install missing system package '${pkg}'?" "y"; then
-      approved+=("${pkg}")
-    fi
-  done
-
-  if [ "${#approved[@]}" -eq 0 ]; then
-    return
-  fi
-
-  echo "Installing system packages: ${approved[*]}"
-  sudo_apt apt-get update
-  sudo_apt apt-get install -y "${approved[@]}"
-}
-
-detect_base_python() {
-  if [ -n "${BASE_PYTHON_BIN}" ] && [ -x "${BASE_PYTHON_BIN}" ]; then
-    return
-  fi
-  local candidate=""
-  while IFS= read -r candidate; do
-    if [ -n "${candidate}" ] && [ -x "${candidate}" ]; then
-      BASE_PYTHON_BIN="${candidate}"
-      return
-    fi
-  done < <(iter_python_candidates | awk '!seen[$0]++')
-}
-
 python_minor_venv_package() {
   detect_base_python
   "${BASE_PYTHON_BIN}" - <<'PY'
@@ -216,19 +229,6 @@ python_can_create_venv() {
   fi
   rm -rf "${tmp_dir}"
   return 1
-}
-
-python_has_runtime_deps() {
-  detect_base_python
-  [ -n "${BASE_PYTHON_BIN}" ] || return 1
-  "${BASE_PYTHON_BIN}" -c "import requests, yaml; from huggingface_hub import HfApi" >/dev/null 2>&1
-}
-
-current_python_has_runtime_deps() {
-  local current_python
-  current_python="$(detect_path_python)"
-  [ -n "${current_python}" ] || return 1
-  "${current_python}" -c "import requests, yaml; from huggingface_hub import HfApi" >/dev/null 2>&1
 }
 
 bootstrap_venv_usable() {
@@ -267,18 +267,41 @@ collect_missing_apt_packages() {
   if ! command -v curl >/dev/null 2>&1; then
     missing+=("curl")
   fi
-  if ! command -v git >/dev/null 2>&1; then
-    missing+=("git")
-  fi
-  if ! command -v cc >/dev/null 2>&1 || ! command -v c++ >/dev/null 2>&1; then
-    missing+=("build-essential")
-  fi
-
   if ! dpkg-query -W -f='${Status}\n' ca-certificates 2>/dev/null | grep -qx 'install ok installed'; then
     missing+=("ca-certificates")
   fi
 
   printf '%s\n' "${missing[@]}" | awk 'NF && !seen[$0]++'
+}
+
+apt_install_if_missing() {
+  local missing=()
+  local approved=()
+  while [ "$#" -gt 0 ]; do
+    if ! dpkg-query -W -f='${Status}\n' "$1" 2>/dev/null | grep -qx 'install ok installed'; then
+      missing+=("$1")
+    fi
+    shift
+  done
+
+  if [ "${#missing[@]}" -eq 0 ]; then
+    return
+  fi
+
+  local pkg=""
+  for pkg in "${missing[@]}"; do
+    if prompt_yes_no "Install missing system package '${pkg}'?" "y"; then
+      approved+=("${pkg}")
+    fi
+  done
+
+  if [ "${#approved[@]}" -eq 0 ]; then
+    return
+  fi
+
+  echo "Installing system packages: ${approved[*]}"
+  sudo_apt apt-get update
+  sudo_apt apt-get install -y "${approved[@]}"
 }
 
 ensure_min_runtime_prereqs() {
@@ -315,11 +338,13 @@ ensure_min_runtime_prereqs() {
 
 ensure_uv_if_missing() {
   if command -v uv >/dev/null 2>&1; then
+    BOOTSTRAP_UV_BIN="$(command -v uv)"
     return
   fi
   echo "uv not found. Installing user-local uv for convenience."
   curl -LsSf https://astral.sh/uv/install.sh | sh
   export PATH="${HOME}/.local/bin:${PATH}"
+  BOOTSTRAP_UV_BIN="$(command -v uv)"
 }
 
 ensure_bootstrap_venv() {
@@ -346,9 +371,22 @@ ensure_bootstrap_venv() {
 run_bundle_module() {
   local module="$1"
   shift
+  detect_stack_root
+  local resolved_module=""
+  resolved_module="$(resolve_bundle_module "${module}")"
   ensure_bootstrap_venv
   announce_python_runtime
   export PATH="${BOOTSTRAP_VENV}/bin:${PATH}"
-  export PYTHONPATH="${STACK_PARENT}${PYTHONPATH:+:${PYTHONPATH}}"
-  exec "${BOOTSTRAP_PYTHON}" -m "${module}" "$@"
+  export PYTHONPATH="$(dirname "${STACK_ROOT}")${PYTHONPATH:+:${PYTHONPATH}}"
+  export LLAMACPP_BOOTSTRAP_UV="${BOOTSTRAP_UV_BIN}"
+  if [ "${STACK_LAYOUT}" = "script" ]; then
+    "${BOOTSTRAP_PYTHON}" "${STACK_ROOT}/${resolved_module}.py" "$@"
+  else
+    "${BOOTSTRAP_PYTHON}" -m "${resolved_module}" "$@"
+  fi
+  local status=$?
+  if [ "${status}" -eq 0 ] && [ -d "${BOOTSTRAP_VENV}" ]; then
+    rm -rf "${BOOTSTRAP_VENV}"
+  fi
+  return "${status}"
 }

@@ -53,6 +53,8 @@ except ImportError:
 # Paths & Constants
 def _load_installed_env() -> None:
     candidates = [
+        Path.home() / ".config/llamacpp-superserver/llamacpp-superserver.env",
+        Path("/etc/llamacpp-superserver/llamacpp-superserver.env"),
         Path.home() / ".config/llamacpp/llamacpp-stack.env",
         Path("/etc/llamacpp/llamacpp-stack.env"),
     ]
@@ -78,22 +80,22 @@ def _env_path(name: str, default: str) -> Path:
     return Path(os.environ.get(name, default)).expanduser()
 
 
-SOCKET_PATH = os.environ.get("LLAMACPP_MANAGER_SOCKET", "/run/llamacpp/manager.sock")
+SOCKET_PATH = os.environ.get("LLAMACPP_MANAGER_SOCKET", "/run/llamacpp-superserver/manager.sock")
 DEFAULT_MODELS_DIR = _env_path("LLAMACPP_MODELS", "/workvols/data3/LLAMACPP_MODELS")
-DEFAULT_CONFIG_PATH = _env_path("LLAMACPP_CONFIG", "/var/lib/llamacpp/config.yaml")
-DEFAULT_CATALOG_PATH = _env_path("LLAMACPP_CATALOG", "/var/lib/llamacpp/catalog.json")
+DEFAULT_CONFIG_PATH = _env_path("LLAMACPP_CONFIG", "/var/lib/llamacpp-superserver/config.yaml")
+DEFAULT_CATALOG_PATH = _env_path("LLAMACPP_CATALOG", "/var/lib/llamacpp-superserver/catalog.json")
 DEFAULT_SERVER_CONFIG_PATH = _env_path(
     "LLAMACPP_SERVER_CONFIG",
-    "/etc/llamacpp/llamacpp-superserver.json"
+    "/etc/llamacpp-superserver/llamacpp-superserver.json"
     if os.geteuid() == 0
-    else str(Path.home() / ".config/llamacpp/llamacpp-superserver.json"),
+    else str(Path.home() / ".config/llamacpp-superserver/llamacpp-superserver.json"),
 )
 DEFAULT_SERVICE_NAME = os.environ.get("LLAMACPP_SERVICE_NAME", "llamaswap")
 CLI_COMMAND = "llamacpp-superserver"
 LEGACY_CLI_COMMAND = "llamacpp-server"
 MANAGER_SERVICE_NAME = "llamacpp-superserver-manager"
 SWAP_SERVICE_NAME = "llamacpp-superserver-swap"
-DEFAULT_LLAMA_SERVER = _env_path("LLAMA_SERVER_BIN", "/opt/llm/llama.cpp/build/bin/llama-server")
+DEFAULT_LLAMA_SERVER = _env_path("LLAMA_SERVER_BIN", "/opt/llamacpp-superserver/llama.cpp/build/bin/llama-server")
 
 DEFAULT_CTX_SIZE = 8192
 DEFAULT_N_GPU_LAYERS = 999
@@ -128,7 +130,9 @@ DEFAULT_PUBLIC_PORT = int(os.environ.get("LLAMACPP_PUBLIC_PORT", "11437"))
 DEFAULT_API_PORT = int(os.environ.get("LLAMACPP_API_PORT", str(DEFAULT_PUBLIC_PORT - 1)))
 DEFAULT_REQUESTS_LOG_PATH = _env_path(
     "LLAMACPP_REQUESTS_LOG",
-    "/var/lib/llamacpp/api-requests.log" if os.geteuid() == 0 else str(Path.home() / ".local/state/llamacpp/api-requests.log"),
+    "/var/lib/llamacpp-superserver/api-requests.log"
+    if os.geteuid() == 0
+    else str(Path.home() / ".local/state/llamacpp-superserver/api-requests.log"),
 )
 MODEL_ACTIVITY_LOCK = threading.Lock()
 MODEL_ACTIVITY: dict[str, dict[str, float | str]] = {}
@@ -241,6 +245,7 @@ class ManagedModel:
     description: str = ""
     auto_ctx_failed: bool = False
     auto_ctx_error: str = ""
+    server_overrides: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -284,6 +289,60 @@ def normalize_tensor_split(value: str | None) -> str:
     return ",".join(parts)
 
 
+def _normalize_bool_flag(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def normalize_server_overrides(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, object] = {}
+    for raw_key, raw_val in value.items():
+        key = str(raw_key).strip().lower().replace("-", "_")
+        if not key:
+            continue
+        if key == "gpu_layers":
+            key = "n_gpu_layers"
+            if isinstance(raw_val, str) and raw_val.strip().lower() == "all":
+                continue
+        if key == "split_mode" and str(raw_val).strip().lower() == "layer":
+            continue
+        if key == "mmap":
+            bool_val = _normalize_bool_flag(raw_val)
+            if bool_val is True:
+                continue
+            if bool_val is not None:
+                normalized[key] = bool_val
+            continue
+        if key in {"ctx_size", "n_gpu_layers", "batch_size", "ubatch_size", "threads", "threads_batch", "fit_target"}:
+            try:
+                normalized[key] = int(raw_val)
+            except (TypeError, ValueError):
+                continue
+            continue
+        if key == "flash_attn":
+            bool_val = _normalize_bool_flag(raw_val)
+            if bool_val is not None:
+                normalized[key] = bool_val
+            continue
+        if key == "tensor_split":
+            normalized[key] = normalize_tensor_split(str(raw_val))
+            continue
+        if key in {"split_mode", "numa", "cache_type_k", "cache_type_v", "host"}:
+            normalized[key] = str(raw_val).strip()
+    return normalized
+
+
 def _is_equal_weight_tensor_split(value: str) -> bool:
     parts = [part.strip() for part in value.split(",") if part.strip()]
     if len(parts) <= 1:
@@ -314,6 +373,10 @@ def load_catalog(path: Path) -> list[ManagedModel]:
             if normalized != item.tensor_split:
                 item.tensor_split = normalized
                 changed = True
+            normalized_overrides = normalize_server_overrides(item.server_overrides)
+            if normalized_overrides != item.server_overrides:
+                item.server_overrides = normalized_overrides
+                changed = True
         if changed:
             save_catalog(path, items)
         return items
@@ -324,6 +387,7 @@ def save_catalog(path: Path, models: list[ManagedModel]):
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps([asdict(m) for m in models], indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
+
 
 def normalize_model_id(repo_id, quant, filename):
     base = repo_id.split("/")[-1]
@@ -378,13 +442,10 @@ def render_llamaswap_config(catalog, path, server_path, start_port, idle_ttl=DEF
         "healthCheckTimeout": 600, "logLevel": "info", "logToStdout": "proxy", "startPort": start_port,
         "sendLoadingState": True, "includeAliasesInList": True, "models": {},
     }
+    server_defaults = resolve_llama_server_defaults()
     for m in sorted(catalog, key=lambda x: x.model_id):
-        tensor_split = preferred_tensor_split(m, m.tensor_split)
-        cmd = [str(server_path), "--port ${PORT}", f"--model {shell_quote(m.local_path)}", f"--ctx-size {m.ctx_size}", f"--n-gpu-layers {m.n_gpu_layers}", f"--tensor-split {tensor_split}", f"--host {m.host}"]
-        if m.mmproj_path:
-            cmd.append(f"--mmproj {shell_quote(m.mmproj_path)}")
-        if m.jinja: cmd.append("--jinja")
-        data["models"][m.model_id] = {"cmd": " \\\n  ".join(cmd), "checkEndpoint": "/health", "ttl": int(idle_ttl)}
+        cmd = build_llama_server_command(m, server_path, port="${PORT}", server_defaults=server_defaults)
+        data["models"][m.model_id] = {"cmd": " \\\n  ".join(shell_quote(part) for part in cmd), "checkEndpoint": "/health", "ttl": int(idle_ttl)}
         if m.aliases: data["models"][m.model_id]["aliases"] = m.aliases
         if m.description: data["models"][m.model_id]["description"] = m.description
     tmp = path.with_suffix(".tmp")
@@ -392,6 +453,8 @@ def render_llamaswap_config(catalog, path, server_path, start_port, idle_ttl=DEF
     tmp.replace(path)
 
 def shell_quote(v):
+    if re.fullmatch(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", v):
+        return v
     if re.fullmatch(r"[A-Za-z0-9_./:=,+-]+", v): return v
     return "'" + v.replace("'", "'\"'\"'") + "'"
 
@@ -418,6 +481,85 @@ def resolve_idle_ttl(args = None) -> int:
     if value is not None:
         return int(value)
     return DEFAULT_IDLE_TTL
+
+
+def resolve_llama_server_defaults(args = None) -> dict[str, object]:
+    return normalize_server_overrides(_load_server_config_payload(args).get("llama_server_defaults"))
+
+
+def _append_llama_server_flag(cmd: list[str], key: str, value: object) -> None:
+    if key == "split_mode":
+        cmd.extend(["--split-mode", str(value)])
+    elif key == "flash_attn":
+        bool_val = _normalize_bool_flag(value)
+        if bool_val:
+            cmd.append("--flash-attn")
+    elif key == "batch_size":
+        cmd.extend(["--batch-size", str(int(value))])
+    elif key == "ubatch_size":
+        cmd.extend(["--ubatch-size", str(int(value))])
+    elif key == "threads":
+        cmd.extend(["--threads", str(int(value))])
+    elif key == "threads_batch":
+        cmd.extend(["--threads-batch", str(int(value))])
+    elif key == "numa":
+        cmd.extend(["--numa", str(value)])
+    elif key == "fit_target":
+        cmd.extend(["--fit-target", str(int(value))])
+    elif key == "cache_type_k":
+        cmd.extend(["--cache-type-k", str(value)])
+    elif key == "cache_type_v":
+        cmd.extend(["--cache-type-v", str(value)])
+    elif key == "mmap":
+        bool_val = _normalize_bool_flag(value)
+        if bool_val is False:
+            cmd.append("--no-mmap")
+
+
+def build_llama_server_command(
+    model: ManagedModel,
+    server_path: Path,
+    *,
+    port: str,
+    host: str | None = None,
+    include_model_path: bool = True,
+    include_mmproj: bool = True,
+    include_jinja: bool = True,
+    server_defaults: dict[str, object] | None = None,
+) -> list[str]:
+    effective = dict(normalize_server_overrides(server_defaults or {}))
+    effective.update(normalize_server_overrides(model.server_overrides))
+    ctx_size = int(effective.pop("ctx_size", model.ctx_size))
+    n_gpu_layers = int(effective.pop("n_gpu_layers", model.n_gpu_layers))
+    tensor_split = preferred_tensor_split(model, str(effective.pop("tensor_split", model.tensor_split)))
+    resolved_host = str(effective.pop("host", host or model.host))
+    cmd = [str(server_path), "--port", str(port)]
+    if include_model_path:
+        cmd.extend(["--model", str(model.local_path)])
+    cmd.extend(["--ctx-size", str(ctx_size)])
+    cmd.extend(["--n-gpu-layers", str(n_gpu_layers)])
+    cmd.extend(["--tensor-split", tensor_split])
+    cmd.extend(["--host", resolved_host])
+    for key in (
+        "split_mode",
+        "flash_attn",
+        "batch_size",
+        "ubatch_size",
+        "threads",
+        "threads_batch",
+        "numa",
+        "fit_target",
+        "cache_type_k",
+        "cache_type_v",
+        "mmap",
+    ):
+        if key in effective:
+            _append_llama_server_flag(cmd, key, effective[key])
+    if include_mmproj and model.mmproj_path:
+        cmd.extend(["--mmproj", str(model.mmproj_path)])
+    if include_jinja and model.jinja:
+        cmd.append("--jinja")
+    return cmd
 
 
 def resolve_api_port(args = None) -> int:
@@ -1261,6 +1403,10 @@ def ensure_model_available(args, progress_callback = None):
         _emit_message("All required model files already exist locally. Skipping download.", progress_callback)
         if not ctx_changed and not config_changed and wait_for_model(existing.model_id, args.public_host, args.public_port, timeout=2):
             return existing.model_id
+        gpu_conflict = get_gpu_conflict_message(existing.model_id, catalog, args.public_host, args.public_port)
+        if gpu_conflict:
+            _emit_message(gpu_conflict, progress_callback)
+            raise RuntimeError(gpu_conflict)
         try:
             apply_config_and_wait(
                 catalog,
@@ -1400,6 +1546,11 @@ def ensure_model_available(args, progress_callback = None):
     new_m = ManagedModel(model_id=mid, repo_id=repo_id, quant=quant, filename=selected_file, local_path=str(local_path), mmproj_filename=mmproj_filename, mmproj_path=mmproj_path, ctx_size=desired_ctx, n_gpu_layers=int(args.n_gpu_layers), tensor_split=args.tensor_split, host=args.host, jinja=not args.no_jinja, ttl=resolve_idle_ttl(args), description=args.description or f"{repo_id} / {selected_file}", auto_ctx_failed=auto_ctx_failed, auto_ctx_error=auto_ctx_error)
     new_cat = [m for m in catalog if m.model_id != mid] + [new_m]
     save_catalog(args.catalog, new_cat)
+    gpu_conflict = get_gpu_conflict_message(mid, new_cat, args.public_host, args.public_port)
+    if gpu_conflict:
+        _emit_message(gpu_conflict, progress_callback)
+        save_catalog(args.catalog, stable_catalog)
+        raise RuntimeError(gpu_conflict)
     try:
         apply_config_and_wait(
             new_cat,
@@ -1710,6 +1861,68 @@ def get_gpu_process_map() -> dict[int, str]:
         used = chunks[1]
         gpu_map[int(chunks[0])] = used
     return gpu_map
+
+
+def _describe_pid(pid: int) -> str:
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", errors="ignore").replace("\x00", " ").strip()
+        if cmdline:
+            return cmdline
+    except Exception:
+        pass
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "comm="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        value = result.stdout.strip()
+        if value:
+            return value
+    except Exception:
+        pass
+    return "unknown-process"
+
+
+def _is_ollama_process(pid: int) -> bool:
+    description = _describe_pid(pid).lower()
+    return "ollama" in description
+
+
+def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DEFAULT_PUBLIC_HOST, port=DEFAULT_PUBLIC_PORT) -> str | None:
+    published_models = get_published_model_ids(host, port)
+    if model_id in published_models:
+        return None
+    processes = get_llama_server_processes()
+    process_by_pid = {proc["pid"]: proc for proc in processes}
+    model_by_path = {_safe_realpath(model.local_path): model.model_id for model in catalog}
+    gpu_process_map = get_gpu_process_map()
+    if not gpu_process_map:
+        return None
+    conflicts: list[str] = []
+    for pid, used_mem in sorted(gpu_process_map.items()):
+        if _is_ollama_process(pid):
+            continue
+        process = process_by_pid.get(pid)
+        if process is not None:
+            running_model = model_by_path.get(process.get("model_path") or "")
+            if running_model == model_id:
+                continue
+            if running_model:
+                conflicts.append(f"{running_model} (pid {pid}, {used_mem} MiB)")
+                continue
+        conflicts.append(f"{_describe_pid(pid)} (pid {pid}, {used_mem} MiB)")
+    if not conflicts:
+        return None
+    joined = "; ".join(conflicts[:4])
+    if len(conflicts) > 4:
+        joined += f"; +{len(conflicts) - 4} more"
+    return (
+        f"Cannot load model '{model_id}' because the GPU is already in use: {joined}. "
+        "Wait for those workloads to finish or unload them first."
+    )
 
 
 def get_configured_idle_ttl(config_path: Path | None = None, fallback: int = DEFAULT_IDLE_TTL) -> int:
@@ -2382,6 +2595,17 @@ def start_ctx_metadata_server(args):
                 payload = {}
             return payload if isinstance(payload, dict) else {}
 
+        def _reject_if_gpu_busy(self, model_name: str, catalog: list[ManagedModel], *, api_style: str) -> bool:
+            gpu_conflict = get_gpu_conflict_message(model_name, catalog, host, int(args.public_port))
+            if not gpu_conflict:
+                return False
+            log_api_event("model_load_blocked_gpu_busy", {"model": model_name, "message": gpu_conflict, "api_style": api_style})
+            if api_style == "openai":
+                self._send_json({"error": {"message": gpu_conflict, "type": "server_error"}}, status=503)
+            else:
+                self._send_json({"error": gpu_conflict}, status=503)
+            return True
+
         def _handle_ollama_chat(self):
             payload = self._read_json_body()
             log_api_event("ollama_chat_request", payload)
@@ -2389,6 +2613,8 @@ def start_ctx_metadata_server(args):
             model_name = resolve_catalog_model_name(str(payload.get("model") or "").strip(), catalog)
             if not model_name:
                 self._send_json({"error": "model is required"}, status=400)
+                return
+            if self._reject_if_gpu_busy(model_name, catalog, api_style="ollama"):
                 return
             mark_model_activity(model_name, "ollama_chat", "request_start")
             model_entry = next((item for item in catalog if item.model_id == model_name), None)
@@ -2540,6 +2766,8 @@ def start_ctx_metadata_server(args):
             if not model_name:
                 self._send_json({"error": {"message": "model is required", "type": "invalid_request_error"}}, status=400)
                 return
+            if self._reject_if_gpu_busy(model_name, catalog, api_style="openai"):
+                return
             mark_model_activity(model_name, "openai_chat", "request_start")
             model_entry = next((item for item in catalog if item.model_id == model_name), None)
             raw_messages = payload.get("messages") or []
@@ -2637,6 +2865,8 @@ def start_ctx_metadata_server(args):
             if not model_name:
                 self._send_json({"error": "model is required"}, status=400)
                 return
+            if self._reject_if_gpu_busy(model_name, catalog, api_style="ollama"):
+                return
             mark_model_activity(model_name, "ollama_generate", "request_start")
             model_entry = next((item for item in catalog if item.model_id == model_name), None)
             prompt = str(payload.get("prompt") or "")
@@ -2721,12 +2951,15 @@ def start_ctx_metadata_server(args):
             payload = self._read_json_body()
             log_api_event("ollama_embeddings_request", payload)
             model = str(payload.get("model") or "").strip()
-            model = resolve_catalog_model_name(model, load_catalog(catalog_path))
+            catalog = load_catalog(catalog_path)
+            model = resolve_catalog_model_name(model, catalog)
             text_input = payload.get("input")
             if text_input is None:
                 text_input = payload.get("prompt")
             if not model or text_input is None:
                 self._send_json({"error": "model and input are required"}, status=400)
+                return
+            if self._reject_if_gpu_busy(model, catalog, api_style="ollama"):
                 return
             mark_model_activity(model, "ollama_embeddings", "request_start")
             upstream_payload = {"model": model, "input": text_input}
@@ -3051,19 +3284,15 @@ def _spawn_validation_server(model: ManagedModel, llama_server: Path, ctx_size: 
 
     port = _find_free_port()
     trace_path, trace_handle = create_llamacpp_trace_file(model.model_id, ctx_size)
-    cmd = [
-        str(llama_server),
-        "--model", str(local_path),
-        "--ctx-size", str(ctx_size),
-        "--n-gpu-layers", str(model.n_gpu_layers),
-        "--tensor-split", model.tensor_split,
-        "--host", "127.0.0.1",
-        "--port", str(port),
-    ]
-    if model.jinja:
-        cmd.append("--jinja")
-    if _has_vision_runtime(model):
-        cmd.extend(["--mmproj", str(model.mmproj_path)])
+    probe_model = ManagedModel(**asdict(model))
+    probe_model.ctx_size = int(ctx_size)
+    cmd = build_llama_server_command(
+        probe_model,
+        llama_server,
+        port=str(port),
+        host="127.0.0.1",
+        server_defaults=resolve_llama_server_defaults(),
+    )
 
     proc = subprocess.Popen(
         cmd,
@@ -3195,19 +3424,15 @@ def probe_model_ctx(model: ManagedModel, llama_server: Path, ctx_size: int, time
 
     port = _find_free_port()
     trace_path, trace_handle = create_llamacpp_trace_file(model.model_id, ctx_size)
-    cmd = [
-        str(llama_server),
-        "--model", str(local_path),
-        "--ctx-size", str(ctx_size),
-        "--n-gpu-layers", str(model.n_gpu_layers),
-        "--tensor-split", model.tensor_split,
-        "--host", "127.0.0.1",
-        "--port", str(port),
-    ]
-    if model.jinja:
-        cmd.append("--jinja")
-    if _has_vision_runtime(model):
-        cmd.extend(["--mmproj", str(model.mmproj_path)])
+    probe_model = ManagedModel(**asdict(model))
+    probe_model.ctx_size = int(ctx_size)
+    cmd = build_llama_server_command(
+        probe_model,
+        llama_server,
+        port=str(port),
+        host="127.0.0.1",
+        server_defaults=resolve_llama_server_defaults(),
+    )
 
     proc = None
     loader = LoadingBar(f"\033[35;1mProbe {model.model_id} ctx={ctx_size}:\033[0m ")
@@ -3849,18 +4074,24 @@ def build_help_epilog():
     ui_url = f"http://{DEFAULT_PUBLIC_HOST}:{DEFAULT_PUBLIC_PORT}"
     api_url = f"http://{DEFAULT_PUBLIC_HOST}:{resolve_api_port()}"
     return (
+        "Default endpoints:\n"
+        f"  llama-swap UI/backend: {ui_url}\n"
+        f"  Superserver API:       {api_url}\n"
         "Runtime info:\n"
-        f"  Models dir:  {DEFAULT_MODELS_DIR}\n"
-        f"  Config file: {DEFAULT_CONFIG_PATH}\n"
-        f"  App config:  {DEFAULT_SERVER_CONFIG_PATH}\n"
-        f"  Catalog:     {DEFAULT_CATALOG_PATH}\n"
-        f"  Binary:      {DEFAULT_LLAMA_SERVER}\n"
-        f"  Public API:  {api_url}\n"
-        f"  UI:          {ui_url}/ui/#/activity\n"
-        f"  llama-swap:  {ui_url}\n"
-        f"  Idle TTL:    {resolve_idle_ttl()}s\n"
-        f"  API status:  {get_api_endpoint_status()}\n"
-        f"  UI status:   {get_public_endpoint_status()}"
+        f"  Install root:        {DEFAULT_LLAMA_SERVER.parent.parent.parent if 'llama.cpp/build/bin' in str(DEFAULT_LLAMA_SERVER) else DEFAULT_LLAMA_SERVER.parent}\n"
+        f"  Models dir:          {DEFAULT_MODELS_DIR}\n"
+        f"  llama-swap config:   {DEFAULT_CONFIG_PATH}\n"
+        f"  Catalog:             {DEFAULT_CATALOG_PATH}\n"
+        f"  App config:          {DEFAULT_SERVER_CONFIG_PATH}\n"
+        f"  llama-server binary: {DEFAULT_LLAMA_SERVER}\n"
+        f"  UI activity:         {ui_url}/ui/#/activity\n"
+        f"  Idle TTL:            {resolve_idle_ttl()}s\n"
+        "Config knobs:\n"
+        f"  Global llama-server defaults: {DEFAULT_SERVER_CONFIG_PATH} -> llama_server_defaults\n"
+        f"  Per-model overrides:          {DEFAULT_CATALOG_PATH} -> server_overrides\n"
+        "  Main folders: install root, models dir, state/config paths above.\n"
+        f"  API status:          {get_api_endpoint_status()}\n"
+        f"  UI status:           {get_public_endpoint_status()}"
     )
 
 def main():

@@ -1,1 +1,1 @@
-"""Packaging helpers and shell entrypoints for the llama.cpp stack."""
+"""Bundle helpers for portable shell installers."""

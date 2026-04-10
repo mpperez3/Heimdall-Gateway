@@ -33,7 +33,10 @@ SWAP_WRAPPER_NAME = "llamacpp-superserver-swap-start"
 OLLAMA_DEFAULT_PORT = 11434
 SERVER_CONFIG_BASENAME = "llamacpp-superserver.json"
 LEGACY_SERVER_CONFIG_BASENAME = "llamacpp-server.json"
+ENV_BASENAME = "llamacpp-superserver.env"
+LEGACY_ENV_BASENAME = "llamacpp-stack.env"
 LLAMA_CPP_MODES = ("native", "prebuilt", "source")
+ELEVATED_INSTALL_ENV = "LLAMACPP_INSTALL_ELEVATED"
 
 
 @dataclass
@@ -81,23 +84,33 @@ def prompt_choice(message: str, options: list[tuple[str, str]], default: str) ->
     if not sys.stdin.isatty():
         return default
     labels = {key: label for key, label in options}
-    rendered = ", ".join(f"{key}={label}" for key, label in options)
+    lines = [message]
+    numeric_to_key: dict[str, str] = {}
+    for index, (key, label) in enumerate(options, start=1):
+        numeric_to_key[str(index)] = key
+        suffix = " [default]" if key == default else ""
+        title = key.capitalize()
+        lines.append(f"  {index}. {title}{suffix}")
+        lines.append(f"     {label}")
+    lines.append(f"Choice [{default}]")
+    prompt = "\n".join(lines) + ": "
     while True:
-        raw = input(f"{message} [{rendered}; default: {default}] ").strip().lower()
-        choice = raw or default
+        raw = input(prompt).strip().lower()
+        choice = numeric_to_key.get(raw, raw) or default
         if choice in labels:
             return choice
-        print(f"Choose one of: {', '.join(labels)}")
+        print(f"Choose one of: {', '.join(numeric_to_key)} or {', '.join(labels)}")
 
 
 def resolve_install_mode(requested_mode: str | None) -> str:
     if requested_mode:
         return requested_mode
-    if existing := detect_existing_mode():
-        return existing
-    default_mode = "system" if os.geteuid() == 0 else "user"
+    existing = detect_existing_mode()
+    default_mode = existing or ("system" if os.geteuid() == 0 else "user")
     if not sys.stdin.isatty():
         return default_mode
+    if existing:
+        print(f"Existing installation detected in {existing} mode.")
     if prompt_bool("Install for all users?", default=(default_mode == "system")):
         return "system"
     return "user"
@@ -107,14 +120,24 @@ def resolve_llama_cpp_mode(requested_mode: str | None) -> str:
     if requested_mode:
         return requested_mode
     return prompt_choice(
-        "How should llama.cpp be provided?",
+        "How should llama.cpp be installed?",
         [
-            ("source", "build-from-source"),
-            ("prebuilt", "precompiled-binary"),
-            ("native", "system-native"),
+            ("source", "build locally from source (best default, best GPU tuning)"),
+            ("prebuilt", "download a precompiled binary (fastest install)"),
+            ("native", "use a system-wide llama.cpp already installed on the machine"),
         ],
         default="source",
     )
+
+
+def resolve_public_host(requested_host: str | None) -> str:
+    if requested_host and requested_host != "127.0.0.1":
+        return requested_host
+    if not sys.stdin.isatty():
+        return requested_host or "127.0.0.1"
+    if prompt_bool("Expose superserver API and llama-swap on all network interfaces (0.0.0.0)?", default=False):
+        return "0.0.0.0"
+    return "127.0.0.1"
 
 
 def find_next_free_port(host: str = "127.0.0.1", start: int = 11437, limit: int = 11550) -> int:
@@ -285,6 +308,48 @@ def _sudo_prefix() -> list[str]:
     return [] if os.geteuid() == 0 else ["sudo"]
 
 
+def _args_to_cli(argv: argparse.Namespace, chosen_mode: str, chosen_llama_cpp_mode: str, chosen_models_dir: Path) -> list[str]:
+    cmd = [
+        "--mode",
+        chosen_mode,
+        "--llama-cpp-mode",
+        chosen_llama_cpp_mode,
+        "--models-dir",
+        str(chosen_models_dir),
+        "--idle-ttl",
+        str(argv.idle_ttl),
+    ]
+    if argv.public_host:
+        cmd.extend(["--public-host", str(argv.public_host)])
+    if argv.public_port is not None:
+        cmd.extend(["--public-port", str(argv.public_port)])
+    if argv.enable_tls:
+        cmd.append("--enable-tls")
+    cmd.append("--prefer-source-cuda" if argv.prefer_source_cuda else "--no-prefer-source-cuda")
+    cmd.append("--prefer-binary" if argv.prefer_binary else "--no-prefer-binary")
+    cmd.append("--install-services" if argv.install_services else "--no-install-services")
+    if argv.dry_run:
+        cmd.append("--dry-run")
+    return cmd
+
+
+def maybe_reexec_system_install(argv: argparse.Namespace, chosen_mode: str, chosen_llama_cpp_mode: str, chosen_models_dir: Path) -> int | None:
+    if chosen_mode != "system" or os.geteuid() == 0 or os.environ.get(ELEVATED_INSTALL_ENV) == "1":
+        return None
+    cmd = [
+        "sudo",
+        "-E",
+        sys.executable,
+        str(Path(__file__).resolve()),
+        *_args_to_cli(argv, chosen_mode, chosen_llama_cpp_mode, chosen_models_dir),
+    ]
+    env = os.environ.copy()
+    env[ELEVATED_INSTALL_ENV] = "1"
+    print("System-wide install selected. Re-running installer with sudo.")
+    subprocess.run(cmd, check=True, env=env)
+    return 0
+
+
 def detect_cuda_toolkit_package() -> str | None:
     if shutil.which("apt-cache") is None:
         return None
@@ -315,14 +380,28 @@ def detect_cuda_toolkit_package() -> str | None:
     return None
 
 
+def resolve_uv_executable() -> str | None:
+    bootstrap_uv = os.environ.get("LLAMACPP_BOOTSTRAP_UV")
+    if bootstrap_uv and Path(bootstrap_uv).exists():
+        return bootstrap_uv
+    if uv_bin := shutil.which("uv"):
+        return uv_bin
+    sibling = Path(sys.executable).resolve().parent / "uv"
+    if sibling.exists():
+        return str(sibling)
+    return None
+
+
 def _export_nvcc_path(nvcc_path: str | None) -> bool:
     if not nvcc_path:
         return False
-    nvcc_dir = str(Path(nvcc_path).resolve().parent)
+    nvcc_resolved = str(Path(nvcc_path).resolve())
+    nvcc_dir = str(Path(nvcc_resolved).parent)
     current_path = os.environ.get("PATH", "")
     parts = current_path.split(os.pathsep) if current_path else []
     if nvcc_dir not in parts:
         os.environ["PATH"] = nvcc_dir + (os.pathsep + current_path if current_path else "")
+    os.environ["CUDACXX"] = nvcc_resolved
     return True
 
 
@@ -371,8 +450,12 @@ def normalize_python_cuda_layout(cuda_root: Path | None) -> bool:
 
 
 def maybe_install_cuda_toolkit_via_uv(python_exec: str, dry_run: bool) -> bool:
+    uv_bin = resolve_uv_executable()
     if dry_run:
-        print(f"[dry-run] would offer CUDA toolkit install via: uv pip install --python {python_exec} cuda-toolkit[all]")
+        print(f"[dry-run] would offer CUDA toolkit install via: {(uv_bin or 'uv')} pip install --python {python_exec} cuda-toolkit[all]")
+        return False
+    if uv_bin is None:
+        print("Could not find uv in PATH or next to the bootstrap Python; cannot install CUDA toolkit into the Python environment automatically.")
         return False
 
     if not prompt_bool(
@@ -382,12 +465,12 @@ def maybe_install_cuda_toolkit_via_uv(python_exec: str, dry_run: bool) -> bool:
         return False
 
     try:
-        subprocess.run(["uv", "pip", "install", "--python", python_exec, "cuda-toolkit[all]"], check=True)
+        subprocess.run([uv_bin, "pip", "install", "--python", python_exec, "cuda-toolkit[all]"], check=True)
     except Exception as exc:
         print(f"Could not install cuda-toolkit[all] with uv: {exc}")
         print("Falling back to a smaller nvcc-only Python package.")
         try:
-            subprocess.run(["uv", "pip", "install", "--python", python_exec, "nvidia-cuda-nvcc"], check=True)
+            subprocess.run([uv_bin, "pip", "install", "--python", python_exec, "nvidia-cuda-nvcc"], check=True)
         except Exception as fallback_exc:
             print(f"Could not install nvidia-cuda-nvcc with uv: {fallback_exc}")
             return False
@@ -528,24 +611,29 @@ def existing_public_port(mode: str) -> int | None:
 
 
 def env_path_for_mode(mode: str) -> Path:
+    base = Path("/etc/llamacpp-superserver") if mode == "system" else Path.home() / ".config/llamacpp-superserver"
+    return base / ENV_BASENAME
+
+
+def legacy_env_path_for_mode(mode: str) -> Path:
     return Path("/etc/llamacpp/llamacpp-stack.env") if mode == "system" else Path.home() / ".config/llamacpp/llamacpp-stack.env"
 
 
 def detect_existing_mode() -> str | None:
-    if env_path_for_mode("system").exists():
+    if env_path_for_mode("system").exists() or legacy_env_path_for_mode("system").exists():
         return "system"
-    if env_path_for_mode("user").exists():
+    if env_path_for_mode("user").exists() or legacy_env_path_for_mode("user").exists():
         return "user"
     return None
 
 
 def existing_models_dir(mode: str) -> Path | None:
-    env_path = env_path_for_mode(mode)
-    if not env_path.exists():
-        return None
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        if line.startswith("LLAMACPP_MODELS="):
-            return Path(line.split("=", 1)[1].strip()).expanduser()
+    for env_path in (env_path_for_mode(mode), legacy_env_path_for_mode(mode)):
+        if not env_path.exists():
+            continue
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("LLAMACPP_MODELS="):
+                return Path(line.split("=", 1)[1].strip()).expanduser()
     return None
 
 
@@ -555,8 +643,8 @@ def derive_models_dir(base: Path | None, mode: str) -> Path:
         if mode == "system" or os.access(base.parent, os.W_OK):
             return sibling
     if mode == "system":
-        return Path("/var/lib/llamacpp/models")
-    return Path.home() / ".local/share/llamacpp/models"
+        return Path("/var/lib/llamacpp-superserver/models")
+    return Path.home() / ".local/share/llamacpp-superserver/models"
 
 
 def choose_layout(mode: str | None, public_host: str, public_port: int | None, models_dir: Path | None = None) -> InstallLayout:
@@ -565,18 +653,18 @@ def choose_layout(mode: str | None, public_host: str, public_port: int | None, m
     ollama_models = detect_ollama_models_dir()
     resolved_models_dir = models_dir or existing_models_dir(resolved_mode) or derive_models_dir(ollama_models, resolved_mode)
     if resolved_mode == "system":
-        install_root = Path("/opt/llm")
-        state_dir = Path("/var/lib/llamacpp")
-        config_dir = Path("/etc/llamacpp")
-        run_dir = Path("/run/llamacpp")
+        install_root = Path("/opt/llamacpp-superserver")
+        state_dir = Path("/var/lib/llamacpp-superserver")
+        config_dir = Path("/etc/llamacpp-superserver")
+        run_dir = Path("/run/llamacpp-superserver")
         user = DEFAULT_SERVICE_USER
         group = user
         bin_dir = Path("/usr/local/bin")
     else:
-        install_root = Path.home() / ".local/opt/llamacpp-stack"
-        state_dir = Path.home() / ".local/state/llamacpp"
-        config_dir = Path.home() / ".config/llamacpp"
-        run_dir = Path.home() / ".local/run/llamacpp"
+        install_root = Path.home() / ".local/opt/llamacpp-superserver"
+        state_dir = Path.home() / ".local/state/llamacpp-superserver"
+        config_dir = Path.home() / ".config/llamacpp-superserver"
+        run_dir = Path.home() / ".local/run/llamacpp-superserver"
         user = os.environ.get("USER", "unknown")
         group = user
         bin_dir = Path.home() / ".local/bin"
@@ -763,8 +851,10 @@ def _render_env(
 def render_manager_service(layout: InstallLayout) -> str:
     wanted_by = "multi-user.target" if layout.mode == "system" else "default.target"
     identity_lines: list[str] = []
+    runtime_lines: list[str] = []
     if layout.mode == "system":
         identity_lines = [f"User={layout.service_user}", f"Group={layout.service_group}"]
+        runtime_lines = [f"RuntimeDirectory={layout.run_dir.name}", "RuntimeDirectoryMode=0755"]
     service_lines = [
         "[Unit]",
         "Description=llamacpp superserver manager",
@@ -773,6 +863,7 @@ def render_manager_service(layout: InstallLayout) -> str:
         "[Service]",
         "Type=simple",
         *identity_lines,
+        *runtime_lines,
         f"ExecStart={layout.bin_dir / MANAGER_WRAPPER_NAME}",
         "Restart=always",
         "RestartSec=2",
@@ -786,8 +877,10 @@ def render_manager_service(layout: InstallLayout) -> str:
 def render_llamaswap_service(layout: InstallLayout) -> str:
     wanted_by = "multi-user.target" if layout.mode == "system" else "default.target"
     identity_lines: list[str] = []
+    runtime_lines: list[str] = []
     if layout.mode == "system":
         identity_lines = [f"User={layout.service_user}", f"Group={layout.service_group}"]
+        runtime_lines = [f"RuntimeDirectory={layout.run_dir.name}", "RuntimeDirectoryMode=0755"]
     service_lines = [
         "[Unit]",
         "Description=llamacpp superserver llama-swap backend",
@@ -796,6 +889,7 @@ def render_llamaswap_service(layout: InstallLayout) -> str:
         "[Service]",
         "Type=simple",
         *identity_lines,
+        *runtime_lines,
         f"ExecStart={layout.bin_dir / SWAP_WRAPPER_NAME}",
         "Restart=always",
         "RestartSec=2",
@@ -807,7 +901,7 @@ def render_llamaswap_service(layout: InstallLayout) -> str:
 
 
 def render_manager_wrapper(layout: InstallLayout) -> str:
-    env_file = layout.config_dir / "llamacpp-stack.env"
+    env_file = layout.config_dir / ENV_BASENAME
     return textwrap.dedent(
         f"""\
         #!/usr/bin/env bash
@@ -823,7 +917,7 @@ def render_manager_wrapper(layout: InstallLayout) -> str:
           export CUDA_PATH="$LLAMACPP_CUDA_ROOT"
           export LD_LIBRARY_PATH="$LLAMACPP_CUDA_ROOT/lib64:$LLAMACPP_CUDA_ROOT/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
         fi
-        mkdir -p "$(dirname "$LLAMACPP_MANAGER_SOCKET")"
+        mkdir -p "$(dirname "$LLAMACPP_MANAGER_SOCKET")" || true
         exec "$PYTHON_BIN" -m llamacpp_stack.cli \\
           --models-dir "$LLAMACPP_MODELS" \\
           --config "$LLAMACPP_CONFIG" \\
@@ -837,7 +931,7 @@ def render_manager_wrapper(layout: InstallLayout) -> str:
 
 
 def render_llamaswap_wrapper(layout: InstallLayout) -> str:
-    env_file = layout.config_dir / "llamacpp-stack.env"
+    env_file = layout.config_dir / ENV_BASENAME
     return textwrap.dedent(
         f"""\
         #!/usr/bin/env bash
@@ -852,7 +946,7 @@ def render_llamaswap_wrapper(layout: InstallLayout) -> str:
         fi
         exec "$LLAMASWAP_BIN" \\
           --config "$LLAMACPP_CONFIG" \\
-          --listen "{layout.public_host}:{layout.public_port}" \\
+          --listen "$LLAMACPP_PUBLIC_HOST:$LLAMACPP_PUBLIC_PORT" \\
           --watch-config
         """
     )
@@ -937,7 +1031,8 @@ def ensure_models_dir_ready(layout: InstallLayout, dry_run: bool) -> None:
     try:
         models_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(models_dir, 0o775)
-        shutil.chown(models_dir, user=owner_user, group=owner_group)
+        if layout.mode == "system":
+            shutil.chown(models_dir, user=owner_user, group=owner_group)
         local_ready = os.access(models_dir, os.W_OK | os.X_OK)
     except PermissionError:
         local_ready = False
@@ -973,6 +1068,10 @@ def ensure_models_dir_ready(layout: InstallLayout, dry_run: bool) -> None:
         )
 
 
+def determine_build_jobs() -> int:
+    return max(1, os.cpu_count() or 1)
+
+
 def _run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True, env=env)
 
@@ -980,12 +1079,13 @@ def _run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = N
 def ensure_runtime_python(layout: InstallLayout, dry_run: bool) -> tuple[Path, Path]:
     runtime_python = layout.runtime_venv / "bin" / "python"
     python_path = layout.python_root
+    uv_bin = resolve_uv_executable()
     if dry_run:
         print(f"[dry-run] would create runtime venv at {layout.runtime_venv}")
         print(f"[dry-run] would copy Python package to {python_path / 'llamacpp_stack'}")
         return runtime_python, python_path
 
-    if shutil.which("uv") is None:
+    if uv_bin is None:
         raise RuntimeError("uv is required to create the runtime Python environment.")
 
     source_pkg = Path(__file__).resolve().parent
@@ -1007,10 +1107,10 @@ def ensure_runtime_python(layout: InstallLayout, dry_run: bool) -> tuple[Path, P
 
     if layout.runtime_venv.exists():
         shutil.rmtree(layout.runtime_venv)
-    _run(["uv", "venv", "--python", sys.executable, str(layout.runtime_venv)])
+    _run([uv_bin, "venv", "--python", sys.executable, str(layout.runtime_venv)])
     _run(
         [
-            "uv",
+            uv_bin,
             "pip",
             "install",
             "--python",
@@ -1082,6 +1182,11 @@ def build_llama_cpp_from_source(
     if enable_cuda and (arch := detect_cuda_arch()):
         cmake_args.append(f"-DCMAKE_CUDA_ARCHITECTURES={arch}")
     build_env = os.environ.copy()
+    nvcc_path = build_env.get("CUDACXX") or locate_nvcc() or locate_nvcc_for_python(python_exec)
+    if enable_cuda and nvcc_path:
+        _export_nvcc_path(nvcc_path)
+        build_env = os.environ.copy()
+        cmake_args.append(f"-DCMAKE_CUDA_COMPILER={Path(nvcc_path).resolve()}")
     cuda_root = Path(build_env["CUDAToolkit_ROOT"]) if build_env.get("CUDAToolkit_ROOT") else locate_cuda_root_for_python(python_exec)
     if enable_cuda and cuda_root:
         normalize_python_cuda_layout(cuda_root)
@@ -1096,8 +1201,9 @@ def build_llama_cpp_from_source(
         for flag in ("LLAMA_CURL", "LLAMA_HTTP_SERVER"):
             if source_tree_supports_flag(src_dir, flag):
                 cmake_args.append(f"-D{flag}=ON")
+    build_jobs = determine_build_jobs()
     _run(cmake_args, env=build_env)
-    _run(["cmake", "--build", str(build_dir), "--target", "llama-server", "-j"], env=build_env)
+    _run(["cmake", "--build", str(build_dir), "--target", "llama-server", "-j", str(build_jobs)], env=build_env)
     return build_dir / "bin/llama-server"
 
 
@@ -1154,6 +1260,24 @@ def write_manifest(layout: InstallLayout, llama_cpp_release: dict, llamaswap_rel
     (layout.state_dir / "install-manifest.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def detect_existing_llama_cpp_mode(layout: InstallLayout) -> str:
+    manifest_path = layout.state_dir / "install-manifest.json"
+    if not manifest_path.exists():
+        return "source"
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return "source"
+    strategy = str(payload.get("llama_cpp_strategy") or "").strip()
+    if strategy == "native":
+        return "native"
+    if strategy == "binary":
+        return "prebuilt"
+    if strategy.startswith("source-build"):
+        return "source"
+    return "source"
+
+
 def is_existing_install(layout: InstallLayout) -> bool:
     return (layout.state_dir / "install-manifest.json").exists() or layout.install_root.exists()
 
@@ -1182,10 +1306,37 @@ def install_systemd_units(layout: InstallLayout, dry_run: bool) -> None:
     _run(enable_cmd)
 
 
+def maybe_offer_ufw_ports(layout: InstallLayout, dry_run: bool) -> None:
+    if layout.mode != "system" or layout.public_host != "0.0.0.0":
+        return
+    if shutil.which("ufw") is None:
+        return
+    try:
+        result = subprocess.run(["ufw", "status"], check=False, capture_output=True, text=True)
+    except Exception:
+        return
+    if result.returncode != 0 or "Status: active" not in result.stdout:
+        return
+    if not prompt_bool(
+        f"UFW is active. Allow TCP ports {layout.public_port - 1} and {layout.public_port} through the firewall?",
+        default=True,
+    ):
+        return
+    if dry_run:
+        print(
+            f"[dry-run] would run: {' '.join(_sudo_prefix() + ['ufw', 'allow', f'{layout.public_port - 1}/tcp'])}"
+            f" && {' '.join(_sudo_prefix() + ['ufw', 'allow', f'{layout.public_port}/tcp'])}"
+        )
+        return
+    _run(_sudo_prefix() + ["ufw", "allow", f"{layout.public_port - 1}/tcp"])
+    _run(_sudo_prefix() + ["ufw", "allow", f"{layout.public_port}/tcp"])
+
+
 def print_install_summary(layout: InstallLayout, install_services: bool) -> None:
     ui_base_url = f"http://{layout.public_host}:{layout.public_port}"
     api_url = f"http://{layout.public_host}:{layout.public_port - 1}"
     ui_url = f"{ui_base_url}/ui/#/activity"
+    help_cmd = layout.bin_dir / CLI_COMMAND
     if layout.mode == "system":
         start_cmd = f"sudo systemctl start {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}"
         status_cmd = f"sudo systemctl status {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}"
@@ -1199,8 +1350,8 @@ def print_install_summary(layout: InstallLayout, install_services: bool) -> None
     print(f"  {CLI_COMMAND} ps")
     print(f"  {CLI_COMMAND} list")
     print(f"  {CLI_COMMAND} run <repo-or-hf-ref>")
-    print(f"Superserver API endpoint: {api_url}")
-    print(f"UI activity:  {ui_url}")
+    print(f"OpenAI/Ollama API:   {api_url}")
+    print(f"UI activity:         {ui_url}")
     print(f"llama-swap UI/backend: {ui_base_url}")
     if install_services:
         print(f"Services enabled. Check with: {status_cmd}")
@@ -1208,20 +1359,105 @@ def print_install_summary(layout: InstallLayout, install_services: bool) -> None
         print("Services were not enabled automatically.")
         print(f"Start them with: {start_cmd}")
         print(f"Then check with: {status_cmd}")
+    if help_cmd.exists():
+        print("\nShowing command help:\n")
+        try:
+            subprocess.run([str(help_cmd), "--help"], check=False)
+        except Exception as exc:
+            print(f"Could not show {CLI_COMMAND} --help automatically: {exc}")
+
+
+def _catalog_model_count(catalog_path: Path) -> int:
+    try:
+        payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    if not isinstance(payload, list):
+        return 0
+    return sum(1 for item in payload if isinstance(item, dict) and item.get("model_id"))
+
+
+def _models_dir_has_gguf(models_dir: Path) -> bool:
+    try:
+        return any(models_dir.rglob("*.gguf"))
+    except Exception:
+        return False
+
+
+def maybe_rerun_auto_ctx(layout: InstallLayout, install_services: bool, dry_run: bool) -> None:
+    catalog_path = layout.state_dir / "catalog.json"
+    catalog_models = _catalog_model_count(catalog_path)
+    if catalog_models <= 0:
+        if _models_dir_has_gguf(layout.models_dir):
+            if prompt_bool(
+                "Detected GGUF files from a previous installation in the models directory. Re-run auto-ctx after reinstall?",
+                default=False,
+            ):
+                if dry_run:
+                    print(f"[dry-run] would run: {layout.bin_dir / CLI_COMMAND} update --auto")
+                    return
+                if not install_services:
+                    print("Services were not enabled, so auto-ctx cannot be re-run automatically yet.")
+                    return
+                _run([str(layout.bin_dir / CLI_COMMAND), "update", "--auto"])
+            else:
+                print("Detected GGUF files in the models directory, but no registered catalog entries exist yet. Skipping auto-ctx.")
+        return
+    if not prompt_bool(f"Detected {catalog_models} registered models. Re-run auto-ctx now?", default=False):
+        return
+    if dry_run:
+        print(f"[dry-run] would run: {layout.bin_dir / CLI_COMMAND} update --auto")
+        return
+    if not install_services:
+        print("Services were not enabled, so auto-ctx cannot be re-run automatically yet.")
+        return
+    _run([str(layout.bin_dir / CLI_COMMAND), "update", "--auto"])
+
+
+def maybe_migrate_existing_install(target_mode: str, public_host: str, public_port: int | None, dry_run: bool) -> None:
+    existing_mode = detect_existing_mode()
+    if not existing_mode or existing_mode == target_mode:
+        return
+    print(
+        f"Existing {existing_mode}-mode installation detected. "
+        f"It will be uninstalled before installing in {target_mode} mode."
+    )
+    print("Downloaded models will be kept.")
+    if dry_run:
+        print(f"[dry-run] would uninstall previous {existing_mode}-mode installation with --keep-models.")
+        return
+    from .uninstall import uninstall_stack
+
+    uninstall_stack(
+        argparse.Namespace(
+            mode=existing_mode,
+            public_host=public_host,
+            public_port=public_port,
+            keep_models=True,
+            dry_run=False,
+        )
+    )
 
 
 def install_stack(args: argparse.Namespace) -> int:
     pre_mode = resolve_install_mode(args.mode)
-    llama_cpp_mode = resolve_llama_cpp_mode(args.llama_cpp_mode)
+    chosen_public_host = resolve_public_host(args.public_host)
     suggested_models_dir = existing_models_dir(pre_mode) or derive_models_dir(detect_ollama_models_dir(), pre_mode)
     chosen_models_dir = Path(args.models_dir).expanduser() if args.models_dir else prompt_path("Models directory", suggested_models_dir)
-    layout = choose_layout(pre_mode, args.public_host, args.public_port, chosen_models_dir)
+    maybe_migrate_existing_install(pre_mode, chosen_public_host, args.public_port, args.dry_run)
+    args.public_host = chosen_public_host
+    layout = choose_layout(pre_mode, chosen_public_host, args.public_port, chosen_models_dir)
     update_binaries = True
     if is_existing_install(layout):
-        if llama_cpp_mode == "native":
-            update_binaries = prompt_bool("Existing installation detected. Refresh llama-swap and re-check native llama.cpp?", default=True)
-        else:
-            update_binaries = prompt_bool("Existing installation detected. Update llama.cpp and llama-swap binaries?", default=True)
+        update_binaries = prompt_bool("Existing installation detected. Update llama.cpp and llama-swap binaries?", default=True)
+    if update_binaries:
+        llama_cpp_mode = resolve_llama_cpp_mode(args.llama_cpp_mode)
+    else:
+        llama_cpp_mode = detect_existing_llama_cpp_mode(layout)
+        print(f"Keeping existing llama.cpp mode: {llama_cpp_mode}")
+    reexec_status = maybe_reexec_system_install(args, pre_mode, llama_cpp_mode, chosen_models_dir)
+    if reexec_status is not None:
+        return reexec_status
     if args.dry_run:
         print(f"[dry-run] would ensure directories under {layout.install_root}, {layout.state_dir}, {layout.models_dir}")
     else:
@@ -1353,9 +1589,24 @@ def install_stack(args: argparse.Namespace) -> int:
         print(manager_unit)
         print(swap_unit)
     else:
-        (layout.config_dir / "llamacpp-stack.env").write_text(env_text, encoding="utf-8")
-        server_config_payload = json.dumps({"idle_ttl": args.idle_ttl, "api_port": layout.public_port - 1}, indent=2) + "\n"
+        (layout.config_dir / ENV_BASENAME).write_text(env_text, encoding="utf-8")
+        legacy_env_path = layout.config_dir.parent / "llamacpp" / LEGACY_ENV_BASENAME
+        if not legacy_env_path.exists():
+            legacy_env_path.parent.mkdir(parents=True, exist_ok=True)
+            legacy_env_path.write_text(env_text, encoding="utf-8")
         server_config_path = layout.config_dir / SERVER_CONFIG_BASENAME
+        server_config_data: dict[str, object] = {}
+        if server_config_path.exists():
+            try:
+                payload = json.loads(server_config_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    server_config_data = payload
+            except Exception:
+                server_config_data = {}
+        server_config_data["idle_ttl"] = args.idle_ttl
+        server_config_data["api_port"] = layout.public_port - 1
+        server_config_data.setdefault("llama_server_defaults", {})
+        server_config_payload = json.dumps(server_config_data, indent=2) + "\n"
         server_config_path.write_text(
             server_config_payload,
             encoding="utf-8",
@@ -1384,7 +1635,7 @@ def install_stack(args: argparse.Namespace) -> int:
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
             "set -a\n"
-            f"source {layout.config_dir / 'llamacpp-stack.env'}\n"
+            f"source {layout.config_dir / ENV_BASENAME}\n"
             "set +a\n"
             "export PYTHONPATH=\"$LLAMACPP_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}\"\n"
             "if [[ -n \"${LLAMACPP_CUDA_ROOT:-}\" ]]; then\n"
@@ -1403,6 +1654,9 @@ def install_stack(args: argparse.Namespace) -> int:
     write_manifest(layout, llama_cpp_release, llamaswap_release, strategy, args.dry_run)
     if args.install_services:
         install_systemd_units(layout, args.dry_run)
+        maybe_offer_ufw_ports(layout, args.dry_run)
+    if not args.dry_run:
+        maybe_rerun_auto_ctx(layout, args.install_services, args.dry_run)
     if not args.dry_run:
         print_install_summary(layout, args.install_services)
     return 0
@@ -1416,7 +1670,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=LLAMA_CPP_MODES,
         help="How to provide llama.cpp: native system package, prebuilt binary, or build from source.",
     )
-    parser.add_argument("--public-host", default="127.0.0.1")
+    parser.add_argument("--public-host")
     parser.add_argument(
         "--public-port",
         type=int,
