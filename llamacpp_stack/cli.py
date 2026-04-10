@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import hashlib
 import json
 import math
@@ -364,23 +365,36 @@ def preferred_tensor_split(model: ManagedModel | None, value: str | None = None)
 
 
 def load_catalog(path: Path) -> list[ManagedModel]:
-    if not path.exists(): return []
+    items, _ = load_catalog_with_diagnostics(path)
+    return items
+
+
+def load_catalog_with_diagnostics(path: Path) -> tuple[list[ManagedModel], str | None]:
+    if not path.exists():
+        return [], f"Catalog file not found: {path}"
     try:
-        items = [ManagedModel(**m) for m in json.loads(path.read_text("utf-8"))]
-        changed = False
-        for item in items:
-            normalized = preferred_tensor_split(item, item.tensor_split)
-            if normalized != item.tensor_split:
-                item.tensor_split = normalized
-                changed = True
-            normalized_overrides = normalize_server_overrides(item.server_overrides)
-            if normalized_overrides != item.server_overrides:
-                item.server_overrides = normalized_overrides
-                changed = True
-        if changed:
-            save_catalog(path, items)
-        return items
-    except: return []
+        payload = json.loads(path.read_text("utf-8"))
+    except Exception as exc:
+        return [], f"Could not read/parse catalog {path}: {exc}"
+    if not isinstance(payload, list):
+        return [], f"Catalog {path} has invalid format (expected a JSON array)."
+    try:
+        items = [ManagedModel(**m) for m in payload]
+    except Exception as exc:
+        return [], f"Catalog {path} has invalid entries: {exc}"
+    changed = False
+    for item in items:
+        normalized = preferred_tensor_split(item, item.tensor_split)
+        if normalized != item.tensor_split:
+            item.tensor_split = normalized
+            changed = True
+        normalized_overrides = normalize_server_overrides(item.server_overrides)
+        if normalized_overrides != item.server_overrides:
+            item.server_overrides = normalized_overrides
+            changed = True
+    if changed:
+        save_catalog(path, items)
+    return items, None
 
 def save_catalog(path: Path, models: list[ManagedModel]):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1176,8 +1190,32 @@ def manager_hint() -> str:
         f"  {user_mode_commands[0]}\n"
         f"  {user_mode_commands[1]}\n"
         f"  {system_mode_commands[0]}\n"
-        f"  {system_mode_commands[1]}"
+        f"  {system_mode_commands[1]}\n"
+        f"Socket path: {SOCKET_PATH}"
     )
+
+
+def _has_gguf_files(models_dir: Path) -> bool:
+    try:
+        return any(models_dir.rglob("*.gguf"))
+    except Exception:
+        return False
+
+
+def _show_local_catalog_fallback(args, reason: Exception) -> None:
+    print(f"{manager_hint()}\nDetails: {reason}")
+    catalog, catalog_diag = load_catalog_with_diagnostics(args.catalog)
+    print("\nManager unavailable; showing local catalog view (published/loaded status may be stale).")
+    print("\n" + render_models_table(catalog, args.public_host, args.public_port, get_effective_idle_ttl(args)))
+    if catalog:
+        return
+    if catalog_diag:
+        print(f"Catalog diagnostic: {catalog_diag}")
+    elif _has_gguf_files(args.models_dir):
+        print(
+            "Detected GGUF files in the models directory, but there are no registered catalog entries yet. "
+            "Register models first with 'llamacpp-superserver run <hf-repo[:quant]>' or 'add'."
+        )
 
 def _ask_confirmation(prompt: str, progress_callback = None, default: bool = False) -> bool:
     default_key = "y" if default else "n"
@@ -2997,6 +3035,7 @@ def start_ctx_metadata_server(args):
         server = ThreadingHTTPServer((host, port), Handler)
     except OSError as e:
         print(f"[!] Could not start ctx metadata server on http://{host}:{port}: {e}")
+        print(f"    Check which process owns the port with: sudo ss -ltnp 'sport = :{port}'")
         return None
 
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -3019,11 +3058,11 @@ def list_models(args):
         except RuntimeError as e:
             message = str(e)
             if "FileNotFoundError" in message or "No such file or directory" in message:
-                print(manager_hint())
+                _show_local_catalog_fallback(args, e)
                 return 0
             raise e
         except Exception as e:
-            print(f"{manager_hint()}\nDetails: {e}")
+            _show_local_catalog_fallback(args, e)
             return 0
 
     output = render_models_table(load_catalog(args.catalog), args.public_host, args.public_port, get_effective_idle_ttl(args))
@@ -3754,10 +3793,15 @@ def update_config(args, progress_callback = None):
     if not is_owner:
         try:
             return run_manager_command("update", args)
-        except RuntimeError as e:
-            raise e
+        except RuntimeError:
+            raise
         except Exception as e:
-            raise manager_unavailable_error(e)
+            if os.geteuid() != 0:
+                raise manager_unavailable_error(e)
+            _emit_message(
+                f"Manager unavailable ({e}). Continuing with a local update as root.",
+                progress_callback,
+            )
 
     catalog = load_catalog(args.catalog)
     target = getattr(args, "repo", None)
@@ -3969,13 +4013,19 @@ def start_chat(model_id, host, port):
 
 def daemon_mode(args):
     """Background manager listening on Unix socket."""
-    if os.path.exists(SOCKET_PATH): os.remove(SOCKET_PATH)
-    os.makedirs(os.path.dirname(SOCKET_PATH), exist_ok=True)
+    _prepare_manager_socket_path(SOCKET_PATH)
+    try:
+        os.makedirs(os.path.dirname(SOCKET_PATH), exist_ok=True)
+    except Exception as exc:
+        raise RuntimeError(f"Could not create manager socket directory for {SOCKET_PATH}: {exc}") from exc
     ctx_metadata_server = start_ctx_metadata_server(args)
     unload_guard_thread = start_unexpected_unload_guard(args)
     
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(SOCKET_PATH)
+    try:
+        server.bind(SOCKET_PATH)
+    except Exception as exc:
+        raise RuntimeError(f"Could not bind manager socket {SOCKET_PATH}: {exc}") from exc
     os.chmod(SOCKET_PATH, 0o666)
     server.listen(5)
     
@@ -4043,32 +4093,63 @@ def daemon_mode(args):
                 conn.close()
         threading.Thread(target=handle).start()
 
+
+def _prepare_manager_socket_path(socket_path: str) -> None:
+    if not os.path.exists(socket_path):
+        return
+
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(0.5)
+        probe.connect(socket_path)
+    except OSError as exc:
+        if exc.errno not in {errno.ECONNREFUSED, errno.ENOENT}:
+            raise RuntimeError(f"Could not probe existing manager socket {socket_path}: {exc}") from exc
+        try:
+            os.remove(socket_path)
+        except Exception as remove_exc:
+            raise RuntimeError(f"Could not remove stale manager socket {socket_path}: {remove_exc}") from remove_exc
+    else:
+        raise RuntimeError(
+            f"Manager socket {socket_path} is already in use by a running manager instance. "
+            f"Stop it first (for example: sudo systemctl stop {MANAGER_SERVICE_NAME})."
+        )
+    finally:
+        try:
+            probe.close()
+        except Exception:
+            pass
+
 def get_public_endpoint_status(host=DEFAULT_PUBLIC_HOST, port=DEFAULT_PUBLIC_PORT):
     base_url = f"http://{host}:{port}"
-    models_url = f"{base_url}/v1/models"
+    probe_host = "127.0.0.1" if host in {"0.0.0.0", "::", "[::]"} else host
+    models_url = f"http://{probe_host}:{port}/v1/models"
+    via = "" if probe_host == host else f" via {probe_host}"
     try:
         r = requests.get(models_url, timeout=1.5)
         if r.status_code == 200:
             data = r.json().get("data", [])
-            return f"reachable on {base_url} ({len(data)} models listed)"
-        return f"responding on {base_url} with HTTP {r.status_code}"
+            return f"reachable on {base_url}{via} ({len(data)} models listed)"
+        return f"responding on {base_url}{via} with HTTP {r.status_code}"
     except Exception as e:
-        return f"not reachable on {base_url} ({e.__class__.__name__})"
+        return f"not reachable on {base_url}{via} ({e.__class__.__name__})"
 
 
 def get_api_endpoint_status(host=DEFAULT_PUBLIC_HOST, port=None):
     if port is None:
         port = resolve_api_port()
     base_url = f"http://{host}:{port}"
-    models_url = f"{base_url}/v1/models"
+    probe_host = "127.0.0.1" if host in {"0.0.0.0", "::", "[::]"} else host
+    models_url = f"http://{probe_host}:{port}/v1/models"
+    via = "" if probe_host == host else f" via {probe_host}"
     try:
         r = requests.get(models_url, timeout=1.5)
         if r.status_code == 200:
             data = r.json().get("data", [])
-            return f"reachable on {base_url} ({len(data)} catalog models listed)"
-        return f"responding on {base_url} with HTTP {r.status_code}"
+            return f"reachable on {base_url}{via} ({len(data)} catalog models listed)"
+        return f"responding on {base_url}{via} with HTTP {r.status_code}"
     except Exception as e:
-        return f"not reachable on {base_url} ({e.__class__.__name__})"
+        return f"not reachable on {base_url}{via} ({e.__class__.__name__})"
 
 def build_help_epilog():
     ui_url = f"http://{DEFAULT_PUBLIC_HOST}:{DEFAULT_PUBLIC_PORT}"

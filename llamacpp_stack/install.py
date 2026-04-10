@@ -328,6 +328,9 @@ def _args_to_cli(argv: argparse.Namespace, chosen_mode: str, chosen_llama_cpp_mo
     cmd.append("--prefer-source-cuda" if argv.prefer_source_cuda else "--no-prefer-source-cuda")
     cmd.append("--prefer-binary" if argv.prefer_binary else "--no-prefer-binary")
     cmd.append("--install-services" if argv.install_services else "--no-install-services")
+    update_binaries = getattr(argv, "update_binaries", None)
+    if update_binaries is not None:
+        cmd.append("--update-binaries" if update_binaries else "--no-update-binaries")
     if argv.dry_run:
         cmd.append("--dry-run")
     return cmd
@@ -801,10 +804,62 @@ def _find_executable(root: Path, name: str) -> Path:
     raise RuntimeError(f"Executable {name} not found under {root}")
 
 
+def _resolve_existing_stable_target(install_root: Path, stable_link: Path, name: str) -> Path | None:
+    candidates: list[Path] = []
+    for extracted_root in install_root.glob("*.d"):
+        if not extracted_root.is_dir():
+            continue
+        for candidate in extracted_root.rglob(name):
+            if not candidate.is_file():
+                continue
+            candidates.append(candidate)
+
+    if not candidates:
+        return None
+
+    def _sort_key(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except Exception:
+            return 0.0
+
+    stable_abs = os.path.abspath(str(stable_link))
+    for candidate in sorted(candidates, key=_sort_key, reverse=True):
+        candidate_abs = os.path.abspath(str(candidate))
+        if candidate_abs == stable_abs:
+            continue
+        candidate.chmod(candidate.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        return candidate
+    return None
+
+
+def _is_self_referential_symlink(path: Path) -> bool:
+    if not path.is_symlink():
+        return False
+    try:
+        raw_target = os.readlink(path)
+    except OSError:
+        return False
+    resolved_target = os.path.abspath(os.path.join(str(path.parent), raw_target))
+    return resolved_target == os.path.abspath(str(path))
+
+
 def _link_stable_binary(target: Path, link_path: Path, dry_run: bool) -> Path:
     if dry_run:
         return link_path
     link_path.parent.mkdir(parents=True, exist_ok=True)
+    target_abs = os.path.abspath(str(target))
+    link_abs = os.path.abspath(str(link_path))
+    if target_abs == link_abs:
+        if link_path.is_symlink():
+            raw_target = os.readlink(link_path)
+            resolved_target = os.path.abspath(os.path.join(str(link_path.parent), raw_target))
+            if resolved_target == link_abs:
+                raise RuntimeError(
+                    f"Detected broken self-referential symlink at {link_path}. "
+                    "Re-run installer with binary update enabled to recreate llama-server."
+                )
+        return link_path
     if link_path.exists() or link_path.is_symlink():
         link_path.unlink()
     link_path.symlink_to(target)
@@ -906,13 +961,27 @@ def render_manager_wrapper(layout: InstallLayout) -> str:
         f"""\
         #!/usr/bin/env bash
         set -euo pipefail
+                if [[ ! -f {env_file} ]]; then
+                    echo "[llamacpp-manager] Missing env file: {env_file}" >&2
+                    exit 1
+                fi
         set -a
         source {env_file}
         set +a
+                if [[ -z "${{PYTHON_BIN:-}}" ]] || [[ ! -x "$PYTHON_BIN" ]]; then
+                    echo "[llamacpp-manager] PYTHON_BIN is missing or not executable: '${{PYTHON_BIN:-}}'" >&2
+                    exit 1
+                fi
         export PYTHONPATH="$LLAMACPP_PYTHONPATH${{PYTHONPATH:+:$PYTHONPATH}}"
-        LLAMA_SERVER_REAL="$(readlink -f "$LLAMA_SERVER_BIN")"
-        LLAMA_SERVER_LIB_DIR="$(dirname "$LLAMA_SERVER_REAL")"
-        export LD_LIBRARY_PATH="$LLAMA_SERVER_LIB_DIR${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+                if [[ -n "${{LLAMA_SERVER_BIN:-}}" ]] && [[ -e "$LLAMA_SERVER_BIN" || -L "$LLAMA_SERVER_BIN" ]]; then
+                    LLAMA_SERVER_REAL="$(readlink -f "$LLAMA_SERVER_BIN" || printf '%s' "$LLAMA_SERVER_BIN")"
+                    if [[ -n "$LLAMA_SERVER_REAL" ]]; then
+                        LLAMA_SERVER_LIB_DIR="$(dirname "$LLAMA_SERVER_REAL")"
+                        export LD_LIBRARY_PATH="$LLAMA_SERVER_LIB_DIR${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+                    fi
+                else
+                    echo "[llamacpp-manager] Warning: LLAMA_SERVER_BIN not found yet: '${{LLAMA_SERVER_BIN:-}}'" >&2
+                fi
         if [[ -n "${{LLAMACPP_CUDA_ROOT:-}}" ]]; then
           export CUDA_PATH="$LLAMACPP_CUDA_ROOT"
           export LD_LIBRARY_PATH="$LLAMACPP_CUDA_ROOT/lib64:$LLAMACPP_CUDA_ROOT/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
@@ -1306,6 +1375,48 @@ def install_systemd_units(layout: InstallLayout, dry_run: bool) -> None:
     _run(enable_cmd)
 
 
+def restart_systemd_units(layout: InstallLayout, dry_run: bool) -> bool:
+    if layout.mode == "system":
+        restart_cmd = ["systemctl", "restart", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME]
+    else:
+        restart_cmd = ["systemctl", "--user", "restart", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME]
+
+    if dry_run:
+        print(f"[dry-run] would run: {' '.join(restart_cmd)}")
+        return True
+
+    try:
+        _run(restart_cmd)
+        return True
+    except Exception as exc:
+        print(
+            "Warning: could not restart services automatically at the end of install "
+            f"({exc}). You can restart them manually with: {' '.join(restart_cmd)}"
+        )
+        return False
+
+
+def stop_systemd_units(layout: InstallLayout, dry_run: bool) -> bool:
+    if layout.mode == "system":
+        stop_cmd = ["systemctl", "stop", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME]
+    else:
+        stop_cmd = ["systemctl", "--user", "stop", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME]
+
+    if dry_run:
+        print(f"[dry-run] would run: {' '.join(stop_cmd)}")
+        return True
+
+    try:
+        _run(stop_cmd)
+        return True
+    except Exception as exc:
+        print(
+            "Warning: could not stop existing services before reinstall "
+            f"({exc}). Install will continue and services will be restarted at the end."
+        )
+        return False
+
+
 def maybe_offer_ufw_ports(layout: InstallLayout, dry_run: bool) -> None:
     if layout.mode != "system" or layout.public_host != "0.0.0.0":
         return
@@ -1384,24 +1495,152 @@ def _models_dir_has_gguf(models_dir: Path) -> bool:
         return False
 
 
+def _slugify_model_id(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9._-]+", "-", (value or "").lower()).strip("-")
+    return slug or "model"
+
+
+def _infer_quant_from_filename(filename: str) -> str | None:
+    upper = (filename or "").upper()
+    match = re.search(
+        r"(?<![A-Z0-9])(IQ\d(?:_[A-Z0-9]+)?|Q\d_K_[SML]|Q\d_[01]|Q\d_K|Q\d|BF16|F16|F32)(?![A-Z0-9])",
+        upper,
+    )
+    return match.group(1) if match else None
+
+
+def _catalog_payload_for_import(catalog_path: Path) -> tuple[list[dict[str, object]] | None, str | None]:
+    if not catalog_path.exists():
+        return [], None
+    try:
+        payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, f"Could not parse existing catalog {catalog_path}: {exc}"
+    if not isinstance(payload, list):
+        return None, f"Catalog {catalog_path} has invalid format (expected a JSON array)."
+    filtered: list[dict[str, object]] = []
+    for item in payload:
+        if isinstance(item, dict):
+            filtered.append(dict(item))
+    return filtered, None
+
+
+def _auto_register_local_gguf_models(layout: InstallLayout, dry_run: bool) -> int:
+    catalog_path = layout.state_dir / "catalog.json"
+    payload, error = _catalog_payload_for_import(catalog_path)
+    if error:
+        print(
+            "Warning: found GGUF files but automatic catalog import was skipped because the existing "
+            f"catalog is invalid ({error})."
+        )
+        return 0
+    assert payload is not None
+
+    existing_local_paths: set[str] = set()
+    used_model_ids: set[str] = set()
+    for item in payload:
+        model_id = str(item.get("model_id") or "").strip()
+        if model_id:
+            used_model_ids.add(model_id)
+        local_path = str(item.get("local_path") or "").strip()
+        if local_path:
+            try:
+                existing_local_paths.add(str(Path(local_path).resolve()))
+            except Exception:
+                existing_local_paths.add(local_path)
+
+    candidates: list[Path] = []
+    try:
+        for gguf_path in sorted(layout.models_dir.rglob("*.gguf")):
+            if not gguf_path.is_file():
+                continue
+            lowered = gguf_path.name.lower()
+            if "mmproj" in lowered:
+                continue
+            shard = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", lowered)
+            if shard and shard.group(1) != "00001":
+                continue
+            resolved_path = str(gguf_path.resolve())
+            if resolved_path in existing_local_paths:
+                continue
+            candidates.append(gguf_path)
+    except Exception:
+        return 0
+
+    if not candidates:
+        return 0
+
+    imported: list[dict[str, object]] = []
+    for gguf_path in candidates:
+        try:
+            parent_rel = gguf_path.parent.relative_to(layout.models_dir)
+            repo_id = parent_rel.as_posix() if str(parent_rel) != "." else "."
+        except Exception:
+            repo_id = "."
+        base_model_id = _slugify_model_id(gguf_path.stem)
+        model_id = base_model_id
+        suffix = 2
+        while model_id in used_model_ids:
+            model_id = f"{base_model_id}-{suffix}"
+            suffix += 1
+        used_model_ids.add(model_id)
+        imported.append(
+            {
+                "model_id": model_id,
+                "repo_id": repo_id,
+                "quant": _infer_quant_from_filename(gguf_path.name),
+                "filename": gguf_path.name,
+                "local_path": str(gguf_path),
+                "description": f"local / {gguf_path.name}",
+            }
+        )
+
+    if dry_run:
+        print(
+            f"[dry-run] would auto-register {len(imported)} GGUF file(s) into {catalog_path} "
+            "because catalog had no entries."
+        )
+        return len(imported)
+
+    payload.extend(imported)
+    catalog_path.parent.mkdir(parents=True, exist_ok=True)
+    catalog_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(
+        f"Auto-registered {len(imported)} GGUF file(s) into catalog during reinstall: {catalog_path}"
+    )
+    return len(imported)
+
+
 def maybe_rerun_auto_ctx(layout: InstallLayout, install_services: bool, dry_run: bool) -> None:
+    def _run_auto_ctx_update() -> None:
+        try:
+            _run([str(layout.bin_dir / CLI_COMMAND), "update", "--auto"])
+        except subprocess.CalledProcessError as exc:
+            print(
+                "Warning: auto-ctx update failed during install "
+                f"(exit code {exc.returncode}). You can retry later with: "
+                f"{layout.bin_dir / CLI_COMMAND} update --auto"
+            )
+
     catalog_path = layout.state_dir / "catalog.json"
     catalog_models = _catalog_model_count(catalog_path)
     if catalog_models <= 0:
         if _models_dir_has_gguf(layout.models_dir):
-            if prompt_bool(
-                "Detected GGUF files from a previous installation in the models directory. Re-run auto-ctx after reinstall?",
-                default=False,
-            ):
-                if dry_run:
-                    print(f"[dry-run] would run: {layout.bin_dir / CLI_COMMAND} update --auto")
-                    return
-                if not install_services:
-                    print("Services were not enabled, so auto-ctx cannot be re-run automatically yet.")
-                    return
-                _run([str(layout.bin_dir / CLI_COMMAND), "update", "--auto"])
-            else:
-                print("Detected GGUF files in the models directory, but no registered catalog entries exist yet. Skipping auto-ctx.")
+            imported_count = _auto_register_local_gguf_models(layout, dry_run)
+            if imported_count > 0:
+                catalog_models = _catalog_model_count(catalog_path)
+    if catalog_models <= 0:
+        if _models_dir_has_gguf(layout.models_dir):
+            print(
+                "Detected GGUF files in the models directory, but no registered catalog entries exist yet. "
+                "Auto-ctx only applies to registered catalog models, so it was skipped."
+            )
+            print(
+                "Register models first with: "
+                f"{layout.bin_dir / CLI_COMMAND} run <hf-repo[:quant]> "
+                "or "
+                f"{layout.bin_dir / CLI_COMMAND} add <hf-repo[:quant]>"
+            )
         return
     if not prompt_bool(f"Detected {catalog_models} registered models. Re-run auto-ctx now?", default=False):
         return
@@ -1411,7 +1650,7 @@ def maybe_rerun_auto_ctx(layout: InstallLayout, install_services: bool, dry_run:
     if not install_services:
         print("Services were not enabled, so auto-ctx cannot be re-run automatically yet.")
         return
-    _run([str(layout.bin_dir / CLI_COMMAND), "update", "--auto"])
+    _run_auto_ctx_update()
 
 
 def maybe_migrate_existing_install(target_mode: str, public_host: str, public_port: int | None, dry_run: bool) -> None:
@@ -1447,9 +1686,22 @@ def install_stack(args: argparse.Namespace) -> int:
     maybe_migrate_existing_install(pre_mode, chosen_public_host, args.public_port, args.dry_run)
     args.public_host = chosen_public_host
     layout = choose_layout(pre_mode, chosen_public_host, args.public_port, chosen_models_dir)
-    update_binaries = True
-    if is_existing_install(layout):
-        update_binaries = prompt_bool("Existing installation detected. Update llama.cpp and llama-swap binaries?", default=True)
+    if args.update_binaries is not None:
+        update_binaries = bool(args.update_binaries)
+    else:
+        update_binaries = True
+        if is_existing_install(layout):
+            update_binaries = prompt_bool("Existing installation detected. Update llama.cpp and llama-swap binaries?", default=True)
+    # Preserve the interactive selection when re-executing in system mode via sudo.
+    args.update_binaries = update_binaries
+    stable_llama_server = layout.install_root / "llama-server"
+    if not update_binaries and _is_self_referential_symlink(stable_llama_server):
+        print(
+            f"Detected broken self-referential symlink at {stable_llama_server}. "
+            "Forcing binary update so llama-server can be recreated."
+        )
+        update_binaries = True
+        args.update_binaries = True
     if update_binaries:
         llama_cpp_mode = resolve_llama_cpp_mode(args.llama_cpp_mode)
     else:
@@ -1458,6 +1710,10 @@ def install_stack(args: argparse.Namespace) -> int:
     reexec_status = maybe_reexec_system_install(args, pre_mode, llama_cpp_mode, chosen_models_dir)
     if reexec_status is not None:
         return reexec_status
+
+    if args.install_services:
+        stop_systemd_units(layout, args.dry_run)
+
     if args.dry_run:
         print(f"[dry-run] would ensure directories under {layout.install_root}, {layout.state_dir}, {layout.models_dir}")
     else:
@@ -1539,7 +1795,11 @@ def install_stack(args: argparse.Namespace) -> int:
                 enable_cuda=True,
             )
         else:
-            llama_server_real = layout.install_root / "llama-server"
+            llama_server_real = _resolve_existing_stable_target(
+                layout.install_root,
+                layout.install_root / "llama-server",
+                "llama-server",
+            ) or (layout.install_root / "llama-server")
         llama_server_bin = (
             layout.install_root / "llama-server"
             if args.dry_run
@@ -1564,7 +1824,11 @@ def install_stack(args: argparse.Namespace) -> int:
                 enable_cuda=cuda_toolkit_present and gpu_present,
             )
         else:
-            llama_server_real = layout.install_root / "llama-server"
+            llama_server_real = _resolve_existing_stable_target(
+                layout.install_root,
+                layout.install_root / "llama-server",
+                "llama-server",
+            ) or (layout.install_root / "llama-server")
         llama_server_bin = (
             layout.install_root / "llama-server"
             if args.dry_run
@@ -1657,6 +1921,8 @@ def install_stack(args: argparse.Namespace) -> int:
         maybe_offer_ufw_ports(layout, args.dry_run)
     if not args.dry_run:
         maybe_rerun_auto_ctx(layout, args.install_services, args.dry_run)
+    if args.install_services:
+        restart_systemd_units(layout, args.dry_run)
     if not args.dry_run:
         print_install_summary(layout, args.install_services)
     return 0
@@ -1696,6 +1962,12 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Install and enable systemd services after rendering them.",
+    )
+    parser.add_argument(
+        "--update-binaries",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Force whether installer updates llama.cpp and llama-swap binaries on existing installs.",
     )
     parser.add_argument("--dry-run", action="store_true")
     return parser

@@ -1,4 +1,7 @@
 import os
+import errno
+import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -10,10 +13,12 @@ import yaml
 
 from llamacpp_stack.cli import (
     ManagedModel,
+    _prepare_manager_socket_path,
     build_llama_server_command,
     build_help_epilog,
     ensure_model_available,
     get_gpu_conflict_message,
+    list_models,
     list_running_ollama_models,
     load_catalog,
     normalize_server_overrides,
@@ -23,12 +28,15 @@ from llamacpp_stack.cli import (
     save_catalog,
     should_reload_after_unexpected_unload,
     stop_running_ollama_models,
+    update_config,
 )
 from llamacpp_stack.install import (
     CLI_COMMAND,
     DEFAULT_SERVICE_USER,
     ELEVATED_INSTALL_ENV,
+    MANAGER_SERVICE_NAME,
     SERVER_CONFIG_BASENAME,
+    SWAP_SERVICE_NAME,
     _export_nvcc_path,
     determine_build_jobs,
     build_parser,
@@ -48,9 +56,16 @@ from llamacpp_stack.install import (
     InstallLayout,
     maybe_reexec_system_install,
     maybe_migrate_existing_install,
+    _link_stable_binary,
+    _is_self_referential_symlink,
+    _resolve_existing_stable_target,
     parse_ollama_models_from_systemctl,
     print_install_summary,
+    maybe_rerun_auto_ctx,
     prompt_choice,
+    render_manager_wrapper,
+    restart_systemd_units,
+    stop_systemd_units,
     resolve_public_host,
     resolve_uv_executable,
     resolve_install_mode,
@@ -72,6 +87,68 @@ class InstallHelpersTest(unittest.TestCase):
     def test_choose_llamacpp_linux_asset(self) -> None:
         release = {"assets": [{"name": "llama-b8705-bin-ubuntu-x64.tar.gz", "browser_download_url": "x"}]}
         self.assertEqual(choose_llamacpp_linux_asset(release)["name"], "llama-b8705-bin-ubuntu-x64.tar.gz")
+
+    def test_link_stable_binary_keeps_existing_file_when_target_matches_link(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "llama-server"
+            path.write_text("bin", encoding="utf-8")
+            result = _link_stable_binary(path, path, dry_run=False)
+            self.assertEqual(result, path)
+            self.assertTrue(path.exists())
+            self.assertFalse(path.is_symlink())
+
+    def test_link_stable_binary_rejects_self_referential_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "llama-server"
+            path.symlink_to(path)
+            with self.assertRaises(RuntimeError) as ctx:
+                _link_stable_binary(path, path, dry_run=False)
+            self.assertIn("self-referential symlink", str(ctx.exception))
+
+    def test_link_stable_binary_repairs_self_loop_when_target_is_real_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stable = root / "llama-server"
+            stable.symlink_to(stable)
+            real = root / "llama-b8770-bin.d" / "bin" / "llama-server"
+            real.parent.mkdir(parents=True)
+            real.write_text("bin", encoding="utf-8")
+            result = _link_stable_binary(real, stable, dry_run=False)
+            self.assertEqual(result, stable)
+            self.assertTrue(stable.is_symlink())
+            self.assertEqual(stable.resolve(), real.resolve())
+
+    def test_resolve_existing_stable_target_prefers_latest_extracted_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stable = root / "llama-server"
+            older = root / "llama-b8700-bin.d" / "bin" / "llama-server"
+            newer = root / "llama-b8710-bin.d" / "bin" / "llama-server"
+            older.parent.mkdir(parents=True)
+            newer.parent.mkdir(parents=True)
+            older.write_text("older", encoding="utf-8")
+            newer.write_text("newer", encoding="utf-8")
+
+            os.utime(older, (1, 1))
+            os.utime(newer, (2, 2))
+
+            resolved = _resolve_existing_stable_target(root, stable, "llama-server")
+            self.assertEqual(resolved, newer)
+
+    def test_is_self_referential_symlink_detects_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "llama-server"
+            path.symlink_to(path)
+            self.assertTrue(_is_self_referential_symlink(path))
+
+    def test_is_self_referential_symlink_returns_false_for_regular_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "real-llama-server"
+            target.write_text("bin", encoding="utf-8")
+            link = root / "llama-server"
+            link.symlink_to(target)
+            self.assertFalse(_is_self_referential_symlink(link))
 
     def test_detect_cuda_toolkit_uses_nvcc_lookup(self) -> None:
         with mock.patch("llamacpp_stack.install.locate_nvcc", return_value="/usr/local/cuda/bin/nvcc"):
@@ -329,6 +406,7 @@ class InstallHelpersTest(unittest.TestCase):
             prefer_source_cuda=True,
             prefer_binary=True,
             install_services=True,
+            update_binaries=False,
             dry_run=False,
         )
         with (
@@ -346,6 +424,7 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertIn("source", cmd)
         self.assertIn("--models-dir", cmd)
         self.assertIn("/var/llamacpp_models", cmd)
+        self.assertIn("--no-update-binaries", cmd)
         env = run_mock.call_args.kwargs["env"]
         self.assertEqual(env[ELEVATED_INSTALL_ENV], "1")
 
@@ -358,6 +437,7 @@ class InstallHelpersTest(unittest.TestCase):
             prefer_source_cuda=True,
             prefer_binary=True,
             install_services=True,
+            update_binaries=None,
             dry_run=False,
         )
         with mock.patch("llamacpp_stack.install.os.geteuid", return_value=0):
@@ -414,6 +494,31 @@ class InstallHelpersTest(unittest.TestCase):
             (layout.state_dir / "install-manifest.json").write_text('{"llama_cpp_strategy":"binary"}\n', encoding="utf-8")
             self.assertEqual(detect_existing_llama_cpp_mode(layout), "prebuilt")
 
+    def test_render_manager_wrapper_is_resilient_to_missing_llama_server(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            layout = InstallLayout(
+                mode="system",
+                state_dir=root / "state",
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=root / "models",
+                config_dir=root / "config",
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+            wrapper = render_manager_wrapper(layout)
+            self.assertIn("Warning: LLAMA_SERVER_BIN not found yet", wrapper)
+            self.assertIn("readlink -f \"$LLAMA_SERVER_BIN\" || printf '%s' \"$LLAMA_SERVER_BIN\"", wrapper)
+            self.assertIn("PYTHON_BIN is missing or not executable", wrapper)
+
     def test_print_install_summary_invokes_help_when_command_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -439,6 +544,227 @@ class InstallHelpersTest(unittest.TestCase):
             with mock.patch("llamacpp_stack.install.subprocess.run") as run_mock:
                 print_install_summary(layout, install_services=True)
             run_mock.assert_called_once_with([str(help_cmd), "--help"], check=False)
+
+    def test_maybe_rerun_auto_ctx_keeps_install_running_when_update_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            models_dir.mkdir(parents=True)
+            (models_dir / "model.gguf").write_bytes(b"gguf")
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True)
+            (state_dir / "catalog.json").write_text(
+                '[{"model_id":"repo-q4","repo_id":"org/repo","filename":"model.gguf"}]\n',
+                encoding="utf-8",
+            )
+            layout = InstallLayout(
+                mode="system",
+                state_dir=state_dir,
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=models_dir,
+                config_dir=root / "config",
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+            with (
+                mock.patch("llamacpp_stack.install.prompt_bool", return_value=True),
+                mock.patch(
+                    "llamacpp_stack.install._run",
+                    side_effect=subprocess.CalledProcessError(1, [str(layout.bin_dir / CLI_COMMAND), "update", "--auto"]),
+                ) as run_mock,
+            ):
+                maybe_rerun_auto_ctx(layout, install_services=True, dry_run=False)
+            run_mock.assert_called_once_with([str(layout.bin_dir / CLI_COMMAND), "update", "--auto"])
+
+    def test_maybe_rerun_auto_ctx_auto_registers_local_gguf_when_catalog_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            models_dir.mkdir(parents=True)
+            model_path = models_dir / "qwen2.5-7b-instruct-q4_k_m.gguf"
+            model_path.write_bytes(b"gguf")
+            (models_dir / "mmproj-f16.gguf").write_bytes(b"gguf")
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True)
+            catalog_path = state_dir / "catalog.json"
+            catalog_path.write_text("[]\n", encoding="utf-8")
+            layout = InstallLayout(
+                mode="system",
+                state_dir=state_dir,
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=models_dir,
+                config_dir=root / "config",
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+
+            with (
+                mock.patch("llamacpp_stack.install.prompt_bool", return_value=False) as prompt_mock,
+                mock.patch("llamacpp_stack.install._run") as run_mock,
+            ):
+                maybe_rerun_auto_ctx(layout, install_services=True, dry_run=False)
+
+            payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(payload), 1)
+            self.assertEqual(payload[0]["filename"], "qwen2.5-7b-instruct-q4_k_m.gguf")
+            self.assertEqual(payload[0]["quant"], "Q4_K_M")
+            self.assertEqual(payload[0]["local_path"], str(model_path))
+            prompt_mock.assert_called_once()
+            run_mock.assert_not_called()
+
+    def test_maybe_rerun_auto_ctx_skips_auto_register_when_catalog_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            models_dir.mkdir(parents=True)
+            (models_dir / "model.gguf").write_bytes(b"gguf")
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True)
+            catalog_path = state_dir / "catalog.json"
+            catalog_path.write_text("{invalid-json\n", encoding="utf-8")
+            layout = InstallLayout(
+                mode="system",
+                state_dir=state_dir,
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=models_dir,
+                config_dir=root / "config",
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+
+            with (
+                mock.patch("llamacpp_stack.install.prompt_bool") as prompt_mock,
+                mock.patch("llamacpp_stack.install._run") as run_mock,
+                mock.patch("builtins.print") as print_mock,
+            ):
+                maybe_rerun_auto_ctx(layout, install_services=True, dry_run=False)
+
+            self.assertEqual(catalog_path.read_text(encoding="utf-8"), "{invalid-json\n")
+            prompt_mock.assert_not_called()
+            run_mock.assert_not_called()
+            printed = "\n".join(str(call.args[0]) for call in print_mock.call_args_list if call.args)
+            self.assertIn("automatic catalog import was skipped", printed)
+
+    def test_restart_systemd_units_uses_expected_system_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            layout = InstallLayout(
+                mode="system",
+                state_dir=root / "state",
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=root / "models",
+                config_dir=root / "config",
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+            with mock.patch("llamacpp_stack.install._run") as run_mock:
+                self.assertTrue(restart_systemd_units(layout, dry_run=False))
+            run_mock.assert_called_once_with(["systemctl", "restart", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME])
+
+    def test_stop_systemd_units_uses_expected_system_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            layout = InstallLayout(
+                mode="system",
+                state_dir=root / "state",
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=root / "models",
+                config_dir=root / "config",
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+            with mock.patch("llamacpp_stack.install._run") as run_mock:
+                self.assertTrue(stop_systemd_units(layout, dry_run=False))
+            run_mock.assert_called_once_with(["systemctl", "stop", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME])
+
+    def test_update_config_root_falls_back_to_local_when_manager_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            catalog_path = root / "catalog.json"
+            config_path = root / "config.yaml"
+            save_catalog(
+                catalog_path,
+                [
+                    ManagedModel(
+                        model_id="repo-q4",
+                        repo_id="org/repo",
+                        quant="Q4",
+                        filename="model-q4.gguf",
+                        local_path=str(root / "models" / "model-q4.gguf"),
+                    )
+                ],
+            )
+            args = Namespace(
+                repo=None,
+                hf=None,
+                model_id=None,
+                file=None,
+                ctx_override=4096,
+                auto_ctx=False,
+                catalog=catalog_path,
+                config=config_path,
+                llama_server=root / "llama-server",
+                start_port=18080,
+                public_host="127.0.0.1",
+                public_port=11435,
+                idle_ttl=10,
+                server_config=root / SERVER_CONFIG_BASENAME,
+            )
+
+            response = mock.Mock(status_code=200)
+            response.json.return_value = {"data": []}
+
+            with (
+                mock.patch("llamacpp_stack.cli.run_manager_command", side_effect=FileNotFoundError("missing socket")) as manager_mock,
+                mock.patch("llamacpp_stack.cli.os.getuid", return_value=2000),
+                mock.patch("llamacpp_stack.cli.os.geteuid", return_value=0),
+                mock.patch("llamacpp_stack.cli.time.sleep"),
+                mock.patch("llamacpp_stack.cli.requests.get", return_value=response),
+            ):
+                result = update_config(args)
+
+            manager_mock.assert_called_once()
+            self.assertEqual(result, "updated")
 
     def test_desired_models_dir_owner_uses_service_identity_for_system_mode(self) -> None:
         layout = InstallLayout(
@@ -776,6 +1102,101 @@ class InstallHelpersTest(unittest.TestCase):
             ),
             (False, 20.0),
         )
+
+    def test_list_models_falls_back_to_local_catalog_when_manager_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            catalog_path = root / "catalog.json"
+            config_path = root / "config.yaml"
+            save_catalog(
+                catalog_path,
+                [
+                    ManagedModel(
+                        model_id="repo-q4",
+                        repo_id="org/repo",
+                        quant="Q4",
+                        filename="model-q4.gguf",
+                        local_path=str(root / "models" / "model-q4.gguf"),
+                    )
+                ],
+            )
+            args = Namespace(
+                catalog=catalog_path,
+                config=config_path,
+                models_dir=root / "models",
+                public_host="127.0.0.1",
+                public_port=11437,
+            )
+
+            with (
+                mock.patch("llamacpp_stack.cli.os.getuid", return_value=999999),
+                mock.patch("llamacpp_stack.cli.run_manager_command", side_effect=FileNotFoundError("missing socket")),
+                mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value=set()),
+                mock.patch("llamacpp_stack.cli.get_llama_server_processes", return_value=[]),
+                mock.patch("llamacpp_stack.cli.get_gpu_process_map", return_value={}),
+                mock.patch("builtins.print") as print_mock,
+            ):
+                self.assertEqual(list_models(args), 0)
+
+            printed = "\n".join(str(call.args[0]) for call in print_mock.call_args_list if call.args)
+            self.assertIn("Manager unavailable; showing local catalog view", printed)
+            self.assertIn("repo-q4", printed)
+
+    def test_list_models_reports_gguf_without_catalog_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            models_dir.mkdir(parents=True)
+            (models_dir / "orphan.gguf").write_bytes(b"gguf")
+            catalog_path = root / "catalog.json"
+            catalog_path.write_text("[]\n", encoding="utf-8")
+            args = Namespace(
+                catalog=catalog_path,
+                config=root / "config.yaml",
+                models_dir=models_dir,
+                public_host="127.0.0.1",
+                public_port=11437,
+            )
+
+            with (
+                mock.patch("llamacpp_stack.cli.os.getuid", return_value=999999),
+                mock.patch("llamacpp_stack.cli.run_manager_command", side_effect=FileNotFoundError("missing socket")),
+                mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value=set()),
+                mock.patch("llamacpp_stack.cli.get_llama_server_processes", return_value=[]),
+                mock.patch("llamacpp_stack.cli.get_gpu_process_map", return_value={}),
+                mock.patch("builtins.print") as print_mock,
+            ):
+                self.assertEqual(list_models(args), 0)
+
+            printed = "\n".join(str(call.args[0]) for call in print_mock.call_args_list if call.args)
+            self.assertIn("Detected GGUF files in the models directory", printed)
+
+    def test_prepare_manager_socket_path_rejects_active_manager_socket(self) -> None:
+        fake_socket = mock.Mock()
+        with (
+            mock.patch("llamacpp_stack.cli.os.path.exists", return_value=True),
+            mock.patch("llamacpp_stack.cli.socket.socket", return_value=fake_socket),
+            mock.patch("llamacpp_stack.cli.os.remove") as remove_mock,
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                _prepare_manager_socket_path("/tmp/manager.sock")
+
+        self.assertIn("already in use", str(ctx.exception))
+        remove_mock.assert_not_called()
+        fake_socket.close.assert_called_once()
+
+    def test_prepare_manager_socket_path_removes_stale_socket(self) -> None:
+        fake_socket = mock.Mock()
+        fake_socket.connect.side_effect = OSError(errno.ECONNREFUSED, "Connection refused")
+        with (
+            mock.patch("llamacpp_stack.cli.os.path.exists", return_value=True),
+            mock.patch("llamacpp_stack.cli.socket.socket", return_value=fake_socket),
+            mock.patch("llamacpp_stack.cli.os.remove") as remove_mock,
+        ):
+            _prepare_manager_socket_path("/tmp/manager.sock")
+
+        remove_mock.assert_called_once_with("/tmp/manager.sock")
+        fake_socket.close.assert_called_once()
 
     def test_list_running_ollama_models_parses_ps_output(self) -> None:
         completed = mock.Mock(returncode=0, stdout="NAME                ID              SIZE    PROCESSOR\nqwen2.5:7b         abc123          5 GB    100% GPU\nphi4-mini:latest   def456          2 GB    100% GPU\n")
