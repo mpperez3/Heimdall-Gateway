@@ -1,6 +1,7 @@
 import os
 import errno
 import json
+import socket
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,7 @@ import yaml
 from llamacpp_stack.cli import (
     ManagedModel,
     _prepare_manager_socket_path,
+    _probe_runtime_env,
     build_llama_server_command,
     build_help_epilog,
     ensure_model_available,
@@ -47,6 +49,8 @@ from llamacpp_stack.install import (
     choose_llamaswap_asset,
     detect_existing_llama_cpp_mode,
     locate_cuda_root_for_python,
+    locate_nccl_root_for_python,
+    maybe_install_nccl_via_uv,
     normalize_python_cuda_layout,
     detect_cuda_toolkit_package,
     maybe_install_cuda_toolkit_via_uv,
@@ -66,6 +70,7 @@ from llamacpp_stack.install import (
     render_manager_wrapper,
     restart_systemd_units,
     stop_systemd_units,
+    wait_for_manager_socket,
     resolve_public_host,
     resolve_uv_executable,
     resolve_install_mode,
@@ -174,13 +179,40 @@ class InstallHelpersTest(unittest.TestCase):
             mock.patch("llamacpp_stack.install.locate_nvcc", return_value=None),
             mock.patch("llamacpp_stack.install.locate_nvcc_for_python", return_value="/tmp/nvcc"),
             mock.patch("llamacpp_stack.install.locate_cuda_root_for_python", return_value=Path("/tmp/cuda")),
+            mock.patch("llamacpp_stack.install.locate_nccl_root_for_python", return_value=Path("/tmp/nccl")),
             mock.patch("llamacpp_stack.install.resolve_uv_executable", return_value="/tmp/bootstrap/bin/uv"),
         ):
             self.assertTrue(maybe_install_cuda_toolkit_via_uv("/usr/bin/python3", dry_run=False))
+        self.assertEqual(
+            run_mock.call_args_list[0],
+            mock.call(["/tmp/bootstrap/bin/uv", "pip", "install", "--python", "/usr/bin/python3", "cuda-toolkit[all]"], check=True),
+        )
+        self.assertEqual(
+            run_mock.call_args_list[1],
+            mock.call(["/tmp/bootstrap/bin/uv", "pip", "install", "--python", "/usr/bin/python3", "nvidia-nccl-cu12"], check=True),
+        )
+
+    def test_maybe_install_nccl_via_uv_invokes_uv_pip(self) -> None:
+        with (
+            mock.patch("llamacpp_stack.install.subprocess.run") as run_mock,
+            mock.patch("llamacpp_stack.install.locate_nccl_root_for_python", return_value=Path("/tmp/nccl")),
+            mock.patch("llamacpp_stack.install.resolve_uv_executable", return_value="/tmp/bootstrap/bin/uv"),
+        ):
+            self.assertTrue(maybe_install_nccl_via_uv("/usr/bin/python3", dry_run=False))
         run_mock.assert_called_once_with(
-            ["/tmp/bootstrap/bin/uv", "pip", "install", "--python", "/usr/bin/python3", "cuda-toolkit[all]"],
+            ["/tmp/bootstrap/bin/uv", "pip", "install", "--python", "/usr/bin/python3", "nvidia-nccl-cu12"],
             check=True,
         )
+
+    def test_locate_nccl_root_for_python_from_site_packages(self) -> None:
+        with mock.patch(
+            "llamacpp_stack.install.subprocess.run",
+            return_value=mock.Mock(stdout="/tmp/venv/lib/python3.12/site-packages/nvidia/nccl_cu12\n"),
+        ):
+            self.assertEqual(
+                locate_nccl_root_for_python("/usr/bin/python3"),
+                Path("/tmp/venv/lib/python3.12/site-packages/nvidia/nccl_cu12"),
+            )
 
     def test_resolve_uv_executable_falls_back_to_bootstrap_sibling(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -224,10 +256,14 @@ class InstallHelpersTest(unittest.TestCase):
             archive = root / "b9999.tar.gz"
             nvcc = root / "cuda" / "bin" / "nvcc"
             cuda_root = root / "cuda"
+            nccl_root = root / "nccl"
             nvcc.parent.mkdir(parents=True)
             nvcc.write_text("", encoding="utf-8")
             (cuda_root / "include").mkdir(parents=True)
             (cuda_root / "lib64").mkdir(parents=True)
+            (nccl_root / "include").mkdir(parents=True)
+            (nccl_root / "lib").mkdir(parents=True)
+            (nccl_root / "lib" / "libnccl.so.2").write_text("", encoding="utf-8")
             commands: list[list[str]] = []
 
             def fake_run(cmd, cwd=None, env=None):
@@ -242,6 +278,7 @@ class InstallHelpersTest(unittest.TestCase):
                 mock.patch("llamacpp_stack.install.detect_cuda_arch", return_value="86"),
                 mock.patch("llamacpp_stack.install.locate_nvcc", return_value=str(nvcc)),
                 mock.patch("llamacpp_stack.install.locate_cuda_root_for_python", return_value=cuda_root),
+                mock.patch("llamacpp_stack.install.locate_nccl_root_for_python", return_value=nccl_root),
                 mock.patch("llamacpp_stack.install.normalize_python_cuda_layout"),
                 mock.patch("llamacpp_stack.install.determine_build_jobs", return_value=12),
                 mock.patch("llamacpp_stack.install._run", side_effect=fake_run),
@@ -255,6 +292,8 @@ class InstallHelpersTest(unittest.TestCase):
             build_cmd = commands[1]
             self.assertIn(f"-DCMAKE_CUDA_COMPILER={nvcc.resolve()}", cmake_cmd)
             self.assertIn(f"-DCUDAToolkit_ROOT={cuda_root}", cmake_cmd)
+            self.assertIn(f"-DNCCL_INCLUDE_DIR={nccl_root / 'include'}", cmake_cmd)
+            self.assertIn(f"-DNCCL_LIBRARY={nccl_root / 'lib' / 'libnccl.so.2'}", cmake_cmd)
             self.assertEqual(build_cmd[-2:], ["-j", "12"])
 
     def test_determine_build_jobs_uses_all_available_cpus(self) -> None:
@@ -519,6 +558,21 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertIn("readlink -f \"$LLAMA_SERVER_BIN\" || printf '%s' \"$LLAMA_SERVER_BIN\"", wrapper)
             self.assertIn("PYTHON_BIN is missing or not executable", wrapper)
 
+    def test_probe_runtime_env_adds_nccl_paths(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LLAMACPP_NCCL_ROOT": "/opt/llamacpp-superserver/nccl",
+                "LD_LIBRARY_PATH": "/existing/lib",
+            },
+            clear=False,
+        ):
+            env = _probe_runtime_env()
+        self.assertIsNotNone(env)
+        self.assertIn("/opt/llamacpp-superserver/nccl/lib64", env["LD_LIBRARY_PATH"])
+        self.assertIn("/opt/llamacpp-superserver/nccl/lib", env["LD_LIBRARY_PATH"])
+        self.assertIn("/existing/lib", env["LD_LIBRARY_PATH"])
+
     def test_print_install_summary_invokes_help_when_command_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -544,6 +598,36 @@ class InstallHelpersTest(unittest.TestCase):
             with mock.patch("llamacpp_stack.install.subprocess.run") as run_mock:
                 print_install_summary(layout, install_services=True)
             run_mock.assert_called_once_with([str(help_cmd), "--help"], check=False)
+
+    def test_wait_for_manager_socket_returns_true_when_socket_is_reachable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            socket_path = root / "run" / "manager.sock"
+            socket_path.parent.mkdir(parents=True)
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                server.bind(str(socket_path))
+                server.listen(1)
+                layout = InstallLayout(
+                    mode="system",
+                    state_dir=root / "state",
+                    bin_dir=root / "bin",
+                    install_root=root / "install",
+                    models_dir=root / "models",
+                    config_dir=root / "config",
+                    run_dir=root / "run",
+                    service_user=DEFAULT_SERVICE_USER,
+                    service_group=DEFAULT_SERVICE_USER,
+                    public_host="127.0.0.1",
+                    public_port=11436,
+                    manager_socket=socket_path,
+                    python_root=root / "python",
+                    runtime_venv=root / "venv",
+                    cuda_root=root / "cuda",
+                )
+                self.assertTrue(wait_for_manager_socket(layout, dry_run=False, timeout_seconds=1))
+            finally:
+                server.close()
 
     def test_maybe_rerun_auto_ctx_keeps_install_running_when_update_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -576,6 +660,7 @@ class InstallHelpersTest(unittest.TestCase):
             )
             with (
                 mock.patch("llamacpp_stack.install.prompt_bool", return_value=True),
+                mock.patch("llamacpp_stack.install.wait_for_manager_socket", return_value=True),
                 mock.patch(
                     "llamacpp_stack.install._run",
                     side_effect=subprocess.CalledProcessError(1, [str(layout.bin_dir / CLI_COMMAND), "update", "--auto"]),

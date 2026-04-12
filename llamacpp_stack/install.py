@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import time
 import textwrap
 import urllib.request
 from dataclasses import dataclass
@@ -56,6 +57,7 @@ class InstallLayout:
     python_root: Path
     runtime_venv: Path
     cuda_root: Path
+    nccl_root: Path = Path()
 
 
 def prompt_bool(message: str, default: bool = True) -> bool:
@@ -300,6 +302,32 @@ def locate_cuda_root_for_python(python_exec: str) -> Path | None:
     return None
 
 
+def locate_nccl_root_for_python(python_exec: str) -> Path | None:
+    probe_script = """
+import glob
+import os
+import site
+
+roots = site.getsitepackages() + [site.getusersitepackages()]
+for root in roots:
+    for candidate in glob.glob(os.path.join(root, "nvidia", "nccl*")):
+        include_dir = os.path.join(candidate, "include")
+        for lib_name in ("lib", "lib64"):
+            lib_dir = os.path.join(candidate, lib_name)
+            if os.path.isdir(include_dir) and os.path.isdir(lib_dir):
+                if glob.glob(os.path.join(lib_dir, "libnccl.so*")):
+                    print(candidate)
+                    raise SystemExit(0)
+print("")
+""".strip()
+    try:
+        probe = subprocess.run([python_exec, "-c", probe_script], check=True, capture_output=True, text=True)
+    except Exception:
+        return None
+    path = probe.stdout.strip()
+    return Path(path).resolve() if path else None
+
+
 def detect_cuda_toolkit() -> bool:
     return locate_nvcc() is not None
 
@@ -433,6 +461,22 @@ def _export_cuda_root(cuda_root: Path | None) -> bool:
     return True
 
 
+def _export_nccl_root(nccl_root: Path | None) -> bool:
+    if not nccl_root:
+        return False
+    nccl_root = nccl_root.resolve()
+    os.environ["NCCL_ROOT"] = str(nccl_root)
+    ld_parts = [part for part in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep) if part]
+    updated = False
+    for lib_dir in (nccl_root / "lib64", nccl_root / "lib"):
+        if lib_dir.exists() and str(lib_dir) not in ld_parts:
+            ld_parts.insert(0, str(lib_dir))
+            updated = True
+    if updated:
+        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(ld_parts)
+    return True
+
+
 def normalize_python_cuda_layout(cuda_root: Path | None) -> bool:
     if not cuda_root or not cuda_root.exists():
         return False
@@ -477,6 +521,10 @@ def maybe_install_cuda_toolkit_via_uv(python_exec: str, dry_run: bool) -> bool:
         except Exception as fallback_exc:
             print(f"Could not install nvidia-cuda-nvcc with uv: {fallback_exc}")
             return False
+    try:
+        subprocess.run([uv_bin, "pip", "install", "--python", python_exec, "nvidia-nccl-cu12"], check=True)
+    except Exception as exc:
+        print(f"Could not install optional multi-GPU NCCL package with uv: {exc}")
     nvcc_path = locate_nvcc() or locate_nvcc_for_python(python_exec)
     cuda_root = locate_cuda_root_for_python(python_exec)
     normalize_python_cuda_layout(cuda_root)
@@ -484,7 +532,29 @@ def maybe_install_cuda_toolkit_via_uv(python_exec: str, dry_run: bool) -> bool:
         print(f"Using nvcc from Python environment: {nvcc_path}")
     if _export_cuda_root(cuda_root):
         print(f"Using CUDA toolkit root from Python environment: {cuda_root}")
+    nccl_root = locate_nccl_root_for_python(python_exec)
+    if _export_nccl_root(nccl_root):
+        print(f"Using NCCL root from Python environment: {nccl_root}")
     return nvcc_path is not None
+
+
+def maybe_install_nccl_via_uv(python_exec: str, dry_run: bool) -> bool:
+    uv_bin = resolve_uv_executable()
+    if dry_run:
+        print(f"[dry-run] would offer NCCL install via: {(uv_bin or 'uv')} pip install --python {python_exec} nvidia-nccl-cu12")
+        return False
+    if uv_bin is None:
+        return False
+    try:
+        subprocess.run([uv_bin, "pip", "install", "--python", python_exec, "nvidia-nccl-cu12"], check=True)
+    except Exception as exc:
+        print(f"Could not install optional multi-GPU NCCL package with uv: {exc}")
+        return False
+    nccl_root = locate_nccl_root_for_python(python_exec)
+    if _export_nccl_root(nccl_root):
+        print(f"Using NCCL root from Python environment: {nccl_root}")
+        return True
+    return False
 
 
 def maybe_install_cuda_toolkit(gpu_present: bool, dry_run: bool, prefer_source_cuda: bool, python_exec: str) -> bool:
@@ -687,6 +757,7 @@ def choose_layout(mode: str | None, public_host: str, public_port: int | None, m
         python_root=install_root / "python",
         runtime_venv=install_root / "venv",
         cuda_root=install_root / "cuda",
+        nccl_root=install_root / "nccl",
     )
 
 
@@ -874,12 +945,19 @@ def _render_env(
     python_path: Path,
     idle_ttl: int,
     cuda_root: Path | None,
+    nccl_root: Path | None,
 ) -> str:
     extra = ""
     if cuda_root is not None:
         extra = textwrap.dedent(
             f"""\
             LLAMACPP_CUDA_ROOT={cuda_root}
+            """
+        )
+    if nccl_root is not None:
+        extra += textwrap.dedent(
+            f"""\
+            LLAMACPP_NCCL_ROOT={nccl_root}
             """
         )
     return textwrap.dedent(
@@ -986,6 +1064,9 @@ def render_manager_wrapper(layout: InstallLayout) -> str:
           export CUDA_PATH="$LLAMACPP_CUDA_ROOT"
           export LD_LIBRARY_PATH="$LLAMACPP_CUDA_ROOT/lib64:$LLAMACPP_CUDA_ROOT/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
         fi
+        if [[ -n "${{LLAMACPP_NCCL_ROOT:-}}" ]]; then
+          export LD_LIBRARY_PATH="$LLAMACPP_NCCL_ROOT/lib64:$LLAMACPP_NCCL_ROOT/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+        fi
         mkdir -p "$(dirname "$LLAMACPP_MANAGER_SOCKET")" || true
         exec "$PYTHON_BIN" -m llamacpp_stack.cli \\
           --models-dir "$LLAMACPP_MODELS" \\
@@ -1012,6 +1093,9 @@ def render_llamaswap_wrapper(layout: InstallLayout) -> str:
         if [[ -n "${{LLAMACPP_CUDA_ROOT:-}}" ]]; then
           export CUDA_PATH="$LLAMACPP_CUDA_ROOT"
           export LD_LIBRARY_PATH="$LLAMACPP_CUDA_ROOT/lib64:$LLAMACPP_CUDA_ROOT/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+        fi
+        if [[ -n "${{LLAMACPP_NCCL_ROOT:-}}" ]]; then
+          export LD_LIBRARY_PATH="$LLAMACPP_NCCL_ROOT/lib64:$LLAMACPP_NCCL_ROOT/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
         fi
         exec "$LLAMASWAP_BIN" \\
           --config "$LLAMACPP_CONFIG" \\
@@ -1208,6 +1292,19 @@ def sync_cuda_runtime(layout: InstallLayout, python_exec: str, dry_run: bool) ->
     return layout.cuda_root
 
 
+def sync_nccl_runtime(layout: InstallLayout, python_exec: str, dry_run: bool) -> Path | None:
+    nccl_root = locate_nccl_root_for_python(python_exec)
+    if nccl_root is None or not nccl_root.exists():
+        return None
+    if dry_run:
+        print(f"[dry-run] would copy NCCL runtime from {nccl_root} to {layout.nccl_root}")
+        return layout.nccl_root
+    if layout.nccl_root.exists():
+        shutil.rmtree(layout.nccl_root)
+    shutil.copytree(nccl_root, layout.nccl_root, symlinks=True)
+    return layout.nccl_root
+
+
 def build_llama_cpp_from_source(
     release: dict,
     install_root: Path,
@@ -1262,6 +1359,20 @@ def build_llama_cpp_from_source(
         _export_cuda_root(cuda_root)
         build_env = os.environ.copy()
         cmake_args.append(f"-DCUDAToolkit_ROOT={cuda_root}")
+    nccl_root = locate_nccl_root_for_python(python_exec)
+    if enable_cuda and nccl_root:
+        _export_nccl_root(nccl_root)
+        build_env = os.environ.copy()
+        include_dir = nccl_root / "include"
+        library = None
+        for lib_dir in (nccl_root / "lib64", nccl_root / "lib"):
+            if lib_dir.exists():
+                library = next(iter(lib_dir.glob("libnccl.so*")), None)
+                if library:
+                    break
+        if include_dir.exists() and library:
+            cmake_args.append(f"-DNCCL_INCLUDE_DIR={include_dir}")
+            cmake_args.append(f"-DNCCL_LIBRARY={library}")
     if enable_cuda:
         for flag in ("GGML_CUDA_GRAPHS", "GGML_CUDA_FA_ALL_QUANTS"):
             if source_tree_supports_flag(src_dir, flag):
@@ -1329,14 +1440,19 @@ def write_manifest(layout: InstallLayout, llama_cpp_release: dict, llamaswap_rel
     (layout.state_dir / "install-manifest.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def detect_existing_llama_cpp_mode(layout: InstallLayout) -> str:
+def read_install_manifest(layout: InstallLayout) -> dict[str, object]:
     manifest_path = layout.state_dir / "install-manifest.json"
     if not manifest_path.exists():
-        return "source"
+        return {}
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception:
-        return "source"
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def detect_existing_llama_cpp_mode(layout: InstallLayout) -> str:
+    payload = read_install_manifest(layout)
     strategy = str(payload.get("llama_cpp_strategy") or "").strip()
     if strategy == "native":
         return "native"
@@ -1396,6 +1512,28 @@ def restart_systemd_units(layout: InstallLayout, dry_run: bool) -> bool:
         return False
 
 
+def wait_for_manager_socket(layout: InstallLayout, dry_run: bool, timeout_seconds: int = 20) -> bool:
+    if dry_run:
+        print(f"[dry-run] would wait for manager socket: {layout.manager_socket}")
+        return True
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if layout.manager_socket.exists():
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(0.5)
+                    sock.connect(str(layout.manager_socket))
+                return True
+            except OSError:
+                pass
+        time.sleep(0.25)
+    print(
+        "Warning: manager socket did not become ready after service restart "
+        f"({layout.manager_socket}). Automatic auto-ctx may be skipped for now."
+    )
+    return False
+
+
 def stop_systemd_units(layout: InstallLayout, dry_run: bool) -> bool:
     if layout.mode == "system":
         stop_cmd = ["systemctl", "stop", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME]
@@ -1448,6 +1586,9 @@ def print_install_summary(layout: InstallLayout, install_services: bool) -> None
     api_url = f"http://{layout.public_host}:{layout.public_port - 1}"
     ui_url = f"{ui_base_url}/ui/#/activity"
     help_cmd = layout.bin_dir / CLI_COMMAND
+    manifest = read_install_manifest(layout)
+    current_llama_cpp = str(manifest.get("llama_cpp_tag") or "unknown")
+    current_llamaswap = str(manifest.get("llamaswap_tag") or "unknown")
     if layout.mode == "system":
         start_cmd = f"sudo systemctl start {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}"
         status_cmd = f"sudo systemctl status {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}"
@@ -1461,7 +1602,9 @@ def print_install_summary(layout: InstallLayout, install_services: bool) -> None
     print(f"  {CLI_COMMAND} ps")
     print(f"  {CLI_COMMAND} list")
     print(f"  {CLI_COMMAND} run <repo-or-hf-ref>")
-    print(f"OpenAI/Ollama API:   {api_url}")
+    print(f"Installed llama.cpp: {current_llama_cpp}")
+    print(f"Installed llama-swap: {current_llamaswap}")
+    print(f"Superserver API:     {api_url}")
     print(f"UI activity:         {ui_url}")
     print(f"llama-swap UI/backend: {ui_base_url}")
     if install_services:
@@ -1650,6 +1793,8 @@ def maybe_rerun_auto_ctx(layout: InstallLayout, install_services: bool, dry_run:
     if not install_services:
         print("Services were not enabled, so auto-ctx cannot be re-run automatically yet.")
         return
+    if not wait_for_manager_socket(layout, dry_run):
+        return
     _run_auto_ctx_update()
 
 
@@ -1742,15 +1887,24 @@ def install_stack(args: argparse.Namespace) -> int:
             python_exec=sys.executable,
         )
         nvcc_path = locate_nvcc()
+    if llama_cpp_mode == "source" and update_binaries and gpu_present:
+        maybe_install_nccl_via_uv(sys.executable, args.dry_run)
     if llama_cpp_mode == "source" and update_binaries:
         maybe_install_source_build_prereqs(args.dry_run)
 
-    print(f"llama.cpp latest: {llama_cpp_release['tag_name']}")
-    print(f"llama-swap latest: {llamaswap_release['tag_name']}")
+    current_manifest = read_install_manifest(layout)
+    current_llama_cpp_tag = str(current_manifest.get("llama_cpp_tag") or "not installed")
+    current_llamaswap_tag = str(current_manifest.get("llamaswap_tag") or "not installed")
+    target_llama_cpp_tag = llama_cpp_release["tag_name"] if update_binaries else current_llama_cpp_tag
+    target_llamaswap_tag = llamaswap_release["tag_name"] if update_binaries else current_llamaswap_tag
+    print(f"llama.cpp target: {target_llama_cpp_tag}")
+    print(f"llama-swap target: {target_llamaswap_tag}")
+    print(f"llama.cpp current: {current_llama_cpp_tag}")
+    print(f"llama-swap current: {current_llamaswap_tag}")
     print(f"installation mode: {layout.mode}")
     print(f"models directory: {layout.models_dir}")
     print(f"llama-swap UI/backend: http://{layout.public_host}:{layout.public_port}")
-    print(f"OpenAI/Ollama API:   http://{layout.public_host}:{layout.public_port - 1}")
+    print(f"Superserver API:     http://{layout.public_host}:{layout.public_port - 1}")
     print(f"llama.cpp mode: {llama_cpp_mode}")
     if llama_cpp_mode == "source" and update_binaries and gpu_present and not cuda_toolkit_present:
         print("NVIDIA GPU detected but no nvcc/CUDA toolkit was found; falling back to prebuilt llama.cpp binary.")
@@ -1845,6 +1999,7 @@ def install_stack(args: argparse.Namespace) -> int:
         runtime_python_path,
         args.idle_ttl,
         installed_cuda_root,
+        sync_nccl_runtime(layout, sys.executable, args.dry_run),
     )
     manager_unit = render_manager_service(layout)
     swap_unit = render_llamaswap_service(layout)
@@ -1906,6 +2061,9 @@ def install_stack(args: argparse.Namespace) -> int:
             "  export CUDA_PATH=\"$LLAMACPP_CUDA_ROOT\"\n"
             "  export LD_LIBRARY_PATH=\"$LLAMACPP_CUDA_ROOT/lib64:$LLAMACPP_CUDA_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"\n"
             "fi\n"
+            "if [[ -n \"${LLAMACPP_NCCL_ROOT:-}\" ]]; then\n"
+            "  export LD_LIBRARY_PATH=\"$LLAMACPP_NCCL_ROOT/lib64:$LLAMACPP_NCCL_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"\n"
+            "fi\n"
             "exec \"$PYTHON_BIN\" -m llamacpp_stack.llamacpp_api_install \"$@\"\n",
             encoding="utf-8",
         )
@@ -1919,10 +2077,10 @@ def install_stack(args: argparse.Namespace) -> int:
     if args.install_services:
         install_systemd_units(layout, args.dry_run)
         maybe_offer_ufw_ports(layout, args.dry_run)
-    if not args.dry_run:
-        maybe_rerun_auto_ctx(layout, args.install_services, args.dry_run)
     if args.install_services:
         restart_systemd_units(layout, args.dry_run)
+    if not args.dry_run:
+        maybe_rerun_auto_ctx(layout, args.install_services, args.dry_run)
     if not args.dry_run:
         print_install_summary(layout, args.install_services)
     return 0

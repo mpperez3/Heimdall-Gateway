@@ -3304,12 +3304,17 @@ def _stop_process(proc):
 
 def _probe_runtime_env() -> dict[str, str] | None:
     env = os.environ.copy()
+    lib_paths: list[str] = []
     cuda_root = env.get("LLAMACPP_CUDA_ROOT", "").strip()
-    if not cuda_root:
-        return env
-    env["CUDA_PATH"] = cuda_root
-    lib_paths = [f"{cuda_root}/lib64", f"{cuda_root}/lib"]
+    nccl_root = env.get("LLAMACPP_NCCL_ROOT", "").strip()
+    if cuda_root:
+        env["CUDA_PATH"] = cuda_root
+        lib_paths.extend([f"{cuda_root}/lib64", f"{cuda_root}/lib"])
+    if nccl_root:
+        lib_paths.extend([f"{nccl_root}/lib64", f"{nccl_root}/lib"])
     existing = env.get("LD_LIBRARY_PATH", "")
+    if not lib_paths:
+        return env
     if existing:
         lib_paths.append(existing)
     env["LD_LIBRARY_PATH"] = ":".join(lib_paths)
@@ -4151,13 +4156,29 @@ def get_api_endpoint_status(host=DEFAULT_PUBLIC_HOST, port=None):
     except Exception as e:
         return f"not reachable on {base_url}{via} ({e.__class__.__name__})"
 
+def read_install_manifest():
+    manifest_path = DEFAULT_CONFIG_PATH.parent / "install-manifest.json"
+    if not manifest_path.exists():
+        return {}
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
 def build_help_epilog():
     ui_url = f"http://{DEFAULT_PUBLIC_HOST}:{DEFAULT_PUBLIC_PORT}"
     api_url = f"http://{DEFAULT_PUBLIC_HOST}:{resolve_api_port()}"
+    manifest = read_install_manifest()
+    llama_cpp_tag = str(manifest.get("llama_cpp_tag") or "unknown")
+    llamaswap_tag = str(manifest.get("llamaswap_tag") or "unknown")
     return (
         "Default endpoints:\n"
         f"  llama-swap UI/backend: {ui_url}\n"
         f"  Superserver API:       {api_url}\n"
+        "Installed versions:\n"
+        f"  llama.cpp:           {llama_cpp_tag}\n"
+        f"  llama-swap:          {llamaswap_tag}\n"
         "Runtime info:\n"
         f"  Install root:        {DEFAULT_LLAMA_SERVER.parent.parent.parent if 'llama.cpp/build/bin' in str(DEFAULT_LLAMA_SERVER) else DEFAULT_LLAMA_SERVER.parent}\n"
         f"  Models dir:          {DEFAULT_MODELS_DIR}\n"

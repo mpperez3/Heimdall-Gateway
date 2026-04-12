@@ -238,7 +238,9 @@ bootstrap_venv_usable() {
 
 clear_stale_bootstrap_venv() {
   if [ -d "${BOOTSTRAP_VENV}" ] && ! bootstrap_venv_usable; then
-    rm -rf "${BOOTSTRAP_VENV}"
+    if ! rm -rf "${BOOTSTRAP_VENV}" 2>/dev/null; then
+      sudo_apt rm -rf "${BOOTSTRAP_VENV}"
+    fi
   fi
 }
 
@@ -386,7 +388,9 @@ run_bundle_module() {
   fi
   local status=$?
   if [ "${status}" -eq 0 ] && [ -d "${BOOTSTRAP_VENV}" ]; then
-    rm -rf "${BOOTSTRAP_VENV}"
+    if ! rm -rf "${BOOTSTRAP_VENV}" 2>/dev/null; then
+      sudo_apt rm -rf "${BOOTSTRAP_VENV}"
+    fi
   fi
   return "${status}"
 }
