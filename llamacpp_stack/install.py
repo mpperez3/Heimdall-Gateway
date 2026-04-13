@@ -15,6 +15,7 @@ import tarfile
 import time
 import textwrap
 import urllib.request
+import yaml
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -181,17 +182,49 @@ def detect_ollama_port(default: int = OLLAMA_DEFAULT_PORT) -> int:
     return default
 
 
-def choose_default_swap_port(host: str, mode: str, explicit_public_port: int | None) -> int:
+def choose_default_swap_port(host: str, mode: str, explicit_public_port: int | None, args: argparse.Namespace | None = None) -> int:
     if explicit_public_port:
         return explicit_public_port
-    if existing := existing_public_port(mode):
-        return existing
+
+    # If we already have a chosen port in args from a previous pass, use it.
+    if args and getattr(args, "public_port", None):
+        return args.public_port
+
     ollama_port = detect_ollama_port()
-    api_port = ollama_port + 1
-    swap_port = ollama_port + 2
-    if _port_is_free(host, api_port) and _port_is_free(host, swap_port):
-        return swap_port
-    return find_next_free_port(host, start=swap_port)
+    ideal_swap_port = ollama_port + 2
+    ideal_api_port = ollama_port + 1
+
+    existing = existing_public_port(mode)
+
+    # If it matches our ideal logic, use it.
+    if existing == ideal_swap_port:
+        return existing
+
+    # If we have an existing port that differs from the ideal
+    if existing:
+        if not sys.stdin.isatty():
+            return existing
+
+        print(f"\nExisting installation uses port {existing} for llama-swap UI.")
+        print(f"Recommended ports based on Ollama ({ollama_port}) are:")
+        print(f"  UI:  {ideal_swap_port}")
+        print(f"  API: {ideal_api_port}")
+
+        # Don't check if ports are free here because they might be occupied by 
+        # the currently running services we are about to upgrade/replace.
+        if prompt_bool(f"Migrate to recommended ports ({ideal_swap_port}/{ideal_api_port})?", default=True):
+            if args:
+                args.public_port = ideal_swap_port
+            return ideal_swap_port
+        if args:
+            args.public_port = existing
+        return existing
+
+    # No existing config, follow ideal logic
+    if _port_is_free(host, ideal_api_port) and _port_is_free(host, ideal_swap_port):
+        return ideal_swap_port
+
+    return find_next_free_port(host, start=ideal_swap_port)
 
 
 def _fetch_json(url: str) -> dict:
@@ -659,15 +692,32 @@ def detect_ollama_models_dir() -> Path | None:
             return Path(parsed).expanduser()
 
     for candidate in (
+        Path("/var/llamacpp_models"),
         Path("/var/lib/ollama/models"),
         Path("/usr/share/ollama/.ollama/models"),
         Path.home() / ".ollama" / "models",
     ):
         try:
             if candidate.exists():
-                return candidate
-        except PermissionError:
+                # Just check if it has ANY .gguf files in top or one level deep
+                # This is much faster than rglob() for huge directories
+                if any(candidate.glob("*.gguf")) or any(candidate.glob("*/*.gguf")):
+                    return candidate
+        except (PermissionError, Exception):
             continue
+
+    # Try paths without GGUF check if none found with GGUF
+    for candidate in (
+        Path("/var/llamacpp_models"),
+        Path("/var/lib/ollama/models"),
+        Path.home() / ".ollama" / "models",
+    ):
+        try:
+            if candidate.exists():
+                return candidate
+        except (PermissionError, Exception):
+            continue
+
     return None
 
 
@@ -676,8 +726,9 @@ def existing_public_port(mode: str) -> int | None:
     if not env_path.exists():
         return None
     for line in env_path.read_text(encoding="utf-8").splitlines():
-        if line.startswith("LLAMACPP_PUBLIC_PORT="):
-            raw = line.split("=", 1)[1].strip()
+        clean = line.strip()
+        if clean.startswith("LLAMACPP_PUBLIC_PORT="):
+            raw = clean.split("=", 1)[1].strip()
             if raw.isdigit():
                 return int(raw)
     return None
@@ -705,8 +756,9 @@ def existing_models_dir(mode: str) -> Path | None:
         if not env_path.exists():
             continue
         for line in env_path.read_text(encoding="utf-8").splitlines():
-            if line.startswith("LLAMACPP_MODELS="):
-                return Path(line.split("=", 1)[1].strip()).expanduser()
+            clean = line.strip()
+            if clean.startswith("LLAMACPP_MODELS="):
+                return Path(clean.split("=", 1)[1].strip()).expanduser()
     return None
 
 
@@ -720,9 +772,9 @@ def derive_models_dir(base: Path | None, mode: str) -> Path:
     return Path.home() / ".local/share/llamacpp-superserver/models"
 
 
-def choose_layout(mode: str | None, public_host: str, public_port: int | None, models_dir: Path | None = None) -> InstallLayout:
+def choose_layout(mode: str | None, public_host: str, public_port: int | None, models_dir: Path | None = None, args: argparse.Namespace | None = None) -> InstallLayout:
     resolved_mode = mode or detect_existing_mode() or ("system" if os.geteuid() == 0 else "user")
-    resolved_port = choose_default_swap_port(public_host, resolved_mode, public_port)
+    resolved_port = choose_default_swap_port(public_host, resolved_mode, public_port, args=args)
     ollama_models = detect_ollama_models_dir()
     resolved_models_dir = models_dir or existing_models_dir(resolved_mode) or derive_models_dir(ollama_models, resolved_mode)
     if resolved_mode == "system":
@@ -1090,6 +1142,13 @@ def render_llamaswap_wrapper(layout: InstallLayout) -> str:
         source {env_file}
         set +a
         export PYTHONPATH="$LLAMACPP_PYTHONPATH${{PYTHONPATH:+:$PYTHONPATH}}"
+        if [[ -n "${{LLAMA_SERVER_BIN:-}}" ]] && [[ -e "$LLAMA_SERVER_BIN" || -L "$LLAMA_SERVER_BIN" ]]; then
+          LLAMA_SERVER_REAL="$(readlink -f "$LLAMA_SERVER_BIN" || printf '%s' "$LLAMA_SERVER_BIN")"
+          if [[ -n "$LLAMA_SERVER_REAL" ]]; then
+            LLAMA_SERVER_LIB_DIR="$(dirname "$LLAMA_SERVER_REAL")"
+            export LD_LIBRARY_PATH="$LLAMA_SERVER_LIB_DIR${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+          fi
+        fi
         if [[ -n "${{LLAMACPP_CUDA_ROOT:-}}" ]]; then
           export CUDA_PATH="$LLAMACPP_CUDA_ROOT"
           export LD_LIBRARY_PATH="$LLAMACPP_CUDA_ROOT/lib64:$LLAMACPP_CUDA_ROOT/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
@@ -1229,6 +1288,12 @@ def _run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = N
     subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True, env=env)
 
 
+def _systemctl_cmd(mode: str, *args: str) -> list[str]:
+    if mode == "system":
+        return _sudo_prefix() + ["systemctl", *args]
+    return ["systemctl", "--user", *args]
+
+
 def ensure_runtime_python(layout: InstallLayout, dry_run: bool) -> tuple[Path, Path]:
     runtime_python = layout.runtime_venv / "bin" / "python"
     python_path = layout.python_root
@@ -1277,31 +1342,34 @@ def ensure_runtime_python(layout: InstallLayout, dry_run: bool) -> tuple[Path, P
     return runtime_python, python_path
 
 
+def _sync_dir(src: Path, dst: Path, dry_run: bool) -> None:
+    if dry_run:
+        print(f"[dry-run] would sync {src} to {dst}")
+        return
+    dst.mkdir(parents=True, exist_ok=True)
+    # Using cp -au is much faster than shutil.copytree for large directories like CUDA
+    # -a: archive (preserve links, permissions, etc)
+    # -u: update (only copy when src is newer than dst or dst is missing)
+    # Using ./. to copy contents of src into dst
+    subprocess.run(["cp", "-au", f"{src}/.", str(dst)], check=True)
+
+
 def sync_cuda_runtime(layout: InstallLayout, python_exec: str, dry_run: bool) -> Path | None:
     cuda_root = locate_cuda_root_for_python(python_exec)
     if cuda_root is None or not cuda_root.exists():
-        return None
-    if dry_run:
-        print(f"[dry-run] would copy CUDA runtime from {cuda_root} to {layout.cuda_root}")
-        return layout.cuda_root
+        return layout.cuda_root if layout.cuda_root.exists() else None
     normalize_python_cuda_layout(cuda_root)
-    if layout.cuda_root.exists():
-        shutil.rmtree(layout.cuda_root)
-    shutil.copytree(cuda_root, layout.cuda_root, symlinks=True)
-    normalize_python_cuda_layout(layout.cuda_root)
+    _sync_dir(cuda_root, layout.cuda_root, dry_run)
+    if not dry_run:
+        normalize_python_cuda_layout(layout.cuda_root)
     return layout.cuda_root
 
 
 def sync_nccl_runtime(layout: InstallLayout, python_exec: str, dry_run: bool) -> Path | None:
     nccl_root = locate_nccl_root_for_python(python_exec)
     if nccl_root is None or not nccl_root.exists():
-        return None
-    if dry_run:
-        print(f"[dry-run] would copy NCCL runtime from {nccl_root} to {layout.nccl_root}")
-        return layout.nccl_root
-    if layout.nccl_root.exists():
-        shutil.rmtree(layout.nccl_root)
-    shutil.copytree(nccl_root, layout.nccl_root, symlinks=True)
+        return layout.nccl_root if layout.nccl_root.exists() else None
+    _sync_dir(nccl_root, layout.nccl_root, dry_run)
     return layout.nccl_root
 
 
@@ -1353,12 +1421,16 @@ def build_llama_cpp_from_source(
         _export_nvcc_path(nvcc_path)
         build_env = os.environ.copy()
         cmake_args.append(f"-DCMAKE_CUDA_COMPILER={Path(nvcc_path).resolve()}")
+    rpath_dirs: list[str] = []
     cuda_root = Path(build_env["CUDAToolkit_ROOT"]) if build_env.get("CUDAToolkit_ROOT") else locate_cuda_root_for_python(python_exec)
     if enable_cuda and cuda_root:
         normalize_python_cuda_layout(cuda_root)
         _export_cuda_root(cuda_root)
         build_env = os.environ.copy()
         cmake_args.append(f"-DCUDAToolkit_ROOT={cuda_root}")
+        for lib_dir in (cuda_root / "lib64", cuda_root / "lib", cuda_root / "targets" / "x86_64-linux" / "lib"):
+            if lib_dir.exists():
+                rpath_dirs.append(str(lib_dir))
     nccl_root = locate_nccl_root_for_python(python_exec)
     if enable_cuda and nccl_root:
         _export_nccl_root(nccl_root)
@@ -1367,12 +1439,19 @@ def build_llama_cpp_from_source(
         library = None
         for lib_dir in (nccl_root / "lib64", nccl_root / "lib"):
             if lib_dir.exists():
+                rpath_dirs.append(str(lib_dir))
                 library = next(iter(lib_dir.glob("libnccl.so*")), None)
                 if library:
                     break
         if include_dir.exists() and library:
             cmake_args.append(f"-DNCCL_INCLUDE_DIR={include_dir}")
             cmake_args.append(f"-DNCCL_LIBRARY={library}")
+    if rpath_dirs:
+        rpath_value = ";".join(dict.fromkeys(rpath_dirs))
+        cmake_args.append(f"-DCMAKE_BUILD_RPATH={rpath_value}")
+        cmake_args.append(f"-DCMAKE_INSTALL_RPATH={rpath_value}")
+        cmake_args.append("-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON")
+        cmake_args.append("-DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON")
     if enable_cuda:
         for flag in ("GGML_CUDA_GRAPHS", "GGML_CUDA_FA_ALL_QUANTS"):
             if source_tree_supports_flag(src_dir, flag):
@@ -1471,13 +1550,13 @@ def install_systemd_units(layout: InstallLayout, dry_run: bool) -> None:
     if layout.mode == "system":
         systemd_dir = Path("/etc/systemd/system")
         env_dir = layout.config_dir
-        reload_cmd = ["systemctl", "daemon-reload"]
-        enable_cmd = ["systemctl", "enable", "--now", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME]
+        reload_cmd = _systemctl_cmd(layout.mode, "daemon-reload")
+        enable_cmd = _systemctl_cmd(layout.mode, "enable", "--now", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME)
     else:
         systemd_dir = Path.home() / ".config/systemd/user"
         env_dir = layout.config_dir
-        reload_cmd = ["systemctl", "--user", "daemon-reload"]
-        enable_cmd = ["systemctl", "--user", "enable", "--now", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME]
+        reload_cmd = _systemctl_cmd(layout.mode, "daemon-reload")
+        enable_cmd = _systemctl_cmd(layout.mode, "enable", "--now", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME)
 
     if dry_run:
         print(f"[dry-run] would write units to {systemd_dir} and run: {' '.join(reload_cmd)} && {' '.join(enable_cmd)}")
@@ -1492,10 +1571,7 @@ def install_systemd_units(layout: InstallLayout, dry_run: bool) -> None:
 
 
 def restart_systemd_units(layout: InstallLayout, dry_run: bool) -> bool:
-    if layout.mode == "system":
-        restart_cmd = ["systemctl", "restart", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME]
-    else:
-        restart_cmd = ["systemctl", "--user", "restart", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME]
+    restart_cmd = _systemctl_cmd(layout.mode, "restart", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME)
 
     if dry_run:
         print(f"[dry-run] would run: {' '.join(restart_cmd)}")
@@ -1535,10 +1611,7 @@ def wait_for_manager_socket(layout: InstallLayout, dry_run: bool, timeout_second
 
 
 def stop_systemd_units(layout: InstallLayout, dry_run: bool) -> bool:
-    if layout.mode == "system":
-        stop_cmd = ["systemctl", "stop", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME]
-    else:
-        stop_cmd = ["systemctl", "--user", "stop", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME]
+    stop_cmd = _systemctl_cmd(layout.mode, "stop", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME)
 
     if dry_run:
         print(f"[dry-run] would run: {' '.join(stop_cmd)}")
@@ -1591,9 +1664,11 @@ def print_install_summary(layout: InstallLayout, install_services: bool) -> None
     current_llamaswap = str(manifest.get("llamaswap_tag") or "unknown")
     if layout.mode == "system":
         start_cmd = f"sudo systemctl start {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}"
+        restart_cmd = f"sudo systemctl restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}"
         status_cmd = f"sudo systemctl status {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}"
     else:
         start_cmd = f"systemctl --user start {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}"
+        restart_cmd = f"systemctl --user restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}"
         status_cmd = f"systemctl --user status {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}"
 
     print("\nInstallation complete.")
@@ -1608,7 +1683,8 @@ def print_install_summary(layout: InstallLayout, install_services: bool) -> None
     print(f"UI activity:         {ui_url}")
     print(f"llama-swap UI/backend: {ui_base_url}")
     if install_services:
-        print(f"Services enabled. Check with: {status_cmd}")
+        print(f"Services enabled and running. Check status with: {status_cmd}")
+        print(f"Restart them with: {restart_cmd}")
     else:
         print("Services were not enabled automatically.")
         print(f"Start them with: {start_cmd}")
@@ -1754,7 +1830,114 @@ def _auto_register_local_gguf_models(layout: InstallLayout, dry_run: bool) -> in
     return len(imported)
 
 
-def maybe_rerun_auto_ctx(layout: InstallLayout, install_services: bool, dry_run: bool) -> None:
+def _ensure_basic_server_config(layout: InstallLayout) -> None:
+    server_config_path = layout.config_dir / SERVER_CONFIG_BASENAME
+    catalog_path = layout.state_dir / "catalog.json"
+    if not catalog_path.exists():
+        return
+
+    try:
+        catalog_raw = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+
+    if not isinstance(catalog_raw, list):
+        return
+
+    # Update llamacpp-superserver.json (Manager config)
+    try:
+        if server_config_path.exists():
+            server_config = json.loads(server_config_path.read_text(encoding="utf-8"))
+        else:
+            server_config = {}
+    except Exception:
+        server_config = {}
+
+    if "models" not in server_config:
+        server_config["models"] = {}
+    
+    if "llama_server_defaults" not in server_config:
+        server_config["llama_server_defaults"] = {}
+
+    server_changed = False
+    for model in catalog_raw:
+        if not isinstance(model, dict):
+            continue
+        model_id = str(model.get("model_id") or "")
+        if not model_id:
+            continue
+
+        if model_id not in server_config["models"]:
+            server_config["models"][model_id] = {
+                "ctx_size": 8192,
+                "n_gpu_layers": 999,
+            }
+            server_changed = True
+
+    if server_changed:
+        server_config_path.parent.mkdir(parents=True, exist_ok=True)
+        server_config_path.write_text(json.dumps(server_config, indent=2) + "\n", encoding="utf-8")
+        print(f"Verified Manager configuration in {server_config_path}")
+
+    # 2. Update config.yaml (llama-swap UI config) preserving your achieved features
+    config_path = layout.state_dir / "config.yaml"
+    if not config_path.exists():
+        render_initial_config(config_path)
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            ui_config = yaml.safe_load(f) or {}
+    except Exception:
+        ui_config = {}
+
+    if "models" not in ui_config:
+        ui_config["models"] = {}
+
+    ui_changed = False
+    for model in catalog_raw:
+        if not isinstance(model, dict):
+            continue
+        model_id = str(model.get("model_id") or "")
+        if not model_id:
+            continue
+
+        # Get current entry or create a new one
+        current = ui_config["models"].get(model_id, {})
+        
+        # We ensure keepAlive and other metadata are present as you achieved
+        # We use a default of 5m if not specified, but we don't overwrite if it exists
+        needs_update = False
+        entry = current.copy()
+        
+        if "keepAlive" not in entry:
+            entry["keepAlive"] = "5m"
+            needs_update = True
+        
+        # Sync metadata from catalog if missing or different
+        if model.get("aliases") and entry.get("aliases") != model["aliases"]:
+            entry["aliases"] = model["aliases"]
+            needs_update = True
+            
+        if model.get("description") and entry.get("description") != model["description"]:
+            entry["description"] = model["description"]
+            needs_update = True
+
+        # CRITICAL: ensure checkEndpoint is present for llama-swap
+        if "checkEndpoint" not in entry:
+            entry["checkEndpoint"] = "/health"
+            needs_update = True
+
+        if needs_update:
+            ui_config["models"][model_id] = entry
+            ui_changed = True
+
+    if ui_changed:
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(ui_config, f, default_flow_style=False, sort_keys=False)
+        print(f"Restored and verified metadata (keepAlive, aliases) for {len(catalog_raw)} models in UI configuration.")
+
+
+def maybe_rerun_auto_ctx(layout: InstallLayout, install_services: bool, dry_run: bool, args: argparse.Namespace) -> None:
     def _run_auto_ctx_update() -> None:
         try:
             _run([str(layout.bin_dir / CLI_COMMAND), "update", "--auto"])
@@ -1765,6 +1948,13 @@ def maybe_rerun_auto_ctx(layout: InstallLayout, install_services: bool, dry_run:
                 f"{layout.bin_dir / CLI_COMMAND} update --auto"
             )
 
+    def _run_sync_config() -> None:
+        try:
+            _run([str(layout.bin_dir / CLI_COMMAND), "update"])
+            print(f"Synced registered models to llama-swap UI configuration.")
+        except subprocess.CalledProcessError as exc:
+            print(f"Warning: model sync failed (exit code {exc.returncode}).")
+
     catalog_path = layout.state_dir / "catalog.json"
     catalog_models = _catalog_model_count(catalog_path)
     if catalog_models <= 0:
@@ -1772,21 +1962,31 @@ def maybe_rerun_auto_ctx(layout: InstallLayout, install_services: bool, dry_run:
             imported_count = _auto_register_local_gguf_models(layout, dry_run)
             if imported_count > 0:
                 catalog_models = _catalog_model_count(catalog_path)
+    
     if catalog_models <= 0:
-        if _models_dir_has_gguf(layout.models_dir):
-            print(
-                "Detected GGUF files in the models directory, but no registered catalog entries exist yet. "
-                "Auto-ctx only applies to registered catalog models, so it was skipped."
-            )
-            print(
-                "Register models first with: "
-                f"{layout.bin_dir / CLI_COMMAND} run <hf-repo[:quant]> "
-                "or "
-                f"{layout.bin_dir / CLI_COMMAND} add <hf-repo[:quant]>"
-            )
         return
-    if not prompt_bool(f"Detected {catalog_models} registered models. Re-run auto-ctx now?", default=False):
+
+    # Ensure we have at least a basic config even if they skip auto-ctx
+    if not dry_run:
+        _ensure_basic_server_config(layout)
+
+    # Check if we already have an answer from a previous execution (pre-sudo)
+    rerun = getattr(args, "rerun_auto_ctx", None)
+    if rerun is None:
+        if not sys.stdin.isatty():
+            rerun = False
+        else:
+            rerun = prompt_bool(f"Detected {catalog_models} registered models. Re-run auto-ctx now?", default=False)
+            args.rerun_auto_ctx = rerun
+
+    if not rerun:
+        # If they skip auto-ctx, we still need to sync models to config.yaml 
+        # so they show up in the UI.
+        if not dry_run and install_services:
+            if wait_for_manager_socket(layout, dry_run):
+                _run_sync_config()
         return
+
     if dry_run:
         print(f"[dry-run] would run: {layout.bin_dir / CLI_COMMAND} update --auto")
         return
@@ -1830,7 +2030,16 @@ def install_stack(args: argparse.Namespace) -> int:
     chosen_models_dir = Path(args.models_dir).expanduser() if args.models_dir else prompt_path("Models directory", suggested_models_dir)
     maybe_migrate_existing_install(pre_mode, chosen_public_host, args.public_port, args.dry_run)
     args.public_host = chosen_public_host
-    layout = choose_layout(pre_mode, chosen_public_host, args.public_port, chosen_models_dir)
+
+    # 1. First tentative layout to stop services if they exist
+    layout = choose_layout(pre_mode, chosen_public_host, args.public_port, chosen_models_dir, args=args)
+    if args.install_services:
+        # Stop existing services early so ports they occupy can be re-assigned or migrated to.
+        stop_systemd_units(layout, args.dry_run)
+
+    # 2. Re-calculate layout (specifically ports) after services are stopped
+    layout = choose_layout(pre_mode, chosen_public_host, args.public_port, chosen_models_dir, args=args)
+
     if args.update_binaries is not None:
         update_binaries = bool(args.update_binaries)
     else:
@@ -1855,9 +2064,6 @@ def install_stack(args: argparse.Namespace) -> int:
     reexec_status = maybe_reexec_system_install(args, pre_mode, llama_cpp_mode, chosen_models_dir)
     if reexec_status is not None:
         return reexec_status
-
-    if args.install_services:
-        stop_systemd_units(layout, args.dry_run)
 
     if args.dry_run:
         print(f"[dry-run] would ensure directories under {layout.install_root}, {layout.state_dir}, {layout.models_dir}")
@@ -2080,7 +2286,7 @@ def install_stack(args: argparse.Namespace) -> int:
     if args.install_services:
         restart_systemd_units(layout, args.dry_run)
     if not args.dry_run:
-        maybe_rerun_auto_ctx(layout, args.install_services, args.dry_run)
+        maybe_rerun_auto_ctx(layout, args.install_services, args.dry_run, args)
     if not args.dry_run:
         print_install_summary(layout, args.install_services)
     return 0

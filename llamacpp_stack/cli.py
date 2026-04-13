@@ -32,7 +32,7 @@ import tempfile
 import signal
 import termios
 from datetime import datetime, timezone
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
@@ -138,6 +138,7 @@ DEFAULT_REQUESTS_LOG_PATH = _env_path(
 MODEL_ACTIVITY_LOCK = threading.Lock()
 MODEL_ACTIVITY: dict[str, dict[str, float | str]] = {}
 LAST_ACTIVITY_MODEL_ID = ""
+CATALOG_CACHE: dict[str, tuple[int, int, list["ManagedModel"]]] = {}
 
 def manager_unavailable_error(exc: Exception) -> RuntimeError:
     return RuntimeError(f"Could not connect to manager: {exc}. Is {MANAGER_SERVICE_NAME} running?")
@@ -371,16 +372,30 @@ def load_catalog(path: Path) -> list[ManagedModel]:
 
 def load_catalog_with_diagnostics(path: Path) -> tuple[list[ManagedModel], str | None]:
     if not path.exists():
+        CATALOG_CACHE.pop(str(path), None)
         return [], f"Catalog file not found: {path}"
+    cache_key = str(path)
+    try:
+        stat = path.stat()
+        signature = (stat.st_mtime_ns, stat.st_size)
+    except OSError as exc:
+        CATALOG_CACHE.pop(cache_key, None)
+        return [], f"Could not stat catalog {path}: {exc}"
+    cached = CATALOG_CACHE.get(cache_key)
+    if cached is not None and cached[0] == signature[0] and cached[1] == signature[1]:
+        return [replace(item) for item in cached[2]], None
     try:
         payload = json.loads(path.read_text("utf-8"))
     except Exception as exc:
+        CATALOG_CACHE.pop(cache_key, None)
         return [], f"Could not read/parse catalog {path}: {exc}"
     if not isinstance(payload, list):
+        CATALOG_CACHE.pop(cache_key, None)
         return [], f"Catalog {path} has invalid format (expected a JSON array)."
     try:
         items = [ManagedModel(**m) for m in payload]
     except Exception as exc:
+        CATALOG_CACHE.pop(cache_key, None)
         return [], f"Catalog {path} has invalid entries: {exc}"
     changed = False
     for item in items:
@@ -394,13 +409,20 @@ def load_catalog_with_diagnostics(path: Path) -> tuple[list[ManagedModel], str |
             changed = True
     if changed:
         save_catalog(path, items)
-    return items, None
+    cached_items = [replace(item) for item in items]
+    CATALOG_CACHE[cache_key] = (signature[0], signature[1], cached_items)
+    return [replace(item) for item in cached_items], None
 
 def save_catalog(path: Path, models: list[ManagedModel]):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps([asdict(m) for m in models], indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
+    try:
+        stat = path.stat()
+        CATALOG_CACHE[str(path)] = (stat.st_mtime_ns, stat.st_size, [replace(model) for model in models])
+    except OSError:
+        CATALOG_CACHE.pop(str(path), None)
 
 
 def normalize_model_id(repo_id, quant, filename):
@@ -617,6 +639,10 @@ def log_api_event(kind: str, payload: dict, log_path: Path = DEFAULT_REQUESTS_LO
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return int((time.monotonic() - started_at) * 1000)
 
 
 def mark_model_activity(model_id: str, source: str, phase: str, *, log: bool = True) -> None:
@@ -992,14 +1018,33 @@ def _download_hf_file_fast(repo_id: str, filename: str, token: str | None, targe
         else:
             os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = previous
 
-def download_hf_file(repo_id: str, filename: str, token: str | None, target_dir: Path, label: str | None = None, progress_callback = None) -> str:
+
+def download_hf_file(
+    repo_id: str,
+    filename: str,
+    token: str | None,
+    target_dir: Path,
+    label: str | None = None,
+    progress_callback = None,
+    expected_size: int | None = None,
+) -> str:
     dest_path = target_dir / filename
     part_path = dest_path.with_name(dest_path.name + ".part")
     dest_path.parent.mkdir(parents=True, exist_ok=True)
 
     if dest_path.exists():
-        _emit_message(f"{filename} already available.", progress_callback)
-        return str(dest_path)
+        current_size = dest_path.stat().st_size
+        if expected_size is None and current_size > 0:
+            _emit_message(f"{filename} already available.", progress_callback)
+            return str(dest_path)
+        if expected_size is not None and current_size == expected_size and current_size > 0:
+            _emit_message(f"{filename} already available.", progress_callback)
+            return str(dest_path)
+        if current_size > 0 and not part_path.exists():
+            if expected_size is not None and current_size > expected_size:
+                dest_path.unlink(missing_ok=True)
+            else:
+                dest_path.replace(part_path)
 
     parallel_path = _download_hf_file_parallel(repo_id, filename, token, target_dir, label=label, progress_callback=progress_callback)
     if parallel_path:
@@ -1039,9 +1084,9 @@ def download_hf_file(repo_id: str, filename: str, token: str | None, target_dir:
 
             resp.raise_for_status()
 
-            total = None
+            total = expected_size
             content_range = resp.headers.get("Content-Range", "")
-            if "/" in content_range:
+            if total is None and "/" in content_range:
                 total_str = content_range.rsplit("/", 1)[1]
                 if total_str.isdigit():
                     total = int(total_str)
@@ -1086,26 +1131,54 @@ def download_hf_file(repo_id: str, filename: str, token: str | None, target_dir:
 
     raise RuntimeError(f"Could not download {filename} from {repo_id}")
 
-def model_files_ready(target_dir: Path, filenames: list[str]) -> bool:
+
+def _repo_sibling_sizes(api, repo_id: str, token: str | None) -> dict[str, int]:
+    try:
+        info = api.model_info(repo_id=repo_id, token=token)
+    except Exception:
+        return {}
+    sizes: dict[str, int] = {}
+    for sibling in getattr(info, "siblings", []) or []:
+        filename = getattr(sibling, "rfilename", None)
+        size = getattr(sibling, "size", None)
+        if filename and isinstance(size, int) and size > 0:
+            sizes[filename] = size
+    return sizes
+
+
+def _download_file_state(target_dir: Path, filename: str, expected_size: int | None = None) -> str:
+    final_path = target_dir / filename
+    part_path = final_path.with_name(final_path.name + ".part")
+    if final_path.exists():
+        final_size = final_path.stat().st_size
+        if final_size <= 0:
+            return "missing"
+        if expected_size is None or final_size == expected_size:
+            return "completed"
+        return "partial"
+    if part_path.exists() and part_path.stat().st_size > 0:
+        return "partial"
+    return "missing"
+
+
+def model_files_ready(target_dir: Path, filenames: list[str], expected_sizes: dict[str, int] | None = None) -> bool:
+    sizes = expected_sizes or {}
     for filename in filenames:
-        final_path = target_dir / filename
-        part_path = final_path.with_name(final_path.name + ".part")
-        if not final_path.exists() or final_path.stat().st_size <= 0:
-            return False
-        if part_path.exists():
+        if _download_file_state(target_dir, filename, sizes.get(filename)) != "completed":
             return False
     return True
 
-def summarize_download_state(target_dir: Path, filenames: list[str]):
+
+def summarize_download_state(target_dir: Path, filenames: list[str], expected_sizes: dict[str, int] | None = None):
+    sizes = expected_sizes or {}
     completed = 0
     partial = 0
     missing = 0
     for filename in filenames:
-        final_path = target_dir / filename
-        part_path = final_path.with_name(final_path.name + ".part")
-        if final_path.exists() and final_path.stat().st_size > 0:
+        state = _download_file_state(target_dir, filename, sizes.get(filename))
+        if state == "completed":
             completed += 1
-        elif part_path.exists() and part_path.stat().st_size > 0:
+        elif state == "partial":
             partial += 1
         else:
             missing += 1
@@ -1361,6 +1434,8 @@ def ensure_model_available(args, progress_callback = None):
         if existing is None and not args.file:
             existing = next((m for m in catalog if m.repo_id == repo_id and m.quant == quant), None)
 
+    expected_sizes = _repo_sibling_sizes(api, repo_id, token)
+
     target_dir = args.models_dir / repo_id
     target_dir.mkdir(parents=True, exist_ok=True)
     mmproj_filename = existing.mmproj_filename if existing else None
@@ -1434,8 +1509,8 @@ def ensure_model_available(args, progress_callback = None):
             save_catalog(args.catalog, catalog)
 
     mid = args.model_id or (existing.model_id if existing else normalize_model_id(repo_id, quant, selected_file))
-    files_ready = model_files_ready(target_dir, to_download)
-    completed_files, partial_files, missing_files = summarize_download_state(target_dir, to_download)
+    files_ready = model_files_ready(target_dir, to_download, expected_sizes)
+    completed_files, partial_files, missing_files = summarize_download_state(target_dir, to_download, expected_sizes)
 
     if existing and not args.force and files_ready and mmproj_ready and not force_auto_ctx:
         _emit_message("All required model files already exist locally. Skipping download.", progress_callback)
@@ -1480,12 +1555,28 @@ def ensure_model_available(args, progress_callback = None):
     total_files = len(to_download)
     for idx, f in enumerate(to_download, start=1):
         label = f"[{idx}/{total_files}] {Path(f).name}" if total_files > 1 else Path(f).name
-        loc = download_hf_file(repo_id=repo_id, filename=f, token=token, target_dir=target_dir, label=label, progress_callback=progress_callback)
+        loc = download_hf_file(
+            repo_id=repo_id,
+            filename=f,
+            token=token,
+            target_dir=target_dir,
+            label=label,
+            progress_callback=progress_callback,
+            expected_size=expected_sizes.get(f),
+        )
         if f == selected_file:
             local_path = loc
     if mmproj_filename:
         mmproj_label = f"mmproj {Path(mmproj_filename).name}"
-        mmproj_loc = download_hf_file(repo_id=repo_id, filename=mmproj_filename, token=token, target_dir=target_dir, label=mmproj_label, progress_callback=progress_callback)
+        mmproj_loc = download_hf_file(
+            repo_id=repo_id,
+            filename=mmproj_filename,
+            token=token,
+            target_dir=target_dir,
+            label=mmproj_label,
+            progress_callback=progress_callback,
+            expected_size=expected_sizes.get(mmproj_filename),
+        )
         mmproj_path = mmproj_loc
 
     desired_ctx = ctx_override if ctx_override is not None else (existing.ctx_size if existing and existing.auto_ctx_failed else default_ctx)
@@ -2647,6 +2738,7 @@ def start_ctx_metadata_server(args):
         def _handle_ollama_chat(self):
             payload = self._read_json_body()
             log_api_event("ollama_chat_request", payload)
+            started_at = time.monotonic()
             catalog = load_catalog(catalog_path)
             model_name = resolve_catalog_model_name(str(payload.get("model") or "").strip(), catalog)
             if not model_name:
@@ -2702,6 +2794,7 @@ def start_ctx_metadata_server(args):
                         timeout=(10, 600),
                         stream=True,
                     )
+                    log_api_event("ollama_chat_upstream_headers", {"model": model_name, "status": response.status_code, "wait_ms": _elapsed_ms(started_at), "stream": True})
                 except requests.RequestException as exc:
                     log_api_event("ollama_chat_upstream_network_error", {"error": str(exc)})
                     self._send_json({"error": f"upstream unavailable: {exc}"}, status=502)
@@ -2714,6 +2807,7 @@ def start_ctx_metadata_server(args):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/x-ndjson")
                 self.end_headers()
+                first_chunk_logged = False
                 for line in response.iter_lines(chunk_size=1, decode_unicode=False):
                     if not line:
                         continue
@@ -2727,6 +2821,7 @@ def start_ctx_metadata_server(args):
                         self.wfile.flush()
                         mark_model_activity(model_name, "ollama_chat", "stream_done")
                         log_api_event("ollama_chat_stream_done", done_payload)
+                        log_api_event("ollama_chat_total", {"model": model_name, "total_ms": _elapsed_ms(started_at), "stream": True})
                         return
                     try:
                         chunk = json.loads(chunk_payload)
@@ -2735,6 +2830,9 @@ def start_ctx_metadata_server(args):
                     text = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
                     if not text:
                         continue
+                    if not first_chunk_logged:
+                        first_chunk_logged = True
+                        log_api_event("ollama_chat_first_chunk", {"model": model_name, "first_chunk_ms": _elapsed_ms(started_at)})
                     ollama_chunk = {
                         "model": model_name,
                         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -2748,6 +2846,7 @@ def start_ctx_metadata_server(args):
                 self.wfile.flush()
                 mark_model_activity(model_name, "ollama_chat", "stream_done")
                 log_api_event("ollama_chat_stream_done", done_payload)
+                log_api_event("ollama_chat_total", {"model": model_name, "total_ms": _elapsed_ms(started_at), "stream": True})
                 return
 
             try:
@@ -2756,8 +2855,9 @@ def start_ctx_metadata_server(args):
                     data=json.dumps(upstream_payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     timeout=(10, 600),
-                    stream=True,
+                    stream=False,
                 )
+                log_api_event("ollama_chat_upstream_headers", {"model": model_name, "status": response.status_code, "wait_ms": _elapsed_ms(started_at), "stream": False})
             except requests.RequestException as exc:
                 log_api_event("ollama_chat_upstream_network_error", {"error": str(exc)})
                 self._send_json({"error": f"upstream unavailable: {exc}"}, status=502)
@@ -2768,25 +2868,28 @@ def start_ctx_metadata_server(args):
                 self._send_json({"error": f"upstream unavailable: HTTP {response.status_code}: {body_text[:1000]}"}, status=502)
                 return
             try:
-                data = _collect_openai_sse_response(response)
+                data = response.json()
             except Exception as exc:
-                log_api_event("ollama_chat_upstream_invalid_json", {"status": response.status_code, "error": str(exc)})
+                log_api_event("ollama_chat_upstream_invalid_json", {"status": response.status_code, "error": str(exc), "body": response.text[:4000]})
                 self._send_json({"error": f"upstream invalid response: {exc}"}, status=502)
                 return
+            log_api_event("ollama_chat_total", {"model": model_name, "total_ms": _elapsed_ms(started_at), "stream": False})
             message = data.get("choices", [{}])[0].get("message", {})
             content = message.get("content", "")
+            usage = data.get("usage") or {}
+            timings = data.get("timings") or {}
             base = {
                 "model": model_name,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "message": {"role": "assistant", "content": content},
                 "done": True,
                 "done_reason": "stop",
-                "total_duration": 0,
+                "total_duration": int(float(timings.get("prompt_ms", 0) + timings.get("predicted_ms", 0)) * 1_000_000),
                 "load_duration": 0,
-                "prompt_eval_count": 0,
-                "prompt_eval_duration": 0,
-                "eval_count": 0,
-                "eval_duration": 0,
+                "prompt_eval_count": int(usage.get("prompt_tokens") or 0),
+                "prompt_eval_duration": int(float(timings.get("prompt_ms", 0)) * 1_000_000),
+                "eval_count": int(usage.get("completion_tokens") or 0),
+                "eval_duration": int(float(timings.get("predicted_ms", 0)) * 1_000_000),
             }
             if stream:
                 _stream_ollama_json_lines(self, [base])
@@ -2799,6 +2902,7 @@ def start_ctx_metadata_server(args):
         def _handle_openai_chat_completions(self):
             payload = self._read_json_body()
             log_api_event("openai_chat_request", payload)
+            started_at = time.monotonic()
             catalog = load_catalog(catalog_path)
             model_name = resolve_catalog_model_name(str(payload.get("model") or "").strip(), catalog)
             if not model_name:
@@ -2840,8 +2944,9 @@ def start_ctx_metadata_server(args):
                     data=json.dumps(upstream_payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     timeout=(10, 600),
-                    stream=True,
+                    stream=stream,
                 )
+                log_api_event("openai_chat_upstream_headers", {"model": model_name, "status": response.status_code, "wait_ms": _elapsed_ms(started_at), "stream": stream})
             except requests.RequestException as exc:
                 log_api_event("openai_chat_upstream_network_error", {"error": str(exc), "payload": upstream_payload})
                 self._send_json({"error": {"message": f"upstream unavailable: {exc}", "type": "server_error"}}, status=502)
@@ -2858,10 +2963,14 @@ def start_ctx_metadata_server(args):
                 self.send_response(200)
                 self.send_header("Content-Type", response.headers.get("Content-Type", "text/event-stream"))
                 self.end_headers()
+                first_chunk_logged = False
                 try:
                     for chunk in response.iter_content(chunk_size=4096):
                         if not chunk:
                             continue
+                        if not first_chunk_logged:
+                            first_chunk_logged = True
+                            log_api_event("openai_chat_first_chunk", {"model": model_name, "first_chunk_ms": _elapsed_ms(started_at)})
                         self.wfile.write(chunk)
                         self.wfile.flush()
                         mark_model_activity(model_name, "openai_chat", "stream_chunk", log=False)
@@ -2870,27 +2979,33 @@ def start_ctx_metadata_server(args):
                 finally:
                     response.close()
                     mark_model_activity(model_name, "openai_chat", "stream_closed")
+                    log_api_event("openai_chat_total", {"model": model_name, "total_ms": _elapsed_ms(started_at), "stream": True})
                 return
             try:
-                data = _collect_openai_sse_response(response)
+                data = response.json()
             except Exception as exc:
-                log_api_event("openai_chat_upstream_invalid_json", {"error": str(exc), "payload": upstream_payload})
+                log_api_event("openai_chat_upstream_invalid_json", {"error": str(exc), "payload": upstream_payload, "body": response.text[:4000]})
                 self._send_json({"error": {"message": f"upstream invalid response: {exc}", "type": "server_error"}}, status=502)
                 return
+            log_api_event("openai_chat_total", {"model": model_name, "total_ms": _elapsed_ms(started_at), "stream": False})
             choice = (data.get("choices") or [{}])[0]
             final_payload = {
-                "id": f"chatcmpl-{uuid.uuid4().hex}",
-                "object": "chat.completion",
-                "created": int(time.time()),
+                "id": data.get("id") or f"chatcmpl-{uuid.uuid4().hex}",
+                "object": data.get("object") or "chat.completion",
+                "created": int(data.get("created") or time.time()),
                 "model": model_name,
                 "choices": [
                     {
                         "index": 0,
                         "message": choice.get("message") or {"role": "assistant", "content": ""},
-                        "finish_reason": "stop",
+                        "finish_reason": choice.get("finish_reason") or "stop",
                     }
                 ],
             }
+            if data.get("usage") is not None:
+                final_payload["usage"] = data.get("usage")
+            if data.get("system_fingerprint") is not None:
+                final_payload["system_fingerprint"] = data.get("system_fingerprint")
             log_api_event("openai_chat_response", final_payload)
             mark_model_activity(model_name, "openai_chat", "response_done")
             self._send_json(final_payload)
@@ -3697,6 +3812,7 @@ def _materialize_validation_model(args, progress_callback = None) -> tuple[Manag
     token = args.hf_token or os.environ.get("HF_TOKEN")
     api = HfApi()
     selected_file = choose_gguf_file(api, repo_id, quant, args.file, token)
+    expected_sizes = _repo_sibling_sizes(api, repo_id, token)
     temp_root = Path(tempfile.mkdtemp(prefix="llamacpp-validate-"))
     repo_dir = temp_root / repo_id
     repo_dir.mkdir(parents=True, exist_ok=True)
@@ -3707,6 +3823,7 @@ def _materialize_validation_model(args, progress_callback = None) -> tuple[Manag
         target_dir=repo_dir,
         label=Path(selected_file).name,
         progress_callback=progress_callback,
+        expected_size=expected_sizes.get(selected_file),
     )
 
     mmproj_filename = choose_mmproj_file(api, repo_id, token)
@@ -3719,6 +3836,7 @@ def _materialize_validation_model(args, progress_callback = None) -> tuple[Manag
             target_dir=repo_dir,
             label=f"mmproj {Path(mmproj_filename).name}",
             progress_callback=progress_callback,
+            expected_size=expected_sizes.get(mmproj_filename),
         )
 
     temp_model = ManagedModel(
@@ -4196,10 +4314,18 @@ def build_help_epilog():
         f"  UI status:           {get_public_endpoint_status()}"
     )
 
-def main():
-    class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
-        pass
+class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
+    pass
 
+
+def _detect_requested_subcommand(argv: list[str], available: set[str]) -> str | None:
+    for token in argv:
+        if token in available:
+            return token
+    return None
+
+
+def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParser]]:
     parser = argparse.ArgumentParser(
         prog=CLI_COMMAND,
         description="Manage GGUF models for llama-swap + llama-server.",
@@ -4218,11 +4344,14 @@ def main():
     parser.add_argument("--api-port", type=int, default=None)
     parser.add_argument("--idle-ttl", type=int, default=None)
     sub = parser.add_subparsers(dest="command", required=True)
+    subparsers: dict[str, argparse.ArgumentParser] = {}
     
     p_add = sub.add_parser("add")
+    subparsers["add"] = p_add
     p_add.set_defaults(func=lambda a: ensure_model_available(a) and 0)
     
     p_run = sub.add_parser("run")
+    subparsers["run"] = p_run
     p_run.set_defaults(
         func=lambda a: (
             (ensure_model_available(a) and 0)
@@ -4234,31 +4363,50 @@ def main():
     p_run.add_argument("-ctx", "--ctx", dest="ctx_override", type=int, help="Override ctx size for this run")
 
     p_remove = sub.add_parser("remove")
+    subparsers["remove"] = p_remove
     p_remove.set_defaults(func=lambda a: remove_model(a) and 0)
     p_remove.add_argument("repo", nargs="?", help="Model id or HF repo[:QUANT]")
-    p_remove.add_argument("-hf", help="HF repo")
+    p_remove.add_argument("-hf", "--hf", help="HF repo")
     p_remove.add_argument("--file")
     p_remove.add_argument("--model-id")
     p_remove.add_argument("--delete-files", action="store_true")
 
     p_update = sub.add_parser("update")
+    subparsers["update"] = p_update
     p_update.set_defaults(func=lambda a: update_config(a) and 0)
     p_update.add_argument("repo", nargs="?", help="Model id or HF repo[:QUANT]")
-    p_update.add_argument("-hf", help="HF repo")
+    p_update.add_argument("-hf", "--hf", help="HF repo")
     p_update.add_argument("--file")
     p_update.add_argument("--model-id")
     p_update.add_argument("-ctx", "--ctx", dest="ctx_override", type=int, help="Set ctx size for the selected model(s)")
-    p_update.add_argument("--auto", dest="auto_ctx", action="store_true", help="Probe and set a practical ctx size per model automatically")
+    p_update.add_argument(
+        "--auto",
+        "-auto",
+        "--auto-ctx",
+        "-auto-ctx",
+        dest="auto_ctx",
+        action="store_true",
+        help="Probe and set a practical ctx size per model automatically",
+    )
 
     p_validate = sub.add_parser("validate")
+    subparsers["validate"] = p_validate
     p_validate.set_defaults(func=validate_model)
     p_validate.add_argument("repo", nargs="?", help="HF repo[:QUANT] or installed model id")
-    p_validate.add_argument("-hf", help="HF repo")
+    p_validate.add_argument("-hf", "--hf", help="HF repo")
     p_validate.add_argument("--file")
     p_validate.add_argument("--model-id")
     p_validate.add_argument("-ctx", "--ctx", dest="ctx_override", type=int, help="Validate using this ctx directly")
     p_validate.add_argument("--ctx-size", default=DEFAULT_CTX_SIZE, help="Fallback ctx before auto-fit for temporary models")
-    p_validate.add_argument("--auto", dest="auto_ctx", action="store_true", help="Force auto-fit before validating")
+    p_validate.add_argument(
+        "--auto",
+        "-auto",
+        "--auto-ctx",
+        "-auto-ctx",
+        dest="auto_ctx",
+        action="store_true",
+        help="Force auto-fit before validating",
+    )
     p_validate.add_argument("--n-gpu-layers", default=DEFAULT_N_GPU_LAYERS)
     p_validate.add_argument("--tensor-split", default=default_tensor_split())
     p_validate.add_argument("--host", default="127.0.0.1")
@@ -4266,15 +4414,25 @@ def main():
     p_validate.add_argument("--hf-token")
     p_validate.add_argument("--description")
     
-    sub.add_parser("daemon").set_defaults(func=daemon_mode)
+    p_daemon = sub.add_parser("daemon")
+    subparsers["daemon"] = p_daemon
+    p_daemon.set_defaults(func=daemon_mode)
     
     for p in [p_add, p_run]:
         p.add_argument("repo", nargs="?", help="HF repo[:QUANT]")
-        p.add_argument("-hf", help="HF repo")
+        p.add_argument("-hf", "--hf", help="HF repo")
         p.add_argument("--file")
         p.add_argument("--model-id")
         p.add_argument("--ctx-size", default=DEFAULT_CTX_SIZE)
-        p.add_argument("--auto", dest="auto_ctx", action="store_true", help="Force a fresh automatic ctx probe even if a fallback was already saved")
+        p.add_argument(
+            "--auto",
+            "-auto",
+            "--auto-ctx",
+            "-auto-ctx",
+            dest="auto_ctx",
+            action="store_true",
+            help="Force a fresh automatic ctx probe even if a fallback was already saved",
+        )
         p.add_argument("--skip-ctx", action="store_true", help="Skip automatic ctx tuning and keep the default ctx size")
         p.add_argument("--n-gpu-layers", default=DEFAULT_N_GPU_LAYERS)
         p.add_argument("--tensor-split", default=default_tensor_split())
@@ -4284,13 +4442,40 @@ def main():
         p.add_argument("--hf-token")
         p.add_argument("--description")
 
-    sub.add_parser("list").set_defaults(func=list_models)
-    sub.add_parser("ps").set_defaults(func=list_models)
+    p_list = sub.add_parser("list")
+    subparsers["list"] = p_list
+    p_list.set_defaults(func=list_models)
+    p_ps = sub.add_parser("ps")
+    subparsers["ps"] = p_ps
+    p_ps.set_defaults(func=list_models)
     p_requests = sub.add_parser("requests")
+    subparsers["requests"] = p_requests
     p_requests.add_argument("-n", "--lines", type=int, default=50)
     p_requests.set_defaults(func=show_request_log)
-    
-    args = parser.parse_args()
+
+    return parser, subparsers
+
+
+def parse_cli_args(
+    parser: argparse.ArgumentParser,
+    subparsers: dict[str, argparse.ArgumentParser],
+    argv: list[str] | None = None,
+) -> argparse.Namespace:
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    try:
+        return parser.parse_args(argv_list)
+    except SystemExit as exc:
+        if exc.code == 2 and subparsers:
+            command = _detect_requested_subcommand(argv_list, set(subparsers.keys()))
+            if command:
+                print(f"\nOptions for '{command}':", file=sys.stderr)
+                subparsers[command].print_help(sys.stderr)
+        raise
+
+
+def main(argv: list[str] | None = None):
+    parser, subparsers = build_cli_parser()
+    args = parse_cli_args(parser, subparsers, argv=argv)
     persist_server_config(args)
     return args.func(args)
 

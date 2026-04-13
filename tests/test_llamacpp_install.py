@@ -1,3 +1,5 @@
+import argparse
+import io
 import os
 import errno
 import json
@@ -5,7 +7,9 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from contextlib import redirect_stderr
 from argparse import Namespace
 from pathlib import Path
 from unittest import mock
@@ -14,23 +18,28 @@ import yaml
 
 from llamacpp_stack.cli import (
     ManagedModel,
+    download_hf_file,
     _prepare_manager_socket_path,
     _probe_runtime_env,
     build_llama_server_command,
     build_help_epilog,
+    build_cli_parser,
     ensure_model_available,
     get_gpu_conflict_message,
     list_models,
     list_running_ollama_models,
     load_catalog,
     normalize_server_overrides,
+    model_files_ready,
     render_llamaswap_config,
     resolve_llama_server_defaults,
     resolve_idle_ttl,
     save_catalog,
+    summarize_download_state,
     should_reload_after_unexpected_unload,
     stop_running_ollama_models,
     update_config,
+    main as cli_main,
 )
 from llamacpp_stack.install import (
     CLI_COMMAND,
@@ -52,6 +61,8 @@ from llamacpp_stack.install import (
     locate_nccl_root_for_python,
     maybe_install_nccl_via_uv,
     normalize_python_cuda_layout,
+    sync_cuda_runtime,
+    sync_nccl_runtime,
     detect_cuda_toolkit_package,
     maybe_install_cuda_toolkit_via_uv,
     desired_models_dir_owner,
@@ -68,6 +79,7 @@ from llamacpp_stack.install import (
     maybe_rerun_auto_ctx,
     prompt_choice,
     render_manager_wrapper,
+    render_llamaswap_wrapper,
     restart_systemd_units,
     stop_systemd_units,
     wait_for_manager_socket,
@@ -92,6 +104,59 @@ class InstallHelpersTest(unittest.TestCase):
     def test_choose_llamacpp_linux_asset(self) -> None:
         release = {"assets": [{"name": "llama-b8705-bin-ubuntu-x64.tar.gz", "browser_download_url": "x"}]}
         self.assertEqual(choose_llamacpp_linux_asset(release)["name"], "llama-b8705-bin-ubuntu-x64.tar.gz")
+
+    def test_model_files_ready_requires_expected_size_when_provided(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_dir = root / "models"
+            model_dir.mkdir(parents=True)
+            file_path = model_dir / "model.gguf"
+            file_path.write_bytes(b"1234")
+            self.assertFalse(model_files_ready(model_dir, ["model.gguf"], {"model.gguf": 8}))
+            file_path.write_bytes(b"12345678")
+            self.assertTrue(model_files_ready(model_dir, ["model.gguf"], {"model.gguf": 8}))
+
+    def test_summarize_download_state_counts_truncated_final_as_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_dir = root / "models"
+            model_dir.mkdir(parents=True)
+            file_path = model_dir / "model.gguf"
+            file_path.write_bytes(b"1234")
+            completed, partial, missing = summarize_download_state(model_dir, ["model.gguf", "missing.gguf"], {"model.gguf": 8})
+            self.assertEqual((completed, partial, missing), (0, 1, 1))
+
+    def test_download_hf_file_resumes_truncated_final_file_using_expected_size(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_dir = root / "models"
+            target_dir.mkdir(parents=True)
+            dest_path = target_dir / "model.gguf"
+            dest_path.write_bytes(b"ab")
+
+            response = mock.MagicMock()
+            response.status_code = 206
+            response.headers = {"Content-Range": "bytes 2-3/4", "Content-Length": "2"}
+            response.iter_content.return_value = [b"cd"]
+            response.raise_for_status.return_value = None
+            response.__enter__.return_value = response
+            response.__exit__.return_value = None
+
+            with (
+                mock.patch("llamacpp_stack.cli._download_hf_file_parallel", return_value=None),
+                mock.patch("llamacpp_stack.cli._download_hf_file_fast", return_value=None),
+                mock.patch("llamacpp_stack.cli.requests.get", return_value=response),
+            ):
+                result = download_hf_file(
+                    repo_id="org/repo",
+                    filename="model.gguf",
+                    token=None,
+                    target_dir=target_dir,
+                    expected_size=4,
+                )
+
+            self.assertEqual(Path(result), dest_path)
+            self.assertEqual(dest_path.read_bytes(), b"abcd")
 
     def test_link_stable_binary_keeps_existing_file_when_target_matches_link(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -294,7 +359,34 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertIn(f"-DCUDAToolkit_ROOT={cuda_root}", cmake_cmd)
             self.assertIn(f"-DNCCL_INCLUDE_DIR={nccl_root / 'include'}", cmake_cmd)
             self.assertIn(f"-DNCCL_LIBRARY={nccl_root / 'lib' / 'libnccl.so.2'}", cmake_cmd)
+            self.assertIn(f"-DCMAKE_BUILD_RPATH={cuda_root / 'lib64'};{nccl_root / 'lib'}", cmake_cmd)
+            self.assertIn(f"-DCMAKE_INSTALL_RPATH={cuda_root / 'lib64'};{nccl_root / 'lib'}", cmake_cmd)
             self.assertEqual(build_cmd[-2:], ["-j", "12"])
+
+    def test_render_llamaswap_wrapper_exports_llama_server_lib_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            layout = InstallLayout(
+                mode="system",
+                state_dir=root / "state",
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=root / "models",
+                config_dir=root / "config",
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+            wrapper = render_llamaswap_wrapper(layout)
+            self.assertIn('if [[ -n "${LLAMA_SERVER_BIN:-}" ]]', wrapper)
+            self.assertIn('LLAMA_SERVER_LIB_DIR="$(dirname "$LLAMA_SERVER_REAL")"', wrapper)
+            self.assertIn('export LD_LIBRARY_PATH="$LLAMA_SERVER_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"', wrapper)
 
     def test_determine_build_jobs_uses_all_available_cpus(self) -> None:
         with mock.patch("llamacpp_stack.install.os.cpu_count", return_value=32):
@@ -491,6 +583,27 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertIn("llama-swap UI/backend", help_text)
         self.assertNotIn("Wrapper API", help_text)
 
+    def test_cli_parser_accepts_single_dash_auto_alias_for_run(self) -> None:
+        parser, _ = build_cli_parser()
+        args = parser.parse_args(["run", "-hf", "org/repo:Q4_K_M", "-auto", "--no-chat"])
+        self.assertEqual(args.command, "run")
+        self.assertTrue(args.auto_ctx)
+
+    def test_cli_main_shows_subcommand_help_on_unrecognized_argument(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", [CLI_COMMAND, "run", "-hf", "org/repo:Q4_K_M", "--not-a-real-flag"]),
+            redirect_stderr(stderr),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                cli_main()
+
+        self.assertEqual(ctx.exception.code, 2)
+        rendered = stderr.getvalue()
+        self.assertIn("unrecognized arguments: --not-a-real-flag", rendered)
+        self.assertIn("Options for 'run':", rendered)
+        self.assertIn(f"usage: {CLI_COMMAND} run", rendered)
+
     def test_choose_default_swap_port_prefers_ollama_plus_two(self) -> None:
         with (
             mock.patch("llamacpp_stack.install.existing_public_port", return_value=None),
@@ -505,7 +618,7 @@ class InstallHelpersTest(unittest.TestCase):
             mock.patch("llamacpp_stack.install.existing_public_port", return_value=11436),
             mock.patch("llamacpp_stack.install.detect_ollama_models_dir", return_value=Path("/var/lib/ollama/models")),
         ):
-            layout = choose_layout("system", "127.0.0.1", None, None)
+            layout = choose_layout("system", "127.0.0.1", None, None, args=None)
         self.assertEqual(layout.service_user, DEFAULT_SERVICE_USER)
         self.assertEqual(layout.service_group, DEFAULT_SERVICE_USER)
         self.assertEqual(layout.bin_dir, Path("/usr/local/bin"))
@@ -661,12 +774,13 @@ class InstallHelpersTest(unittest.TestCase):
             with (
                 mock.patch("llamacpp_stack.install.prompt_bool", return_value=True),
                 mock.patch("llamacpp_stack.install.wait_for_manager_socket", return_value=True),
+                mock.patch("llamacpp_stack.install.sys.stdin.isatty", return_value=True),
                 mock.patch(
                     "llamacpp_stack.install._run",
                     side_effect=subprocess.CalledProcessError(1, [str(layout.bin_dir / CLI_COMMAND), "update", "--auto"]),
                 ) as run_mock,
             ):
-                maybe_rerun_auto_ctx(layout, install_services=True, dry_run=False)
+                maybe_rerun_auto_ctx(layout, install_services=True, dry_run=False, args=argparse.Namespace())
             run_mock.assert_called_once_with([str(layout.bin_dir / CLI_COMMAND), "update", "--auto"])
 
     def test_maybe_rerun_auto_ctx_auto_registers_local_gguf_when_catalog_empty(self) -> None:
@@ -697,21 +811,59 @@ class InstallHelpersTest(unittest.TestCase):
                 python_root=root / "python",
                 runtime_venv=root / "venv",
                 cuda_root=root / "cuda",
+                )
+
+    def test_sync_cuda_runtime_reuses_existing_runtime_when_python_env_has_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            existing_cuda = root / "cuda"
+            (existing_cuda / "lib64").mkdir(parents=True)
+            layout = InstallLayout(
+                mode="system",
+                state_dir=root / "state",
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=root / "models",
+                config_dir=root / "config",
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=existing_cuda,
             )
+            with mock.patch("llamacpp_stack.install.locate_cuda_root_for_python", return_value=None):
+                self.assertEqual(sync_cuda_runtime(layout, sys.executable, dry_run=False), existing_cuda)
 
-            with (
-                mock.patch("llamacpp_stack.install.prompt_bool", return_value=False) as prompt_mock,
-                mock.patch("llamacpp_stack.install._run") as run_mock,
-            ):
-                maybe_rerun_auto_ctx(layout, install_services=True, dry_run=False)
+    def test_sync_nccl_runtime_reuses_existing_runtime_when_python_env_has_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            existing_nccl = root / "install" / "nccl"
+            (existing_nccl / "lib").mkdir(parents=True)
+            layout = InstallLayout(
+                mode="system",
+                state_dir=root / "state",
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=root / "models",
+                config_dir=root / "config",
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+                nccl_root=existing_nccl,
+            )
+            with mock.patch("llamacpp_stack.install.locate_nccl_root_for_python", return_value=None):
+                self.assertEqual(sync_nccl_runtime(layout, sys.executable, dry_run=False), existing_nccl)
 
-            payload = json.loads(catalog_path.read_text(encoding="utf-8"))
-            self.assertEqual(len(payload), 1)
-            self.assertEqual(payload[0]["filename"], "qwen2.5-7b-instruct-q4_k_m.gguf")
-            self.assertEqual(payload[0]["quant"], "Q4_K_M")
-            self.assertEqual(payload[0]["local_path"], str(model_path))
-            prompt_mock.assert_called_once()
-            run_mock.assert_not_called()
 
     def test_maybe_rerun_auto_ctx_skips_auto_register_when_catalog_is_invalid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -746,7 +898,7 @@ class InstallHelpersTest(unittest.TestCase):
                 mock.patch("llamacpp_stack.install._run") as run_mock,
                 mock.patch("builtins.print") as print_mock,
             ):
-                maybe_rerun_auto_ctx(layout, install_services=True, dry_run=False)
+                maybe_rerun_auto_ctx(layout, install_services=True, dry_run=False, args=argparse.Namespace())
 
             self.assertEqual(catalog_path.read_text(encoding="utf-8"), "{invalid-json\n")
             prompt_mock.assert_not_called()
@@ -774,9 +926,39 @@ class InstallHelpersTest(unittest.TestCase):
                 runtime_venv=root / "venv",
                 cuda_root=root / "cuda",
             )
-            with mock.patch("llamacpp_stack.install._run") as run_mock:
+            with (
+                mock.patch("llamacpp_stack.install._sudo_prefix", return_value=[]),
+                mock.patch("llamacpp_stack.install._run") as run_mock,
+            ):
                 self.assertTrue(restart_systemd_units(layout, dry_run=False))
             run_mock.assert_called_once_with(["systemctl", "restart", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME])
+
+    def test_restart_systemd_units_uses_sudo_when_not_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            layout = InstallLayout(
+                mode="system",
+                state_dir=root / "state",
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=root / "models",
+                config_dir=root / "config",
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+            with (
+                mock.patch("llamacpp_stack.install._sudo_prefix", return_value=["sudo"]),
+                mock.patch("llamacpp_stack.install._run") as run_mock,
+            ):
+                self.assertTrue(restart_systemd_units(layout, dry_run=False))
+            run_mock.assert_called_once_with(["sudo", "systemctl", "restart", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME])
 
     def test_stop_systemd_units_uses_expected_system_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -798,7 +980,10 @@ class InstallHelpersTest(unittest.TestCase):
                 runtime_venv=root / "venv",
                 cuda_root=root / "cuda",
             )
-            with mock.patch("llamacpp_stack.install._run") as run_mock:
+            with (
+                mock.patch("llamacpp_stack.install._sudo_prefix", return_value=[]),
+                mock.patch("llamacpp_stack.install._run") as run_mock,
+            ):
                 self.assertTrue(stop_systemd_units(layout, dry_run=False))
             run_mock.assert_called_once_with(["systemctl", "stop", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME])
 
@@ -925,6 +1110,7 @@ class InstallHelpersTest(unittest.TestCase):
             )
             with (
                 mock.patch("llamacpp_stack.cli.wait_for_model", return_value=False),
+                mock.patch("llamacpp_stack.cli.get_gpu_conflict_message", return_value=None),
                 mock.patch("llamacpp_stack.cli.apply_config_and_wait", return_value=True),
             ):
                 result = ensure_model_available(args)
@@ -986,6 +1172,49 @@ class InstallHelpersTest(unittest.TestCase):
             )
             model = load_catalog(catalog_path)[0]
             self.assertEqual(model.server_overrides, {"flash_attn": True, "batch_size": 1024})
+
+    def test_load_catalog_uses_mtime_cache_until_file_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog_path = Path(tmp) / "catalog.json"
+            catalog_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "model_id": "repo-q4",
+                            "repo_id": "org/repo",
+                            "quant": "Q4",
+                            "filename": "model-q4.gguf",
+                            "local_path": "/tmp/model-q4.gguf",
+                        }
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            first = load_catalog(catalog_path)
+            second = load_catalog(catalog_path)
+            self.assertEqual(first[0].model_id, "repo-q4")
+            self.assertEqual(second[0].model_id, "repo-q4")
+            self.assertIsNot(first[0], second[0])
+
+            time.sleep(0.001)
+            catalog_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "model_id": "repo-q5",
+                            "repo_id": "org/repo",
+                            "quant": "Q5",
+                            "filename": "model-q5.gguf",
+                            "local_path": "/tmp/model-q5.gguf",
+                        }
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            updated = load_catalog(catalog_path)
+            self.assertEqual(updated[0].model_id, "repo-q5")
 
     def test_render_config_applies_global_defaults_and_model_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

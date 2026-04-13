@@ -379,7 +379,11 @@ run_bundle_module() {
   ensure_bootstrap_venv
   announce_python_runtime
   export PATH="${BOOTSTRAP_VENV}/bin:${PATH}"
-  export PYTHONPATH="$(dirname "${STACK_ROOT}")${PYTHONPATH:+:${PYTHONPATH}}"
+  if [ "${STACK_LAYOUT}" = "nested" ]; then
+    export PYTHONPATH="${STACK_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+  else
+    export PYTHONPATH="$(dirname "${STACK_ROOT}")${PYTHONPATH:+:${PYTHONPATH}}"
+  fi
   export LLAMACPP_BOOTSTRAP_UV="${BOOTSTRAP_UV_BIN}"
   if [ "${STACK_LAYOUT}" = "script" ]; then
     "${BOOTSTRAP_PYTHON}" "${STACK_ROOT}/${resolved_module}.py" "$@"

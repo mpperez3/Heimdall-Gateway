@@ -18,6 +18,7 @@ from .install import (
     choose_layout,
     detect_existing_mode,
     prompt_bool,
+    _sudo_prefix,
 )
 
 
@@ -42,20 +43,55 @@ def uninstall_systemd_units(layout: InstallLayout, dry_run: bool) -> None:
         if dry_run:
             print("[dry-run] systemctl not available; would skip service stop/disable.")
         return
-    if layout.mode == "system":
-        reload_cmd = ["systemctl", "daemon-reload"]
-        stop_cmd = ["systemctl", "disable", "--now", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME]
-        unit_dir = Path("/etc/systemd/system")
-    else:
-        reload_cmd = ["systemctl", "--user", "daemon-reload"]
-        stop_cmd = ["systemctl", "--user", "disable", "--now", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME]
+
+    all_service_names = [
+        MANAGER_SERVICE_NAME,
+        SWAP_SERVICE_NAME,
+        LEGACY_MANAGER_SERVICE_NAME,
+        LEGACY_SWAP_SERVICE_NAME,
+    ]
+
+    base_systemctl = ["systemctl"]
+    if layout.mode == "user":
+        base_systemctl.append("--user")
         unit_dir = Path.home() / ".config/systemd/user"
-
-    if dry_run:
-        print(f"[dry-run] would run {' '.join(stop_cmd)}")
     else:
-        _run(stop_cmd, check=False)
+        base_systemctl = _sudo_prefix() + ["systemctl"]
+        unit_dir = Path("/etc/systemd/system")
 
+    # 1. Dynamically find any other llama-related units that might be running
+    try:
+        list_units_cmd = base_systemctl + ["list-units", "--all", "--full", "--no-legend", "*llama*"]
+        result = _run(list_units_cmd, check=False)
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if parts:
+                unit_name = parts[0]
+                # Filter for llama but exclude ollama
+                is_llama = "llama" in unit_name.lower()
+                is_ollama = "ollama" in unit_name.lower()
+                if unit_name.endswith(".service") and is_llama and not is_ollama and unit_name not in all_service_names:
+                    all_service_names.append(unit_name)
+    except Exception:
+        pass
+
+    # 2. Stop and disable all of them
+    if all_service_names:
+        # First stop them all to make sure port is freed
+        stop_cmd = base_systemctl + ["stop"] + all_service_names
+        if dry_run:
+            print(f"[dry-run] would run {' '.join(stop_cmd)}")
+        else:
+            _run(stop_cmd, check=False)
+
+        # Then disable them
+        disable_cmd = base_systemctl + ["disable"] + all_service_names
+        if dry_run:
+            print(f"[dry-run] would run {' '.join(disable_cmd)}")
+        else:
+            _run(disable_cmd, check=False)
+
+    # 3. Remove known unit files and symlinks
     for path in (
         unit_dir / MANAGER_SERVICE_NAME,
         unit_dir / SWAP_SERVICE_NAME,
@@ -72,6 +108,8 @@ def uninstall_systemd_units(layout: InstallLayout, dry_run: bool) -> None:
     ):
         _remove_path(path, dry_run)
 
+    # 4. Reload daemon
+    reload_cmd = base_systemctl + ["daemon-reload"]
     if dry_run:
         print(f"[dry-run] would run {' '.join(reload_cmd)}")
     else:
@@ -79,26 +117,66 @@ def uninstall_systemd_units(layout: InstallLayout, dry_run: bool) -> None:
 
 
 def uninstall_stack(args: argparse.Namespace) -> int:
-    resolved_mode = args.mode or detect_existing_mode() or ("system" if Path("/etc/llamacpp-superserver").exists() else "user")
-    layout = choose_layout(resolved_mode, args.public_host, args.public_port)
+    # 1. Detect mode more robustly
+    resolved_mode = args.mode
+    if not resolved_mode:
+        resolved_mode = detect_existing_mode()
+
+    if not resolved_mode:
+        # Check systemctl for any llama related services
+        for mode in ("user", "system"):
+            base_cmd = ["systemctl"]
+            if mode == "user":
+                base_cmd.append("--user")
+            try:
+                result = subprocess.run(
+                    base_cmd + ["list-units", "--all", "--full", "--no-legend", "*llama*"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if result.stdout.strip():
+                    resolved_mode = mode
+                    break
+            except Exception:
+                continue
+
+    if not resolved_mode:
+        resolved_mode = "system" if Path("/etc/llamacpp-superserver").exists() else "user"
+
+    layout = choose_layout(resolved_mode, args.public_host, args.public_port, args=args)
     uninstall_systemd_units(layout, args.dry_run)
 
     remove_models = not args.keep_models
     if not args.keep_models and not args.dry_run:
         remove_models = prompt_bool("Remove downloaded models too?", default=True)
 
+    remove_binaries = True
+    if not args.dry_run:
+        remove_binaries = prompt_bool("Remove compiled binaries and installation root?", default=True)
+
     targets = [
-        layout.config_dir,
-        layout.state_dir,
         layout.run_dir,
-        layout.install_root,
-        layout.bin_dir / MANAGER_WRAPPER_NAME,
-        layout.bin_dir / SWAP_WRAPPER_NAME,
-        layout.bin_dir / CLI_COMMAND,
-        layout.bin_dir / LEGACY_CLI_COMMAND,
     ]
-    if remove_models:
+
+    if remove_binaries:
+        targets.extend([
+            layout.install_root,
+            layout.bin_dir / MANAGER_WRAPPER_NAME,
+            layout.bin_dir / SWAP_WRAPPER_NAME,
+            layout.bin_dir / CLI_COMMAND,
+            layout.bin_dir / LEGACY_CLI_COMMAND,
+            # Ensure older wrapper names are also cleaned up
+            layout.bin_dir / "llamacpp-manager-start",
+            layout.bin_dir / "llamaswap-start",
+        ])
+
+    if not args.keep_models:
+        targets.append(layout.config_dir)
+        targets.append(layout.state_dir)
         targets.append(layout.models_dir)
+    else:
+        print(f"Keeping configuration ({layout.config_dir}), catalog ({layout.state_dir}) and models ({layout.models_dir})")
 
     for target in targets:
         _remove_path(target, args.dry_run)
@@ -113,10 +191,21 @@ def uninstall_stack(args: argparse.Namespace) -> int:
         Path.home() / ".local/state/llamacpp",
         Path.home() / ".local/run/llamacpp",
     ]
+    if not args.keep_models:
+        legacy_targets.extend([
+            Path("/etc/llamacpp-superserver"),
+            Path("/var/lib/llamacpp-superserver"),
+            Path("/run/llamacpp-superserver"),
+            Path("/opt/llamacpp-superserver"),
+            Path.home() / ".local/opt/llamacpp-superserver",
+            Path.home() / ".local/state/llamacpp-superserver",
+            Path.home() / ".config/llamacpp-superserver",
+            Path.home() / ".local/run/llamacpp-superserver",
+        ])
     for target in legacy_targets:
         _remove_path(target, args.dry_run)
 
-    print("llamacpp stack uninstalled.")
+    print(f"llamacpp stack ({resolved_mode} mode) uninstalled.")
     return 0
 
 
