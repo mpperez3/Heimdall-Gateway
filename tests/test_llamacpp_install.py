@@ -32,10 +32,16 @@ from llamacpp_stack.cli import (
     load_catalog,
     normalize_server_overrides,
     model_files_ready,
+    model_name_aliases,
     normalize_model_id,
+    persist_server_config,
+    manager_hint,
+    infer_install_mode,
     render_llamaswap_config,
     resolve_llama_server_defaults,
     resolve_idle_ttl,
+    resolve_catalog_model_name,
+    service_commands_for_mode,
     save_catalog,
     summarize_download_state,
     should_reload_after_unexpected_unload,
@@ -585,7 +591,35 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertIn("server_overrides", help_text)
         self.assertIn("Superserver API", help_text)
         self.assertIn("llama-swap UI/backend", help_text)
+        self.assertIn("Commands:", help_text)
+        self.assertIn("requests -n 1", help_text)
+        self.assertIn("Requests log:", help_text)
         self.assertNotIn("Wrapper API", help_text)
+
+    def test_service_commands_for_mode_use_user_scope_for_user_install(self) -> None:
+        start_cmd, status_cmd, restart_cmd = service_commands_for_mode("user")
+        self.assertIn("systemctl --user", start_cmd)
+        self.assertIn("systemctl --user", status_cmd)
+        self.assertIn("systemctl --user", restart_cmd)
+        self.assertNotIn("sudo systemctl", restart_cmd)
+
+    def test_service_commands_for_mode_use_system_scope_for_system_install(self) -> None:
+        start_cmd, status_cmd, restart_cmd = service_commands_for_mode("system")
+        self.assertIn("sudo systemctl", start_cmd)
+        self.assertIn("sudo systemctl", status_cmd)
+        self.assertIn("sudo systemctl", restart_cmd)
+        self.assertNotIn("systemctl --user", restart_cmd)
+
+    def test_manager_hint_shows_only_user_commands_when_user_mode_detected(self) -> None:
+        with mock.patch("llamacpp_stack.cli.infer_install_mode", return_value="user"):
+            hint = manager_hint()
+        self.assertIn("Detected install mode: user", hint)
+        self.assertIn("systemctl --user start", hint)
+        self.assertNotIn("sudo systemctl start", hint)
+
+    def test_infer_install_mode_prefers_explicit_env(self) -> None:
+        with mock.patch.dict("os.environ", {"LLAMACPP_INSTALL_MODE": "user"}, clear=False):
+            self.assertEqual(infer_install_mode(), "user")
 
     def test_cli_parser_accepts_single_dash_auto_alias_for_run(self) -> None:
         parser, _ = build_cli_parser()
@@ -812,6 +846,220 @@ class InstallHelpersTest(unittest.TestCase):
             ):
                 maybe_rerun_auto_ctx(layout, install_services=True, dry_run=False, args=argparse.Namespace())
             run_mock.assert_called_once_with([str(layout.bin_dir / CLI_COMMAND), "update", "--auto"])
+
+    def test_maybe_rerun_auto_ctx_repairs_stale_server_config_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            models_dir.mkdir(parents=True)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True)
+            catalog_path = state_dir / "catalog.json"
+            catalog_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "model_id": "qwen3-coder-next-ud-q5_k_xl",
+                            "repo_id": "local",
+                            "quant": "UD-Q5_K_XL",
+                            "filename": "Qwen3-Coder-Next-UD-Q5_K_XL-00001-of-00003.gguf",
+                            "local_path": str(models_dir / "Qwen3-Coder-Next-UD-Q5_K_XL-00001-of-00003.gguf"),
+                            "ctx_size": 260096,
+                            "n_gpu_layers": 128,
+                        }
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config_dir = root / "config"
+            config_dir.mkdir(parents=True)
+            server_config = config_dir / SERVER_CONFIG_BASENAME
+            server_config.write_text(
+                json.dumps(
+                    {
+                        "models": {
+                            "qwen3-coder-next-ud-q5_k_xl": {"ctx_size": 8192, "n_gpu_layers": 999}
+                        },
+                        "llama_server_defaults": {},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            layout = InstallLayout(
+                mode="system",
+                state_dir=state_dir,
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=models_dir,
+                config_dir=config_dir,
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+
+            maybe_rerun_auto_ctx(
+                layout,
+                install_services=False,
+                dry_run=False,
+                args=argparse.Namespace(migrate_model_ids=False, rerun_auto_ctx=False),
+            )
+
+            payload = json.loads(server_config.read_text(encoding="utf-8"))
+            model_cfg = payload["models"]["qwen3-coder-next-ud-q5_k_xl"]
+            self.assertEqual(model_cfg["ctx_size"], 260096)
+            self.assertEqual(model_cfg["n_gpu_layers"], 128)
+
+    def test_maybe_rerun_auto_ctx_adds_server_config_metadata_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            models_dir.mkdir(parents=True)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True)
+            catalog_path = state_dir / "catalog.json"
+            catalog_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "model_id": "repo-q4",
+                            "repo_id": "org/repo",
+                            "quant": "Q4",
+                            "filename": "model-q4.gguf",
+                            "local_path": str(models_dir / "model-q4.gguf"),
+                            "ctx_size": 32768,
+                            "n_gpu_layers": 777,
+                        }
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config_dir = root / "config"
+            config_dir.mkdir(parents=True)
+            server_config = config_dir / SERVER_CONFIG_BASENAME
+            server_config.write_text('{"models": {"repo-q4": {"ctx_size": 32768, "n_gpu_layers": 777}}}\n', encoding="utf-8")
+
+            layout = InstallLayout(
+                mode="system",
+                state_dir=state_dir,
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=models_dir,
+                config_dir=config_dir,
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+
+            maybe_rerun_auto_ctx(
+                layout,
+                install_services=False,
+                dry_run=False,
+                args=argparse.Namespace(migrate_model_ids=False, rerun_auto_ctx=False),
+            )
+            payload = json.loads(server_config.read_text(encoding="utf-8"))
+            self.assertIn("_meta", payload)
+            self.assertIn("example", payload["_meta"])
+
+    def test_maybe_rerun_auto_ctx_refreshes_server_config_after_auto_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            models_dir.mkdir(parents=True)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True)
+            catalog_path = state_dir / "catalog.json"
+            catalog_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "model_id": "qwen3-coder-next-ud-q5_k_xl",
+                            "repo_id": "local",
+                            "quant": "UD-Q5_K_XL",
+                            "filename": "Qwen3-Coder-Next-UD-Q5_K_XL-00001-of-00003.gguf",
+                            "local_path": str(models_dir / "Qwen3-Coder-Next-UD-Q5_K_XL-00001-of-00003.gguf"),
+                            "ctx_size": 8192,
+                            "n_gpu_layers": 999,
+                        }
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config_dir = root / "config"
+            config_dir.mkdir(parents=True)
+            server_config = config_dir / SERVER_CONFIG_BASENAME
+            server_config.write_text(
+                json.dumps(
+                    {
+                        "models": {
+                            "qwen3-coder-next-ud-q5_k_xl": {"ctx_size": 8192, "n_gpu_layers": 999}
+                        },
+                        "llama_server_defaults": {},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            layout = InstallLayout(
+                mode="system",
+                state_dir=state_dir,
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=models_dir,
+                config_dir=config_dir,
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+
+            def _fake_run(cmd, **kwargs):
+                if cmd == [str(layout.bin_dir / CLI_COMMAND), "update", "--auto"]:
+                    updated_catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+                    updated_catalog[0]["ctx_size"] = 260096
+                    updated_catalog[0]["n_gpu_layers"] = 128
+                    catalog_path.write_text(json.dumps(updated_catalog) + "\n", encoding="utf-8")
+                    return
+                raise AssertionError(f"Unexpected command: {cmd}")
+
+            with (
+                mock.patch("llamacpp_stack.install.wait_for_manager_socket", return_value=True),
+                mock.patch("llamacpp_stack.install._run", side_effect=_fake_run) as run_mock,
+            ):
+                maybe_rerun_auto_ctx(
+                    layout,
+                    install_services=True,
+                    dry_run=False,
+                    args=argparse.Namespace(migrate_model_ids=False, rerun_auto_ctx=True),
+                )
+
+            run_mock.assert_called_once_with([str(layout.bin_dir / CLI_COMMAND), "update", "--auto"])
+            payload = json.loads(server_config.read_text(encoding="utf-8"))
+            model_cfg = payload["models"]["qwen3-coder-next-ud-q5_k_xl"]
+            self.assertEqual(model_cfg["ctx_size"], 260096)
+            self.assertEqual(model_cfg["n_gpu_layers"], 128)
 
     def test_maybe_rerun_auto_ctx_migrates_model_ids_when_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1046,6 +1294,80 @@ class InstallHelpersTest(unittest.TestCase):
                 runtime_venv=root / "venv",
                 cuda_root=root / "cuda",
                 )
+
+    def test_maybe_rerun_auto_ctx_backfills_aliases_and_prunes_default_ttl_for_existing_catalog_models(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models" / "org" / "repo"
+            models_dir.mkdir(parents=True)
+            model_path = models_dir / "example-model-q4_k_m-00001-of-00002.gguf"
+            model_path.write_bytes(b"gguf")
+
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True)
+            catalog_path = state_dir / "catalog.json"
+            catalog_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "model_id": "example-model-q4_k_m",
+                            "repo_id": "org/repo",
+                            "quant": "Q4_K_M",
+                            "filename": model_path.name,
+                            "local_path": str(model_path),
+                            "aliases": [],
+                            "ttl": 300,
+                        }
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config_dir = root / "config"
+            config_dir.mkdir(parents=True)
+            (config_dir / SERVER_CONFIG_BASENAME).write_text(
+                json.dumps({"idle_ttl": 300, "models": {}, "llama_server_defaults": {}}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            layout = InstallLayout(
+                mode="system",
+                state_dir=state_dir,
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=root / "models",
+                config_dir=config_dir,
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+
+            maybe_rerun_auto_ctx(
+                layout,
+                install_services=False,
+                dry_run=False,
+                args=argparse.Namespace(rerun_auto_ctx=False, migrate_model_ids=False),
+            )
+
+            updated = json.loads(catalog_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(updated), 1)
+            model = updated[0]
+            aliases = model.get("aliases") or []
+            self.assertIn("example-model-q4_k_m-00001-of-00002.gguf", aliases)
+            self.assertIn("example-model-q4_k_m-00001-of-00002", aliases)
+            self.assertIn("example-model-q4_k_m", aliases)
+            self.assertIn("hf.co/org/repo", aliases)
+            self.assertIn("org/repo", aliases)
+            self.assertIn("hf.co/org/repo:Q4_K_M", aliases)
+            self.assertIn("org/repo:Q4_K_M", aliases)
+            self.assertNotIn("ttl", model)
 
     def test_sync_cuda_runtime_reuses_existing_runtime_when_python_env_has_none(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1378,7 +1700,20 @@ class InstallHelpersTest(unittest.TestCase):
                 18080,
                 idle_ttl=10,
             )
-            self.assertIn("ttl: 10", config_path.read_text(encoding="utf-8"))
+            rendered_text = config_path.read_text(encoding="utf-8")
+            self.assertIn("ttl: 10", rendered_text)
+            self.assertTrue(rendered_text.startswith("# llamacpp-superserver config.yaml"))
+
+    def test_persist_server_config_writes_metadata_header_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server_config = Path(tmp) / SERVER_CONFIG_BASENAME
+            args = Namespace(server_config=server_config, idle_ttl=123, api_port=11436)
+            persist_server_config(args)
+            payload = json.loads(server_config.read_text(encoding="utf-8"))
+            self.assertEqual(payload["idle_ttl"], 123)
+            self.assertEqual(payload["api_port"], 11436)
+            self.assertIn("_meta", payload)
+            self.assertIn("purpose", payload["_meta"])
 
     def test_load_catalog_normalizes_server_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1406,6 +1741,109 @@ class InstallHelpersTest(unittest.TestCase):
             )
             model = load_catalog(catalog_path)[0]
             self.assertEqual(model.server_overrides, {"flash_attn": True, "batch_size": 1024})
+
+    def test_load_catalog_deduplicates_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog_path = Path(tmp) / "catalog.json"
+            catalog_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "model_id": "repo-q4",
+                            "repo_id": "org/repo",
+                            "quant": "Q4",
+                            "filename": "model-q4.gguf",
+                            "local_path": "/tmp/model-q4.gguf",
+                            "aliases": ["chat", " chat ", "chat", "", "friendly"],
+                        }
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            model = load_catalog(catalog_path)[0]
+            self.assertEqual(model.aliases, ["chat", "friendly"])
+
+    def test_save_catalog_prunes_ttl_equal_to_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.yaml"
+            config_path.write_text(
+                """
+models:
+  any-model:
+    ttl: 42
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            catalog_path = root / "catalog.json"
+            model_same = ManagedModel(
+                model_id="same-ttl",
+                repo_id="org/repo-a",
+                quant="Q4",
+                filename="a.gguf",
+                local_path="/tmp/a.gguf",
+                ttl=42,
+            )
+            model_diff = ManagedModel(
+                model_id="diff-ttl",
+                repo_id="org/repo-b",
+                quant="Q4",
+                filename="b.gguf",
+                local_path="/tmp/b.gguf",
+                ttl=99,
+            )
+
+            with mock.patch("llamacpp_stack.cli.DEFAULT_CONFIG_PATH", config_path):
+                save_catalog(catalog_path, [model_same, model_diff])
+
+            raw = json.loads(catalog_path.read_text(encoding="utf-8"))
+            same_entry = next(item for item in raw if item["model_id"] == "same-ttl")
+            diff_entry = next(item for item in raw if item["model_id"] == "diff-ttl")
+            self.assertNotIn("ttl", same_entry)
+            self.assertEqual(diff_entry.get("ttl"), 99)
+
+        def test_load_catalog_prunes_overrides_equal_to_global_defaults(self) -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                server_config = root / SERVER_CONFIG_BASENAME
+                server_config.write_text(
+                    json.dumps({"llama_server_defaults": {"n_gpu_layers": 16, "batch_size": 1024}}),
+                    encoding="utf-8",
+                )
+                with mock.patch("llamacpp_stack.cli.DEFAULT_SERVER_CONFIG_PATH", server_config):
+                    catalog_path = root / "catalog.json"
+                    catalog_path.write_text(
+                        json.dumps(
+                            [
+                                {
+                                    "model_id": "repo-q4",
+                                    "repo_id": "org/repo",
+                                    "quant": "Q4",
+                                    "filename": "model-q4.gguf",
+                                    "local_path": "/tmp/model-q4.gguf",
+                                    "server_overrides": {"n_gpu_layers": 16, "batch_size": 1024},
+                                }
+                            ]
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    model = load_catalog(catalog_path)[0]
+                    # per-model overrides that match global defaults should be pruned
+                    self.assertEqual(model.server_overrides, {})
+                    # and the effective server command should reflect the global defaults
+                    cmd = build_llama_server_command(
+                        model, Path("/bin/llama"), port="1234", server_defaults=resolve_llama_server_defaults()
+                    )
+                    self.assertIn("--n-gpu-layers", cmd)
+                    idx = cmd.index("--n-gpu-layers")
+                    self.assertEqual(cmd[idx + 1], "16")
+                    self.assertIn("--batch-size", cmd)
+                    idx2 = cmd.index("--batch-size")
+                    self.assertEqual(cmd[idx2 + 1], "1024")
 
     def test_load_catalog_uses_mtime_cache_until_file_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1837,6 +2275,66 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertEqual(status, "selected")
         self.assertEqual(selected, 10240)
         self.assertEqual(info["first_failure"], 12288)
+
+    def test_model_name_aliases_include_filename_variants_and_repo_with_without_hf_prefix(self) -> None:
+        model = ManagedModel(
+            model_id="qwen2-5-7b-instruct-q4-k-m",
+            repo_id="Qwen/Qwen2.5-7B-Instruct-GGUF",
+            quant="Q4_K_M",
+            filename="Qwen2.5-7B-Instruct-Q4_K_M-00001-of-00025.gguf",
+            local_path="/tmp/Qwen2.5-7B-Instruct-Q4_K_M-00001-of-00025.gguf",
+            aliases=["custom-alias"],
+        )
+
+        aliases = model_name_aliases(model)
+
+        self.assertIn("custom-alias", aliases)
+        self.assertIn("Qwen2.5-7B-Instruct-Q4_K_M-00001-of-00025.gguf", aliases)
+        self.assertIn("Qwen2.5-7B-Instruct-Q4_K_M-00001-of-00025", aliases)
+        self.assertIn("Qwen2.5-7B-Instruct-Q4_K_M", aliases)
+        self.assertIn("hf.co/Qwen/Qwen2.5-7B-Instruct-GGUF", aliases)
+        self.assertIn("Qwen/Qwen2.5-7B-Instruct-GGUF", aliases)
+        self.assertIn("hf.co/Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M", aliases)
+        self.assertIn("Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M", aliases)
+
+    def test_resolve_catalog_model_name_accepts_filename_and_repo_alias_variants(self) -> None:
+        model = ManagedModel(
+            model_id="qwen2-5-7b-instruct-q4-k-m",
+            repo_id="Qwen/Qwen2.5-7B-Instruct-GGUF",
+            quant="Q4_K_M",
+            filename="Qwen2.5-7B-Instruct-Q4_K_M-00001-of-00025.gguf",
+            local_path="/tmp/Qwen2.5-7B-Instruct-Q4_K_M-00001-of-00025.gguf",
+        )
+        catalog = [model]
+
+        self.assertEqual(
+            resolve_catalog_model_name("Qwen2.5-7B-Instruct-Q4_K_M-00001-of-00025.gguf", catalog),
+            model.model_id,
+        )
+        self.assertEqual(
+            resolve_catalog_model_name("Qwen2.5-7B-Instruct-Q4_K_M-00001-of-00025", catalog),
+            model.model_id,
+        )
+        self.assertEqual(
+            resolve_catalog_model_name("Qwen2.5-7B-Instruct-Q4_K_M", catalog),
+            model.model_id,
+        )
+        self.assertEqual(
+            resolve_catalog_model_name("Qwen/Qwen2.5-7B-Instruct-GGUF", catalog),
+            model.model_id,
+        )
+        self.assertEqual(
+            resolve_catalog_model_name("hf.co/Qwen/Qwen2.5-7B-Instruct-GGUF", catalog),
+            model.model_id,
+        )
+        self.assertEqual(
+            resolve_catalog_model_name("Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M", catalog),
+            model.model_id,
+        )
+        self.assertEqual(
+            resolve_catalog_model_name("hf.co/Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M", catalog),
+            model.model_id,
+        )
 
 
 if __name__ == "__main__":

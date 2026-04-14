@@ -9,3 +9,7 @@ build/
 dist/
 wheels/
 
+# Local editor history and transient lock files can explode agent context during iterative runs.
+.history/
+uv.lock
+

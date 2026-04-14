@@ -23,6 +23,7 @@ from pathlib import Path
 DEFAULT_LLAMA_CPP_REPO = "ggml-org/llama.cpp"
 DEFAULT_LLAMASWAP_REPO = "mostlygeek/llama-swap"
 DEFAULT_IDLE_TTL = 300
+DEFAULT_SERVER_KEEP = 512
 DEFAULT_SERVICE_USER = "llamaswap"
 MANAGER_SERVICE_NAME = "llamacpp-superserver-manager.service"
 SWAP_SERVICE_NAME = "llamacpp-superserver-swap.service"
@@ -33,12 +34,67 @@ LEGACY_CLI_COMMAND = "llamacpp-server"
 MANAGER_WRAPPER_NAME = "llamacpp-superserver-manager-start"
 SWAP_WRAPPER_NAME = "llamacpp-superserver-swap-start"
 OLLAMA_DEFAULT_PORT = 11434
-SERVER_CONFIG_BASENAME = "llamacpp-superserver.json"
+SERVER_CONFIG_BASENAME = "conf.json"
 LEGACY_SERVER_CONFIG_BASENAME = "llamacpp-server.json"
 ENV_BASENAME = "llamacpp-superserver.env"
 LEGACY_ENV_BASENAME = "llamacpp-stack.env"
 LLAMA_CPP_MODES = ("native", "prebuilt", "source")
 ELEVATED_INSTALL_ENV = "LLAMACPP_INSTALL_ELEVATED"
+
+CONFIG_YAML_HEADER = textwrap.dedent(
+    """\
+    # llamacpp-superserver config.yaml
+    # Purpose: llama-swap runtime routing + per-model launch command map.
+    # This file is generated/updated by installer and `llamacpp-superserver update`.
+    # Example:
+    #   models:
+    #     my-model-id:
+    #       cmd: /opt/llama-server --model /models/my.gguf --ctx-size 65536
+    #       checkEndpoint: /health
+    #       ttl: 300
+
+    """
+)
+
+ENV_FILE_HEADER = textwrap.dedent(
+    """\
+    # llamacpp-superserver.env
+    # Purpose: global process environment consumed by manager/swap wrappers.
+    # Example:
+    #   LLAMACPP_CATALOG=/var/lib/llamacpp-superserver/catalog.json
+    #   LLAMACPP_SERVER_CONFIG=/etc/llamacpp-superserver/conf.json
+    #   LLAMACPP_IDLE_TTL=300
+
+    """
+)
+
+
+def _ensure_server_config_metadata(payload: dict[str, object]) -> dict[str, object]:
+    meta = payload.get("_meta")
+    if not isinstance(meta, dict):
+        meta = {}
+    meta.setdefault("purpose", "Global superserver settings consumed by CLI/services.")
+    meta.setdefault(
+        "note",
+        "Per-model context source of truth is catalog/config.yaml; this file stores global defaults and service-level settings.",
+    )
+    meta.setdefault(
+        "example",
+        {
+            "idle_ttl": 300,
+            "api_port": 11436,
+            "llama_server_defaults": {"ctx_size": 65536, "n_gpu_layers": 999, "keep": 512},
+        },
+    )
+    meta.setdefault(
+        "service_restart_help",
+        {
+            "system_mode": f"sudo systemctl restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
+            "user_mode": f"systemctl --user restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
+        },
+    )
+    payload["_meta"] = meta
+    return payload
 
 
 @dataclass
@@ -1015,7 +1071,7 @@ def _render_env(
             LLAMACPP_NCCL_ROOT={nccl_root}
             """
         )
-    return textwrap.dedent(
+    return ENV_FILE_HEADER + textwrap.dedent(
         f"""\
         LLAMACPP_STACK_ROOT={layout.install_root}
         LLAMACPP_MODELS={layout.models_dir}
@@ -1029,6 +1085,7 @@ def _render_env(
         LLAMACPP_PUBLIC_PORT={layout.public_port}
         LLAMACPP_API_PORT={layout.public_port - 1}
         LLAMACPP_IDLE_TTL={idle_ttl}
+        LLAMACPP_INSTALL_MODE={layout.mode}
         LLAMACPP_SERVICE_NAME={SWAP_SERVICE_NAME}
         PYTHON_BIN={python_exec}
         LLAMACPP_PYTHONPATH={python_path}
@@ -1169,7 +1226,7 @@ def render_llamaswap_wrapper(layout: InstallLayout) -> str:
 
 def render_initial_config(config_path: Path, start_port: int = 18080) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = textwrap.dedent(
+    payload = CONFIG_YAML_HEADER + textwrap.dedent(
         f"""\
         healthCheckTimeout: 600
         logLevel: info
@@ -1772,6 +1829,85 @@ def _infer_quant_from_filename(filename: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _derived_aliases_for_import(repo_id: str, quant: str | None, filename: str) -> list[str]:
+    filename = (filename or "").strip()
+    aliases: list[str] = []
+    if not filename and not repo_id:
+        return aliases
+
+    def _append(v: str | None) -> None:
+        if not v:
+            return
+        s = str(v).strip()
+        if s and s not in aliases:
+            aliases.append(s)
+
+    # Filename variants
+    if filename:
+        _append(filename)
+        basename = Path(filename).name
+        _append(basename)
+        no_ext = re.sub(r"(?i)\.gguf$", "", filename)
+        _append(no_ext)
+        no_shard = re.sub(r"[-._]?\d+-of-\d+$", "", no_ext)
+        _append(no_shard)
+
+    # Repo variants (with/without hf.co and optional :quant)
+    repo = (repo_id or "").strip()
+    if repo:
+        _append(f"hf.co/{repo}")
+        _append(repo)
+        if quant:
+            q = str(quant).strip()
+            if q:
+                _append(f"hf.co/{repo}:{q}")
+                _append(f"{repo}:{q}")
+
+    return aliases
+
+
+def _normalize_catalog_aliases(value: object) -> list[str]:
+    if value is None:
+        return []
+    raw_values = value if isinstance(value, list) else [value]
+    normalized: list[str] = []
+    for raw in raw_values:
+        alias = str(raw).strip()
+        if alias and alias not in normalized:
+            normalized.append(alias)
+    return normalized
+
+
+def _effective_catalog_idle_ttl(layout: InstallLayout, server_config: dict[str, object]) -> int:
+    fallback = DEFAULT_IDLE_TTL
+    try:
+        server_idle = server_config.get("idle_ttl") if isinstance(server_config, dict) else None
+        if server_idle is not None:
+            fallback = int(server_idle)
+    except Exception:
+        fallback = DEFAULT_IDLE_TTL
+
+    config_path = layout.state_dir / "config.yaml"
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return fallback
+    models = payload.get("models") or {}
+    if not isinstance(models, dict):
+        return fallback
+    for model_config in models.values():
+        if not isinstance(model_config, dict):
+            continue
+        ttl = model_config.get("ttl")
+        if ttl is None:
+            continue
+        try:
+            return int(ttl)
+        except Exception:
+            return fallback
+    return fallback
+
+
 def _catalog_payload_for_import(catalog_path: Path) -> tuple[list[dict[str, object]] | None, str | None]:
     if not catalog_path.exists():
         return [], None
@@ -1845,6 +1981,7 @@ def _remap_model_maps(layout: InstallLayout, id_map: dict[str, str]) -> None:
                 remapped[new_key] = value
             if changed:
                 payload["models"] = remapped
+                _ensure_server_config_metadata(payload)
                 server_config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
     ui_config_path = layout.state_dir / "config.yaml"
@@ -2002,6 +2139,7 @@ def _auto_register_local_gguf_models(layout: InstallLayout, dry_run: bool) -> in
                 "filename": gguf_path.name,
                 "local_path": str(gguf_path),
                 "description": f"local / {gguf_path.name}",
+                "aliases": _derived_aliases_for_import(repo_id, quant, gguf_path.name),
             }
         )
 
@@ -2035,7 +2173,7 @@ def _ensure_basic_server_config(layout: InstallLayout) -> None:
     if not isinstance(catalog_raw, list):
         return
 
-    # Update llamacpp-superserver.json (Manager config)
+    # Update server config (Manager config)
     try:
         if server_config_path.exists():
             server_config = json.loads(server_config_path.read_text(encoding="utf-8"))
@@ -2046,29 +2184,169 @@ def _ensure_basic_server_config(layout: InstallLayout) -> None:
 
     if "models" not in server_config:
         server_config["models"] = {}
-    
+    had_meta = isinstance(server_config.get("_meta"), dict)
     if "llama_server_defaults" not in server_config:
         server_config["llama_server_defaults"] = {}
+    if not isinstance(server_config.get("llama_server_defaults"), dict):
+        server_config["llama_server_defaults"] = {}
+    _ensure_server_config_metadata(server_config)
 
-    server_changed = False
+    default_ctx = 8192
+    default_n_gpu_layers = 999
+
+    server_changed = not had_meta
+    catalog_changed = False
+
+    current_keep = server_config["llama_server_defaults"].get("keep")
+    try:
+        keep_value = int(current_keep)
+    except Exception:
+        keep_value = 0
+    if keep_value <= 0:
+        server_config["llama_server_defaults"]["keep"] = DEFAULT_SERVER_KEEP
+        server_changed = True
+
+    # If server-level defaults are missing, try to infer common defaults from catalog
+    try:
+        total_models = sum(1 for m in catalog_raw if isinstance(m, dict) and m.get("model_id"))
+        if total_models > 0:
+            n_gpu_counts: dict[int, int] = {}
+            ts_counts: dict[str, int] = {}
+            ttl_counts: dict[int, int] = {}
+            for model in catalog_raw:
+                if not isinstance(model, dict):
+                    continue
+                # n_gpu_layers
+                if "n_gpu_layers" in model:
+                    try:
+                        n = int(model.get("n_gpu_layers"))
+                        n_gpu_counts[n] = n_gpu_counts.get(n, 0) + 1
+                    except Exception:
+                        pass
+                # tensor_split
+                if "tensor_split" in model and model.get("tensor_split") is not None:
+                    ts = str(model.get("tensor_split")).strip()
+                    ts_counts[ts] = ts_counts.get(ts, 0) + 1
+                # ttl (per-model may use "ttl" or "idle_ttl")
+                ttl_raw = model.get("ttl") if "ttl" in model else model.get("idle_ttl")
+                if ttl_raw is not None:
+                    try:
+                        t = int(ttl_raw)
+                        ttl_counts[t] = ttl_counts.get(t, 0) + 1
+                    except Exception:
+                        pass
+
+            def _majority(counts: dict) -> tuple[object, int] | None:
+                if not counts:
+                    return None
+                best, cnt = max(counts.items(), key=lambda kv: kv[1])
+                return (best, cnt)
+
+            # Promote n_gpu_layers to global default when a clear majority exists
+            if not server_config.get("llama_server_defaults"):
+                server_config.setdefault("llama_server_defaults", {})
+            majority = _majority(n_gpu_counts)
+            if majority and majority[1] >= max(2, (total_models // 2) + 1) and majority[0] != default_n_gpu_layers:
+                server_config["llama_server_defaults"]["n_gpu_layers"] = int(majority[0])
+                server_changed = True
+
+            majority_ts = _majority(ts_counts)
+            if majority_ts and majority_ts[1] >= max(2, (total_models // 2) + 1):
+                server_config["llama_server_defaults"]["tensor_split"] = str(majority_ts[0])
+                server_changed = True
+
+            # Promote TTL to top-level idle_ttl when consistent across models
+            majority_ttl = _majority(ttl_counts)
+            if majority_ttl and majority_ttl[1] >= max(2, (total_models // 2) + 1) and majority_ttl[0] != DEFAULT_IDLE_TTL:
+                server_config["idle_ttl"] = int(majority_ttl[0])
+                server_changed = True
+    except Exception:
+        # Non-fatal: inference best-effort only
+        pass
+
+    effective_idle_ttl = _effective_catalog_idle_ttl(layout, server_config)
+
     for model in catalog_raw:
         if not isinstance(model, dict):
             continue
+
+        existing_aliases = _normalize_catalog_aliases(model.get("aliases"))
+        merged_aliases = list(existing_aliases)
+        quant = str(model.get("quant") or "").strip() or None
+        for alias in _derived_aliases_for_import(str(model.get("repo_id") or ""), quant, str(model.get("filename") or "")):
+            if alias not in merged_aliases:
+                merged_aliases.append(alias)
+        if model.get("aliases") != merged_aliases:
+            model["aliases"] = merged_aliases
+            catalog_changed = True
+
+        for ttl_key in ("ttl", "idle_ttl"):
+            ttl_raw = model.get(ttl_key)
+            if ttl_raw is None:
+                continue
+            try:
+                if int(ttl_raw) == effective_idle_ttl:
+                    model.pop(ttl_key, None)
+                    catalog_changed = True
+            except Exception:
+                continue
+
         model_id = str(model.get("model_id") or "")
         if not model_id:
             continue
 
-        if model_id not in server_config["models"]:
+        try:
+            catalog_ctx = int(model.get("ctx_size") or default_ctx)
+        except Exception:
+            catalog_ctx = default_ctx
+        try:
+            catalog_n_gpu_layers = int(model.get("n_gpu_layers") or default_n_gpu_layers)
+        except Exception:
+            catalog_n_gpu_layers = default_n_gpu_layers
+
+        current_entry = server_config["models"].get(model_id)
+        if not isinstance(current_entry, dict):
             server_config["models"][model_id] = {
-                "ctx_size": 8192,
-                "n_gpu_layers": 999,
+                "ctx_size": catalog_ctx,
+                "n_gpu_layers": catalog_n_gpu_layers,
             }
+            server_changed = True
+            continue
+
+        entry = dict(current_entry)
+        entry_changed = False
+        try:
+            current_ctx = int(entry.get("ctx_size"))
+        except Exception:
+            current_ctx = None
+        try:
+            current_n_gpu_layers = int(entry.get("n_gpu_layers"))
+        except Exception:
+            current_n_gpu_layers = None
+
+        # Repair stale defaults left behind by previous installs/auto-ctx runs.
+        if current_ctx is None or (current_ctx == default_ctx and catalog_ctx != default_ctx):
+            entry["ctx_size"] = catalog_ctx
+            entry_changed = True
+        if current_n_gpu_layers is None or (
+            current_n_gpu_layers == default_n_gpu_layers and catalog_n_gpu_layers != default_n_gpu_layers
+        ):
+            entry["n_gpu_layers"] = catalog_n_gpu_layers
+            entry_changed = True
+
+        if entry_changed:
+            server_config["models"][model_id] = entry
             server_changed = True
 
     if server_changed:
         server_config_path.parent.mkdir(parents=True, exist_ok=True)
         server_config_path.write_text(json.dumps(server_config, indent=2) + "\n", encoding="utf-8")
         print(f"Verified Manager configuration in {server_config_path}")
+
+    if catalog_changed:
+        catalog_path.parent.mkdir(parents=True, exist_ok=True)
+        catalog_path.write_text(json.dumps(catalog_raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"Updated catalog aliases/ttl defaults in {catalog_path}")
 
     # 2. Update config.yaml (llama-swap UI config) preserving your achieved features
     config_path = layout.state_dir / "config.yaml"
@@ -2095,15 +2373,17 @@ def _ensure_basic_server_config(layout: InstallLayout) -> None:
         # Get current entry or create a new one
         current = ui_config["models"].get(model_id, {})
         
-        # We ensure keepAlive and other metadata are present as you achieved
-        # We use a default of 5m if not specified, but we don't overwrite if it exists
+        # Keep UI metadata in sync, but do not force keepAlive defaults here.
+        # Forcing a short keepAlive can unload models between long agent cycles.
         needs_update = False
         entry = current.copy()
-        
-        if "keepAlive" not in entry:
-            entry["keepAlive"] = "5m"
+
+        # Heal legacy auto-injected keepAlive from previous installer versions.
+        # If catalog does not define keepAlive, remove the forced 5m value.
+        if entry.get("keepAlive") == "5m" and not model.get("keepAlive"):
+            entry.pop("keepAlive", None)
             needs_update = True
-        
+
         # Sync metadata from catalog if missing or different
         if model.get("aliases") and entry.get("aliases") != model["aliases"]:
             entry["aliases"] = model["aliases"]
@@ -2125,13 +2405,14 @@ def _ensure_basic_server_config(layout: InstallLayout) -> None:
     if ui_changed:
         with open(config_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(ui_config, f, default_flow_style=False, sort_keys=False)
-        print(f"Restored and verified metadata (keepAlive, aliases) for {len(catalog_raw)} models in UI configuration.")
+        print(f"Restored and verified metadata (aliases, descriptions) for {len(catalog_raw)} models in UI configuration.")
 
 
 def maybe_rerun_auto_ctx(layout: InstallLayout, install_services: bool, dry_run: bool, args: argparse.Namespace) -> None:
     def _run_auto_ctx_update() -> None:
         try:
             _run([str(layout.bin_dir / CLI_COMMAND), "update", "--auto"])
+            _ensure_basic_server_config(layout)
         except subprocess.CalledProcessError as exc:
             print(
                 "Warning: auto-ctx update failed during install "
@@ -2142,6 +2423,7 @@ def maybe_rerun_auto_ctx(layout: InstallLayout, install_services: bool, dry_run:
     def _run_sync_config() -> None:
         try:
             _run([str(layout.bin_dir / CLI_COMMAND), "update"])
+            _ensure_basic_server_config(layout)
             print(f"Synced registered models to llama-swap UI configuration.")
         except subprocess.CalledProcessError as exc:
             print(f"Warning: model sync failed (exit code {exc.returncode}).")
@@ -2425,7 +2707,18 @@ def install_stack(args: argparse.Namespace) -> int:
                 server_config_data = {}
         server_config_data["idle_ttl"] = args.idle_ttl
         server_config_data["api_port"] = layout.public_port - 1
-        server_config_data.setdefault("llama_server_defaults", {})
+        llama_defaults = server_config_data.setdefault("llama_server_defaults", {})
+        if not isinstance(llama_defaults, dict):
+            llama_defaults = {}
+            server_config_data["llama_server_defaults"] = llama_defaults
+        current_keep = llama_defaults.get("keep")
+        try:
+            keep_value = int(current_keep)
+        except Exception:
+            keep_value = 0
+        if keep_value <= 0:
+            llama_defaults["keep"] = DEFAULT_SERVER_KEEP
+        _ensure_server_config_metadata(server_config_data)
         server_config_payload = json.dumps(server_config_data, indent=2) + "\n"
         server_config_path.write_text(
             server_config_payload,
