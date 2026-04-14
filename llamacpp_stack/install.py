@@ -392,6 +392,9 @@ def _args_to_cli(argv: argparse.Namespace, chosen_mode: str, chosen_llama_cpp_mo
     update_binaries = getattr(argv, "update_binaries", None)
     if update_binaries is not None:
         cmd.append("--update-binaries" if update_binaries else "--no-update-binaries")
+    migrate_model_ids = getattr(argv, "migrate_model_ids", None)
+    if migrate_model_ids is not None:
+        cmd.append("--migrate-model-ids" if migrate_model_ids else "--no-migrate-model-ids")
     if argv.dry_run:
         cmd.append("--dry-run")
     return cmd
@@ -1715,8 +1718,49 @@ def _models_dir_has_gguf(models_dir: Path) -> bool:
 
 
 def _slugify_model_id(value: str) -> str:
-    slug = re.sub(r"[^a-z0-9._-]+", "-", (value or "").lower()).strip("-")
+    slug = re.sub(r"[^a-z0-9._-]+", "-", (value or "").lower()).strip("-._")
     return slug or "model"
+
+
+def _normalize_model_id_token(value: str) -> str:
+    token = (value or "").strip().lower()
+    if not token:
+        return ""
+    # Normalize legacy artifacts so API-facing IDs are concise and stable.
+    token = re.sub(r"\.gguf\b", "", token)
+    token = re.sub(r"(^|[-._])gguf(?=($|[-._]))", r"\1", token)
+    token = re.sub(r"[-._]?\d{5}-of-\d{5}$", "", token)
+    token = re.sub(r"[-._]{2,}", "-", token)
+    token = re.sub(r"[^a-z0-9._-]+", "-", token).strip("-._")
+    return token
+
+
+def _append_quant_suffix_if_missing(base_id: str, quant: str | None) -> str:
+    quant_token = _normalize_model_id_token(quant or "")
+    if not quant_token:
+        return base_id
+    if re.search(rf"(^|[-._]){re.escape(quant_token)}($|[-._])", base_id):
+        return base_id
+    return _normalize_model_id_token(f"{base_id}-{quant_token}")
+
+
+def _normalized_model_id_components(repo_id: str, quant: str | None, filename: str, fallback: str) -> str:
+    filename_seed = Path(filename).stem if filename else ""
+    candidate = _normalize_model_id_token(filename_seed)
+    candidate = _append_quant_suffix_if_missing(candidate, quant)
+    if candidate:
+        return candidate
+    repo_tail = (repo_id or "").split("/")[-1].strip()
+    candidate = _normalize_model_id_token(repo_tail)
+    candidate = _append_quant_suffix_if_missing(candidate, quant)
+    if candidate:
+        return candidate
+    if filename:
+        candidate = _normalize_model_id_token(Path(filename).stem)
+        candidate = _append_quant_suffix_if_missing(candidate, quant)
+        if candidate:
+            return candidate
+    return _normalize_model_id_token(fallback) or "model"
 
 
 def _infer_quant_from_filename(filename: str) -> str | None:
@@ -1742,6 +1786,152 @@ def _catalog_payload_for_import(catalog_path: Path) -> tuple[list[dict[str, obje
         if isinstance(item, dict):
             filtered.append(dict(item))
     return filtered, None
+
+
+def _plan_model_id_migration(payload: list[dict[str, object]]) -> dict[str, str]:
+    current_ids = {
+        str(item.get("model_id") or "").strip()
+        for item in payload
+        if isinstance(item, dict) and str(item.get("model_id") or "").strip()
+    }
+    planned_ids = set(current_ids)
+    mapping: dict[str, str] = {}
+
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        current = str(item.get("model_id") or "").strip()
+        if not current:
+            continue
+        target_base = _normalized_model_id_components(
+            str(item.get("repo_id") or ""),
+            str(item.get("quant") or "") or None,
+            str(item.get("filename") or ""),
+            current,
+        )
+        if not target_base or target_base == current:
+            continue
+
+        planned_ids.discard(current)
+        target = target_base
+        suffix = 2
+        while target in planned_ids:
+            target = f"{target_base}-{suffix}"
+            suffix += 1
+        planned_ids.add(target)
+        mapping[current] = target
+
+    return mapping
+
+
+def _remap_model_maps(layout: InstallLayout, id_map: dict[str, str]) -> None:
+    if not id_map:
+        return
+
+    server_config_path = layout.config_dir / SERVER_CONFIG_BASENAME
+    if server_config_path.exists():
+        try:
+            payload = json.loads(server_config_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("models"), dict):
+            original = payload["models"]
+            remapped: dict[str, object] = {}
+            changed = False
+            for key, value in original.items():
+                new_key = id_map.get(str(key), str(key))
+                if new_key != key:
+                    changed = True
+                remapped[new_key] = value
+            if changed:
+                payload["models"] = remapped
+                server_config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    ui_config_path = layout.state_dir / "config.yaml"
+    if ui_config_path.exists():
+        try:
+            payload = yaml.safe_load(ui_config_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict) and isinstance(payload.get("models"), dict):
+            original = payload["models"]
+            remapped: dict[str, object] = {}
+            changed = False
+            for key, value in original.items():
+                new_key = id_map.get(str(key), str(key))
+                if new_key != key:
+                    changed = True
+                remapped[new_key] = value
+            if changed:
+                payload["models"] = remapped
+                ui_config_path.write_text(
+                    yaml.safe_dump(payload, default_flow_style=False, sort_keys=False),
+                    encoding="utf-8",
+                )
+
+
+def _maybe_migrate_catalog_model_ids(layout: InstallLayout, dry_run: bool, args: argparse.Namespace) -> int:
+    catalog_path = layout.state_dir / "catalog.json"
+    payload, error = _catalog_payload_for_import(catalog_path)
+    if error or payload is None:
+        return 0
+
+    mapping = _plan_model_id_migration(payload)
+    if not mapping:
+        return 0
+
+    migrate_ids = getattr(args, "migrate_model_ids", None)
+    if migrate_ids is None:
+        if not sys.stdin.isatty():
+            migrate_ids = False
+        else:
+            preview_items = sorted(mapping.items())
+            preview_limit = 12
+            print(
+                "Model IDs are the API names exposed to clients."
+            )
+            print(
+                "New naming removes '.gguf' and shard suffixes like '-00001-of-00009' "
+                "to align better with API client configs."
+            )
+            print("If you accept, existing references in catalog/config files are updated automatically.")
+            print("Preview of model ID renames:")
+            for old_id, new_id in preview_items[:preview_limit]:
+                print(f"  {old_id} -> {new_id}")
+            if len(preview_items) > preview_limit:
+                print(f"  ... and {len(preview_items) - preview_limit} more")
+            migrate_ids = prompt_bool(
+                f"Apply this renaming for {len(mapping)} model ID(s) now?",
+                default=False,
+            )
+        args.migrate_model_ids = migrate_ids
+
+    if not migrate_ids:
+        print("Keeping existing model IDs.")
+        return 0
+
+    if dry_run:
+        print(f"[dry-run] would rename {len(mapping)} model ID(s) to the new naming format.")
+        return len(mapping)
+
+    updated = 0
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        current = str(item.get("model_id") or "").strip()
+        renamed = mapping.get(current)
+        if not renamed:
+            continue
+        item["model_id"] = renamed
+        updated += 1
+
+    if updated <= 0:
+        return 0
+
+    catalog_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _remap_model_maps(layout, mapping)
+    print(f"Renamed {updated} model ID(s) to the new naming format in {catalog_path}.")
+    return updated
 
 
 def _auto_register_local_gguf_models(layout: InstallLayout, dry_run: bool) -> int:
@@ -1796,7 +1986,8 @@ def _auto_register_local_gguf_models(layout: InstallLayout, dry_run: bool) -> in
             repo_id = parent_rel.as_posix() if str(parent_rel) != "." else "."
         except Exception:
             repo_id = "."
-        base_model_id = _slugify_model_id(gguf_path.stem)
+        quant = _infer_quant_from_filename(gguf_path.name)
+        base_model_id = _normalized_model_id_components(repo_id, quant, gguf_path.name, gguf_path.stem)
         model_id = base_model_id
         suffix = 2
         while model_id in used_model_ids:
@@ -1807,7 +1998,7 @@ def _auto_register_local_gguf_models(layout: InstallLayout, dry_run: bool) -> in
             {
                 "model_id": model_id,
                 "repo_id": repo_id,
-                "quant": _infer_quant_from_filename(gguf_path.name),
+                "quant": quant,
                 "filename": gguf_path.name,
                 "local_path": str(gguf_path),
                 "description": f"local / {gguf_path.name}",
@@ -1965,6 +2156,10 @@ def maybe_rerun_auto_ctx(layout: InstallLayout, install_services: bool, dry_run:
     
     if catalog_models <= 0:
         return
+
+    renamed_models = _maybe_migrate_catalog_model_ids(layout, dry_run, args)
+    if renamed_models > 0:
+        catalog_models = _catalog_model_count(catalog_path)
 
     # Ensure we have at least a basic config even if they skip auto-ctx
     if not dry_run:
@@ -2332,6 +2527,12 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Force whether installer updates llama.cpp and llama-swap binaries on existing installs.",
+    )
+    parser.add_argument(
+        "--migrate-model-ids",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="During install, optionally rename legacy model IDs to the cleaner API naming format.",
     )
     parser.add_argument("--dry-run", action="store_true")
     return parser

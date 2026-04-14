@@ -425,15 +425,38 @@ def save_catalog(path: Path, models: list[ManagedModel]):
         CATALOG_CACHE.pop(str(path), None)
 
 
+def _normalize_model_id_token(value: str) -> str:
+    token = (value or "").strip().lower()
+    if not token:
+        return ""
+    token = re.sub(r"\.gguf\b", "", token)
+    token = re.sub(r"(^|[-._])gguf(?=($|[-._]))", r"\1", token)
+    token = re.sub(r"[-._]?\d{5}-of-\d{5}$", "", token)
+    token = re.sub(r"[-._]{2,}", "-", token)
+    token = re.sub(r"[^a-z0-9._-]+", "-", token).strip("-._")
+    return token
+
+
+def _append_quant_suffix_if_missing(base_id: str, quant: str | None) -> str:
+    quant_token = _normalize_model_id_token(quant or "")
+    if not quant_token:
+        return base_id
+    if re.search(rf"(^|[-._]){re.escape(quant_token)}($|[-._])", base_id):
+        return base_id
+    return _normalize_model_id_token(f"{base_id}-{quant_token}")
+
+
 def normalize_model_id(repo_id, quant, filename):
-    base = repo_id.split("/")[-1]
-    mid = f"{base}-{quant}" if quant else base
-    mid = mid.lower()
-    mid = re.sub(r"[^a-z0-9._-]+", "-", mid).strip("-")
-    if not mid or mid == "gguf":
-        mid = Path(filename).stem.lower()
-        mid = re.sub(r"[^a-z0-9._-]+", "-", mid).strip("-")
-    return mid
+    filename_seed = Path(filename).stem if filename else ""
+    mid = _normalize_model_id_token(filename_seed)
+    if not mid:
+        base = (repo_id or "").split("/")[-1].strip()
+        mid = _normalize_model_id_token(base)
+    mid = _append_quant_suffix_if_missing(mid, quant)
+    if not mid:
+        mid = _normalize_model_id_token(Path(filename).stem)
+        mid = _append_quant_suffix_if_missing(mid, quant)
+    return mid or "model"
 
 def choose_gguf_file(api, repo_id, quant, explicit_file, token):
     info = api.model_info(repo_id=repo_id, token=token)
@@ -3706,7 +3729,7 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
         return None, "metadata-missing", {"max_ctx": max_ctx}
 
     _emit_message(
-        f"{model.model_id}: GGUF max ctx {max_ctx}. Auto-fit will calibrate memory once, estimate a top candidate, and then probe downward from there.",
+        f"{model.model_id}: GGUF max ctx {max_ctx}. Auto-fit will calibrate memory once, probe the GGUF maximum, and then refine downward using memory-fit hints.",
         progress_callback,
     )
     _emit_message(f"{model.model_id}: each probe now sends a conservative long prompt sized for that ctx candidate.", progress_callback)
@@ -3736,16 +3759,19 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
     _emit_message(f"{model.model_id}: estimated stable ctx ceiling from memory fit = {estimated_ctx}.", progress_callback)
 
     low = calibration_ctx
+    max_probe_ctx = _align_ctx(max_ctx)
     high = None
     last_success = calibration_ctx
     first_failure = None
     tested = {calibration_ctx}
 
     candidate_order: list[int] = []
-    if estimated_ctx > calibration_ctx:
+    if max_probe_ctx > calibration_ctx:
+        candidate_order.append(max_probe_ctx)
+    if estimated_ctx > calibration_ctx and estimated_ctx < max_probe_ctx:
         candidate_order.append(estimated_ctx)
-        optimistic_ctx = _align_ctx(min(max_ctx, max(estimated_ctx + 1024, int(estimated_ctx * 1.2))))
-        if optimistic_ctx > estimated_ctx:
+        optimistic_ctx = _align_ctx(min(max_probe_ctx, max(estimated_ctx + 1024, int(estimated_ctx * 1.2))))
+        if optimistic_ctx > estimated_ctx and optimistic_ctx < max_probe_ctx:
             candidate_order.append(optimistic_ctx)
 
     for candidate in candidate_order:
@@ -3757,14 +3783,24 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
         if ok:
             low = candidate
             last_success = candidate
+            if candidate == max_probe_ctx:
+                return last_success, "selected", {
+                    "max_ctx": max_ctx,
+                    "calibration_ctx": calibration_ctx,
+                    "estimated_ctx": estimated_ctx,
+                    "first_failure": first_failure,
+                    "selected_ctx": last_success,
+                }
             continue
-        high = candidate
+        if high is None or candidate < high:
+            high = candidate
         first_failure = candidate
         _emit_message(f"{model.model_id}: ctx {candidate} failed ({reason}).", progress_callback)
-        break
+        if candidate != max_probe_ctx:
+            break
 
-    if high is None and low < _align_ctx(max_ctx):
-        high = _align_ctx(max_ctx)
+    if high is None and low < max_probe_ctx:
+        high = max_probe_ctx
 
     while high is not None and high - low >= 4096:
         midpoint = _align_ctx((low + high) // 2)

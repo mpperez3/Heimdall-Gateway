@@ -18,6 +18,7 @@ import yaml
 
 from llamacpp_stack.cli import (
     ManagedModel,
+    choose_auto_ctx,
     download_hf_file,
     _prepare_manager_socket_path,
     _probe_runtime_env,
@@ -31,6 +32,7 @@ from llamacpp_stack.cli import (
     load_catalog,
     normalize_server_overrides,
     model_files_ready,
+    normalize_model_id,
     render_llamaswap_config,
     resolve_llama_server_defaults,
     resolve_idle_ttl,
@@ -538,6 +540,7 @@ class InstallHelpersTest(unittest.TestCase):
             prefer_binary=True,
             install_services=True,
             update_binaries=False,
+            migrate_model_ids=True,
             dry_run=False,
         )
         with (
@@ -556,6 +559,7 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertIn("--models-dir", cmd)
         self.assertIn("/var/llamacpp_models", cmd)
         self.assertIn("--no-update-binaries", cmd)
+        self.assertIn("--migrate-model-ids", cmd)
         env = run_mock.call_args.kwargs["env"]
         self.assertEqual(env[ELEVATED_INSTALL_ENV], "1")
 
@@ -603,6 +607,32 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertIn("unrecognized arguments: --not-a-real-flag", rendered)
         self.assertIn("Options for 'run':", rendered)
         self.assertIn(f"usage: {CLI_COMMAND} run", rendered)
+
+    def test_normalize_model_id_strips_gguf_and_shard_suffix(self) -> None:
+        self.assertEqual(
+            normalize_model_id(
+                "unsloth/MiniMax-M2.7-GGUF",
+                "UD-Q4_K_M",
+                "MiniMax-M2.7-UD-Q4_K_M-00001-of-00004.gguf",
+            ),
+            "minimax-m2.7-ud-q4_k_m",
+        )
+        self.assertEqual(
+            normalize_model_id(
+                ".",
+                "IQ1_M",
+                "DeepSeek-V3-0324.IQ1_M.gguf-00001-of-00009.gguf",
+            ),
+            "deepseek-v3-0324.iq1_m",
+        )
+        self.assertEqual(
+            normalize_model_id(
+                "UD-Q4_K_XL",
+                "UD-Q4_K_XL",
+                "Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf",
+            ),
+            "qwen3.5-122b-a10b-ud-q4_k_xl",
+        )
 
     def test_choose_default_swap_port_prefers_ollama_plus_two(self) -> None:
         with (
@@ -782,6 +812,210 @@ class InstallHelpersTest(unittest.TestCase):
             ):
                 maybe_rerun_auto_ctx(layout, install_services=True, dry_run=False, args=argparse.Namespace())
             run_mock.assert_called_once_with([str(layout.bin_dir / CLI_COMMAND), "update", "--auto"])
+
+    def test_maybe_rerun_auto_ctx_migrates_model_ids_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            models_dir.mkdir(parents=True)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True)
+            catalog_path = state_dir / "catalog.json"
+            catalog_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "model_id": "minimax-m2.7-gguf-ud-q4_k_m",
+                            "repo_id": "unsloth/MiniMax-M2.7-GGUF",
+                            "quant": "UD-Q4_K_M",
+                            "filename": "MiniMax-M2.7-UD-Q4_K_M-00001-of-00004.gguf",
+                            "local_path": str(models_dir / "MiniMax-M2.7-UD-Q4_K_M-00001-of-00004.gguf"),
+                        }
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            layout = InstallLayout(
+                mode="system",
+                state_dir=state_dir,
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=models_dir,
+                config_dir=root / "config",
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+            args = argparse.Namespace(migrate_model_ids=True, rerun_auto_ctx=False)
+            maybe_rerun_auto_ctx(layout, install_services=False, dry_run=False, args=args)
+            updated = json.loads(catalog_path.read_text(encoding="utf-8"))
+            self.assertEqual(updated[0]["model_id"], "minimax-m2.7-ud-q4_k_m")
+
+    def test_maybe_rerun_auto_ctx_migration_prefers_filename_over_repo_folder_slug(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            models_dir.mkdir(parents=True)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True)
+            catalog_path = state_dir / "catalog.json"
+            catalog_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "model_id": "q8_0",
+                            "repo_id": "Q8_0",
+                            "quant": "Q8_0",
+                            "filename": "Mistral-Small-4-119B-2603-Q8_0-00001-of-00004.gguf",
+                            "local_path": str(models_dir / "Mistral-Small-4-119B-2603-Q8_0-00001-of-00004.gguf"),
+                        },
+                        {
+                            "model_id": "ud-q4_k_xl",
+                            "repo_id": "UD-Q4_K_XL",
+                            "quant": "UD-Q4_K_XL",
+                            "filename": "NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_XL-00001-of-00003.gguf",
+                            "local_path": str(models_dir / "NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_XL-00001-of-00003.gguf"),
+                        },
+                        {
+                            "model_id": "ud-q4_k_xl-2",
+                            "repo_id": "UD-Q4_K_XL",
+                            "quant": "UD-Q4_K_XL",
+                            "filename": "Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf",
+                            "local_path": str(models_dir / "Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf"),
+                        },
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            layout = InstallLayout(
+                mode="system",
+                state_dir=state_dir,
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=models_dir,
+                config_dir=root / "config",
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+            args = argparse.Namespace(migrate_model_ids=True, rerun_auto_ctx=False)
+            maybe_rerun_auto_ctx(layout, install_services=False, dry_run=False, args=args)
+            updated = json.loads(catalog_path.read_text(encoding="utf-8"))
+            renamed_ids = [item["model_id"] for item in updated]
+            self.assertIn("mistral-small-4-119b-2603-q8_0", renamed_ids)
+            self.assertIn("nvidia-nemotron-3-super-120b-a12b-ud-q4_k_xl", renamed_ids)
+            self.assertIn("qwen3.5-122b-a10b-ud-q4_k_xl", renamed_ids)
+
+    def test_maybe_rerun_auto_ctx_migration_prompt_shows_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            models_dir.mkdir(parents=True)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True)
+            catalog_path = state_dir / "catalog.json"
+            catalog_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "model_id": "ud-q2_k_xl",
+                            "repo_id": "UD-Q2_K_XL",
+                            "quant": "UD-Q2_K_XL",
+                            "filename": "MiniMax-M2.5-UD-Q2_K_XL-00001-of-00003.gguf",
+                            "local_path": str(models_dir / "MiniMax-M2.5-UD-Q2_K_XL-00001-of-00003.gguf"),
+                        }
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            layout = InstallLayout(
+                mode="system",
+                state_dir=state_dir,
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=models_dir,
+                config_dir=root / "config",
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+
+            with (
+                mock.patch("llamacpp_stack.install.sys.stdin.isatty", return_value=True),
+                mock.patch("llamacpp_stack.install.prompt_bool", return_value=False),
+                mock.patch("builtins.print") as print_mock,
+            ):
+                maybe_rerun_auto_ctx(layout, install_services=False, dry_run=False, args=argparse.Namespace(rerun_auto_ctx=False))
+
+            rendered = "\n".join(str(call.args[0]) for call in print_mock.call_args_list if call.args)
+            self.assertIn("Preview of model ID renames:", rendered)
+            self.assertIn("ud-q2_k_xl -> minimax-m2.5-ud-q2_k_xl", rendered)
+
+    def test_maybe_rerun_auto_ctx_keeps_model_ids_when_migration_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            models_dir.mkdir(parents=True)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True)
+            catalog_path = state_dir / "catalog.json"
+            catalog_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "model_id": "minimax-m2.7-gguf-ud-q4_k_m",
+                            "repo_id": "unsloth/MiniMax-M2.7-GGUF",
+                            "quant": "UD-Q4_K_M",
+                            "filename": "MiniMax-M2.7-UD-Q4_K_M-00001-of-00004.gguf",
+                            "local_path": str(models_dir / "MiniMax-M2.7-UD-Q4_K_M-00001-of-00004.gguf"),
+                        }
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            layout = InstallLayout(
+                mode="system",
+                state_dir=state_dir,
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=models_dir,
+                config_dir=root / "config",
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+            args = argparse.Namespace(migrate_model_ids=False, rerun_auto_ctx=False)
+            maybe_rerun_auto_ctx(layout, install_services=False, dry_run=False, args=args)
+            updated = json.loads(catalog_path.read_text(encoding="utf-8"))
+            self.assertEqual(updated[0]["model_id"], "minimax-m2.7-gguf-ud-q4_k_m")
 
     def test_maybe_rerun_auto_ctx_auto_registers_local_gguf_when_catalog_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1548,6 +1782,61 @@ class InstallHelpersTest(unittest.TestCase):
                 ["ollama", "stop", "phi4-mini:latest"],
             ],
         )
+
+    def test_choose_auto_ctx_probes_max_second_and_short_circuits_on_success(self) -> None:
+        model = ManagedModel(
+            model_id="repo-q4",
+            repo_id="org/repo",
+            quant="Q4_K_M",
+            filename="model.gguf",
+            local_path="/tmp/model.gguf",
+        )
+        with (
+            mock.patch("llamacpp_stack.cli.get_model_context_size", return_value=262144),
+            mock.patch("llamacpp_stack.cli._query_gpu_free_memory_mib", return_value={0: 24576.0}),
+            mock.patch("llamacpp_stack.cli._parse_probe_trace_metrics", return_value=mock.Mock()),
+            mock.patch("llamacpp_stack.cli._estimate_ctx_ceiling", return_value=212992),
+            mock.patch(
+                "llamacpp_stack.cli.probe_model_ctx",
+                side_effect=[(True, "ok"), (True, "ok")],
+            ) as probe_mock,
+        ):
+            selected, status, info = choose_auto_ctx(model, Path("/tmp/llama-server"))
+
+        self.assertEqual([call.args[2] for call in probe_mock.call_args_list], [8192, 262144])
+        self.assertEqual(selected, 262144)
+        self.assertEqual(status, "selected")
+        self.assertEqual(info["selected_ctx"], 262144)
+
+    def test_choose_auto_ctx_uses_memory_estimate_after_max_failure(self) -> None:
+        model = ManagedModel(
+            model_id="repo-q4",
+            repo_id="org/repo",
+            quant="Q4_K_M",
+            filename="model.gguf",
+            local_path="/tmp/model.gguf",
+        )
+        with (
+            mock.patch("llamacpp_stack.cli.get_model_context_size", return_value=32768),
+            mock.patch("llamacpp_stack.cli._query_gpu_free_memory_mib", return_value={0: 24576.0}),
+            mock.patch("llamacpp_stack.cli._parse_probe_trace_metrics", return_value=mock.Mock()),
+            mock.patch("llamacpp_stack.cli._estimate_ctx_ceiling", return_value=12288),
+            mock.patch(
+                "llamacpp_stack.cli.probe_model_ctx",
+                side_effect=[
+                    (True, "ok"),
+                    (False, "exit--11"),
+                    (False, "exit--11"),
+                    (True, "ok"),
+                ],
+            ) as probe_mock,
+        ):
+            selected, status, info = choose_auto_ctx(model, Path("/tmp/llama-server"))
+
+        self.assertEqual([call.args[2] for call in probe_mock.call_args_list], [8192, 32768, 12288, 10240])
+        self.assertEqual(status, "selected")
+        self.assertEqual(selected, 10240)
+        self.assertEqual(info["first_failure"], 12288)
 
 
 if __name__ == "__main__":
