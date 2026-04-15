@@ -54,6 +54,7 @@ from llamacpp_stack.install import (
     DEFAULT_SERVICE_USER,
     ELEVATED_INSTALL_ENV,
     MANAGER_SERVICE_NAME,
+    LLAMA_SERVER_DEFAULTS_BASENAME,
     SERVER_CONFIG_BASENAME,
     SWAP_SERVICE_NAME,
     _export_nvcc_path,
@@ -82,6 +83,7 @@ from llamacpp_stack.install import (
     _link_stable_binary,
     _is_self_referential_symlink,
     _resolve_existing_stable_target,
+    _ensure_llama_server_defaults_file,
     parse_ollama_models_from_systemctl,
     print_install_summary,
     maybe_rerun_auto_ctx,
@@ -976,6 +978,173 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertIn("_meta", payload)
             self.assertIn("example", payload["_meta"])
 
+    def test_maybe_rerun_auto_ctx_preserves_existing_llama_server_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            models_dir.mkdir(parents=True)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True)
+            catalog_path = state_dir / "catalog.json"
+            catalog_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "model_id": "repo-q4",
+                            "repo_id": "org/repo",
+                            "quant": "Q4",
+                            "filename": "model-q4.gguf",
+                            "local_path": str(models_dir / "model-q4.gguf"),
+                            "ctx_size": 32768,
+                            "n_gpu_layers": 777,
+                        }
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config_dir = root / "config"
+            config_dir.mkdir(parents=True)
+            server_config = config_dir / SERVER_CONFIG_BASENAME
+            existing_defaults = {
+                "tensor_split": "0.94,1,1,1,1,1,0.94",
+                "batch-size": 3064,
+                "ubatch-size": 1024,
+                "threads": 32,
+                "threads-batch": 32,
+                "numa": "distribute",
+                "fit-target": 1536,
+                "flash-attn": "on",
+                "keep": 512,
+                "mirostat": 2,
+                "mirostat_ent": 4.5,
+                "mirostat_lr": 0.1,
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q8_0",
+            }
+            server_config.write_text(
+                json.dumps(
+                    {
+                        "idle_ttl": 300,
+                        "api_port": 11436,
+                        "llama_server_defaults": existing_defaults,
+                        "models": {"repo-q4": {"ctx_size": 32768, "n_gpu_layers": 777}},
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            layout = InstallLayout(
+                mode="system",
+                state_dir=state_dir,
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=models_dir,
+                config_dir=config_dir,
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+
+            maybe_rerun_auto_ctx(
+                layout,
+                install_services=False,
+                dry_run=False,
+                args=argparse.Namespace(migrate_model_ids=False, rerun_auto_ctx=False),
+            )
+
+            payload = json.loads(server_config.read_text(encoding="utf-8"))
+            self.assertEqual(payload["llama_server_defaults"], existing_defaults)
+
+    def test_maybe_rerun_auto_ctx_merges_missing_llama_server_defaults_without_overwriting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            models_dir.mkdir(parents=True)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True)
+            catalog_path = state_dir / "catalog.json"
+            catalog_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "model_id": "repo-q4",
+                            "repo_id": "org/repo",
+                            "quant": "Q4",
+                            "filename": "model-q4.gguf",
+                            "local_path": str(models_dir / "model-q4.gguf"),
+                            "ctx_size": 32768,
+                            "n_gpu_layers": 777,
+                        }
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config_dir = root / "config"
+            config_dir.mkdir(parents=True)
+            server_config = config_dir / SERVER_CONFIG_BASENAME
+            server_config.write_text(
+                json.dumps(
+                    {
+                        "idle_ttl": 300,
+                        "api_port": 11436,
+                        "llama_server_defaults": {
+                            "keep": 256,
+                            "cache_type_k": "q4_0",
+                        },
+                        "models": {"repo-q4": {"ctx_size": 32768, "n_gpu_layers": 777}},
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            layout = InstallLayout(
+                mode="system",
+                state_dir=state_dir,
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=models_dir,
+                config_dir=config_dir,
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+
+            with mock.patch("llamacpp_stack.install.detect_cuda_device_count", return_value=7):
+                maybe_rerun_auto_ctx(
+                    layout,
+                    install_services=False,
+                    dry_run=False,
+                    args=argparse.Namespace(migrate_model_ids=False, rerun_auto_ctx=False),
+                )
+
+            payload = json.loads(server_config.read_text(encoding="utf-8"))
+            llama_defaults = payload["llama_server_defaults"]
+            self.assertEqual(llama_defaults["keep"], 256)
+            self.assertEqual(llama_defaults["cache_type_k"], "q4_0")
+            self.assertEqual(llama_defaults["batch-size"], 2048)
+            self.assertEqual(llama_defaults["ubatch-size"], 1024)
+            self.assertEqual(llama_defaults["threads-batch"], 16)
+            self.assertEqual(llama_defaults["fit-target"], 1536)
+            self.assertTrue(llama_defaults["flash-attn"])
+
     def test_maybe_rerun_auto_ctx_refreshes_server_config_after_auto_update(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1056,6 +1225,83 @@ class InstallHelpersTest(unittest.TestCase):
                 )
 
             run_mock.assert_called_once_with([str(layout.bin_dir / CLI_COMMAND), "update", "--auto"])
+
+        def test_maybe_rerun_auto_ctx_seeds_editable_llama_server_defaults_file(self) -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                models_dir = root / "models"
+                models_dir.mkdir(parents=True)
+                state_dir = root / "state"
+                state_dir.mkdir(parents=True)
+                catalog_path = state_dir / "catalog.json"
+                catalog_path.write_text(
+                    json.dumps(
+                        [
+                            {
+                                "model_id": "repo-q4",
+                                "repo_id": "org/repo",
+                                "quant": "Q4",
+                                "filename": "model-q4.gguf",
+                                "local_path": str(models_dir / "model-q4.gguf"),
+                                "ctx_size": 32768,
+                                "n_gpu_layers": 777,
+                            }
+                        ]
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                config_dir = root / "config"
+                config_dir.mkdir(parents=True)
+                server_config = config_dir / SERVER_CONFIG_BASENAME
+                server_config.write_text(
+                    json.dumps({"idle_ttl": 300, "api_port": 11436, "models": {"repo-q4": {"ctx_size": 32768, "n_gpu_layers": 777}}}, indent=2)
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+                layout = InstallLayout(
+                    mode="system",
+                    state_dir=state_dir,
+                    bin_dir=root / "bin",
+                    install_root=root / "install",
+                    models_dir=models_dir,
+                    config_dir=config_dir,
+                    run_dir=root / "run",
+                    service_user=DEFAULT_SERVICE_USER,
+                    service_group=DEFAULT_SERVICE_USER,
+                    public_host="127.0.0.1",
+                    public_port=11436,
+                    manager_socket=root / "run" / "manager.sock",
+                    python_root=root / "python",
+                    runtime_venv=root / "venv",
+                    cuda_root=root / "cuda",
+                )
+
+                with mock.patch("llamacpp_stack.install.detect_cuda_device_count", return_value=7):
+                    maybe_rerun_auto_ctx(
+                        layout,
+                        install_services=False,
+                        dry_run=False,
+                        args=argparse.Namespace(migrate_model_ids=False, rerun_auto_ctx=False),
+                    )
+
+                preset_file = config_dir / LLAMA_SERVER_DEFAULTS_BASENAME
+                self.assertTrue(preset_file.exists())
+                self.assertIn("presets:", preset_file.read_text(encoding="utf-8"))
+
+                payload = json.loads(server_config.read_text(encoding="utf-8"))
+                llama_defaults = payload["llama_server_defaults"]
+                self.assertEqual(llama_defaults["keep"], 512)
+                self.assertEqual(llama_defaults["batch-size"], 3064)
+                self.assertEqual(llama_defaults["ubatch-size"], 1024)
+                self.assertEqual(llama_defaults["threads-batch"], 32)
+                self.assertEqual(llama_defaults["fit-target"], 1536)
+                self.assertTrue(llama_defaults["flash-attn"])
+                self.assertEqual(llama_defaults["tensor_split"], "0.94,1,1,1,1,1,0.94")
+                self.assertEqual(llama_defaults["mirostat"], 2)
+                self.assertEqual(llama_defaults["mirostat_ent"], 4.5)
+                self.assertEqual(llama_defaults["mirostat_lr"], 0.1)
             payload = json.loads(server_config.read_text(encoding="utf-8"))
             model_cfg = payload["models"]["qwen3-coder-next-ud-q5_k_xl"]
             self.assertEqual(model_cfg["ctx_size"], 260096)
@@ -1740,7 +1986,75 @@ class InstallHelpersTest(unittest.TestCase):
                 encoding="utf-8",
             )
             model = load_catalog(catalog_path)[0]
-            self.assertEqual(model.server_overrides, {"flash_attn": True, "batch_size": 1024})
+            self.assertEqual(model.server_overrides, {"flash_attn": "on", "batch_size": 1024})
+
+    def test_build_llama_server_command_emits_flash_attn_with_explicit_value(self) -> None:
+        model = ManagedModel(
+            model_id="repo-q4",
+            repo_id="org/repo",
+            quant="Q4",
+            filename="model-q4.gguf",
+            local_path="/tmp/model-q4.gguf",
+            server_overrides={"flash_attn": "on"},
+        )
+        cmd = build_llama_server_command(
+            model,
+            Path("/tmp/llama-server"),
+            port="12345",
+        )
+        self.assertIn("--flash-attn", cmd)
+        idx = cmd.index("--flash-attn")
+        self.assertEqual(cmd[idx + 1], "on")
+
+    def test_load_catalog_reprocesses_when_server_defaults_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            catalog_path = root / "catalog.json"
+            server_config = root / SERVER_CONFIG_BASENAME
+
+            catalog_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "model_id": "repo-q4",
+                            "repo_id": "org/repo",
+                            "quant": "Q4",
+                            "filename": "model-q4.gguf",
+                            "local_path": "/tmp/model-q4.gguf",
+                            "server_overrides": {"batch_size": 2048},
+                        }
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            server_config.write_text(
+                json.dumps({"llama_server_defaults": {"batch_size": 1024}}) + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch("llamacpp_stack.cli.DEFAULT_SERVER_CONFIG_PATH", server_config):
+                first = load_catalog(catalog_path)
+                self.assertEqual(first[0].server_overrides, {"batch_size": 2048})
+
+                server_config.write_text(
+                    json.dumps({"llama_server_defaults": {"batch_size": 2048}}) + "\n",
+                    encoding="utf-8",
+                )
+
+                refreshed = load_catalog(catalog_path)
+                self.assertEqual(refreshed[0].server_overrides, {})
+
+    def test_ensure_llama_server_defaults_file_prefers_bundle_without_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "config"
+            config_dir.mkdir(parents=True)
+
+            resolved = _ensure_llama_server_defaults_file(config_dir)
+
+            self.assertTrue(resolved.exists())
+            self.assertEqual(resolved.name, LLAMA_SERVER_DEFAULTS_BASENAME)
+            self.assertFalse((config_dir / LLAMA_SERVER_DEFAULTS_BASENAME).exists())
 
     def test_load_catalog_deduplicates_aliases(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1974,6 +2288,35 @@ models:
         self.assertIn("--cache-type-k q8_0", rendered)
         self.assertNotIn("--gpu-layers all", rendered)
         self.assertNotIn("--no-mmap", rendered)
+
+    def test_build_llama_server_command_uses_mirostat_and_keep(self) -> None:
+        model = ManagedModel(
+            model_id="repo-q4",
+            repo_id="org/repo",
+            quant="Q4",
+            filename="model-q4.gguf",
+            local_path="/tmp/model-q4.gguf",
+            server_overrides={
+                "mirostat": 2,
+                "mirostat_ent": 4.5,
+                "mirostat_lr": 0.1,
+                "keep": 512,
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q8_0",
+            },
+        )
+        cmd = build_llama_server_command(
+            model,
+            Path("/tmp/llama-server"),
+            port="12345",
+        )
+        rendered = " ".join(cmd)
+        self.assertIn("--mirostat 2", rendered)
+        self.assertIn("--mirostat-ent 4.5", rendered)
+        self.assertIn("--mirostat-lr 0.1", rendered)
+        self.assertIn("--keep 512", rendered)
+        self.assertIn("--cache-type-k q8_0", rendered)
+        self.assertIn("--cache-type-v q8_0", rendered)
 
 
     def test_get_gpu_conflict_message_ignores_target_when_already_published(self) -> None:

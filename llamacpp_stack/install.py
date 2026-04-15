@@ -35,6 +35,7 @@ MANAGER_WRAPPER_NAME = "llamacpp-superserver-manager-start"
 SWAP_WRAPPER_NAME = "llamacpp-superserver-swap-start"
 OLLAMA_DEFAULT_PORT = 11434
 SERVER_CONFIG_BASENAME = "conf.json"
+LLAMA_SERVER_DEFAULTS_BASENAME = "llama_server_defaults.yaml"
 LEGACY_SERVER_CONFIG_BASENAME = "llamacpp-server.json"
 ENV_BASENAME = "llamacpp-superserver.env"
 LEGACY_ENV_BASENAME = "llamacpp-stack.env"
@@ -83,7 +84,16 @@ def _ensure_server_config_metadata(payload: dict[str, object]) -> dict[str, obje
         {
             "idle_ttl": 300,
             "api_port": 11436,
-            "llama_server_defaults": {"ctx_size": 65536, "n_gpu_layers": 999, "keep": 512},
+            "llama_server_defaults": {
+                "ctx_size": 65536,
+                "n_gpu_layers": 999,
+                "keep": 512,
+                "mirostat": 2,
+                "mirostat_ent": 4.5,
+                "mirostat_lr": 0.1,
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q8_0",
+            },
         },
     )
     meta.setdefault(
@@ -95,6 +105,63 @@ def _ensure_server_config_metadata(payload: dict[str, object]) -> dict[str, obje
     )
     payload["_meta"] = meta
     return payload
+
+
+def _bundle_llama_server_defaults_path() -> Path:
+    return Path(__file__).resolve().parent / "bundle" / LLAMA_SERVER_DEFAULTS_BASENAME
+
+
+def _ensure_llama_server_defaults_file(config_dir: Path) -> Path:
+    target = config_dir / LLAMA_SERVER_DEFAULTS_BASENAME
+    # Do not copy the bundled defaults into the user's config dir by default.
+    # Fall back to reading the bundled preset in `bundle/` without creating a
+    # copy. This avoids cluttering user config directories with installer
+    # artifacts while still providing sensible defaults.
+    source = _bundle_llama_server_defaults_path()
+    if source.exists():
+        return source
+    return target
+
+
+def _load_llama_server_defaults_preset(config_dir: Path) -> dict[str, object]:
+    defaults_path = _ensure_llama_server_defaults_file(config_dir)
+    try:
+        payload = yaml.safe_load(defaults_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    base_defaults = payload.get("default")
+    if not isinstance(base_defaults, dict):
+        base_defaults = {}
+    presets = payload.get("presets")
+    selected = {}
+    if isinstance(presets, dict):
+        gpu_count = detect_cuda_device_count()
+        for key in (str(gpu_count), gpu_count):
+            preset = presets.get(key)
+            if isinstance(preset, dict):
+                selected = dict(preset)
+                break
+
+    merged = dict(base_defaults)
+    merged.update(selected)
+    return merged
+
+
+def _merge_missing_llama_server_defaults(target: dict[str, object], config_dir: Path) -> bool:
+    if not isinstance(target, dict):
+        return False
+    preset_defaults = _load_llama_server_defaults_preset(config_dir)
+    if not preset_defaults:
+        return False
+    changed = False
+    for key, value in preset_defaults.items():
+        if key not in target:
+            target[key] = value
+            changed = True
+    return changed
 
 
 @dataclass
@@ -323,6 +390,19 @@ def detect_nvidia_gpu() -> bool:
     except Exception:
         return False
     return any(line.strip() for line in result.stdout.splitlines())
+
+
+def detect_cuda_device_count() -> int:
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return 0
+    return len([line for line in result.stdout.splitlines() if line.strip()])
 
 
 def locate_nvcc() -> str | None:
@@ -983,7 +1063,49 @@ def _find_executable(root: Path, name: str) -> Path:
         if candidate.is_file():
             candidate.chmod(candidate.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
             return candidate
-    raise RuntimeError(f"Executable {name} not found under {root}")
+
+    # If we didn't find it, show what WAS there for debugging
+    contents = []
+    try:
+        if root.exists():
+            for p in root.rglob("*"):
+                contents.append(str(p.relative_to(root)))
+    except Exception:
+        pass
+
+    hint = " Try re-running the installer with binary updates enabled (remove --no-update-binaries or pass --update-binaries)."
+    detail = f" (contents: {', '.join(contents[:20])})" if contents else f" (directory is empty or missing){hint}"
+    raise RuntimeError(f"Executable {name} not found under {root}{detail}")
+
+
+def _is_executable_working(path: Path, timeout: float = 3.0) -> bool:
+    """Return True if the executable at `path` appears runnable.
+
+    This makes a conservative check by ensuring the file exists, is executable,
+    and responds successfully to one of a few common flags. Returns False on
+    any failure or timeout.
+    """
+    if path is None:
+        return False
+    try:
+        if not path.exists() or not path.is_file():
+            return False
+        try:
+            path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        except Exception:
+            pass
+        if not os.access(str(path), os.X_OK):
+            return False
+        for arg in ("--version", "-v", "-h", "--help"):
+            try:
+                res = subprocess.run([str(path), arg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
+                if res.returncode == 0:
+                    return True
+            except Exception:
+                continue
+        return False
+    except Exception:
+        return False
 
 
 def _resolve_existing_stable_target(install_root: Path, stable_link: Path, name: str) -> Path | None:
@@ -2190,6 +2312,7 @@ def _ensure_basic_server_config(layout: InstallLayout) -> None:
     if not isinstance(server_config.get("llama_server_defaults"), dict):
         server_config["llama_server_defaults"] = {}
     _ensure_server_config_metadata(server_config)
+    _ensure_llama_server_defaults_file(layout.config_dir)
 
     default_ctx = 8192
     default_n_gpu_layers = 999
@@ -2197,13 +2320,7 @@ def _ensure_basic_server_config(layout: InstallLayout) -> None:
     server_changed = not had_meta
     catalog_changed = False
 
-    current_keep = server_config["llama_server_defaults"].get("keep")
-    try:
-        keep_value = int(current_keep)
-    except Exception:
-        keep_value = 0
-    if keep_value <= 0:
-        server_config["llama_server_defaults"]["keep"] = DEFAULT_SERVER_KEEP
+    if _merge_missing_llama_server_defaults(server_config["llama_server_defaults"], layout.config_dir):
         server_changed = True
 
     # If server-level defaults are missing, try to infer common defaults from catalog
@@ -2266,16 +2383,29 @@ def _ensure_basic_server_config(layout: InstallLayout) -> None:
 
     effective_idle_ttl = _effective_catalog_idle_ttl(layout, server_config)
 
+    all_used_aliases: set[str] = set()
     for model in catalog_raw:
         if not isinstance(model, dict):
             continue
 
         existing_aliases = _normalize_catalog_aliases(model.get("aliases"))
-        merged_aliases = list(existing_aliases)
-        quant = str(model.get("quant") or "").strip() or None
-        for alias in _derived_aliases_for_import(str(model.get("repo_id") or ""), quant, str(model.get("filename") or "")):
-            if alias not in merged_aliases:
+        merged_aliases = []
+        # First pass: collect existing aliases that are already assigned to this specific model
+        for alias in existing_aliases:
+            if alias not in all_used_aliases:
                 merged_aliases.append(alias)
+                all_used_aliases.add(alias)
+
+        # Second pass: try to add new derived aliases only if they are not already taken globally
+        quant = str(model.get("quant") or "").strip() or None
+        repo_id = str(model.get("repo_id") or "")
+        filename = str(model.get("filename") or "")
+        
+        for derived in _derived_aliases_for_import(repo_id, quant, filename):
+            if derived not in merged_aliases and derived not in all_used_aliases:
+                merged_aliases.append(derived)
+                all_used_aliases.add(derived)
+
         if model.get("aliases") != merged_aliases:
             model["aliases"] = merged_aliases
             catalog_changed = True
@@ -2487,7 +2617,13 @@ def maybe_migrate_existing_install(target_mode: str, public_host: str, public_po
     if dry_run:
         print(f"[dry-run] would uninstall previous {existing_mode}-mode installation with --keep-models.")
         return
-    from .uninstall import uninstall_stack
+
+    try:
+        # Preferred when running as a package
+        from llamacpp_stack.uninstall import uninstall_stack
+    except ImportError:
+        # Fallback for direct script execution
+        from uninstall import uninstall_stack
 
     uninstall_stack(
         argparse.Namespace(
@@ -2599,8 +2735,40 @@ def install_stack(args: argparse.Namespace) -> int:
     if args.dry_run:
         llamaswap_bin = layout.install_root / "llama-swap"
     else:
-        llamaswap_real = _find_executable(llamaswap_root, "llama-swap")
-        llamaswap_bin = _link_stable_binary(llamaswap_real, layout.install_root / "llama-swap", args.dry_run)
+        # Prefer to use an existing extracted asset if present; otherwise offer to
+        # download/install it. Avoid raising an unhandled exception here so the
+        # user can choose to recover interactively.
+        llamaswap_real = None
+        try:
+            print(f"Checking for llama-swap under {llamaswap_root}...")
+            llamaswap_real = _find_executable(llamaswap_root, "llama-swap")
+            if not _is_executable_working(llamaswap_real):
+                print(f"Warning: found llama-swap at {llamaswap_real} but it did not respond to a basic run check.")
+                if update_binaries:
+                    print("Re-installing llama-swap asset due to failing binary.")
+                    llamaswap_root = install_release_asset(llamaswap_asset, layout.install_root, args.dry_run)
+                    llamaswap_real = _find_executable(llamaswap_root, "llama-swap")
+                else:
+                    if prompt_bool("llama-swap appears broken. Download and install a fresh binary now?", default=True):
+                        llamaswap_root = install_release_asset(llamaswap_asset, layout.install_root, args.dry_run)
+                        llamaswap_real = _find_executable(llamaswap_root, "llama-swap")
+                    else:
+                        print("Continuing without updating llama-swap; some features may be unavailable.")
+                        llamaswap_real = None
+        except RuntimeError as exc:
+            print(f"Warning: {exc}")
+            if update_binaries:
+                # Unexpected: we attempted to install but couldn't find the binary.
+                print(f"llama-swap binary missing after extraction of {llamaswap_asset['name']}; aborting install.")
+                raise
+            if prompt_bool(f"llama-swap not found under {llamaswap_root}. Download and install it now?", default=True):
+                llamaswap_root = install_release_asset(llamaswap_asset, layout.install_root, args.dry_run)
+                llamaswap_real = _find_executable(llamaswap_root, "llama-swap")
+
+        if llamaswap_real is not None:
+            llamaswap_bin = _link_stable_binary(llamaswap_real, layout.install_root / "llama-swap", args.dry_run)
+        else:
+            llamaswap_bin = layout.install_root / "llama-swap"
 
     prefer_cuda_build = llama_cpp_mode == "source" and sys.platform.startswith("linux") and gpu_present and cuda_toolkit_present and args.prefer_source_cuda
 
@@ -2647,8 +2815,38 @@ def install_stack(args: argparse.Namespace) -> int:
         if args.dry_run:
             llama_server_bin = layout.install_root / "llama-server"
         else:
-            llama_server_real = _find_executable(cpp_root, "llama-server")
-            llama_server_bin = _link_stable_binary(llama_server_real, layout.install_root / "llama-server", args.dry_run)
+            # Similar robust handling as for llama-swap: check existing asset, validate
+            # binary, and offer to (re-)install if missing or not working.
+            llama_server_real = None
+            try:
+                print(f"Checking for llama-server under {cpp_root}...")
+                llama_server_real = _find_executable(cpp_root, "llama-server")
+                if not _is_executable_working(llama_server_real):
+                    print(f"Warning: found llama-server at {llama_server_real} but it did not respond to a basic run check.")
+                    if update_binaries:
+                        print("Re-installing llama.cpp prebuilt asset due to failing binary.")
+                        cpp_root = install_release_asset(llama_cpp_asset, layout.install_root, args.dry_run)
+                        llama_server_real = _find_executable(cpp_root, "llama-server")
+                    else:
+                        if prompt_bool("llama-server appears broken. Download and install a fresh binary now?", default=True):
+                            cpp_root = install_release_asset(llama_cpp_asset, layout.install_root, args.dry_run)
+                            llama_server_real = _find_executable(cpp_root, "llama-server")
+                        else:
+                            print("Continuing without updating llama-server; some features may be unavailable.")
+                            llama_server_real = None
+            except RuntimeError as exc:
+                print(f"Warning: {exc}")
+                if update_binaries:
+                    print(f"llama-server binary missing after extraction of {llama_cpp_asset['name']}; aborting install.")
+                    raise
+                if prompt_bool(f"llama-server not found under {cpp_root}. Download and install it now?", default=True):
+                    cpp_root = install_release_asset(llama_cpp_asset, layout.install_root, args.dry_run)
+                    llama_server_real = _find_executable(cpp_root, "llama-server")
+
+            if llama_server_real is not None:
+                llama_server_bin = _link_stable_binary(llama_server_real, layout.install_root / "llama-server", args.dry_run)
+            else:
+                llama_server_bin = layout.install_root / "llama-server"
     else:
         strategy = "source-build"
         if update_binaries:
@@ -2711,13 +2909,8 @@ def install_stack(args: argparse.Namespace) -> int:
         if not isinstance(llama_defaults, dict):
             llama_defaults = {}
             server_config_data["llama_server_defaults"] = llama_defaults
-        current_keep = llama_defaults.get("keep")
-        try:
-            keep_value = int(current_keep)
-        except Exception:
-            keep_value = 0
-        if keep_value <= 0:
-            llama_defaults["keep"] = DEFAULT_SERVER_KEEP
+        _ensure_llama_server_defaults_file(layout.config_dir)
+        _merge_missing_llama_server_defaults(llama_defaults, layout.config_dir)
         _ensure_server_config_metadata(server_config_data)
         server_config_payload = json.dumps(server_config_data, indent=2) + "\n"
         server_config_path.write_text(
@@ -2832,6 +3025,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Ensure parent dir is in path so we can import as a package even when re-executing as a script
+    pkg_dir = Path(__file__).resolve().parent.parent
+    if str(pkg_dir) not in sys.path:
+        sys.path.insert(0, str(pkg_dir))
+
     parser = build_parser()
     args = parser.parse_args(argv)
     return install_stack(args)

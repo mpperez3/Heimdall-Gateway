@@ -5,21 +5,38 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .install import (
-    CLI_COMMAND,
-    LEGACY_CLI_COMMAND,
-    LEGACY_MANAGER_SERVICE_NAME,
-    LEGACY_SWAP_SERVICE_NAME,
-    MANAGER_SERVICE_NAME,
-    MANAGER_WRAPPER_NAME,
-    SWAP_SERVICE_NAME,
-    SWAP_WRAPPER_NAME,
-    InstallLayout,
-    choose_layout,
-    detect_existing_mode,
-    prompt_bool,
-    _sudo_prefix,
-)
+try:
+    from llamacpp_stack.install import (
+        CLI_COMMAND,
+        LEGACY_CLI_COMMAND,
+        LEGACY_MANAGER_SERVICE_NAME,
+        LEGACY_SWAP_SERVICE_NAME,
+        MANAGER_SERVICE_NAME,
+        MANAGER_WRAPPER_NAME,
+        SWAP_SERVICE_NAME,
+        SWAP_WRAPPER_NAME,
+        InstallLayout,
+        choose_layout,
+        detect_existing_mode,
+        prompt_bool,
+        _sudo_prefix,
+    )
+except ImportError:
+    from install import (
+        CLI_COMMAND,
+        LEGACY_CLI_COMMAND,
+        LEGACY_MANAGER_SERVICE_NAME,
+        LEGACY_SWAP_SERVICE_NAME,
+        MANAGER_SERVICE_NAME,
+        MANAGER_WRAPPER_NAME,
+        SWAP_SERVICE_NAME,
+        SWAP_WRAPPER_NAME,
+        InstallLayout,
+        choose_layout,
+        detect_existing_mode,
+        prompt_bool,
+        _sudo_prefix,
+    )
 
 
 def _run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:

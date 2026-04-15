@@ -168,7 +168,16 @@ def _ensure_server_config_metadata(payload: dict[str, object]) -> dict[str, obje
         {
             "idle_ttl": 300,
             "api_port": 11436,
-            "llama_server_defaults": {"ctx_size": 65536, "n_gpu_layers": 999},
+            "llama_server_defaults": {
+                "ctx_size": 65536,
+                "n_gpu_layers": 999,
+                "keep": 512,
+                "mirostat": 2,
+                "mirostat_ent": 4.5,
+                "mirostat_lr": 0.1,
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q8_0",
+            },
         },
     )
     meta.setdefault(
@@ -180,7 +189,31 @@ def _ensure_server_config_metadata(payload: dict[str, object]) -> dict[str, obje
     )
     payload["_meta"] = meta
     return payload
-CATALOG_CACHE: dict[str, tuple[int, int, list["ManagedModel"]]] = {}
+CATALOG_CACHE: dict[tuple[str, tuple[str, int, int]], tuple[int, int, list["ManagedModel"]]] = {}
+
+
+def _server_config_signature(server_config_path: Path | None = None) -> tuple[str, int, int]:
+    path = Path(server_config_path or DEFAULT_SERVER_CONFIG_PATH).expanduser()
+    try:
+        resolved = str(path.resolve())
+    except Exception:
+        resolved = str(path)
+    try:
+        stat = path.stat()
+        return (resolved, int(stat.st_mtime_ns), int(stat.st_size))
+    except OSError:
+        return (resolved, -1, -1)
+
+
+def _catalog_cache_key(path: Path, server_config_path: Path | None = None) -> tuple[str, tuple[str, int, int]]:
+    return (str(path), _server_config_signature(server_config_path))
+
+
+def _clear_catalog_cache(path: Path) -> None:
+    path_key = str(path)
+    for key in list(CATALOG_CACHE.keys()):
+        if key[0] == path_key:
+            CATALOG_CACHE.pop(key, None)
 
 def manager_unavailable_error(exc: Exception) -> RuntimeError:
     return RuntimeError(f"Could not connect to manager: {exc}. Is {MANAGER_SERVICE_NAME} running?")
@@ -368,16 +401,26 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
             if bool_val is not None:
                 normalized[key] = bool_val
             continue
-        if key in {"ctx_size", "n_gpu_layers", "batch_size", "ubatch_size", "threads", "threads_batch", "fit_target", "keep"}:
+        if key in {"ctx_size", "n_gpu_layers", "batch_size", "ubatch_size", "threads", "threads_batch", "fit_target", "keep", "mirostat"}:
             try:
                 normalized[key] = int(raw_val)
             except (TypeError, ValueError):
                 continue
             continue
+        if key in {"mirostat_ent", "mirostat_lr"}:
+            try:
+                normalized[key] = float(raw_val)
+            except (TypeError, ValueError):
+                continue
+            continue
         if key == "flash_attn":
-            bool_val = _normalize_bool_flag(raw_val)
-            if bool_val is not None:
-                normalized[key] = bool_val
+            # Accept boolean-like and string values. Keep raw string values (e.g. "auto")
+            if isinstance(raw_val, str):
+                normalized[key] = raw_val.strip()
+            else:
+                bool_val = _normalize_bool_flag(raw_val)
+                if bool_val is not None:
+                    normalized[key] = bool_val
             continue
         if key == "tensor_split":
             normalized[key] = normalize_tensor_split(str(raw_val))
@@ -416,21 +459,21 @@ def normalize_aliases(values: list[str] | None) -> list[str]:
     return normalized
 
 
-def load_catalog(path: Path) -> list[ManagedModel]:
-    items, _ = load_catalog_with_diagnostics(path)
+def load_catalog(path: Path, server_config_path: Path | None = None) -> list[ManagedModel]:
+    items, _ = load_catalog_with_diagnostics(path, server_config_path=server_config_path)
     return items
 
 
-def load_catalog_with_diagnostics(path: Path) -> tuple[list[ManagedModel], str | None]:
+def load_catalog_with_diagnostics(path: Path, server_config_path: Path | None = None) -> tuple[list[ManagedModel], str | None]:
     if not path.exists():
-        CATALOG_CACHE.pop(str(path), None)
+        _clear_catalog_cache(path)
         return [], f"Catalog file not found: {path}"
-    cache_key = str(path)
+    cache_key = _catalog_cache_key(path, server_config_path)
     try:
         stat = path.stat()
         signature = (stat.st_mtime_ns, stat.st_size)
     except OSError as exc:
-        CATALOG_CACHE.pop(cache_key, None)
+        _clear_catalog_cache(path)
         return [], f"Could not stat catalog {path}: {exc}"
     cached = CATALOG_CACHE.get(cache_key)
     if cached is not None and cached[0] == signature[0] and cached[1] == signature[1]:
@@ -438,20 +481,21 @@ def load_catalog_with_diagnostics(path: Path) -> tuple[list[ManagedModel], str |
     try:
         payload = json.loads(path.read_text("utf-8"))
     except Exception as exc:
-        CATALOG_CACHE.pop(cache_key, None)
+        _clear_catalog_cache(path)
         return [], f"Could not read/parse catalog {path}: {exc}"
     if not isinstance(payload, list):
-        CATALOG_CACHE.pop(cache_key, None)
+        _clear_catalog_cache(path)
         return [], f"Catalog {path} has invalid format (expected a JSON array)."
     try:
         items = [ManagedModel(**m) for m in payload]
     except Exception as exc:
-        CATALOG_CACHE.pop(cache_key, None)
+        _clear_catalog_cache(path)
         return [], f"Catalog {path} has invalid entries: {exc}"
     changed = False
     # Load global llama-server defaults (normalized) so we can prune redundant per-model overrides
     try:
-        server_defaults = resolve_llama_server_defaults()
+        args = argparse.Namespace(server_config=server_config_path) if server_config_path is not None else None
+        server_defaults = resolve_llama_server_defaults(args)
     except Exception:
         server_defaults = {}
 
@@ -496,11 +540,7 @@ def save_catalog(path: Path, models: list[ManagedModel]):
         serialized.append(payload)
     tmp.write_text(json.dumps(serialized, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
-    try:
-        stat = path.stat()
-        CATALOG_CACHE[str(path)] = (stat.st_mtime_ns, stat.st_size, [replace(model) for model in models])
-    except OSError:
-        CATALOG_CACHE.pop(str(path), None)
+    _clear_catalog_cache(path)
 
 
 def _normalize_model_id_token(value: str) -> str:
@@ -573,15 +613,22 @@ def choose_mmproj_file(api, repo_id, token):
                 return candidate
     return files[0]
 
-def render_llamaswap_config(catalog, path, server_path, start_port, idle_ttl=DEFAULT_IDLE_TTL):
+def render_llamaswap_config(
+    catalog,
+    path,
+    server_path,
+    start_port,
+    idle_ttl=DEFAULT_IDLE_TTL,
+    server_defaults: dict[str, object] | None = None,
+):
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "healthCheckTimeout": 600, "logLevel": "info", "logToStdout": "proxy", "startPort": start_port,
         "sendLoadingState": True, "includeAliasesInList": True, "models": {},
     }
-    server_defaults = resolve_llama_server_defaults()
+    resolved_defaults = normalize_server_overrides(server_defaults or resolve_llama_server_defaults())
     for m in sorted(catalog, key=lambda x: x.model_id):
-        cmd = build_llama_server_command(m, server_path, port="${PORT}", server_defaults=server_defaults)
+        cmd = build_llama_server_command(m, server_path, port="${PORT}", server_defaults=resolved_defaults)
         data["models"][m.model_id] = {"cmd": " \\\n  ".join(shell_quote(part) for part in cmd), "checkEndpoint": "/health", "ttl": int(idle_ttl)}
         if m.aliases: data["models"][m.model_id]["aliases"] = m.aliases
         if m.description: data["models"][m.model_id]["description"] = m.description
@@ -691,13 +738,36 @@ def resolve_llama_server_defaults(args = None) -> dict[str, object]:
     return normalize_server_overrides(_load_server_config_payload(args).get("llama_server_defaults"))
 
 
+def _args_server_config_path(args) -> Path | None:
+    value = getattr(args, "server_config", None)
+    if value is None:
+        return None
+    return Path(value)
+
+
 def _append_llama_server_flag(cmd: list[str], key: str, value: object) -> None:
     if key == "split_mode":
         cmd.extend(["--split-mode", str(value)])
     elif key == "flash_attn":
-        bool_val = _normalize_bool_flag(value)
-        if bool_val:
-            cmd.append("--flash-attn")
+        # The underlying llama-server expects an explicit value for --flash-attn
+        # (e.g. "on", "off", "auto"). Accept booleans and common
+        # boolean-like strings and always emit a value token so the next
+        # flag is not accidentally parsed as the value.
+        valstr = None
+        if isinstance(value, bool):
+            valstr = "on" if value else "off"
+        else:
+            sval = str(value).strip()
+            if sval:
+                low = sval.lower()
+                if low in {"1", "true", "yes", "on"}:
+                    valstr = "on"
+                elif low in {"0", "false", "no", "off"}:
+                    valstr = "off"
+                else:
+                    valstr = sval
+        if valstr is not None:
+            cmd.extend(["--flash-attn", valstr])
     elif key == "batch_size":
         cmd.extend(["--batch-size", str(int(value))])
     elif key == "ubatch_size":
@@ -712,6 +782,12 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object) -> None:
         cmd.extend(["--fit-target", str(int(value))])
     elif key == "keep":
         cmd.extend(["--keep", str(int(value))])
+    elif key == "mirostat":
+        cmd.extend(["--mirostat", str(int(value))])
+    elif key == "mirostat_ent":
+        cmd.extend(["--mirostat-ent", str(float(value))])
+    elif key == "mirostat_lr":
+        cmd.extend(["--mirostat-lr", str(float(value))])
     elif key == "cache_type_k":
         cmd.extend(["--cache-type-k", str(value)])
     elif key == "cache_type_v":
@@ -756,6 +832,9 @@ def build_llama_server_command(
         "numa",
         "fit_target",
         "keep",
+        "mirostat",
+        "mirostat_ent",
+        "mirostat_lr",
         "cache_type_k",
         "cache_type_v",
         "mmap",
@@ -878,9 +957,28 @@ def wait_for_model(model_id, host, port, timeout=35):
     spinner.stop()
     return False
 
-def apply_config_and_wait(catalog, config_path, llama_server, start_port, model_id, host, port, progress_callback = None, settle_time = 3.0, timeout = 45.0):
+def apply_config_and_wait(
+    catalog,
+    config_path,
+    llama_server,
+    start_port,
+    model_id,
+    host,
+    port,
+    progress_callback = None,
+    settle_time = 3.0,
+    timeout = 45.0,
+    server_defaults: dict[str, object] | None = None,
+):
     stop_running_ollama_models(progress_callback=progress_callback)
-    render_llamaswap_config(catalog, config_path, llama_server, start_port, resolve_idle_ttl())
+    render_llamaswap_config(
+        catalog,
+        config_path,
+        llama_server,
+        start_port,
+        resolve_idle_ttl(),
+        server_defaults=server_defaults,
+    )
     _emit_message("Config updated. Waiting for llama-swap --watch-config...", progress_callback)
     time.sleep(settle_time)
     if wait_for_model(model_id, host, port, timeout=timeout):
@@ -1593,7 +1691,8 @@ def ensure_model_available(args, progress_callback = None):
             raise manager_unavailable_error(e)
 
     # MANAGER MODE
-    catalog = load_catalog(args.catalog)
+    catalog = load_catalog(args.catalog, _args_server_config_path(args))
+    active_server_defaults = resolve_llama_server_defaults(args)
     stable_catalog = [ManagedModel(**asdict(m)) for m in catalog]
     ref = args.repo or args.hf or args.model_id
     if not ref:
@@ -1751,6 +1850,7 @@ def ensure_model_available(args, progress_callback = None):
                 args.public_host,
                 args.public_port,
                 progress_callback=progress_callback,
+                server_defaults=active_server_defaults,
             )
         except Exception:
             save_catalog(args.catalog, stable_catalog)
@@ -1911,6 +2011,7 @@ def ensure_model_available(args, progress_callback = None):
             args.public_host,
             args.public_port,
             progress_callback=progress_callback,
+            server_defaults=active_server_defaults,
         )
     except Exception:
         save_catalog(args.catalog, stable_catalog)
@@ -1937,8 +2038,27 @@ def wait_for_model_absent(model_id, host, port, timeout=35):
     spinner.stop()
     return False
 
-def apply_config_and_wait_absent(catalog, config_path, llama_server, start_port, model_id, host, port, progress_callback = None, settle_time = 3.0, timeout = 45.0):
-    render_llamaswap_config(catalog, config_path, llama_server, start_port, resolve_idle_ttl())
+def apply_config_and_wait_absent(
+    catalog,
+    config_path,
+    llama_server,
+    start_port,
+    model_id,
+    host,
+    port,
+    progress_callback = None,
+    settle_time = 3.0,
+    timeout = 45.0,
+    server_defaults: dict[str, object] | None = None,
+):
+    render_llamaswap_config(
+        catalog,
+        config_path,
+        llama_server,
+        start_port,
+        resolve_idle_ttl(),
+        server_defaults=server_defaults,
+    )
     _emit_message("Config updated. Waiting for llama-swap --watch-config...", progress_callback)
     time.sleep(settle_time)
     if wait_for_model_absent(model_id, host, port, timeout=timeout):
@@ -1962,7 +2082,7 @@ def remove_model(args, progress_callback = None):
         except Exception as e:
             raise manager_unavailable_error(e)
 
-    catalog = load_catalog(args.catalog)
+    catalog = load_catalog(args.catalog, _args_server_config_path(args))
     model = resolve_catalog_model(catalog, target=args.repo, repo_ref=args.hf, model_id=args.model_id, filename=args.file)
     remaining = [m for m in catalog if m.model_id != model.model_id]
 
@@ -1976,6 +2096,7 @@ def remove_model(args, progress_callback = None):
         args.public_host,
         args.public_port,
         progress_callback=progress_callback,
+        server_defaults=resolve_llama_server_defaults(args),
     )
 
     if args.delete_files:
@@ -3453,7 +3574,7 @@ def list_models(args):
             _show_local_catalog_fallback(args, e)
             return 0
 
-    output = render_models_table(load_catalog(args.catalog), args.public_host, args.public_port, get_effective_idle_ttl(args))
+    output = render_models_table(load_catalog(args.catalog, _args_server_config_path(args)), args.public_host, args.public_port, get_effective_idle_ttl(args))
     if output:
         print("\n" + output)
     else:
@@ -3470,7 +3591,14 @@ def temporarily_unload_published_models(args, progress_callback = None, timeout 
         "To probe ctx reliably, published models will be unloaded temporarily so they do not occupy VRAM.",
         progress_callback,
     )
-    render_llamaswap_config([], args.config, args.llama_server, args.start_port, resolve_idle_ttl(args))
+    render_llamaswap_config(
+        [],
+        args.config,
+        args.llama_server,
+        args.start_port,
+        resolve_idle_ttl(args),
+        server_defaults=resolve_llama_server_defaults(args),
+    )
     _emit_message("Temporary empty config written. Waiting for llama-swap --watch-config...", progress_callback)
     time.sleep(3.0)
     url = f"http://{args.public_host}:{args.public_port}/v1/models"
@@ -3511,7 +3639,14 @@ def restart_service_to_free_vram(service_name: str, progress_callback = None, se
     return False
 
 def restore_catalog_config(args, catalog, progress_callback = None, settle_time = 3.0, restart_service = False):
-    render_llamaswap_config(catalog, args.config, args.llama_server, args.start_port, resolve_idle_ttl(args))
+    render_llamaswap_config(
+        catalog,
+        args.config,
+        args.llama_server,
+        args.start_port,
+        resolve_idle_ttl(args),
+        server_defaults=resolve_llama_server_defaults(args),
+    )
     _emit_message("Previous llama-swap config restored after the failed operation.", progress_callback)
     if restart_service:
         restart_service_to_free_vram(args.service, progress_callback=progress_callback, settle_time=settle_time)
@@ -4077,7 +4212,7 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
 
 
 def _materialize_validation_model(args, progress_callback = None) -> tuple[ManagedModel, Path | None]:
-    catalog = load_catalog(args.catalog)
+    catalog = load_catalog(args.catalog, _args_server_config_path(args))
     try:
         existing = resolve_catalog_model(
             catalog,
@@ -4146,7 +4281,7 @@ def _materialize_validation_model(args, progress_callback = None) -> tuple[Manag
 
 
 def validate_model(args, progress_callback = None):
-    stable_catalog = load_catalog(args.catalog)
+    stable_catalog = load_catalog(args.catalog, _args_server_config_path(args))
     model, temp_root = _materialize_validation_model(args, progress_callback=progress_callback)
     try:
         temporarily_unload_published_models(args, progress_callback=progress_callback)
@@ -4212,7 +4347,7 @@ def update_config(args, progress_callback = None):
                 progress_callback,
             )
 
-    catalog = load_catalog(args.catalog)
+    catalog = load_catalog(args.catalog, _args_server_config_path(args))
     target = getattr(args, "repo", None)
     repo_ref = getattr(args, "hf", None)
     model_id = getattr(args, "model_id", None)
@@ -4269,7 +4404,14 @@ def update_config(args, progress_callback = None):
     else:
         updated_ctx, missing_ctx = sync_catalog_context_sizes(target_models)
     save_catalog(args.catalog, catalog)
-    render_llamaswap_config(catalog, args.config, args.llama_server, args.start_port, resolve_idle_ttl(args))
+    render_llamaswap_config(
+        catalog,
+        args.config,
+        args.llama_server,
+        args.start_port,
+        resolve_idle_ttl(args),
+        server_defaults=resolve_llama_server_defaults(args),
+    )
     if auto_ctx:
         _emit_message(
             f"Catalog ctx updated automatically: {updated_ctx} models changed, {missing_ctx} skipped.",
@@ -4466,18 +4608,21 @@ def daemon_mode(args):
                     mock_args.config = Path(mock_args.config)
                     mock_args.models_dir = Path(mock_args.models_dir)
                     mock_args.llama_server = Path(mock_args.llama_server)
+                    mock_args.server_config = Path(getattr(mock_args, "server_config", DEFAULT_SERVER_CONFIG_PATH))
                     model_id = ensure_model_available(mock_args, progress_callback=send_event)
                     send_event({"type": "done", "model_id": model_id})
                 elif req["command"] == "list":
                     mock_args = argparse.Namespace(**req["args"])
                     mock_args.catalog = Path(mock_args.catalog)
-                    table = render_models_table(load_catalog(mock_args.catalog), mock_args.public_host, mock_args.public_port)
+                    mock_args.server_config = Path(getattr(mock_args, "server_config", DEFAULT_SERVER_CONFIG_PATH))
+                    table = render_models_table(load_catalog(mock_args.catalog, mock_args.server_config), mock_args.public_host, mock_args.public_port)
                     send_event({"type": "done", "result": table})
                 elif req["command"] == "update":
                     mock_args = argparse.Namespace(**req["args"])
                     mock_args.catalog = Path(mock_args.catalog)
                     mock_args.config = Path(mock_args.config)
                     mock_args.llama_server = Path(mock_args.llama_server)
+                    mock_args.server_config = Path(getattr(mock_args, "server_config", DEFAULT_SERVER_CONFIG_PATH))
                     result = update_config(mock_args, progress_callback=send_event)
                     send_event({"type": "done", "result": result})
                 elif req["command"] == "remove":
@@ -4486,6 +4631,7 @@ def daemon_mode(args):
                     mock_args.config = Path(mock_args.config)
                     mock_args.models_dir = Path(mock_args.models_dir)
                     mock_args.llama_server = Path(mock_args.llama_server)
+                    mock_args.server_config = Path(getattr(mock_args, "server_config", DEFAULT_SERVER_CONFIG_PATH))
                     model_id = remove_model(mock_args, progress_callback=send_event)
                     send_event({"type": "done", "model_id": model_id})
             except Exception as e:
@@ -4614,6 +4760,10 @@ def build_help_epilog():
         "Config knobs:\n"
         f"  Global llama-server defaults: {DEFAULT_SERVER_CONFIG_PATH} -> llama_server_defaults\n"
         f"  Per-model overrides:          {DEFAULT_CATALOG_PATH} -> server_overrides\n"
+        "  Default llama-server flags:\n"
+        "    --keep 512, --mirostat 2, --mirostat-ent 4.5, --mirostat-lr 0.1\n"
+        "    --cache-type-k q8_0, --cache-type-v q8_0\n"
+        f"    (Change these in {DEFAULT_SERVER_CONFIG_PATH}['llama_server_defaults'])\n"
         "  Main folders: install root, models dir, state/config paths above.\n"
         f"  API status:          {get_api_endpoint_status()}\n"
         f"  UI status:           {get_public_endpoint_status()}"
