@@ -1,0 +1,36 @@
+# Editable defaults for llamacpp-superserver installs.
+#
+# The installer copies this file to the config directory on first install as
+# `llama_server_defaults.yaml`. Edit the copied file to change the defaults
+# used when `llama_server_defaults` is empty in the active server config.
+#
+# The installer picks a preset by detected GPU count. If a matching preset is
+# not found, the `default` block is used.
+
+default:
+  keep: 512
+  mirostat: 2
+  mirostat_ent: 4.5
+  mirostat_lr: 0.1
+  cache_type_k: q8_0
+  cache_type_v: q8_0
+
+presets:
+  "2":
+    tensor_split: "0.94,1"
+    batch-size: 1024
+    ubatch-size: 512
+    threads: 16
+    threads-batch: 16
+    numa: distribute
+    flash-attn: on
+
+  "7":
+    tensor_split: "0.94,1,1,1,1,1,0.94"
+    batch-size: 2048
+    ubatch-size: 1024
+    threads: 16
+    threads-batch: 16
+    numa: distribute
+    fit-target: 1536
+    flash-attn: on
