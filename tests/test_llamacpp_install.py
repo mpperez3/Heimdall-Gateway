@@ -18,6 +18,9 @@ import yaml
 
 from llamacpp_stack.cli import (
     ManagedModel,
+    add_models,
+    build_openai_model_payload,
+    build_info_text,
     choose_auto_ctx,
     download_hf_file,
     _prepare_manager_socket_path,
@@ -34,9 +37,13 @@ from llamacpp_stack.cli import (
     model_files_ready,
     model_name_aliases,
     normalize_model_id,
+    resolve_catalog_model,
     persist_server_config,
     manager_hint,
     infer_install_mode,
+    remove_model,
+    remove_models,
+    render_models_table,
     render_llamaswap_config,
     resolve_llama_server_defaults,
     resolve_idle_ttl,
@@ -46,6 +53,7 @@ from llamacpp_stack.cli import (
     summarize_download_state,
     should_reload_after_unexpected_unload,
     stop_running_ollama_models,
+    update_models,
     update_config,
     main as cli_main,
 )
@@ -78,6 +86,7 @@ from llamacpp_stack.install import (
     detect_cuda_toolkit,
     derive_models_dir,
     InstallLayout,
+    _backup_existing_model_configuration,
     maybe_reexec_system_install,
     maybe_migrate_existing_install,
     _link_stable_binary,
@@ -588,15 +597,94 @@ class InstallHelpersTest(unittest.TestCase):
 
     def test_build_help_epilog_mentions_paths_and_override_locations(self) -> None:
         help_text = build_help_epilog()
-        self.assertIn("Models dir", help_text)
-        self.assertIn("llama_server_defaults", help_text)
-        self.assertIn("server_overrides", help_text)
-        self.assertIn("Superserver API", help_text)
-        self.assertIn("llama-swap UI/backend", help_text)
-        self.assertIn("Commands:", help_text)
-        self.assertIn("requests -n 1", help_text)
-        self.assertIn("Requests log:", help_text)
+        self.assertIn("Command guide:", help_text)
+        self.assertIn("add [repo ...] [-hf HF ...]", help_text)
+        self.assertIn("run [repo|-hf HF]", help_text)
+        self.assertIn("remove [repo ...|-hf HF ...]", help_text)
+        self.assertIn("rm [repo ...|-hf HF ...]", help_text)
+        self.assertIn("--keep-files", help_text)
+        self.assertIn("update [repo ...|-hf HF ...]", help_text)
+        self.assertIn("validate [repo|-hf HF]", help_text)
+        self.assertIn("daemon", help_text)
+        self.assertIn("list", help_text)
+        self.assertIn("ps", help_text)
+        self.assertIn("requests [-n LINES]", help_text)
+        self.assertIn("info", help_text)
+        self.assertIn("Example: llamacpp-superserver add", help_text)
+        self.assertIn("Example: llamacpp-superserver run", help_text)
+        self.assertIn("Example: llamacpp-superserver remove", help_text)
+        self.assertIn("Example: llamacpp-superserver rm", help_text)
+        self.assertIn("Example: llamacpp-superserver update", help_text)
+        self.assertIn("Example: llamacpp-superserver validate", help_text)
+        self.assertIn("Example: llamacpp-superserver daemon", help_text)
+        self.assertIn("Example: llamacpp-superserver list", help_text)
+        self.assertIn("Example: llamacpp-superserver ps", help_text)
+        self.assertIn("Example: llamacpp-superserver requests", help_text)
+        self.assertIn("For endpoints/runtime/service/config details run", help_text)
+        self.assertNotIn("Default endpoints:", help_text)
+        self.assertNotIn("Installed versions:", help_text)
+        self.assertNotIn("Runtime info:", help_text)
+        self.assertNotIn("Service management:", help_text)
+        self.assertNotIn("Config knobs:", help_text)
         self.assertNotIn("Wrapper API", help_text)
+
+    def test_root_help_is_compact_and_without_ascii_banner(self) -> None:
+        parser, _ = build_cli_parser()
+        help_text = parser.format_help()
+        self.assertFalse(help_text.startswith("=" * 72))
+        self.assertNotIn("llama.cpp  SuperServer", help_text)
+        self.assertNotRegex(help_text, r"(?m)^\s*llamacpp-superserver v\d")
+        self.assertRegex(help_text, r"usage: llamacpp-superserver")
+        self.assertIn("info", help_text)
+
+    def test_build_info_text_contains_runtime_sections(self) -> None:
+        args = Namespace(
+            public_host="0.0.0.0",
+            public_port=11436,
+            api_port=11435,
+            models_dir=Path("/workvols/data3/LLAMACPP_MODELS"),
+            config=Path("/var/lib/llamacpp-superserver/config.yaml"),
+            catalog=Path("/var/lib/llamacpp-superserver/catalog.json"),
+            server_config=Path("/etc/llamacpp-superserver/conf.json"),
+            llama_server=Path("/opt/llamacpp-superserver/llama-server"),
+            idle_ttl=300,
+        )
+        with (
+            mock.patch("llamacpp_stack.cli.read_install_manifest", return_value={"llama_cpp_tag": "b8808", "llamaswap_tag": "v202"}),
+            mock.patch("llamacpp_stack.cli.infer_install_mode", return_value="system"),
+            mock.patch(
+                "llamacpp_stack.cli.service_commands_for_mode",
+                return_value=(
+                    "sudo systemctl start llamacpp-superserver-manager llamacpp-superserver-swap",
+                    "sudo systemctl status llamacpp-superserver-manager llamacpp-superserver-swap",
+                    "sudo systemctl restart llamacpp-superserver-manager llamacpp-superserver-swap",
+                ),
+            ),
+            mock.patch(
+                "llamacpp_stack.cli.get_api_endpoint_status",
+                return_value="reachable on http://0.0.0.0:11435 via 127.0.0.1 (13 catalog models listed)",
+            ),
+            mock.patch(
+                "llamacpp_stack.cli.get_public_endpoint_status",
+                return_value="reachable on http://0.0.0.0:11436 via 127.0.0.1 (97 models listed)",
+            ),
+        ):
+            info_text = build_info_text(args)
+
+        self.assertIn("Default endpoints:", info_text)
+        self.assertIn("Superserver API:       http://0.0.0.0:11435", info_text)
+        self.assertIn("Installed versions:", info_text)
+        self.assertIn("llama.cpp:           b8808", info_text)
+        self.assertIn("llama-swap:          v202", info_text)
+        self.assertIn("Runtime info:", info_text)
+        self.assertIn("Install root:        /opt/llamacpp-superserver", info_text)
+        self.assertIn("Models dir:          /workvols/data3/LLAMACPP_MODELS", info_text)
+        self.assertIn("Service management:", info_text)
+        self.assertIn("Install mode:        system", info_text)
+        self.assertIn("Config knobs:", info_text)
+        self.assertIn("API_CTX factor:", info_text)
+        self.assertIn("API status:          reachable on http://0.0.0.0:11435 via 127.0.0.1 (13 catalog models listed)", info_text)
+        self.assertIn("UI status:           reachable on http://0.0.0.0:11436 via 127.0.0.1 (97 models listed)", info_text)
 
     def test_service_commands_for_mode_use_user_scope_for_user_install(self) -> None:
         start_cmd, status_cmd, restart_cmd = service_commands_for_mode("user")
@@ -628,6 +716,299 @@ class InstallHelpersTest(unittest.TestCase):
         args = parser.parse_args(["run", "-hf", "org/repo:Q4_K_M", "-auto", "--no-chat"])
         self.assertEqual(args.command, "run")
         self.assertTrue(args.auto_ctx)
+
+    def test_cli_parser_accepts_remove_alias_rm(self) -> None:
+        parser, _ = build_cli_parser()
+        args = parser.parse_args(["rm", "org/a:Q4", "org/b:Q5", "--delete-files"])
+        self.assertEqual(args.command, "rm")
+        self.assertEqual(args.repo, ["org/a:Q4", "org/b:Q5"])
+        self.assertTrue(args.delete_files)
+
+    def test_cli_parser_remove_deletes_files_by_default(self) -> None:
+        parser, _ = build_cli_parser()
+        args = parser.parse_args(["remove", "org/a:Q4"])
+        self.assertEqual(args.command, "remove")
+        self.assertTrue(args.delete_files)
+
+    def test_cli_parser_remove_keep_files_disables_disk_deletion(self) -> None:
+        parser, _ = build_cli_parser()
+        args = parser.parse_args(["remove", "org/a:Q4", "--keep-files"])
+        self.assertEqual(args.command, "remove")
+        self.assertFalse(args.delete_files)
+
+    def test_cli_parser_add_accepts_hf_list_with_plain_and_hfco_formats(self) -> None:
+        parser, _ = build_cli_parser()
+        args = parser.parse_args(
+            [
+                "add",
+                "-hf",
+                "Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M",
+                "hf.co/Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M",
+                "--skip-ctx",
+            ]
+        )
+        self.assertEqual(
+            args.hf,
+            [
+                "Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M",
+                "hf.co/Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M",
+            ],
+        )
+        self.assertEqual(args.repo, [])
+
+    def test_add_models_dispatches_each_reference(self) -> None:
+        args = Namespace(repo=["org/a:Q4", "hf.co/org/b:Q5"], hf=None, model_id=None)
+        with mock.patch("llamacpp_stack.cli.ensure_model_available", side_effect=["a", "b"]) as add_mock:
+            result = add_models(args)
+        self.assertEqual(result, 0)
+        self.assertEqual([call.args[0].repo for call in add_mock.call_args_list], ["org/a:Q4", "hf.co/org/b:Q5"])
+
+    def test_remove_models_dispatches_each_reference(self) -> None:
+        args = Namespace(repo=["org/a:Q4", "org/b:Q5"], hf=None, model_id=None, file=None)
+        with mock.patch("llamacpp_stack.cli.remove_model", side_effect=["a", "b"]) as remove_mock:
+            result = remove_models(args)
+        self.assertEqual(result, 0)
+        self.assertEqual([call.args[0].repo for call in remove_mock.call_args_list], ["org/a:Q4", "org/b:Q5"])
+
+    def test_remove_models_defaults_delete_files_when_missing_attribute(self) -> None:
+        args = Namespace(repo=["org/a:Q4"], hf=None, model_id=None, file=None, command="remove")
+        with mock.patch("llamacpp_stack.cli.remove_model", side_effect=["a"]) as remove_mock:
+            result = remove_models(args)
+        self.assertEqual(result, 0)
+        self.assertTrue(remove_mock.call_args_list[0].args[0].delete_files)
+
+    def test_remove_model_deletes_selected_file_when_repo_is_shared(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            repo_dir = models_dir / "unsloth" / "Kimi-Dev-72B-GGUF"
+            repo_dir.mkdir(parents=True)
+            q4_0 = repo_dir / "Kimi-Dev-72B-Q4_0.gguf"
+            q4_1 = repo_dir / "Kimi-Dev-72B-Q4_1.gguf"
+            q4_0.write_bytes(b"q4_0")
+            q4_1.write_bytes(b"q4_1")
+
+            catalog_path = root / "state" / "catalog.json"
+            catalog_path.parent.mkdir(parents=True)
+            save_catalog(
+                catalog_path,
+                [
+                    ManagedModel(
+                        model_id="kimi-dev-72b-q4_0",
+                        repo_id="unsloth/Kimi-Dev-72B-GGUF",
+                        quant="Q4_0",
+                        filename=q4_0.name,
+                        local_path=str(q4_0),
+                    ),
+                    ManagedModel(
+                        model_id="kimi-dev-72b-q4_1",
+                        repo_id="unsloth/Kimi-Dev-72B-GGUF",
+                        quant="Q4_1",
+                        filename=q4_1.name,
+                        local_path=str(q4_1),
+                    ),
+                ],
+            )
+
+            args = Namespace(
+                catalog=catalog_path,
+                config=root / "state" / "config.yaml",
+                llama_server=root / "llama-server",
+                start_port=18080,
+                public_host="127.0.0.1",
+                public_port=11435,
+                models_dir=models_dir,
+                repo="kimi-dev-72b-q4_0",
+                hf=None,
+                model_id=None,
+                file=None,
+                delete_files=True,
+                server_config=root / "conf.json",
+            )
+
+            with (
+                mock.patch("llamacpp_stack.cli.apply_config_and_wait_absent"),
+                mock.patch("llamacpp_stack.cli.resolve_llama_server_defaults", return_value={}),
+            ):
+                removed = remove_model(args)
+
+            self.assertEqual(removed, "kimi-dev-72b-q4_0")
+            self.assertFalse(q4_0.exists())
+            self.assertTrue(q4_1.exists())
+            self.assertTrue(repo_dir.exists())
+
+    def test_remove_model_prunes_empty_owner_folder_when_last_model_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            repo_dir = models_dir / "unsloth" / "Kimi-Dev-72B-GGUF"
+            repo_dir.mkdir(parents=True)
+            q4_0 = repo_dir / "Kimi-Dev-72B-Q4_0.gguf"
+            q4_0.write_bytes(b"q4_0")
+
+            catalog_path = root / "state" / "catalog.json"
+            catalog_path.parent.mkdir(parents=True)
+            save_catalog(
+                catalog_path,
+                [
+                    ManagedModel(
+                        model_id="kimi-dev-72b-q4_0",
+                        repo_id="unsloth/Kimi-Dev-72B-GGUF",
+                        quant="Q4_0",
+                        filename=q4_0.name,
+                        local_path=str(q4_0),
+                    )
+                ],
+            )
+
+            args = Namespace(
+                catalog=catalog_path,
+                config=root / "state" / "config.yaml",
+                llama_server=root / "llama-server",
+                start_port=18080,
+                public_host="127.0.0.1",
+                public_port=11435,
+                models_dir=models_dir,
+                repo="kimi-dev-72b-q4_0",
+                hf=None,
+                model_id=None,
+                file=None,
+                delete_files=True,
+                server_config=root / "conf.json",
+            )
+
+            with (
+                mock.patch("llamacpp_stack.cli.apply_config_and_wait_absent"),
+                mock.patch("llamacpp_stack.cli.resolve_llama_server_defaults", return_value={}),
+            ):
+                remove_model(args)
+
+            self.assertFalse(q4_0.exists())
+            self.assertFalse(repo_dir.exists())
+            self.assertFalse((models_dir / "unsloth").exists())
+            self.assertTrue(models_dir.exists())
+
+    def test_remove_model_missing_in_catalog_deletes_matching_orphan_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            repo_dir = models_dir / "unsloth" / "Kimi-Dev-72B-GGUF"
+            repo_dir.mkdir(parents=True)
+            orphan = repo_dir / "Kimi-Dev-72B-Q4_0.gguf"
+            keep = repo_dir / "Kimi-Dev-72B-Q4_1.gguf"
+            orphan.write_bytes(b"q4_0")
+            keep.write_bytes(b"q4_1")
+
+            catalog_path = root / "state" / "catalog.json"
+            catalog_path.parent.mkdir(parents=True)
+            save_catalog(catalog_path, [])
+
+            args = Namespace(
+                catalog=catalog_path,
+                config=root / "state" / "config.yaml",
+                llama_server=root / "llama-server",
+                start_port=18080,
+                public_host="127.0.0.1",
+                public_port=11435,
+                models_dir=models_dir,
+                repo="kimi-dev-72b-q4_0",
+                hf=None,
+                model_id=None,
+                file=None,
+                delete_files=True,
+                server_config=root / "conf.json",
+            )
+
+            removed = remove_model(args)
+
+            self.assertEqual(removed, "kimi-dev-72b-q4_0")
+            self.assertFalse(orphan.exists())
+            self.assertTrue(keep.exists())
+
+    def test_remove_model_missing_in_catalog_still_errors_with_keep_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            repo_dir = models_dir / "unsloth" / "Kimi-Dev-72B-GGUF"
+            repo_dir.mkdir(parents=True)
+            orphan = repo_dir / "Kimi-Dev-72B-Q4_0.gguf"
+            orphan.write_bytes(b"q4_0")
+
+            catalog_path = root / "state" / "catalog.json"
+            catalog_path.parent.mkdir(parents=True)
+            save_catalog(catalog_path, [])
+
+            args = Namespace(
+                catalog=catalog_path,
+                config=root / "state" / "config.yaml",
+                llama_server=root / "llama-server",
+                start_port=18080,
+                public_host="127.0.0.1",
+                public_port=11435,
+                models_dir=models_dir,
+                repo="kimi-dev-72b-q4_0",
+                hf=None,
+                model_id=None,
+                file=None,
+                delete_files=False,
+                server_config=root / "conf.json",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "Model not found in catalog"):
+                remove_model(args)
+
+            self.assertTrue(orphan.exists())
+
+    def test_resolve_catalog_model_accepts_separator_variant_in_model_id(self) -> None:
+        catalog = [
+            ManagedModel(
+                model_id="kimi-dev-72b-q4_0",
+                repo_id="unsloth/Kimi-Dev-72B-GGUF",
+                quant="Q4_0",
+                filename="Kimi-Dev-72B-Q4_0.gguf",
+                local_path="/models/unsloth/Kimi-Dev-72B-GGUF/Kimi-Dev-72B-Q4_0.gguf",
+            )
+        ]
+        resolved = resolve_catalog_model(catalog, target="kimi-dev-72b-q4-0")
+        self.assertEqual(resolved.model_id, "kimi-dev-72b-q4_0")
+
+    def test_resolve_catalog_model_accepts_case_insensitive_model_id(self) -> None:
+        catalog = [
+            ManagedModel(
+                model_id="kimi-dev-72b-q4_0",
+                repo_id="unsloth/Kimi-Dev-72B-GGUF",
+                quant="Q4_0",
+                filename="Kimi-Dev-72B-Q4_0.gguf",
+                local_path="/models/unsloth/Kimi-Dev-72B-GGUF/Kimi-Dev-72B-Q4_0.gguf",
+            )
+        ]
+        resolved = resolve_catalog_model(catalog, target="KIMI-DEV-72B-Q4_0")
+        self.assertEqual(resolved.model_id, "kimi-dev-72b-q4_0")
+
+    def test_cli_parser_accepts_info_command(self) -> None:
+        parser, _ = build_cli_parser()
+        args = parser.parse_args(["info"])
+        self.assertEqual(args.command, "info")
+
+    def test_cli_main_rejects_dash_info_with_clear_message(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", [CLI_COMMAND, "-info"]),
+            redirect_stderr(stderr),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                cli_main()
+
+        self.assertEqual(ctx.exception.code, 2)
+        rendered = stderr.getvalue()
+        self.assertIn("Use the 'info' subcommand without dashes", rendered)
+
+    def test_update_models_dispatches_each_reference(self) -> None:
+        args = Namespace(repo=["org/a:Q4", "org/b:Q5"], hf=None, model_id=None, file=None)
+        with mock.patch("llamacpp_stack.cli.update_config", side_effect=["updated", "updated"]) as update_mock:
+            result = update_models(args)
+        self.assertEqual(result, 0)
+        self.assertEqual([call.args[0].repo for call in update_mock.call_args_list], ["org/a:Q4", "org/b:Q5"])
 
     def test_cli_main_shows_subcommand_help_on_unrecognized_argument(self) -> None:
         stderr = io.StringIO()
@@ -776,7 +1157,48 @@ class InstallHelpersTest(unittest.TestCase):
             )
             with mock.patch("llamacpp_stack.install.subprocess.run") as run_mock:
                 print_install_summary(layout, install_services=True)
-            run_mock.assert_called_once_with([str(help_cmd), "--help"], check=False)
+            self.assertEqual(
+                run_mock.call_args_list,
+                [
+                    mock.call([str(help_cmd), "list"], check=False),
+                    mock.call([str(help_cmd), "--help"], check=False),
+                ],
+            )
+
+    def test_backup_existing_model_configuration_copies_current_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            config_dir = root / "config"
+            state_dir.mkdir(parents=True)
+            config_dir.mkdir(parents=True)
+            (state_dir / "catalog.json").write_text("[]\n", encoding="utf-8")
+            (state_dir / "config.yaml").write_text("models: {}\n", encoding="utf-8")
+            (config_dir / SERVER_CONFIG_BASENAME).write_text('{"api_port":11436}\n', encoding="utf-8")
+
+            layout = InstallLayout(
+                mode="system",
+                state_dir=state_dir,
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=root / "models",
+                config_dir=config_dir,
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+
+            backup_dir = _backup_existing_model_configuration(layout, dry_run=False)
+            self.assertIsNotNone(backup_dir)
+            self.assertTrue((backup_dir / "state" / "catalog.json").exists())
+            self.assertTrue((backup_dir / "state" / "config.yaml").exists())
+            self.assertTrue((backup_dir / "config" / SERVER_CONFIG_BASENAME).exists())
 
     def test_wait_for_manager_socket_returns_true_when_socket_is_reachable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -848,6 +1270,51 @@ class InstallHelpersTest(unittest.TestCase):
             ):
                 maybe_rerun_auto_ctx(layout, install_services=True, dry_run=False, args=argparse.Namespace())
             run_mock.assert_called_once_with([str(layout.bin_dir / CLI_COMMAND), "update", "--auto"])
+
+    def test_maybe_rerun_auto_ctx_sync_uses_preserve_ctx(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            models_dir.mkdir(parents=True)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True)
+            (state_dir / "catalog.json").write_text(
+                '[{"model_id":"repo-q4","repo_id":"org/repo","filename":"model.gguf"}]\n',
+                encoding="utf-8",
+            )
+            config_dir = root / "config"
+            config_dir.mkdir(parents=True)
+
+            layout = InstallLayout(
+                mode="system",
+                state_dir=state_dir,
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=models_dir,
+                config_dir=config_dir,
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+
+            with (
+                mock.patch("llamacpp_stack.install.wait_for_manager_socket", return_value=True),
+                mock.patch("llamacpp_stack.install._run") as run_mock,
+            ):
+                maybe_rerun_auto_ctx(
+                    layout,
+                    install_services=True,
+                    dry_run=False,
+                    args=argparse.Namespace(migrate_model_ids=False, rerun_auto_ctx=False),
+                )
+
+            run_mock.assert_called_once_with([str(layout.bin_dir / CLI_COMMAND), "update", "--preserve-ctx"])
 
     def test_maybe_rerun_auto_ctx_repairs_stale_server_config_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1838,6 +2305,141 @@ class InstallHelpersTest(unittest.TestCase):
             manager_mock.assert_called_once()
             self.assertEqual(result, "updated")
 
+    def test_update_config_preserves_ctx_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            catalog_path = root / "catalog.json"
+            config_path = root / "config.yaml"
+            save_catalog(
+                catalog_path,
+                [
+                    ManagedModel(
+                        model_id="repo-q4",
+                        repo_id="org/repo",
+                        quant="Q4",
+                        filename="model-q4.gguf",
+                        local_path=str(root / "models" / "model-q4.gguf"),
+                        ctx_size=24576,
+                    )
+                ],
+            )
+            args = Namespace(
+                repo=None,
+                hf=None,
+                model_id=None,
+                file=None,
+                ctx_override=None,
+                auto_ctx=False,
+                preserve_ctx=False,
+                sync_gguf_ctx=False,
+                catalog=catalog_path,
+                config=config_path,
+                llama_server=root / "llama-server",
+                start_port=18080,
+                public_host="127.0.0.1",
+                public_port=11435,
+                idle_ttl=10,
+                server_config=root / SERVER_CONFIG_BASENAME,
+            )
+
+            response = mock.Mock(status_code=200)
+            response.json.return_value = {"data": []}
+
+            with (
+                mock.patch("llamacpp_stack.cli.sync_catalog_context_sizes") as sync_mock,
+                mock.patch("llamacpp_stack.cli.time.sleep"),
+                mock.patch("llamacpp_stack.cli.requests.get", return_value=response),
+            ):
+                result = update_config(args)
+
+            self.assertEqual(result, "updated")
+            sync_mock.assert_not_called()
+            refreshed = load_catalog(catalog_path)
+            self.assertEqual(refreshed[0].ctx_size, 24576)
+
+    def test_update_config_auto_ctx_min_failed_prompts_and_deletes_models(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            fail_repo_dir = models_dir / "org/fail-repo"
+            ok_repo_dir = models_dir / "org/ok-repo"
+            fail_repo_dir.mkdir(parents=True)
+            ok_repo_dir.mkdir(parents=True)
+
+            fail_model_path = fail_repo_dir / "fail.gguf"
+            ok_model_path = ok_repo_dir / "ok.gguf"
+            fail_model_path.write_bytes(b"gguf")
+            ok_model_path.write_bytes(b"gguf")
+
+            catalog_path = root / "catalog.json"
+            config_path = root / "config.yaml"
+            save_catalog(
+                catalog_path,
+                [
+                    ManagedModel(
+                        model_id="fail-model",
+                        repo_id="org/fail-repo",
+                        quant="Q8_0",
+                        filename="fail.gguf",
+                        local_path=str(fail_model_path),
+                        ctx_size=8192,
+                    ),
+                    ManagedModel(
+                        model_id="ok-model",
+                        repo_id="org/ok-repo",
+                        quant="Q4_K_M",
+                        filename="ok.gguf",
+                        local_path=str(ok_model_path),
+                        ctx_size=4096,
+                    ),
+                ],
+            )
+
+            args = Namespace(
+                repo=None,
+                hf=None,
+                model_id=None,
+                file=None,
+                ctx_override=None,
+                auto_ctx=True,
+                catalog=catalog_path,
+                config=config_path,
+                llama_server=root / "llama-server",
+                start_port=18080,
+                public_host="127.0.0.1",
+                public_port=11435,
+                idle_ttl=10,
+                server_config=root / SERVER_CONFIG_BASENAME,
+                models_dir=models_dir,
+            )
+
+            response = mock.Mock(status_code=200)
+            response.json.return_value = {"data": []}
+
+            with (
+                mock.patch("llamacpp_stack.cli.temporarily_unload_published_models"),
+                mock.patch(
+                    "llamacpp_stack.cli.choose_auto_ctx",
+                    side_effect=[
+                        (None, "min-failed", {"min_ctx": 8192, "reason": "timeout"}),
+                        (16384, "selected", {"selected_ctx": 16384}),
+                    ],
+                ),
+                mock.patch("llamacpp_stack.cli.resolve_llama_server_defaults", return_value={}),
+                mock.patch("llamacpp_stack.cli._ask_confirmation", return_value=True) as ask_mock,
+                mock.patch("llamacpp_stack.cli.time.sleep"),
+                mock.patch("llamacpp_stack.cli.requests.get", return_value=response),
+            ):
+                result = update_config(args)
+
+            self.assertEqual(result, "updated")
+            ask_mock.assert_called_once()
+
+            remaining = load_catalog(catalog_path)
+            self.assertEqual([m.model_id for m in remaining], ["ok-model"])
+            self.assertFalse(fail_repo_dir.exists())
+            self.assertTrue(ok_repo_dir.exists())
+
     def test_desired_models_dir_owner_uses_service_identity_for_system_mode(self) -> None:
         layout = InstallLayout(
             mode="system",
@@ -1963,6 +2565,8 @@ class InstallHelpersTest(unittest.TestCase):
 
     def test_load_catalog_normalizes_server_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
+            server_config = Path(tmp) / SERVER_CONFIG_BASENAME
+            server_config.write_text('{"llama_server_defaults":{}}\n', encoding="utf-8")
             catalog_path = Path(tmp) / "catalog.json"
             catalog_path.write_text(
                 """
@@ -1985,7 +2589,8 @@ class InstallHelpersTest(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            model = load_catalog(catalog_path)[0]
+            with mock.patch("llamacpp_stack.cli.DEFAULT_SERVER_CONFIG_PATH", server_config):
+                model = load_catalog(catalog_path)[0]
             self.assertEqual(model.server_overrides, {"flash_attn": "on", "batch_size": 1024})
 
     def test_build_llama_server_command_emits_flash_attn_with_explicit_value(self) -> None:
@@ -2589,6 +3194,36 @@ models:
         self.assertEqual(status, "selected")
         self.assertEqual(info["selected_ctx"], 262144)
 
+    def test_choose_auto_ctx_refresh_prefers_previous_ctx_first(self) -> None:
+        model = ManagedModel(
+            model_id="repo-q4",
+            repo_id="org/repo",
+            quant="Q4_K_M",
+            filename="model.gguf",
+            local_path="/tmp/model.gguf",
+            ctx_size=16384,
+        )
+        with (
+            mock.patch("llamacpp_stack.cli.get_model_context_size", return_value=65536),
+            mock.patch("llamacpp_stack.cli._query_gpu_free_memory_mib", return_value={0: 24576.0}),
+            mock.patch("llamacpp_stack.cli._parse_probe_trace_metrics", return_value=mock.Mock()),
+            mock.patch("llamacpp_stack.cli._estimate_ctx_ceiling", return_value=24576),
+            mock.patch(
+                "llamacpp_stack.cli.probe_model_ctx",
+                side_effect=[
+                    (True, "ok", {}),
+                    (True, "ok", {}),
+                    (True, "ok", {}),
+                ],
+            ) as probe_mock,
+        ):
+            selected, status, info = choose_auto_ctx(model, Path("/tmp/llama-server"))
+
+        self.assertEqual([call.args[2] for call in probe_mock.call_args_list], [8192, 16384, 65536])
+        self.assertEqual(status, "selected")
+        self.assertEqual(selected, 65536)
+        self.assertEqual(info["selected_ctx"], 65536)
+
     def test_choose_auto_ctx_uses_memory_estimate_after_max_failure(self) -> None:
         model = ManagedModel(
             model_id="repo-q4",
@@ -2607,6 +3242,7 @@ models:
                 side_effect=[
                     (True, "ok"),
                     (False, "exit--11"),
+                    (True, "ok"),
                     (False, "exit--11"),
                     (True, "ok"),
                 ],
@@ -2614,10 +3250,110 @@ models:
         ):
             selected, status, info = choose_auto_ctx(model, Path("/tmp/llama-server"))
 
-        self.assertEqual([call.args[2] for call in probe_mock.call_args_list], [8192, 32768, 12288, 10240])
+        self.assertEqual([call.args[2] for call in probe_mock.call_args_list], [8192, 32768, 8192, 12288, 10240])
         self.assertEqual(status, "selected")
         self.assertEqual(selected, 10240)
         self.assertEqual(info["first_failure"], 12288)
+
+    def test_build_openai_model_payload_exposes_ctx_probe_metrics_with_nc_defaults(self) -> None:
+        model = ManagedModel(
+            model_id="repo-q4",
+            repo_id="org/repo",
+            quant="Q4",
+            filename="model.gguf",
+            local_path="/tmp/model.gguf",
+            ctx_size=32768,
+        )
+        with mock.patch("llamacpp_stack.cli.get_model_context_size", return_value=65536):
+            payload = build_openai_model_payload(model)
+
+        metadata = payload["metadata"]
+        self.assertEqual(metadata["configured_context_length"], 32768)
+        self.assertEqual(metadata["api_context_length"], 16384)
+        self.assertEqual(metadata["context_length"], 32768)
+        self.assertEqual(metadata["gguf_context_length"], 65536)
+        self.assertIsNone(metadata["ctx_probe_latency_ms"])
+        self.assertIsNone(metadata["ctx_probe_speed_tps"])
+        self.assertIsNone(metadata["ctx_probe_kv_gb"])
+        self.assertEqual(metadata["ctx_probe_latency"], "NC")
+        self.assertEqual(metadata["ctx_probe_speed"], "NC")
+        self.assertEqual(metadata["ctx_probe_kv"], "NC")
+
+    def test_render_models_table_shows_ctx_gb_and_speed_columns(self) -> None:
+        model = ManagedModel(
+            model_id="repo-q4",
+            repo_id="org/repo",
+            quant="Q4",
+            filename="model.gguf",
+            local_path="/tmp/model.gguf",
+            ctx_probe_kv_gb=3.25,
+            ctx_probe_speed_tps=118.4,
+        )
+        with (
+            mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value=set()),
+            mock.patch("llamacpp_stack.cli.get_llama_server_processes", return_value=[]),
+            mock.patch("llamacpp_stack.cli.get_gpu_process_map", return_value={}),
+            mock.patch("llamacpp_stack.cli.get_model_context_size", return_value=65536),
+            mock.patch("llamacpp_stack.cli.get_model_storage_info", return_value={"size": 1024, "file_count": 1, "status": "ready"}),
+        ):
+            table = render_models_table([model], host="127.0.0.1", port=11435, idle_ttl=10)
+
+        self.assertIn("CTX_GB", table)
+        self.assertIn("SPEED", table)
+        self.assertIn("CFG_CTX", table)
+        self.assertIn("API_CTX", table)
+        self.assertNotIn("MAX_CTX", table)
+        self.assertIn("3.25", table)
+        self.assertIn("118.4 tok/s", table)
+
+    def test_render_models_table_marks_error_for_failed_min_probe(self) -> None:
+        model = ManagedModel(
+            model_id="repo-q4",
+            repo_id="org/repo",
+            quant="Q4",
+            filename="model.gguf",
+            local_path="/tmp/model.gguf",
+            auto_ctx_failed=True,
+            auto_ctx_error="min-failed:timeout",
+        )
+        with (
+            mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value=set()),
+            mock.patch("llamacpp_stack.cli.get_llama_server_processes", return_value=[]),
+            mock.patch("llamacpp_stack.cli.get_gpu_process_map", return_value={}),
+            mock.patch("llamacpp_stack.cli.get_model_storage_info", return_value={"size": 1024, "file_count": 1, "status": "ready"}),
+        ):
+            table = render_models_table([model], host="127.0.0.1", port=11435, idle_ttl=10)
+
+        self.assertIn("ERROR", table)
+
+    def test_choose_auto_ctx_returns_min_failed_when_guard_probe_fails(self) -> None:
+        model = ManagedModel(
+            model_id="repo-q4",
+            repo_id="org/repo",
+            quant="Q4_K_M",
+            filename="model.gguf",
+            local_path="/tmp/model.gguf",
+        )
+        with (
+            mock.patch("llamacpp_stack.cli.get_model_context_size", return_value=32768),
+            mock.patch("llamacpp_stack.cli._query_gpu_free_memory_mib", return_value={0: 24576.0}),
+            mock.patch("llamacpp_stack.cli._parse_probe_trace_metrics", return_value=mock.Mock()),
+            mock.patch("llamacpp_stack.cli._estimate_ctx_ceiling", return_value=12288),
+            mock.patch(
+                "llamacpp_stack.cli.probe_model_ctx",
+                side_effect=[
+                    (True, "ok"),
+                    (False, "exit--11"),
+                    (False, "timeout"),
+                ],
+            ) as probe_mock,
+        ):
+            selected, status, info = choose_auto_ctx(model, Path("/tmp/llama-server"))
+
+        self.assertIsNone(selected)
+        self.assertEqual(status, "min-failed")
+        self.assertEqual(info["min_ctx"], 8192)
+        self.assertEqual([call.args[2] for call in probe_mock.call_args_list], [8192, 32768, 8192])
 
     def test_model_name_aliases_include_filename_variants_and_repo_with_without_hf_prefix(self) -> None:
         model = ManagedModel(

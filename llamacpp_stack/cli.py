@@ -34,6 +34,7 @@ import termios
 from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -100,7 +101,12 @@ SWAP_SERVICE_NAME = "llamacpp-superserver-swap"
 DEFAULT_LLAMA_SERVER = _env_path("LLAMA_SERVER_BIN", "/opt/llamacpp-superserver/llama.cpp/build/bin/llama-server")
 
 DEFAULT_CTX_SIZE = 8192
-DEFAULT_CTX_DISPLAY_RATIO = float(os.environ.get("LLAMACPP_CTX_DISPLAY_RATIO", "0.5"))
+try:
+    DEFAULT_API_CTX_FACTOR = float(
+        os.environ.get("LLAMACPP_API_CTX_FACTOR", os.environ.get("LLAMACPP_CTX_DISPLAY_RATIO", "0.5"))
+    )
+except ValueError:
+    DEFAULT_API_CTX_FACTOR = 0.5
 DEFAULT_N_GPU_LAYERS = 999
 DEFAULT_IDLE_TTL = int(os.environ.get("LLAMACPP_IDLE_TTL", os.environ.get("LLAMACPP_DEFAULT_TTL", "300")))
 
@@ -168,6 +174,7 @@ def _ensure_server_config_metadata(payload: dict[str, object]) -> dict[str, obje
         {
             "idle_ttl": 300,
             "api_port": 11436,
+            "api_ctx_factor": 0.5,
             "llama_server_defaults": {
                 "ctx_size": 65536,
                 "n_gpu_layers": 999,
@@ -322,6 +329,10 @@ class ManagedModel:
     description: str = ""
     auto_ctx_failed: bool = False
     auto_ctx_error: str = ""
+    ctx_probe_latency_ms: float | None = None
+    ctx_probe_speed_tps: float | None = None
+    ctx_probe_kv_gb: float | None = None
+    ctx_probe_prompt_tokens: int | None = None
     server_overrides: dict[str, object] = field(default_factory=dict)
 
 
@@ -459,6 +470,93 @@ def normalize_aliases(values: list[str] | None) -> list[str]:
     return normalized
 
 
+def _to_float_or_none(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    try:
+        return float(normalized)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int_or_none(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    try:
+        return int(normalized)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_ctx_probe_gb(value: float | None) -> str:
+    if value is None:
+        return "NC"
+    return f"{value:.2f}"
+
+
+def _format_ctx_probe_speed(value: float | None) -> str:
+    if value is None:
+        return "NC"
+    return f"{value:.1f} tok/s"
+
+
+def _format_ctx_probe_latency(value: float | None) -> str:
+    if value is None:
+        return "NC"
+    return f"{value:.0f} ms"
+
+
+def clear_ctx_probe_metrics(model: ManagedModel) -> None:
+    model.ctx_probe_latency_ms = None
+    model.ctx_probe_speed_tps = None
+    model.ctx_probe_kv_gb = None
+    model.ctx_probe_prompt_tokens = None
+
+
+def apply_ctx_probe_metrics(model: ManagedModel, info: dict[str, object] | None) -> None:
+    payload = info or {}
+    model.ctx_probe_latency_ms = _to_float_or_none(payload.get("probe_latency_ms"))
+    model.ctx_probe_speed_tps = _to_float_or_none(payload.get("probe_speed_tps"))
+    model.ctx_probe_kv_gb = _to_float_or_none(payload.get("selected_ctx_gb"))
+    model.ctx_probe_prompt_tokens = _to_int_or_none(payload.get("probe_prompt_tokens"))
+
+
+def _ctx_probe_api_metrics(model: ManagedModel) -> dict[str, object]:
+    latency_ms = _to_float_or_none(model.ctx_probe_latency_ms)
+    speed_tps = _to_float_or_none(model.ctx_probe_speed_tps)
+    kv_gb = _to_float_or_none(model.ctx_probe_kv_gb)
+    prompt_tokens = _to_int_or_none(model.ctx_probe_prompt_tokens)
+    return {
+        "ctx_probe_latency_ms": latency_ms,
+        "ctx_probe_speed_tps": speed_tps,
+        "ctx_probe_kv_gb": kv_gb,
+        "ctx_probe_prompt_tokens": prompt_tokens,
+        "ctx_probe_latency": _format_ctx_probe_latency(latency_ms),
+        "ctx_probe_speed": _format_ctx_probe_speed(speed_tps),
+        "ctx_probe_kv": _format_ctx_probe_gb(kv_gb),
+    }
+
+
 def load_catalog(path: Path, server_config_path: Path | None = None) -> list[ManagedModel]:
     items, _ = load_catalog_with_diagnostics(path, server_config_path=server_config_path)
     return items
@@ -503,6 +601,26 @@ def load_catalog_with_diagnostics(path: Path, server_config_path: Path | None = 
         normalized_aliases = normalize_aliases(item.aliases)
         if normalized_aliases != item.aliases:
             item.aliases = normalized_aliases
+            changed = True
+
+        normalized_probe_latency = _to_float_or_none(item.ctx_probe_latency_ms)
+        if normalized_probe_latency != item.ctx_probe_latency_ms:
+            item.ctx_probe_latency_ms = normalized_probe_latency
+            changed = True
+
+        normalized_probe_speed = _to_float_or_none(item.ctx_probe_speed_tps)
+        if normalized_probe_speed != item.ctx_probe_speed_tps:
+            item.ctx_probe_speed_tps = normalized_probe_speed
+            changed = True
+
+        normalized_probe_kv_gb = _to_float_or_none(item.ctx_probe_kv_gb)
+        if normalized_probe_kv_gb != item.ctx_probe_kv_gb:
+            item.ctx_probe_kv_gb = normalized_probe_kv_gb
+            changed = True
+
+        normalized_probe_prompt_tokens = _to_int_or_none(item.ctx_probe_prompt_tokens)
+        if normalized_probe_prompt_tokens != item.ctx_probe_prompt_tokens:
+            item.ctx_probe_prompt_tokens = normalized_probe_prompt_tokens
             changed = True
 
         normalized = preferred_tensor_split(item, item.tensor_split)
@@ -553,6 +671,11 @@ def _normalize_model_id_token(value: str) -> str:
     token = re.sub(r"[-._]{2,}", "-", token)
     token = re.sub(r"[^a-z0-9._-]+", "-", token).strip("-._")
     return token
+
+
+def _canonical_model_ref(value: str) -> str:
+    token = _normalize_model_id_token(value)
+    return re.sub(r"[-._]+", "-", token).strip("-")
 
 
 def _append_quant_suffix_if_missing(base_id: str, quant: str | None) -> str:
@@ -670,26 +793,24 @@ def _load_server_config_payload(args = None) -> dict:
     return {}
 
 
-def resolve_ctx_display_ratio(args = None) -> float:
-    """Read runtime display ratio for configured ctx from server config.
+def resolve_api_ctx_factor(args = None) -> float:
+    """Read API ctx factor used to derive API_CTX from CFG_CTX.
 
-    Accepts numeric ratios (0.5), percentages (50 or "50%") and falls back
-    to `DEFAULT_CTX_DISPLAY_RATIO` when missing or invalid. Always returns
-    a value in [0.0, 1.0].
+    Accepts numeric ratios (0.5), percentages (50 or "50%").
+    Prefers `api_ctx_factor` and falls back to legacy ctx_display keys.
+    Always returns a value in [0.0, 1.0].
     """
     try:
         payload = _load_server_config_payload(args)
     except Exception:
-        return float(DEFAULT_CTX_DISPLAY_RATIO)
-    val = payload.get("ctx_display_ratio")
+        return float(DEFAULT_API_CTX_FACTOR)
+    val = payload.get("api_ctx_factor")
+    if val is None:
+        val = payload.get("ctx_display_ratio")
     if val is None:
         val = payload.get("ctx_display_percent")
     if val is None:
-        # allow env override
-        try:
-            return float(DEFAULT_CTX_DISPLAY_RATIO)
-        except Exception:
-            return 0.5
+        return float(DEFAULT_API_CTX_FACTOR)
     try:
         if isinstance(val, str):
             v = val.strip()
@@ -703,26 +824,57 @@ def resolve_ctx_display_ratio(args = None) -> float:
             f = f / 100.0
         return max(0.0, min(1.0, f))
     except Exception:
-        return float(DEFAULT_CTX_DISPLAY_RATIO)
+        return float(DEFAULT_API_CTX_FACTOR)
+
+
+def resolve_ctx_display_ratio(args = None) -> float:
+    """Backward-compatible alias for legacy ctx display configuration keys."""
+    return resolve_api_ctx_factor(args)
 
 
 def displayed_configured_ctx(model: ManagedModel, args = None) -> int:
-    """Compute the on-demand displayed configured ctx for a model.
-
-    This reads the current `ctx_display_ratio` and returns an integer.
-    Always returns at least 1.
-    """
+    """Return configured context for a model (CFG_CTX source of truth)."""
     try:
-        ratio = resolve_ctx_display_ratio(args)
-    except Exception:
-        ratio = float(DEFAULT_CTX_DISPLAY_RATIO)
-    try:
-        gguf = get_model_context_size(model)
-        base = int(gguf) if gguf is not None else int(model.ctx_size or 0)
+        base = int(model.ctx_size or 0)
     except Exception:
         base = 0
-    value = max(1, int(base * ratio)) if base > 0 else 0
-    return value
+    if base > 0:
+        return base
+    try:
+        gguf = get_model_context_size(model)
+        return int(gguf) if gguf is not None else 0
+    except Exception:
+        return 0
+
+
+def displayed_api_ctx(model: ManagedModel, args = None) -> int:
+    """Return API_CTX derived from CFG_CTX * configurable factor."""
+    cfg_ctx = displayed_configured_ctx(model)
+    if cfg_ctx <= 0:
+        return 0
+    try:
+        factor = resolve_api_ctx_factor(args)
+    except Exception:
+        factor = float(DEFAULT_API_CTX_FACTOR)
+    return max(1, int(cfg_ctx * factor))
+
+
+def ctx_evaluation_status(model: ManagedModel) -> str:
+    return "ERROR" if bool(model.auto_ctx_failed) else "OK"
+
+
+def _display_cfg_ctx(model: ManagedModel, args = None) -> str:
+    if ctx_evaluation_status(model) == "ERROR":
+        return "ERROR"
+    value = displayed_configured_ctx(model, args)
+    return str(value) if value > 0 else "?"
+
+
+def _display_api_ctx(model: ManagedModel, args = None) -> str:
+    if ctx_evaluation_status(model) == "ERROR":
+        return "ERROR"
+    value = displayed_api_ctx(model, args)
+    return str(value) if value > 0 else "?"
 
 
 def resolve_idle_ttl(args = None) -> int:
@@ -860,7 +1012,11 @@ def resolve_api_port(args = None) -> int:
 def persist_server_config(args) -> None:
     if getattr(args, "server_config", None) is None:
         return
-    if getattr(args, "idle_ttl", None) is None and getattr(args, "api_port", None) is None:
+    if (
+        getattr(args, "idle_ttl", None) is None
+        and getattr(args, "api_port", None) is None
+        and getattr(args, "api_ctx_factor", None) is None
+    ):
         return
     path = Path(args.server_config)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -874,6 +1030,8 @@ def persist_server_config(args) -> None:
         payload["idle_ttl"] = int(args.idle_ttl)
     if getattr(args, "api_port", None) is not None:
         payload["api_port"] = int(args.api_port)
+    if getattr(args, "api_ctx_factor", None) is not None:
+        payload["api_ctx_factor"] = float(args.api_ctx_factor)
     _ensure_server_config_metadata(payload)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
@@ -1645,6 +1803,16 @@ def _ask_confirmation(prompt: str, progress_callback = None, default: bool = Fal
         print(invalid_message)
 
 def resolve_catalog_model(catalog: list[ManagedModel], target: str | None = None, repo_ref: str | None = None, model_id: str | None = None, filename: str | None = None) -> ManagedModel:
+    def _unique_from(items: list[ManagedModel]) -> list[ManagedModel]:
+        unique: list[ManagedModel] = []
+        seen: set[str] = set()
+        for item in items:
+            if item.model_id in seen:
+                continue
+            seen.add(item.model_id)
+            unique.append(item)
+        return unique
+
     matches = []
     ref = repo_ref or target
 
@@ -1667,6 +1835,31 @@ def resolve_catalog_model(catalog: list[ManagedModel], target: str | None = None
             matches = [m for m in catalog if m.repo_id == repo_id and m.quant == quant]
     else:
         raise RuntimeError("Model reference required. Use model_id or repo[:quant].")
+
+    if not matches and ref:
+        lowered = ref.strip().lower()
+        matches = [m for m in catalog if (m.model_id or "").strip().lower() == lowered]
+
+    if not matches and ref:
+        canonical = _canonical_model_ref(ref)
+        if canonical:
+            matches = [m for m in catalog if _canonical_model_ref(m.model_id or "") == canonical]
+
+    if not matches and ref:
+        resolved_name = resolve_catalog_model_name(ref, catalog)
+        if resolved_name and resolved_name != ref:
+            matches = [m for m in catalog if m.model_id == resolved_name]
+
+    if not matches and ref:
+        canonical = _canonical_model_ref(ref)
+        if canonical:
+            alias_matches: list[ManagedModel] = []
+            for item in catalog:
+                for alias in model_name_aliases(item):
+                    if _canonical_model_ref(alias) == canonical:
+                        alias_matches.append(item)
+                        break
+            matches = _unique_from(alias_matches)
 
     if not matches:
         raise RuntimeError("Model not found in catalog.")
@@ -1772,23 +1965,37 @@ def ensure_model_available(args, progress_callback = None):
     config_changed = False
     auto_ctx_failed = bool(existing.auto_ctx_failed) if existing else False
     auto_ctx_error = existing.auto_ctx_error if existing else ""
+    ctx_probe_latency_ms = _to_float_or_none(existing.ctx_probe_latency_ms) if existing else None
+    ctx_probe_speed_tps = _to_float_or_none(existing.ctx_probe_speed_tps) if existing else None
+    ctx_probe_kv_gb = _to_float_or_none(existing.ctx_probe_kv_gb) if existing else None
+    ctx_probe_prompt_tokens = _to_int_or_none(existing.ctx_probe_prompt_tokens) if existing else None
     if existing and ctx_override is not None and (existing.ctx_size != ctx_override or existing.auto_ctx_failed or existing.auto_ctx_error):
         existing.ctx_size = ctx_override
         existing.auto_ctx_failed = False
         existing.auto_ctx_error = ""
+        clear_ctx_probe_metrics(existing)
         save_catalog(args.catalog, catalog)
         ctx_changed = True
         auto_ctx_failed = False
         auto_ctx_error = ""
+        ctx_probe_latency_ms = None
+        ctx_probe_speed_tps = None
+        ctx_probe_kv_gb = None
+        ctx_probe_prompt_tokens = None
         _emit_message(f"Applied ctx override for {existing.model_id}: {ctx_override}", progress_callback)
     elif existing and skip_ctx and (existing.ctx_size != default_ctx or existing.auto_ctx_failed or existing.auto_ctx_error):
         existing.ctx_size = default_ctx
         existing.auto_ctx_failed = False
         existing.auto_ctx_error = ""
+        clear_ctx_probe_metrics(existing)
         save_catalog(args.catalog, catalog)
         ctx_changed = True
         auto_ctx_failed = False
         auto_ctx_error = ""
+        ctx_probe_latency_ms = None
+        ctx_probe_speed_tps = None
+        ctx_probe_kv_gb = None
+        ctx_probe_prompt_tokens = None
         _emit_message(f"Applied default ctx for {existing.model_id}: {default_ctx}", progress_callback)
 
     if existing:
@@ -1904,10 +2111,18 @@ def ensure_model_available(args, progress_callback = None):
     if ctx_override is not None:
         auto_ctx_failed = False
         auto_ctx_error = ""
+        ctx_probe_latency_ms = None
+        ctx_probe_speed_tps = None
+        ctx_probe_kv_gb = None
+        ctx_probe_prompt_tokens = None
         _emit_message(f"Using explicit ctx override {desired_ctx} for {mid}.", progress_callback)
     elif skip_ctx:
         auto_ctx_failed = False
         auto_ctx_error = ""
+        ctx_probe_latency_ms = None
+        ctx_probe_speed_tps = None
+        ctx_probe_kv_gb = None
+        ctx_probe_prompt_tokens = None
         _emit_message(f"Skipping automatic ctx tuning. Using default ctx {desired_ctx} for {mid}.", progress_callback)
     elif existing and existing.auto_ctx_failed and not force_auto_ctx:
         desired_ctx = existing.ctx_size or default_ctx
@@ -1957,16 +2172,57 @@ def ensure_model_available(args, progress_callback = None):
             desired_ctx = best_ctx
             auto_ctx_failed = False
             auto_ctx_error = ""
+            selected_api_ctx = max(1, int(desired_ctx * resolve_api_ctx_factor(args)))
+            ctx_probe_latency_ms = _to_float_or_none(info.get("probe_latency_ms"))
+            ctx_probe_speed_tps = _to_float_or_none(info.get("probe_speed_tps"))
+            ctx_probe_kv_gb = _to_float_or_none(info.get("selected_ctx_gb"))
+            ctx_probe_prompt_tokens = _to_int_or_none(info.get("probe_prompt_tokens"))
             _emit_message(f"Selected automatic ctx {desired_ctx} for {mid}.", progress_callback)
+            _emit_message(
+                f"{mid}: probe metrics -> ctx_gb={_format_ctx_probe_gb(ctx_probe_kv_gb)} speed={_format_ctx_probe_speed(ctx_probe_speed_tps)} latency={_format_ctx_probe_latency(ctx_probe_latency_ms)}.",
+                progress_callback,
+            )
+            _emit_message(
+                "Auto-ctx summary:\n" + render_auto_ctx_summary_table([
+                    {
+                        "MODEL": mid,
+                        "CFG_CTX": str(desired_ctx),
+                        "API_CTX": str(selected_api_ctx),
+                        "CTX_GB": _format_ctx_probe_gb(ctx_probe_kv_gb),
+                        "SPEED": _format_ctx_probe_speed(ctx_probe_speed_tps),
+                        "LATENCY": _format_ctx_probe_latency(ctx_probe_latency_ms),
+                        "STATUS": "selected",
+                    }
+                ]),
+                progress_callback,
+            )
         elif status == "min-failed":
             if probe_config_replaced:
                 save_catalog(args.catalog, stable_catalog)
                 restore_catalog_config(args, stable_catalog, progress_callback=progress_callback, restart_service=True)
             desired_ctx = int(info.get("min_ctx") or default_ctx)
             auto_ctx_failed = True
-            auto_ctx_error = info.get("reason") or status
+            auto_ctx_error = f"min-failed:{info.get('reason') or status}"
+            ctx_probe_latency_ms = None
+            ctx_probe_speed_tps = None
+            ctx_probe_kv_gb = None
+            ctx_probe_prompt_tokens = None
             _emit_message(
                 f"{mid} failed the automatic probe at the minimum ctx {desired_ctx} ({auto_ctx_error}).",
+                progress_callback,
+            )
+            _emit_message(
+                "Auto-ctx summary:\n" + render_auto_ctx_summary_table([
+                    {
+                        "MODEL": mid,
+                        "CFG_CTX": "ERROR",
+                        "API_CTX": "ERROR",
+                        "CTX_GB": _format_ctx_probe_gb(None),
+                        "SPEED": _format_ctx_probe_speed(None),
+                        "LATENCY": _format_ctx_probe_latency(None),
+                        "STATUS": "ERROR",
+                    }
+                ]),
                 progress_callback,
             )
             if _ask_confirmation(
@@ -1988,12 +2244,30 @@ def ensure_model_available(args, progress_callback = None):
         else:
             auto_ctx_failed = True
             auto_ctx_error = status
+            ctx_probe_latency_ms = None
+            ctx_probe_speed_tps = None
+            ctx_probe_kv_gb = None
+            ctx_probe_prompt_tokens = None
             _emit_message(
                 f"Could not auto-tune ctx for {mid}. Keeping fallback ctx {desired_ctx} and disabling automatic re-probes for future runs.",
                 progress_callback,
             )
+            _emit_message(
+                "Auto-ctx summary:\n" + render_auto_ctx_summary_table([
+                    {
+                        "MODEL": mid,
+                        "CFG_CTX": "ERROR",
+                        "API_CTX": "ERROR",
+                        "CTX_GB": _format_ctx_probe_gb(None),
+                        "SPEED": _format_ctx_probe_speed(None),
+                        "LATENCY": _format_ctx_probe_latency(None),
+                        "STATUS": "ERROR",
+                    }
+                ]),
+                progress_callback,
+            )
 
-    new_m = ManagedModel(model_id=mid, repo_id=repo_id, quant=quant, filename=selected_file, local_path=str(local_path), mmproj_filename=mmproj_filename, mmproj_path=mmproj_path, ctx_size=desired_ctx, n_gpu_layers=int(args.n_gpu_layers), tensor_split=args.tensor_split, host=args.host, jinja=not args.no_jinja, ttl=resolve_idle_ttl(args), description=args.description or f"{repo_id} / {selected_file}", auto_ctx_failed=auto_ctx_failed, auto_ctx_error=auto_ctx_error)
+    new_m = ManagedModel(model_id=mid, repo_id=repo_id, quant=quant, filename=selected_file, local_path=str(local_path), mmproj_filename=mmproj_filename, mmproj_path=mmproj_path, ctx_size=desired_ctx, n_gpu_layers=int(args.n_gpu_layers), tensor_split=args.tensor_split, host=args.host, jinja=not args.no_jinja, ttl=resolve_idle_ttl(args), description=args.description or f"{repo_id} / {selected_file}", auto_ctx_failed=auto_ctx_failed, auto_ctx_error=auto_ctx_error, ctx_probe_latency_ms=ctx_probe_latency_ms, ctx_probe_speed_tps=ctx_probe_speed_tps, ctx_probe_kv_gb=ctx_probe_kv_gb, ctx_probe_prompt_tokens=ctx_probe_prompt_tokens)
     new_cat = [m for m in catalog if m.model_id != mid] + [new_m]
     save_catalog(args.catalog, new_cat)
     gpu_conflict = get_gpu_conflict_message(mid, new_cat, args.public_host, args.public_port)
@@ -2068,6 +2342,146 @@ def apply_config_and_wait_absent(
         "Ensure llama-swap is running with --watch-config and is watching that config file."
     )
 
+
+def _model_candidate_files(model: ManagedModel) -> list[Path]:
+    candidates: set[Path] = set()
+
+    local_raw = str(getattr(model, "local_path", "") or "").strip()
+    if local_raw:
+        local_path = Path(local_raw)
+        filename = Path(str(getattr(model, "filename", "") or "")).name
+        if "-00001-of-" in filename and local_path.parent.exists():
+            prefix = filename.split("-00001-of-")[0]
+            for pattern in (f"{prefix}-*-of-*.gguf", f"{prefix}-*-of-*.gguf.part"):
+                for shard in local_path.parent.glob(pattern):
+                    if shard.is_file():
+                        candidates.add(shard)
+        else:
+            candidates.add(local_path)
+            candidates.add(local_path.with_name(local_path.name + ".part"))
+
+    mmproj_raw = str(getattr(model, "mmproj_path", "") or "").strip()
+    if mmproj_raw:
+        mmproj_path = Path(mmproj_raw)
+        candidates.add(mmproj_path)
+        candidates.add(mmproj_path.with_name(mmproj_path.name + ".part"))
+
+    return sorted(candidates, key=lambda item: str(item))
+
+
+def _catalog_referenced_paths(catalog: list[ManagedModel]) -> set[str]:
+    refs: set[str] = set()
+    for item in catalog:
+        for raw in (getattr(item, "local_path", ""), getattr(item, "mmproj_path", "")):
+            value = str(raw or "").strip()
+            if value:
+                refs.add(_safe_realpath(value))
+    return refs
+
+
+def _prune_empty_dirs_under_root(path: Path, root: Path, progress_callback = None) -> None:
+    try:
+        root_real = root.expanduser().resolve(strict=False)
+        current = path.expanduser().resolve(strict=False)
+    except Exception:
+        return
+
+    while True:
+        try:
+            current.relative_to(root_real)
+        except Exception:
+            break
+
+        if current == root_real:
+            break
+
+        try:
+            current.rmdir()
+            _emit_message(f"Removed empty directory {current}.", progress_callback)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            break
+
+        current = current.parent
+
+
+def _delete_model_files_from_disk(
+    model: ManagedModel,
+    remaining: list[ManagedModel],
+    models_dir: Path,
+    progress_callback = None,
+) -> bool:
+    referenced = _catalog_referenced_paths(remaining)
+    deleted_any = False
+
+    for candidate in _model_candidate_files(model):
+        if _safe_realpath(str(candidate)) in referenced:
+            continue
+        if not candidate.exists():
+            continue
+        try:
+            candidate.unlink()
+            deleted_any = True
+            _emit_message(f"Deleted local file {candidate}.", progress_callback)
+        except IsADirectoryError:
+            shutil.rmtree(candidate, ignore_errors=True)
+            deleted_any = True
+            _emit_message(f"Deleted local directory {candidate}.", progress_callback)
+        except Exception as exc:
+            _emit_message(f"Could not delete local file {candidate}: {exc}", progress_callback)
+            continue
+
+        _prune_empty_dirs_under_root(candidate.parent, models_dir, progress_callback)
+
+    # Fallback: if this repo is no longer referenced and directory still exists, remove it.
+    if not any(item.repo_id == model.repo_id for item in remaining):
+        repo_dir = models_dir / model.repo_id
+        if repo_dir.exists():
+            try:
+                shutil.rmtree(repo_dir)
+                deleted_any = True
+                _emit_message(f"Deleted local files under {repo_dir}.", progress_callback)
+            except Exception as exc:
+                _emit_message(f"Could not delete local files under {repo_dir}: {exc}", progress_callback)
+        _prune_empty_dirs_under_root(repo_dir, models_dir, progress_callback)
+
+    return deleted_any
+
+
+def _orphan_file_aliases(path: Path) -> set[str]:
+    aliases: set[str] = set()
+    candidates = [path.name, path.stem]
+    for value in candidates:
+        base = re.sub(r"(?i)\.gguf$", "", value)
+        aliases.add(base)
+        aliases.add(re.sub(r"[-._]?\d{5}-of-\d{5}$", "", base))
+        aliases.add(re.sub(r"[-._]?\d+-of-\d+$", "", base))
+    return {_canonical_model_ref(item) for item in aliases if _canonical_model_ref(item)}
+
+
+def _remove_orphan_files_by_reference(reference: str, models_dir: Path, progress_callback = None) -> int:
+    canonical_reference = _canonical_model_ref(reference)
+    if not canonical_reference:
+        return 0
+
+    patterns = ("*.gguf", "*.gguf.part")
+    deleted = 0
+    for pattern in patterns:
+        for file_path in models_dir.rglob(pattern):
+            if not file_path.is_file():
+                continue
+            if canonical_reference not in _orphan_file_aliases(file_path):
+                continue
+            try:
+                file_path.unlink()
+                deleted += 1
+                _emit_message(f"Deleted local file {file_path}.", progress_callback)
+                _prune_empty_dirs_under_root(file_path.parent, models_dir, progress_callback)
+            except Exception as exc:
+                _emit_message(f"Could not delete local file {file_path}: {exc}", progress_callback)
+    return deleted
+
 def remove_model(args, progress_callback = None):
     try:
         is_owner = (os.getuid() == os.stat(args.catalog.parent).st_uid)
@@ -2083,7 +2497,23 @@ def remove_model(args, progress_callback = None):
             raise manager_unavailable_error(e)
 
     catalog = load_catalog(args.catalog, _args_server_config_path(args))
-    model = resolve_catalog_model(catalog, target=args.repo, repo_ref=args.hf, model_id=args.model_id, filename=args.file)
+    try:
+        model = resolve_catalog_model(catalog, target=args.repo, repo_ref=args.hf, model_id=args.model_id, filename=args.file)
+    except RuntimeError as exc:
+        if str(exc) == "Model not found in catalog." and args.delete_files:
+            reference = args.repo or args.hf or args.model_id or args.file
+            if reference:
+                removed = _remove_orphan_files_by_reference(str(reference), args.models_dir, progress_callback)
+                if removed > 0:
+                    _emit_message(
+                        (
+                            f"Model not found in catalog. Removed {removed} orphan file(s) "
+                            f"matching '{reference}' from disk."
+                        ),
+                        progress_callback,
+                    )
+                    return str(reference)
+        raise
     remaining = [m for m in catalog if m.model_id != model.model_id]
 
     save_catalog(args.catalog, remaining)
@@ -2100,15 +2530,9 @@ def remove_model(args, progress_callback = None):
     )
 
     if args.delete_files:
-        if any(m.repo_id == model.repo_id for m in remaining):
-            _emit_message("Other catalog entries still use this repository. Keeping files on disk.", progress_callback)
-        else:
-            repo_dir = args.models_dir / model.repo_id
-            if repo_dir.exists():
-                shutil.rmtree(repo_dir)
-                _emit_message(f"Deleted local files under {repo_dir}.", progress_callback)
-            else:
-                _emit_message(f"No local files found under {repo_dir}.", progress_callback)
+        deleted_any = _delete_model_files_from_disk(model, remaining, args.models_dir, progress_callback)
+        if not deleted_any:
+            _emit_message("No removable local files found for this model.", progress_callback)
 
     return model.model_id
 
@@ -2447,11 +2871,11 @@ def render_models_table(catalog: list[ManagedModel], host=DEFAULT_PUBLIC_HOST, p
     rows = []
     for model in catalog:
         storage = get_model_storage_info(model)
-        gguf_ctx = get_model_context_size(model)
         process = process_by_model.get(_safe_realpath(model.local_path))
         published = model.model_id in published_models
         loaded = process is not None
         runtime, planned = classify_runtime(model, loaded, process["pid"] if process else None, gpu_process_map)
+        ctx_status = ctx_evaluation_status(model)
         rows.append({
             "MODEL_ID": model.model_id,
             "PUBLISHED": "yes" if published else "no",
@@ -2459,11 +2883,13 @@ def render_models_table(catalog: list[ManagedModel], host=DEFAULT_PUBLIC_HOST, p
             "RUNTIME": runtime,
             "GPU_PLAN": planned,
             "PID": str(process["pid"]) if process else "-",
-            "MAX_CTX": str(gguf_ctx) if gguf_ctx is not None else "?",
-            "CFG_CTX": str(displayed_configured_ctx(model)) if (get_model_context_size(model) or model.ctx_size) else "?",
+            "CFG_CTX": _display_cfg_ctx(model),
+            "API_CTX": _display_api_ctx(model),
+            "CTX_GB": _format_ctx_probe_gb(_to_float_or_none(model.ctx_probe_kv_gb)),
+            "SPEED": _format_ctx_probe_speed(_to_float_or_none(model.ctx_probe_speed_tps)),
             "SIZE": _format_bytes(storage["size"]),
             "FILES": str(storage["file_count"]),
-            "STATUS": storage["status"],
+            "STATUS": ctx_status if ctx_status == "ERROR" else storage["status"],
             "REPO": model.repo_id,
         })
 
@@ -2474,8 +2900,10 @@ def render_models_table(catalog: list[ManagedModel], host=DEFAULT_PUBLIC_HOST, p
         ("RUNTIME", 12),
         ("GPU_PLAN", 18),
         ("PID", 8),
-        ("MAX_CTX", 8),
         ("CFG_CTX", 8),
+        ("API_CTX", 8),
+        ("CTX_GB", 8),
+        ("SPEED", 12),
         ("SIZE", 10),
         ("FILES", 5),
         ("STATUS", 8),
@@ -2497,8 +2925,36 @@ def render_models_table(catalog: list[ManagedModel], host=DEFAULT_PUBLIC_HOST, p
     lines.append(f"Global idle TTL: {idle_ttl}s")
     return "\n".join(lines) + "\n\n"
 
+
+def render_auto_ctx_summary_table(rows: list[dict[str, str]]) -> str:
+    if not rows:
+        return "No auto-ctx probe data."
+    columns = [
+        ("MODEL", 44),
+        ("CFG_CTX", 9),
+        ("API_CTX", 9),
+        ("CTX_GB", 8),
+        ("SPEED", 12),
+        ("LATENCY", 10),
+        ("STATUS", 12),
+    ]
+    widths: dict[str, int] = {}
+    for key, cap in columns:
+        widths[key] = min(cap, max(len(key), max(len(str(row.get(key, ""))) for row in rows)))
+    header = "  ".join(key.ljust(widths[key]) for key, _ in columns)
+    sep = "  ".join("-" * widths[key] for key, _ in columns)
+    lines = [header, sep]
+    for row in rows:
+        lines.append("  ".join(_truncate(str(row.get(key, "")), widths[key]).ljust(widths[key]) for key, _ in columns))
+    lines.append(sep)
+    return "\n".join(lines)
+
 def build_model_ctx_payload(model: ManagedModel) -> dict:
-    max_ctx = get_model_context_size(model)
+    gguf_ctx = get_model_context_size(model)
+    cfg_ctx = displayed_configured_ctx(model)
+    api_ctx = displayed_api_ctx(model)
+    ctx_status = ctx_evaluation_status(model)
+    probe_metrics = _ctx_probe_api_metrics(model)
     return {
         "name": model.model_id,
         "model": model.model_id,
@@ -2507,23 +2963,35 @@ def build_model_ctx_payload(model: ManagedModel) -> dict:
             "format": "gguf",
             "family": "llama.cpp",
             "parameter_size": model.quant or "",
-            "configured_ctx": displayed_configured_ctx(model),
-            "max_ctx": max_ctx,
+            "configured_ctx": cfg_ctx if ctx_status != "ERROR" else None,
+            "api_ctx": api_ctx if ctx_status != "ERROR" else None,
+            "api_ctx_status": ctx_status,
+            "max_ctx": cfg_ctx if ctx_status != "ERROR" else None,
+            "gguf_ctx": gguf_ctx,
+            **probe_metrics,
         },
     }
 
 
 def build_openai_model_payload(model: ManagedModel) -> dict:
-    max_ctx = get_model_context_size(model)
+    gguf_ctx = get_model_context_size(model)
+    cfg_ctx = displayed_configured_ctx(model)
+    api_ctx = displayed_api_ctx(model)
+    ctx_status = ctx_evaluation_status(model)
+    probe_metrics = _ctx_probe_api_metrics(model)
     return {
         "id": model.model_id,
         "object": "model",
         "created": 0,
         "owned_by": "llama-swap",
         "metadata": {
-            "configured_context_length": displayed_configured_ctx(model),
-            "context_length": max_ctx,
+            "configured_context_length": cfg_ctx if ctx_status != "ERROR" else None,
+            "api_context_length": api_ctx if ctx_status != "ERROR" else None,
+            "api_context_status": ctx_status,
+            "context_length": cfg_ctx if ctx_status != "ERROR" else None,
+            "gguf_context_length": gguf_ctx,
             "vision": _has_vision_runtime(model),
+            **probe_metrics,
         },
     }
 
@@ -2568,7 +3036,11 @@ def _model_digest(model: ManagedModel) -> str:
 
 def build_ollama_model_payload(model: ManagedModel, loaded: bool = False, process: dict | None = None, gpu_process_map: dict[int, str] | None = None) -> dict:
     storage = get_model_storage_info(model)
-    max_ctx = get_model_context_size(model)
+    gguf_ctx = get_model_context_size(model)
+    cfg_ctx = displayed_configured_ctx(model)
+    api_ctx = displayed_api_ctx(model)
+    ctx_status = ctx_evaluation_status(model)
+    probe_metrics = _ctx_probe_api_metrics(model)
     local_path = Path(model.local_path)
     modified = None
     try:
@@ -2582,9 +3054,13 @@ def build_ollama_model_payload(model: ManagedModel, loaded: bool = False, proces
         "families": [_infer_model_family(model)],
         "parameter_size": _infer_parameter_size(model),
         "quantization_level": model.quant or "",
-        "configured_context_length": displayed_configured_ctx(model),
-        "context_length": max_ctx,
+        "configured_context_length": cfg_ctx if ctx_status != "ERROR" else None,
+        "api_context_length": api_ctx if ctx_status != "ERROR" else None,
+        "api_context_status": ctx_status,
+        "context_length": cfg_ctx if ctx_status != "ERROR" else None,
+        "gguf_context_length": gguf_ctx,
         "vision": _has_vision_runtime(model),
+        **probe_metrics,
     }
     payload = {
         "name": model.model_id,
@@ -2594,8 +3070,17 @@ def build_ollama_model_payload(model: ManagedModel, loaded: bool = False, proces
         "digest": _model_digest(model),
         "details": details,
         "model_info": {
-            "llamacpp.configured_context_length": displayed_configured_ctx(model),
-            "llamacpp.context_length": max_ctx,
+            "llamacpp.configured_context_length": cfg_ctx if ctx_status != "ERROR" else None,
+            "llamacpp.api_context_length": api_ctx if ctx_status != "ERROR" else None,
+            "llamacpp.api_context_status": ctx_status,
+            "llamacpp.context_length": cfg_ctx if ctx_status != "ERROR" else None,
+            "llamacpp.gguf_context_length": gguf_ctx,
+            "llamacpp.ctx_probe_latency_ms": probe_metrics["ctx_probe_latency_ms"],
+            "llamacpp.ctx_probe_speed_tps": probe_metrics["ctx_probe_speed_tps"],
+            "llamacpp.ctx_probe_kv_gb": probe_metrics["ctx_probe_kv_gb"],
+            "llamacpp.ctx_probe_latency": probe_metrics["ctx_probe_latency"],
+            "llamacpp.ctx_probe_speed": probe_metrics["ctx_probe_speed"],
+            "llamacpp.ctx_probe_kv": probe_metrics["ctx_probe_kv"],
         },
     }
     if loaded:
@@ -3000,15 +3485,19 @@ def start_ctx_metadata_server(args):
                 self._send_json({"models": running})
                 return
             if parsed.path == "/api/version":
-                self._send_json({"version": "0.1.0-llamacpp-stack"})
+                self._send_json({"version": f"{get_superserver_version()}-llamacpp-superserver"})
                 return
             if parsed.path == "/api/ctx":
                 self._send_json({
                     "models": [
                         {
                             "name": model.model_id,
-                            "configured_ctx": displayed_configured_ctx(model),
-                            "max_ctx": get_model_context_size(model),
+                            "configured_ctx": displayed_configured_ctx(model) if ctx_evaluation_status(model) != "ERROR" else None,
+                            "api_ctx": displayed_api_ctx(model) if ctx_evaluation_status(model) != "ERROR" else None,
+                            "api_ctx_status": ctx_evaluation_status(model),
+                            "max_ctx": displayed_configured_ctx(model) if ctx_evaluation_status(model) != "ERROR" else None,
+                            "gguf_ctx": get_model_context_size(model),
+                            **_ctx_probe_api_metrics(model),
                         }
                         for model in catalog
                     ]
@@ -3052,7 +3541,11 @@ def start_ctx_metadata_server(args):
             if model is None:
                 self._send_json({"error": f"model '{name}' not found"}, status=404)
                 return
-            max_ctx = get_model_context_size(model)
+            gguf_ctx = get_model_context_size(model)
+            cfg_ctx = displayed_configured_ctx(model)
+            api_ctx = displayed_api_ctx(model)
+            ctx_status = ctx_evaluation_status(model)
+            probe_metrics = _ctx_probe_api_metrics(model)
             self._send_json({
                 "license": "",
                 "modelfile": f"FROM {model.model_id}\nPARAMETER num_ctx {model.ctx_size}\n",
@@ -3060,8 +3553,17 @@ def start_ctx_metadata_server(args):
                 "template": "",
                 "details": build_model_ctx_payload(model)["details"],
                 "model_info": {
-                    "llamacpp.configured_context_length": displayed_configured_ctx(model),
-                    "llamacpp.context_length": max_ctx,
+                    "llamacpp.configured_context_length": cfg_ctx if ctx_status != "ERROR" else None,
+                    "llamacpp.api_context_length": api_ctx if ctx_status != "ERROR" else None,
+                    "llamacpp.api_context_status": ctx_status,
+                    "llamacpp.context_length": cfg_ctx if ctx_status != "ERROR" else None,
+                    "llamacpp.gguf_context_length": gguf_ctx,
+                    "llamacpp.ctx_probe_latency_ms": probe_metrics["ctx_probe_latency_ms"],
+                    "llamacpp.ctx_probe_speed_tps": probe_metrics["ctx_probe_speed_tps"],
+                    "llamacpp.ctx_probe_kv_gb": probe_metrics["ctx_probe_kv_gb"],
+                    "llamacpp.ctx_probe_latency": probe_metrics["ctx_probe_latency"],
+                    "llamacpp.ctx_probe_speed": probe_metrics["ctx_probe_speed"],
+                    "llamacpp.ctx_probe_kv": probe_metrics["ctx_probe_kv"],
                 },
                 "capabilities": ["completion", "vision"] if _has_vision_runtime(model) else ["completion"],
             })
@@ -3586,6 +4088,93 @@ def show_request_log(args):
     print(_tail_text_file(DEFAULT_REQUESTS_LOG_PATH, lines=int(args.lines)))
     return 0
 
+
+def _collect_model_references(args) -> list[str]:
+    refs: list[str] = []
+    for raw in (getattr(args, "repo", None), getattr(args, "hf", None)):
+        if isinstance(raw, list):
+            for item in raw:
+                value = str(item).strip()
+                if value:
+                    refs.append(value)
+            continue
+        if raw is None:
+            continue
+        value = str(raw).strip()
+        if value:
+            refs.append(value)
+    unique_refs: list[str] = []
+    for ref in refs:
+        if ref not in unique_refs:
+            unique_refs.append(ref)
+    return unique_refs
+
+
+def _clone_namespace(args) -> argparse.Namespace:
+    return argparse.Namespace(**vars(args))
+
+
+def _normalize_single_ref_args(args) -> argparse.Namespace:
+    cloned = _clone_namespace(args)
+    for field in ("repo", "hf"):
+        value = getattr(cloned, field, None)
+        if isinstance(value, list):
+            if len(value) > 1:
+                raise RuntimeError(f"Multiple values provided for {field}. Use batch mode with add/remove/update wrappers.")
+            setattr(cloned, field, value[0] if value else None)
+    return cloned
+
+
+def add_models(args):
+    refs = _collect_model_references(args)
+    if refs:
+        if getattr(args, "model_id", None):
+            raise RuntimeError("Use either model references list or --model-id, not both.")
+        for ref in refs:
+            cloned = _clone_namespace(args)
+            cloned.repo = ref
+            cloned.hf = None
+            cloned.model_id = None
+            ensure_model_available(cloned)
+        return 0
+    return ensure_model_available(_normalize_single_ref_args(args)) and 0
+
+
+def remove_models(args):
+    effective_args = _clone_namespace(args)
+    if not hasattr(effective_args, "delete_files"):
+        effective_args.delete_files = True
+
+    refs = _collect_model_references(effective_args)
+    if refs:
+        if getattr(effective_args, "model_id", None) or getattr(effective_args, "file", None):
+            raise RuntimeError("Use either a references list or --model-id/--file, not both.")
+        for ref in refs:
+            cloned = _clone_namespace(effective_args)
+            cloned.repo = ref
+            cloned.hf = None
+            cloned.model_id = None
+            cloned.file = None
+            remove_model(cloned)
+        return 0
+    return remove_model(_normalize_single_ref_args(effective_args)) and 0
+
+
+def update_models(args):
+    refs = _collect_model_references(args)
+    if refs:
+        if getattr(args, "model_id", None) or getattr(args, "file", None):
+            raise RuntimeError("Use either a references list or --model-id/--file, not both.")
+        for ref in refs:
+            cloned = _clone_namespace(args)
+            cloned.repo = ref
+            cloned.hf = None
+            cloned.model_id = None
+            cloned.file = None
+            update_config(cloned)
+        return 0
+    return update_config(_normalize_single_ref_args(args)) and 0
+
 def temporarily_unload_published_models(args, progress_callback = None, timeout = 45):
     _emit_message(
         "To probe ctx reliably, published models will be unloaded temporarily so they do not occupy VRAM.",
@@ -4003,6 +4592,7 @@ def probe_model_ctx(model: ManagedModel, llama_server: Path, ctx_size: int, time
 
     proc = None
     loader = LoadingBar(f"\033[35;1mProbe {model.model_id} ctx={ctx_size}:\033[0m ")
+    probe_metrics: dict[str, object] = {}
     try:
         proc = subprocess.Popen(
             cmd,
@@ -4025,6 +4615,7 @@ def probe_model_ctx(model: ManagedModel, llama_server: Path, ctx_size: int, time
                     for endpoint, payload in _probe_request_payload(model, prompt):
                         body = dict(payload)
                         body["model"] = model.model_id
+                        request_started = time.perf_counter()
                         try:
                             probe = requests.post(
                                 f"http://127.0.0.1:{port}{endpoint}",
@@ -4032,11 +4623,29 @@ def probe_model_ctx(model: ManagedModel, llama_server: Path, ctx_size: int, time
                                 timeout=request_timeout,
                             )
                         except requests.Timeout:
+                            elapsed_ms = max(0.0, (time.perf_counter() - request_started) * 1000.0)
+                            probe_metrics = {
+                                "probe_ctx": int(ctx_size),
+                                "probe_endpoint": endpoint,
+                                "probe_latency_ms": elapsed_ms,
+                            }
                             last_reason = _with_trace(f"{endpoint}-timeout", trace_path)
                             continue
                         except Exception as e:
+                            elapsed_ms = max(0.0, (time.perf_counter() - request_started) * 1000.0)
+                            probe_metrics = {
+                                "probe_ctx": int(ctx_size),
+                                "probe_endpoint": endpoint,
+                                "probe_latency_ms": elapsed_ms,
+                            }
                             last_reason = _with_trace(f"{endpoint}-{e.__class__.__name__}", trace_path)
                             continue
+                        elapsed_ms = max(0.0, (time.perf_counter() - request_started) * 1000.0)
+                        probe_metrics = {
+                            "probe_ctx": int(ctx_size),
+                            "probe_endpoint": endpoint,
+                            "probe_latency_ms": elapsed_ms,
+                        }
                         if probe.status_code != 200:
                             detail = ""
                             try:
@@ -4053,6 +4662,18 @@ def probe_model_ctx(model: ManagedModel, llama_server: Path, ctx_size: int, time
                             if not choices:
                                 last_reason = _with_trace(f"{endpoint}-empty", trace_path)
                                 continue
+                            usage = body.get("usage") if isinstance(body, dict) else {}
+                            prompt_tokens = _to_int_or_none((usage or {}).get("prompt_tokens") if isinstance(usage, dict) else None)
+                            speed_tps = None
+                            if prompt_tokens is not None and elapsed_ms > 0:
+                                speed_tps = prompt_tokens / (elapsed_ms / 1000.0)
+                            probe_metrics = {
+                                "probe_ctx": int(ctx_size),
+                                "probe_endpoint": endpoint,
+                                "probe_latency_ms": elapsed_ms,
+                                "probe_prompt_tokens": prompt_tokens,
+                                "probe_speed_tps": speed_tps,
+                            }
                         except Exception:
                             last_reason = _with_trace(f"{endpoint}-invalid-json", trace_path)
                             continue
@@ -4060,12 +4681,12 @@ def probe_model_ctx(model: ManagedModel, llama_server: Path, ctx_size: int, time
                             trace_handle.flush()
                         except Exception:
                             pass
-                        return True, _with_trace("ok", trace_path)
-                    return False, last_reason
+                        return True, _with_trace("ok", trace_path), probe_metrics
+                    return False, last_reason, probe_metrics
             except Exception:
                 pass
             time.sleep(2)
-        return False, _with_trace("timeout", trace_path)
+        return False, _with_trace("timeout", trace_path), probe_metrics
     finally:
         loader.stop()
         _stop_process(proc)
@@ -4102,6 +4723,50 @@ def _align_ctx(value: int) -> int:
     step = 1024
     return max(step, (value // step) * step)
 
+
+def _normalize_probe_result(result: object) -> tuple[bool, str, dict[str, object]]:
+    if isinstance(result, tuple):
+        if len(result) >= 3:
+            ok = bool(result[0])
+            reason = str(result[1])
+            payload = result[2] if isinstance(result[2], dict) else {}
+            return ok, reason, payload
+        if len(result) == 2:
+            ok = bool(result[0])
+            reason = str(result[1])
+            return ok, reason, {}
+    return False, "invalid-probe-result", {}
+
+
+def _trace_path_from_reason(reason: str | None) -> Path | None:
+    match = re.search(r"trace: ([^)]+)", reason or "")
+    if not match:
+        return None
+    return Path(match.group(1))
+
+
+def _ctx_gb_from_metrics(metrics: ProbeTraceMetrics) -> float | None:
+    kv_buffers = getattr(metrics, "kv_buffers_mib", None)
+    if not isinstance(kv_buffers, dict) or not kv_buffers:
+        return None
+    total_mib = 0.0
+    for raw_value in kv_buffers.values():
+        value = _to_float_or_none(raw_value)
+        if value is None or value <= 0:
+            continue
+        total_mib += value
+    if total_mib <= 0:
+        return None
+    return total_mib / 1024.0
+
+
+def _ctx_gb_from_reason(reason: str | None) -> float | None:
+    trace_path = _trace_path_from_reason(reason)
+    if trace_path is None:
+        return None
+    metrics = _parse_probe_trace_metrics(trace_path)
+    return _ctx_gb_from_metrics(metrics)
+
 def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback = None):
     max_ctx = get_model_context_size(model)
     if max_ctx is None:
@@ -4124,21 +4789,24 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
     free_vram_mib = _query_gpu_free_memory_mib()
     calibration_ctx = start_ctx
     _emit_message(f"{model.model_id}: calibration probe at ctx {calibration_ctx}...", progress_callback)
-    ok, reason = probe_model_ctx(model, llama_server, calibration_ctx)
+    ok, reason, calibration_probe_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, calibration_ctx))
     if not ok:
         _emit_message(f"{model.model_id}: failed even at calibration ctx {calibration_ctx} ({reason}), skipping.", progress_callback)
         return None, "min-failed", {"max_ctx": max_ctx, "min_ctx": calibration_ctx, "reason": reason}
 
-    calibration_trace = None
-    match = re.search(r"trace: ([^)]+)", reason or "")
-    if match:
-        calibration_trace = Path(match.group(1))
+    calibration_trace = _trace_path_from_reason(reason)
     metrics = _parse_probe_trace_metrics(calibration_trace)
     if calibration_trace is not None:
         try:
             calibration_trace.unlink()
         except FileNotFoundError:
             pass
+
+    selected_probe_latency_ms = _to_float_or_none(calibration_probe_metrics.get("probe_latency_ms"))
+    selected_probe_speed_tps = _to_float_or_none(calibration_probe_metrics.get("probe_speed_tps"))
+    selected_probe_prompt_tokens = _to_int_or_none(calibration_probe_metrics.get("probe_prompt_tokens"))
+    selected_ctx_gb = _ctx_gb_from_metrics(metrics)
+
     estimated_ctx = _estimate_ctx_ceiling(model, calibration_ctx, metrics, free_vram_mib) or calibration_ctx
     estimated_ctx = max(calibration_ctx, min(_align_ctx(max_ctx), estimated_ctx))
     _emit_message(f"{model.model_id}: estimated stable ctx ceiling from memory fit = {estimated_ctx}.", progress_callback)
@@ -4149,8 +4817,19 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
     last_success = calibration_ctx
     first_failure = None
     tested = {calibration_ctx}
+    min_ctx_rechecked = False
+
+    known_ctx_hint = _align_ctx(int(model.ctx_size))
+    if known_ctx_hint <= calibration_ctx or known_ctx_hint > max_probe_ctx:
+        known_ctx_hint = None
 
     candidate_order: list[int] = []
+    if known_ctx_hint is not None:
+        candidate_order.append(known_ctx_hint)
+        _emit_message(
+            f"{model.model_id}: refresh hint using previous cfg ctx {known_ctx_hint} as first upper probe.",
+            progress_callback,
+        )
     if max_probe_ctx > calibration_ctx:
         candidate_order.append(max_probe_ctx)
     if estimated_ctx > calibration_ctx and estimated_ctx < max_probe_ctx:
@@ -4164,10 +4843,14 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
             continue
         tested.add(candidate)
         _emit_message(f"{model.model_id}: testing ctx {candidate}...", progress_callback)
-        ok, reason = probe_model_ctx(model, llama_server, candidate)
+        ok, reason, probe_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, candidate))
         if ok:
             low = candidate
             last_success = candidate
+            selected_probe_latency_ms = _to_float_or_none(probe_metrics.get("probe_latency_ms"))
+            selected_probe_speed_tps = _to_float_or_none(probe_metrics.get("probe_speed_tps"))
+            selected_probe_prompt_tokens = _to_int_or_none(probe_metrics.get("probe_prompt_tokens"))
+            selected_ctx_gb = _ctx_gb_from_reason(reason) or selected_ctx_gb
             if candidate == max_probe_ctx:
                 return last_success, "selected", {
                     "max_ctx": max_ctx,
@@ -4175,12 +4858,34 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
                     "estimated_ctx": estimated_ctx,
                     "first_failure": first_failure,
                     "selected_ctx": last_success,
+                    "probe_latency_ms": selected_probe_latency_ms,
+                    "probe_speed_tps": selected_probe_speed_tps,
+                    "probe_prompt_tokens": selected_probe_prompt_tokens,
+                    "selected_ctx_gb": selected_ctx_gb,
                 }
             continue
         if high is None or candidate < high:
             high = candidate
         first_failure = candidate
         _emit_message(f"{model.model_id}: ctx {candidate} failed ({reason}).", progress_callback)
+        if not min_ctx_rechecked and candidate > calibration_ctx:
+            min_ctx_rechecked = True
+            _emit_message(
+                f"{model.model_id}: guard probe at minimum ctx {calibration_ctx} after upper-bound failure...",
+                progress_callback,
+            )
+            min_ok, min_reason, _min_probe_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, calibration_ctx))
+            if not min_ok:
+                _emit_message(
+                    f"{model.model_id}: minimum ctx {calibration_ctx} failed on guard probe ({min_reason}).",
+                    progress_callback,
+                )
+                return None, "min-failed", {
+                    "max_ctx": max_ctx,
+                    "min_ctx": calibration_ctx,
+                    "reason": min_reason,
+                    "guard_failed_after": candidate,
+                }
         if candidate != max_probe_ctx:
             break
 
@@ -4193,10 +4898,14 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
             break
         tested.add(midpoint)
         _emit_message(f"{model.model_id}: refinement probe at {midpoint}...", progress_callback)
-        ok, reason = probe_model_ctx(model, llama_server, midpoint)
+        ok, reason, probe_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, midpoint))
         if ok:
             low = midpoint
             last_success = midpoint
+            selected_probe_latency_ms = _to_float_or_none(probe_metrics.get("probe_latency_ms"))
+            selected_probe_speed_tps = _to_float_or_none(probe_metrics.get("probe_speed_tps"))
+            selected_probe_prompt_tokens = _to_int_or_none(probe_metrics.get("probe_prompt_tokens"))
+            selected_ctx_gb = _ctx_gb_from_reason(reason) or selected_ctx_gb
         else:
             high = midpoint
             first_failure = midpoint
@@ -4208,6 +4917,10 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
         "estimated_ctx": estimated_ctx,
         "first_failure": first_failure,
         "selected_ctx": last_success,
+        "probe_latency_ms": selected_probe_latency_ms,
+        "probe_speed_tps": selected_probe_speed_tps,
+        "probe_prompt_tokens": selected_probe_prompt_tokens,
+        "selected_ctx_gb": selected_ctx_gb,
     }
 
 
@@ -4355,6 +5068,10 @@ def update_config(args, progress_callback = None):
     ctx_override = getattr(args, "ctx_override", None)
     ctx_override = int(ctx_override) if ctx_override is not None else None
     auto_ctx = bool(getattr(args, "auto_ctx", False))
+    preserve_ctx = bool(getattr(args, "preserve_ctx", False))
+    sync_gguf_ctx = bool(getattr(args, "sync_gguf_ctx", False))
+    if preserve_ctx:
+        sync_gguf_ctx = False
     if ctx_override is not None and auto_ctx:
         raise RuntimeError("Use either -ctx or --auto, not both.")
 
@@ -4364,6 +5081,8 @@ def update_config(args, progress_callback = None):
     else:
         target_models = catalog
 
+    deleted_models = 0
+    auto_ctx_rows: list[dict[str, str]] = []
     if auto_ctx:
         probe_config_replaced = False
         if target_models:
@@ -4372,26 +5091,114 @@ def update_config(args, progress_callback = None):
         total_models = len(target_models)
         updated_ctx = 0
         missing_ctx = 0
+        min_failed_models: list[ManagedModel] = []
         try:
             for idx, model in enumerate(target_models, start=1):
                 _emit_message(f"[{idx}/{total_models}] Probing {model.model_id}...", progress_callback)
-                best_ctx, status, _info = choose_auto_ctx(model, args.llama_server, progress_callback=progress_callback)
+                best_ctx, status, info = choose_auto_ctx(model, args.llama_server, progress_callback=progress_callback)
                 if best_ctx is None:
                     missing_ctx += 1
+                    details = info if isinstance(info, dict) else {}
+                    failure_reason = str(details.get("reason") or status)
+                    model.auto_ctx_failed = True
+                    model.auto_ctx_error = f"min-failed:{failure_reason}" if status == "min-failed" else failure_reason
+                    clear_ctx_probe_metrics(model)
+                    if status == "min-failed":
+                        min_ctx = int(details.get("min_ctx") or model.ctx_size or DEFAULT_CTX_SIZE)
+                        model.ctx_size = min_ctx
+                        min_failed_models.append(model)
+                        _emit_message(
+                            f"{model.model_id}: failed even at minimum ctx {min_ctx} ({failure_reason}).",
+                            progress_callback,
+                        )
+                    else:
+                        _emit_message(
+                            f"{model.model_id}: automatic ctx probing failed ({failure_reason}).",
+                            progress_callback,
+                        )
+                    auto_ctx_rows.append({
+                        "MODEL": model.model_id,
+                        "CFG_CTX": _display_cfg_ctx(model),
+                        "API_CTX": _display_api_ctx(model),
+                        "CTX_GB": _format_ctx_probe_gb(None),
+                        "SPEED": _format_ctx_probe_speed(None),
+                        "LATENCY": _format_ctx_probe_latency(None),
+                        "STATUS": status,
+                    })
+                    save_catalog(args.catalog, catalog)
                     continue
                 if model.ctx_size != best_ctx:
                     model.ctx_size = best_ctx
                     updated_ctx += 1
                 model.auto_ctx_failed = False
                 model.auto_ctx_error = ""
+                apply_ctx_probe_metrics(model, info)
                 save_catalog(args.catalog, catalog)
                 _emit_message(f"{model.model_id}: selected cfg ctx {model.ctx_size}.", progress_callback)
+                auto_ctx_rows.append({
+                    "MODEL": model.model_id,
+                    "CFG_CTX": str(model.ctx_size),
+                    "API_CTX": str(displayed_api_ctx(model, args)),
+                    "CTX_GB": _format_ctx_probe_gb(model.ctx_probe_kv_gb),
+                    "SPEED": _format_ctx_probe_speed(model.ctx_probe_speed_tps),
+                    "LATENCY": _format_ctx_probe_latency(model.ctx_probe_latency_ms),
+                    "STATUS": "selected",
+                })
+
+            if min_failed_models:
+                failed_ids = {model.model_id for model in min_failed_models}
+                failed_labels = ", ".join(sorted(failed_ids))
+                if _ask_confirmation(
+                    (
+                        "The following models did not load even at the minimum ctx and will remain unusable: "
+                        f"{failed_labels}. Delete them now?"
+                    ),
+                    progress_callback=progress_callback,
+                    default=True,
+                ):
+                    models_root = Path(getattr(args, "models_dir", DEFAULT_MODELS_DIR))
+                    for failed_model in min_failed_models:
+                        shared_repo = any(
+                            item.repo_id == failed_model.repo_id and item.model_id not in failed_ids
+                            for item in catalog
+                        )
+                        if shared_repo:
+                            _emit_message(
+                                (
+                                    f"{failed_model.model_id}: keeping local files because another catalog entry "
+                                    f"still uses {failed_model.repo_id}."
+                                ),
+                                progress_callback,
+                            )
+                            continue
+
+                        repo_dir = models_root / failed_model.repo_id
+                        if repo_dir.exists():
+                            shutil.rmtree(repo_dir, ignore_errors=True)
+                            _emit_message(f"{failed_model.model_id}: deleted local files under {repo_dir}.", progress_callback)
+                        else:
+                            _emit_message(f"{failed_model.model_id}: no local files found under {repo_dir}.", progress_callback)
+
+                    catalog = [item for item in catalog if item.model_id not in failed_ids]
+                    deleted_models = len(failed_ids)
+                    for row in auto_ctx_rows:
+                        if row.get("MODEL") in failed_ids:
+                            row["CFG_CTX"] = "ERROR"
+                            row["API_CTX"] = "ERROR"
+                            row["STATUS"] = "deleted"
+                    save_catalog(args.catalog, catalog)
+                    _emit_message(
+                        f"Removed {deleted_models} model(s) that failed the minimum ctx probe.",
+                        progress_callback,
+                    )
         except Exception:
             if probe_config_replaced:
                 restore_catalog_config(args, catalog, progress_callback=progress_callback)
             raise
     elif ctx_override is not None:
         for model in target_models:
+            if model.ctx_size != ctx_override:
+                clear_ctx_probe_metrics(model)
             model.ctx_size = ctx_override
             model.auto_ctx_failed = False
             model.auto_ctx_error = ""
@@ -4402,7 +5209,15 @@ def update_config(args, progress_callback = None):
         else:
             _emit_message(f"Applied ctx override to all catalog models: {ctx_override}", progress_callback)
     else:
-        updated_ctx, missing_ctx = sync_catalog_context_sizes(target_models)
+        if sync_gguf_ctx:
+            previous_ctx_by_model = {model.model_id: model.ctx_size for model in target_models}
+            updated_ctx, missing_ctx = sync_catalog_context_sizes(target_models)
+            for model in target_models:
+                if model.ctx_size != previous_ctx_by_model.get(model.model_id):
+                    clear_ctx_probe_metrics(model)
+        else:
+            updated_ctx = 0
+            missing_ctx = 0
     save_catalog(args.catalog, catalog)
     render_llamaswap_config(
         catalog,
@@ -4413,20 +5228,28 @@ def update_config(args, progress_callback = None):
         server_defaults=resolve_llama_server_defaults(args),
     )
     if auto_ctx:
-        _emit_message(
-            f"Catalog ctx updated automatically: {updated_ctx} models changed, {missing_ctx} skipped.",
-            progress_callback,
-        )
+        summary = f"Catalog ctx updated automatically: {updated_ctx} models changed, {missing_ctx} skipped."
+        if deleted_models:
+            summary = f"{summary} {deleted_models} deleted after failing the minimum ctx probe."
+        _emit_message(summary, progress_callback)
+        if auto_ctx_rows:
+            _emit_message("Auto-ctx summary:\n" + render_auto_ctx_summary_table(auto_ctx_rows), progress_callback)
     elif ctx_override is not None:
         _emit_message(
             f"Catalog ctx updated manually: {updated_ctx} models set to {ctx_override}.",
             progress_callback,
         )
     else:
-        _emit_message(
-            f"Catalog synchronized from GGUF metadata: {updated_ctx} ctx values updated, {missing_ctx} unavailable.",
-            progress_callback,
-        )
+        if sync_gguf_ctx:
+            _emit_message(
+                f"Catalog synchronized from GGUF metadata: {updated_ctx} ctx values updated, {missing_ctx} unavailable.",
+                progress_callback,
+            )
+        else:
+            _emit_message(
+                "Catalog context values preserved (CFG_CTX unchanged); regenerated llama-swap config from catalog.",
+                progress_callback,
+            )
     _emit_message("Config updated from catalog. Waiting for llama-swap --watch-config...", progress_callback)
     time.sleep(3.0)
     try:
@@ -4716,57 +5539,154 @@ def read_install_manifest():
         return {}
     return payload if isinstance(payload, dict) else {}
 
-def build_help_epilog():
-    ui_url = f"http://{DEFAULT_PUBLIC_HOST}:{DEFAULT_PUBLIC_PORT}"
-    api_url = f"http://{DEFAULT_PUBLIC_HOST}:{resolve_api_port()}"
+
+def get_superserver_version() -> str:
+    forced = os.environ.get("LLAMACPP_SUPERSERVER_VERSION", "").strip()
+    if forced:
+        return forced
+    try:
+        return version("llamacpp-superserver")
+    except PackageNotFoundError:
+        pass
+    except Exception:
+        pass
+    # Fallback for local editable runs.
+    pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    try:
+        for raw in pyproject_path.read_text(encoding="utf-8").splitlines():
+            match = re.match(r"\s*version\s*=\s*\"([^\"]+)\"", raw)
+            if match:
+                return match.group(1)
+    except Exception:
+        pass
+    return "0.0.0"
+
+
+def render_superserver_banner() -> str:
+    divider = "=" * 72
+    return (
+        f"{divider}\n"
+        " _ _                                _\n"
+        "| | | __ _ _ __ ___   __ _  ___ _ __| |_ _ __\n"
+        "| | |/ _` | '_ ` _ \\ / _` |/ __| '__| __| '_ \\\n"
+        "| | | (_| | | | | | | (_| | (__| |  | |_| |_) |\n"
+        "|_|_|\\__,_|_| |_| |_|\\__,_|\\___|_|   \\__| .__/\n"
+        "                                           |_|   \n"
+        "              llama.cpp  SuperServer\n"
+        f"         llamacpp-superserver v{get_superserver_version()}\n"
+        f"{divider}"
+    )
+
+
+def _install_root_from_llama_server(llama_server_path: Path) -> Path:
+    if "llama.cpp/build/bin" in str(llama_server_path):
+        return llama_server_path.parent.parent.parent
+    return llama_server_path.parent
+
+
+def build_info_text(args = None) -> str:
+    public_host = getattr(args, "public_host", DEFAULT_PUBLIC_HOST)
+    public_port = int(getattr(args, "public_port", DEFAULT_PUBLIC_PORT))
+    api_port = resolve_api_port(args)
+    ui_url = f"http://{public_host}:{public_port}"
+    api_url = f"http://{public_host}:{api_port}"
+
     manifest = read_install_manifest()
     llama_cpp_tag = str(manifest.get("llama_cpp_tag") or "unknown")
     llamaswap_tag = str(manifest.get("llamaswap_tag") or "unknown")
+
     install_mode = infer_install_mode()
     start_cmd, status_cmd, restart_cmd = service_commands_for_mode(install_mode)
+
+    models_dir = Path(getattr(args, "models_dir", DEFAULT_MODELS_DIR))
+    config_path = Path(getattr(args, "config", DEFAULT_CONFIG_PATH))
+    catalog_path = Path(getattr(args, "catalog", DEFAULT_CATALOG_PATH))
+    server_config_path = _args_server_config_path(args)
+    llama_server_path = Path(getattr(args, "llama_server", DEFAULT_LLAMA_SERVER))
+    install_root = _install_root_from_llama_server(llama_server_path)
+
     return (
         "Default endpoints:\n"
         f"  llama-swap UI/backend: {ui_url}\n"
         f"  Superserver API:       {api_url}\n"
-        "Commands:\n"
-        f"  {CLI_COMMAND} add <repo-or-hf-ref>\n"
-        f"  {CLI_COMMAND} run <repo-or-hf-ref>\n"
-        f"  {CLI_COMMAND} remove <model-id-or-hf-ref>\n"
-        f"  {CLI_COMMAND} update [model-id-or-hf-ref] [--auto]\n"
-        f"  {CLI_COMMAND} validate <model-id-or-hf-ref> [--auto]\n"
-        f"  {CLI_COMMAND} list\n"
-        f"  {CLI_COMMAND} ps\n"
-        f"  {CLI_COMMAND} requests -n 50\n"
-        f"  {CLI_COMMAND} requests -n 1   (last request)\n"
-        f"  {CLI_COMMAND} daemon\n"
         "Installed versions:\n"
         f"  llama.cpp:           {llama_cpp_tag}\n"
         f"  llama-swap:          {llamaswap_tag}\n"
         "Runtime info:\n"
-        f"  Install root:        {DEFAULT_LLAMA_SERVER.parent.parent.parent if 'llama.cpp/build/bin' in str(DEFAULT_LLAMA_SERVER) else DEFAULT_LLAMA_SERVER.parent}\n"
-        f"  Models dir:          {DEFAULT_MODELS_DIR}\n"
-        f"  llama-swap config:   {DEFAULT_CONFIG_PATH}\n"
-        f"  Catalog:             {DEFAULT_CATALOG_PATH}\n"
-        f"  App config:          {DEFAULT_SERVER_CONFIG_PATH}\n"
-        f"  llama-server binary: {DEFAULT_LLAMA_SERVER}\n"
+        f"  Install root:        {install_root}\n"
+        f"  Models dir:          {models_dir}\n"
+        f"  llama-swap config:   {config_path}\n"
+        f"  Catalog:             {catalog_path}\n"
+        f"  App config:          {server_config_path}\n"
+        f"  llama-server binary: {llama_server_path}\n"
         f"  Requests log:        {DEFAULT_REQUESTS_LOG_PATH}\n"
         f"  UI activity:         {ui_url}/ui/#/activity\n"
-        f"  Idle TTL:            {resolve_idle_ttl()}s\n"
+        f"  Idle TTL:            {resolve_idle_ttl(args)}s\n"
         "Service management:\n"
         f"  Install mode:        {install_mode}\n"
         f"  Start services:      {start_cmd}\n"
         f"  Status:              {status_cmd}\n"
         f"  Restart:             {restart_cmd}\n"
         "Config knobs:\n"
-        f"  Global llama-server defaults: {DEFAULT_SERVER_CONFIG_PATH} -> llama_server_defaults\n"
-        f"  Per-model overrides:          {DEFAULT_CATALOG_PATH} -> server_overrides\n"
+        f"  Global llama-server defaults: {server_config_path} -> llama_server_defaults\n"
+        f"  Per-model overrides:          {catalog_path} -> server_overrides\n"
+        f"  API_CTX factor:               {server_config_path} -> api_ctx_factor (default {DEFAULT_API_CTX_FACTOR})\n"
         "  Default llama-server flags:\n"
         "    --keep 512, --mirostat 2, --mirostat-ent 4.5, --mirostat-lr 0.1\n"
         "    --cache-type-k q8_0, --cache-type-v q8_0\n"
-        f"    (Change these in {DEFAULT_SERVER_CONFIG_PATH}['llama_server_defaults'])\n"
+        f"    (Change these in {server_config_path}['llama_server_defaults'])\n"
         "  Main folders: install root, models dir, state/config paths above.\n"
-        f"  API status:          {get_api_endpoint_status()}\n"
-        f"  UI status:           {get_public_endpoint_status()}"
+        f"  API status:          {get_api_endpoint_status(public_host, api_port)}\n"
+        f"  UI status:           {get_public_endpoint_status(public_host, public_port)}"
+    )
+
+
+def show_info(args):
+    print(render_superserver_banner())
+    print()
+    print(build_info_text(args))
+    return 0
+
+
+def build_help_epilog():
+    return (
+        "Command guide:\n"
+        "  add [repo ...] [-hf HF ...] [--auto|--skip-ctx]\n"
+        "    Register/download one or more models into the catalog.\n"
+        f"    Example: {CLI_COMMAND} add -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M\n"
+        "  run [repo|-hf HF] [--auto] [--no-chat]\n"
+        "    Ensure model exists and start chat (or only preload with --no-chat).\n"
+        f"    Example: {CLI_COMMAND} run -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M --auto\n"
+        "  remove [repo ...|-hf HF ...] [--keep-files]\n"
+        "    Remove models from config/catalog and delete files by default.\n"
+        f"    Example: {CLI_COMMAND} remove qwen2.5-32b-instruct-q4_k_m\n"
+        "  rm [repo ...|-hf HF ...] [--keep-files]\n"
+        "    Alias of remove (also deletes model files by default).\n"
+        f"    Example: {CLI_COMMAND} rm qwen2.5-32b-instruct-q4_k_m\n"
+        "  update [repo ...|-hf HF ...] [--auto|--preserve-ctx|--sync-gguf-ctx]\n"
+        "    Refresh config and optionally re-probe ctx.\n"
+        f"    Example: {CLI_COMMAND} update qwen2.5-32b-instruct-q4_k_m --auto\n"
+        "  validate [repo|-hf HF] [--auto]\n"
+        "    Probe/validate a model and context settings before serving.\n"
+        f"    Example: {CLI_COMMAND} validate -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M --auto\n"
+        "  daemon\n"
+        "    Start the manager daemon loop (socket/API lifecycle automation).\n"
+        f"    Example: {CLI_COMMAND} daemon\n"
+        "  list\n"
+        "    Show configured models (ctx, memory estimate, speed hints).\n"
+        f"    Example: {CLI_COMMAND} list\n"
+        "  ps\n"
+        "    Alias view for model table/state (same rendering as list).\n"
+        f"    Example: {CLI_COMMAND} ps\n"
+        "  requests [-n LINES]\n"
+        "    Show recent API request log entries.\n"
+        f"    Example: {CLI_COMMAND} requests -n 50 (or {CLI_COMMAND} requests -n 1)\n"
+        "  info\n"
+        "    Show endpoints, runtime paths, versions, service commands and status.\n"
+        f"    Example: {CLI_COMMAND} info\n"
+        f"  Help     Show options for any command.\n"
+        f"    Example: {CLI_COMMAND} <command> -h\n"
+        f"For endpoints/runtime/service/config details run: {CLI_COMMAND} info"
     )
 
 class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
@@ -4798,14 +5718,45 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     parser.add_argument("--public-port", type=int, default=DEFAULT_PUBLIC_PORT)
     parser.add_argument("--api-port", type=int, default=None)
     parser.add_argument("--idle-ttl", type=int, default=None)
+    parser.add_argument("--api-ctx-factor", type=float, default=None)
     sub = parser.add_subparsers(dest="command", required=True)
     subparsers: dict[str, argparse.ArgumentParser] = {}
     
-    p_add = sub.add_parser("add")
+    p_add = sub.add_parser(
+        "add",
+        help="Register/download model(s)",
+        description="Register/download one or more GGUF models into the catalog.",
+    )
     subparsers["add"] = p_add
-    p_add.set_defaults(func=lambda a: ensure_model_available(a) and 0)
+    p_add.set_defaults(func=add_models)
+    p_add.add_argument("repo", nargs="*", help="HF repo[:QUANT] (accepts a list)")
+    p_add.add_argument("-hf", "--hf", nargs="+", help="HF repo[:QUANT] list")
+    p_add.add_argument("--file")
+    p_add.add_argument("--model-id")
+    p_add.add_argument("--ctx-size", default=DEFAULT_CTX_SIZE)
+    p_add.add_argument(
+        "--auto",
+        "-auto",
+        "--auto-ctx",
+        "-auto-ctx",
+        dest="auto_ctx",
+        action="store_true",
+        help="Force a fresh automatic ctx probe even if a fallback was already saved",
+    )
+    p_add.add_argument("--skip-ctx", action="store_true", help="Skip automatic ctx tuning and keep the default ctx size")
+    p_add.add_argument("--n-gpu-layers", default=DEFAULT_N_GPU_LAYERS)
+    p_add.add_argument("--tensor-split", default=default_tensor_split())
+    p_add.add_argument("--host", default="127.0.0.1")
+    p_add.add_argument("--no-jinja", action="store_true")
+    p_add.add_argument("--force", action="store_true")
+    p_add.add_argument("--hf-token")
+    p_add.add_argument("--description")
     
-    p_run = sub.add_parser("run")
+    p_run = sub.add_parser(
+        "run",
+        help="Run chat with a model",
+        description="Ensure model availability and run chat unless --no-chat is used.",
+    )
     subparsers["run"] = p_run
     p_run.set_defaults(
         func=lambda a: (
@@ -4817,20 +5768,42 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     p_run.add_argument("--no-chat", action="store_true")
     p_run.add_argument("-ctx", "--ctx", dest="ctx_override", type=int, help="Override ctx size for this run")
 
-    p_remove = sub.add_parser("remove")
+    p_remove = sub.add_parser(
+        "remove",
+        aliases=["rm"],
+        help="Remove model(s) from catalog",
+        description="Remove model entries from catalog/config; rm alias deletes files by default.",
+    )
     subparsers["remove"] = p_remove
-    p_remove.set_defaults(func=lambda a: remove_model(a) and 0)
-    p_remove.add_argument("repo", nargs="?", help="Model id or HF repo[:QUANT]")
-    p_remove.add_argument("-hf", "--hf", help="HF repo")
+    subparsers["rm"] = p_remove
+    p_remove.set_defaults(func=remove_models)
+    p_remove.add_argument("repo", nargs="*", help="Model id or HF repo[:QUANT] (accepts a list)")
+    p_remove.add_argument("-hf", "--hf", nargs="+", help="HF repo list")
     p_remove.add_argument("--file")
     p_remove.add_argument("--model-id")
-    p_remove.add_argument("--delete-files", action="store_true")
+    p_remove.add_argument(
+        "--delete-files",
+        dest="delete_files",
+        action="store_true",
+        default=True,
+        help="Delete local model files from disk (default).",
+    )
+    p_remove.add_argument(
+        "--keep-files",
+        dest="delete_files",
+        action="store_false",
+        help="Keep local model files on disk.",
+    )
 
-    p_update = sub.add_parser("update")
+    p_update = sub.add_parser(
+        "update",
+        help="Refresh model configuration",
+        description="Refresh model configuration and optionally re-probe context limits.",
+    )
     subparsers["update"] = p_update
-    p_update.set_defaults(func=lambda a: update_config(a) and 0)
-    p_update.add_argument("repo", nargs="?", help="Model id or HF repo[:QUANT]")
-    p_update.add_argument("-hf", "--hf", help="HF repo")
+    p_update.set_defaults(func=update_models)
+    p_update.add_argument("repo", nargs="*", help="Model id or HF repo[:QUANT] (accepts a list)")
+    p_update.add_argument("-hf", "--hf", nargs="+", help="HF repo list")
     p_update.add_argument("--file")
     p_update.add_argument("--model-id")
     p_update.add_argument("-ctx", "--ctx", dest="ctx_override", type=int, help="Set ctx size for the selected model(s)")
@@ -4843,8 +5816,22 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
         action="store_true",
         help="Probe and set a practical ctx size per model automatically",
     )
+    p_update.add_argument(
+        "--preserve-ctx",
+        action="store_true",
+        help="Keep existing CFG_CTX values while regenerating config",
+    )
+    p_update.add_argument(
+        "--sync-gguf-ctx",
+        action="store_true",
+        help="Overwrite CFG_CTX values from GGUF metadata",
+    )
 
-    p_validate = sub.add_parser("validate")
+    p_validate = sub.add_parser(
+        "validate",
+        help="Probe/validate model ctx",
+        description="Probe and validate context behavior before serving a model.",
+    )
     subparsers["validate"] = p_validate
     p_validate.set_defaults(func=validate_model)
     p_validate.add_argument("repo", nargs="?", help="HF repo[:QUANT] or installed model id")
@@ -4869,11 +5856,15 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     p_validate.add_argument("--hf-token")
     p_validate.add_argument("--description")
     
-    p_daemon = sub.add_parser("daemon")
+    p_daemon = sub.add_parser(
+        "daemon",
+        help="Start manager daemon",
+        description="Start the manager daemon loop for background lifecycle automation.",
+    )
     subparsers["daemon"] = p_daemon
     p_daemon.set_defaults(func=daemon_mode)
     
-    for p in [p_add, p_run]:
+    for p in [p_run]:
         p.add_argument("repo", nargs="?", help="HF repo[:QUANT]")
         p.add_argument("-hf", "--hf", help="HF repo")
         p.add_argument("--file")
@@ -4897,16 +5888,36 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
         p.add_argument("--hf-token")
         p.add_argument("--description")
 
-    p_list = sub.add_parser("list")
+    p_list = sub.add_parser(
+        "list",
+        help="List configured models",
+        description="Show configured models with runtime/ctx summary.",
+    )
     subparsers["list"] = p_list
     p_list.set_defaults(func=list_models)
-    p_ps = sub.add_parser("ps")
+    p_ps = sub.add_parser(
+        "ps",
+        help="Alias of list",
+        description="Alias of list for compatibility with process-style listing.",
+    )
     subparsers["ps"] = p_ps
     p_ps.set_defaults(func=list_models)
-    p_requests = sub.add_parser("requests")
+    p_requests = sub.add_parser(
+        "requests",
+        help="Show recent request logs",
+        description="Show recent API request log lines.",
+    )
     subparsers["requests"] = p_requests
     p_requests.add_argument("-n", "--lines", type=int, default=50)
     p_requests.set_defaults(func=show_request_log)
+
+    p_info = sub.add_parser(
+        "info",
+        help="Show runtime/system information",
+        description="Show endpoints, versions, runtime paths, service commands and config knobs.",
+    )
+    subparsers["info"] = p_info
+    p_info.set_defaults(func=show_info)
 
     return parser, subparsers
 
@@ -4917,6 +5928,8 @@ def parse_cli_args(
     argv: list[str] | None = None,
 ) -> argparse.Namespace:
     argv_list = list(sys.argv[1:] if argv is None else argv)
+    if any(token in {"-info", "--info"} for token in argv_list):
+        parser.error("Use the 'info' subcommand without dashes: llamacpp-superserver info")
     try:
         return parser.parse_args(argv_list)
     except SystemExit as exc:

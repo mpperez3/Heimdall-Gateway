@@ -14,6 +14,7 @@ default:
   mirostat_lr: 0.1
   cache_type_k: q8_0
   cache_type_v: q8_0
+  flash-attn: on
 
 presets:
   "2":
@@ -22,8 +23,6 @@ presets:
     ubatch-size: 512
     threads: 16
     threads-batch: 16
-    numa: distribute
-    flash-attn: on
 
   "7":
     tensor_split: "0.94,1,1,1,1,1,0.94"
@@ -33,4 +32,3 @@ presets:
     threads-batch: 16
     numa: distribute
     fit-target: 1536
-    flash-attn: on

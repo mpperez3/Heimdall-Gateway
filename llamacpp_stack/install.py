@@ -16,7 +16,9 @@ import time
 import textwrap
 import urllib.request
 import yaml
+from datetime import datetime, timezone
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 
@@ -84,6 +86,7 @@ def _ensure_server_config_metadata(payload: dict[str, object]) -> dict[str, obje
         {
             "idle_ttl": 300,
             "api_port": 11436,
+            "api_ctx_factor": 0.5,
             "llama_server_defaults": {
                 "ctx_size": 65536,
                 "n_gpu_layers": 999,
@@ -1712,6 +1715,43 @@ def read_install_manifest(layout: InstallLayout) -> dict[str, object]:
     return payload if isinstance(payload, dict) else {}
 
 
+def get_superserver_version() -> str:
+    forced = os.environ.get("LLAMACPP_SUPERSERVER_VERSION", "").strip()
+    if forced:
+        return forced
+    try:
+        return version("llamacpp-superserver")
+    except PackageNotFoundError:
+        pass
+    except Exception:
+        pass
+    pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    try:
+        for raw in pyproject_path.read_text(encoding="utf-8").splitlines():
+            match = re.match(r"\s*version\s*=\s*\"([^\"]+)\"", raw)
+            if match:
+                return match.group(1)
+    except Exception:
+        pass
+    return "0.0.0"
+
+
+def render_superserver_banner() -> str:
+    divider = "=" * 72
+    return (
+        f"{divider}\n"
+        " _ _                                _\n"
+        "| | | __ _ _ __ ___   __ _  ___ _ __| |_ _ __\n"
+        "| | |/ _` | '_ ` _ \\ / _` |/ __| '__| __| '_ \\\n"
+        "| | | (_| | | | | | | (_| | (__| |  | |_| |_) |\n"
+        "|_|_|\\__,_|_| |_| |_|\\__,_|\\___|_|   \\__| .__/\n"
+        "                                           |_|   \n"
+        "              llama.cpp  SuperServer\n"
+        f"         llamacpp-superserver v{get_superserver_version()}\n"
+        f"{divider}"
+    )
+
+
 def detect_existing_llama_cpp_mode(layout: InstallLayout) -> str:
     payload = read_install_manifest(layout)
     strategy = str(payload.get("llama_cpp_strategy") or "").strip()
@@ -1726,6 +1766,37 @@ def detect_existing_llama_cpp_mode(layout: InstallLayout) -> str:
 
 def is_existing_install(layout: InstallLayout) -> bool:
     return (layout.state_dir / "install-manifest.json").exists() or layout.install_root.exists()
+
+
+def _backup_existing_model_configuration(layout: InstallLayout, dry_run: bool) -> Path | None:
+    sources = [
+        layout.state_dir / "catalog.json",
+        layout.state_dir / "config.yaml",
+        layout.config_dir / SERVER_CONFIG_BASENAME,
+        layout.config_dir / LEGACY_SERVER_CONFIG_BASENAME,
+        layout.config_dir / ENV_BASENAME,
+        layout.config_dir / LEGACY_ENV_BASENAME,
+    ]
+    existing_sources = [path for path in sources if path.exists()]
+    if not existing_sources:
+        return None
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    backup_dir = layout.state_dir / "reinstall-backups" / stamp
+    if dry_run:
+        print(f"[dry-run] would back up model configuration to {backup_dir}")
+        for source in existing_sources:
+            print(f"[dry-run] would copy {source}")
+        return backup_dir
+
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    for source in existing_sources:
+        prefix = "state" if source.is_relative_to(layout.state_dir) else "config"
+        destination = backup_dir / prefix / source.name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    print(f"Backed up current model configuration to {backup_dir}")
+    return backup_dir
 
 
 def install_systemd_units(layout: InstallLayout, dry_run: bool) -> None:
@@ -1853,6 +1924,7 @@ def print_install_summary(layout: InstallLayout, install_services: bool) -> None
         restart_cmd = f"systemctl --user restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}"
         status_cmd = f"systemctl --user status {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}"
 
+    print(render_superserver_banner())
     print("\nInstallation complete.")
     print("Use:")
     print(f"  {CLI_COMMAND} --help")
@@ -1872,6 +1944,11 @@ def print_install_summary(layout: InstallLayout, install_services: bool) -> None
         print(f"Start them with: {start_cmd}")
         print(f"Then check with: {status_cmd}")
     if help_cmd.exists():
+        print("\nCurrent model summary (ctx, GB, speed):\n")
+        try:
+            subprocess.run([str(help_cmd), "list"], check=False)
+        except Exception as exc:
+            print(f"Could not show {CLI_COMMAND} list automatically: {exc}")
         print("\nShowing command help:\n")
         try:
             subprocess.run([str(help_cmd), "--help"], check=False)
@@ -2307,17 +2384,21 @@ def _ensure_basic_server_config(layout: InstallLayout) -> None:
     if "models" not in server_config:
         server_config["models"] = {}
     had_meta = isinstance(server_config.get("_meta"), dict)
+    api_ctx_factor_added = False
     if "llama_server_defaults" not in server_config:
         server_config["llama_server_defaults"] = {}
     if not isinstance(server_config.get("llama_server_defaults"), dict):
         server_config["llama_server_defaults"] = {}
+    if "api_ctx_factor" not in server_config:
+        server_config["api_ctx_factor"] = 0.5
+        api_ctx_factor_added = True
     _ensure_server_config_metadata(server_config)
     _ensure_llama_server_defaults_file(layout.config_dir)
 
     default_ctx = 8192
     default_n_gpu_layers = 999
 
-    server_changed = not had_meta
+    server_changed = (not had_meta) or api_ctx_factor_added
     catalog_changed = False
 
     if _merge_missing_llama_server_defaults(server_config["llama_server_defaults"], layout.config_dir):
@@ -2552,7 +2633,7 @@ def maybe_rerun_auto_ctx(layout: InstallLayout, install_services: bool, dry_run:
 
     def _run_sync_config() -> None:
         try:
-            _run([str(layout.bin_dir / CLI_COMMAND), "update"])
+            _run([str(layout.bin_dir / CLI_COMMAND), "update", "--preserve-ctx"])
             _ensure_basic_server_config(layout)
             print(f"Synced registered models to llama-swap UI configuration.")
         except subprocess.CalledProcessError as exc:
@@ -2677,6 +2758,9 @@ def install_stack(args: argparse.Namespace) -> int:
     reexec_status = maybe_reexec_system_install(args, pre_mode, llama_cpp_mode, chosen_models_dir)
     if reexec_status is not None:
         return reexec_status
+
+    if is_existing_install(layout):
+        _backup_existing_model_configuration(layout, args.dry_run)
 
     if args.dry_run:
         print(f"[dry-run] would ensure directories under {layout.install_root}, {layout.state_dir}, {layout.models_dir}")
@@ -2905,6 +2989,7 @@ def install_stack(args: argparse.Namespace) -> int:
                 server_config_data = {}
         server_config_data["idle_ttl"] = args.idle_ttl
         server_config_data["api_port"] = layout.public_port - 1
+        server_config_data.setdefault("api_ctx_factor", 0.5)
         llama_defaults = server_config_data.setdefault("llama_server_defaults", {})
         if not isinstance(llama_defaults, dict):
             llama_defaults = {}
