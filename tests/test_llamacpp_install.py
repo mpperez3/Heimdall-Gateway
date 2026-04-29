@@ -20,6 +20,7 @@ from llamacpp_stack.cli import (
     ManagedModel,
     add_models,
     build_openai_model_payload,
+    build_ollama_model_payload,
     build_info_text,
     choose_auto_ctx,
     download_hf_file,
@@ -69,6 +70,7 @@ from llamacpp_stack.install import (
     determine_build_jobs,
     build_parser,
     build_llama_cpp_from_source,
+    _patch_llama_cpp_grammar_repetition_threshold,
     choose_default_swap_port,
     choose_layout,
     choose_llamacpp_linux_asset,
@@ -330,6 +332,20 @@ class InstallHelpersTest(unittest.TestCase):
                 self.assertTrue(_export_nvcc_path(str(nvcc)))
                 self.assertEqual(Path(os.environ["CUDACXX"]), nvcc.resolve())
                 self.assertTrue(os.environ["PATH"].startswith(str(nvcc.parent.resolve())))
+
+    def test_patch_llama_cpp_grammar_repetition_threshold_updates_define(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "llama.cpp-b9999"
+            grammar = root / "src" / "llama-grammar.cpp"
+            grammar.parent.mkdir(parents=True)
+            grammar.write_text(
+                "// test\n#define MAX_REPETITION_THRESHOLD 2000\n",
+                encoding="utf-8",
+            )
+            changed = _patch_llama_cpp_grammar_repetition_threshold(root, 2_000_000)
+            self.assertTrue(changed)
+            rendered = grammar.read_text(encoding="utf-8")
+            self.assertIn("#define MAX_REPETITION_THRESHOLD 2000000", rendered)
 
     def test_build_llama_cpp_from_source_passes_cuda_compiler(self) -> None:
         release = {"tag_name": "b9999"}
@@ -1819,6 +1835,72 @@ class InstallHelpersTest(unittest.TestCase):
             updated = json.loads(catalog_path.read_text(encoding="utf-8"))
             self.assertEqual(updated[0]["model_id"], "minimax-m2.7-ud-q4_k_m")
 
+    def test_maybe_rerun_auto_ctx_migration_keeps_speculative_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            models_dir.mkdir(parents=True)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True)
+            catalog_path = state_dir / "catalog.json"
+            catalog_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "model_id": "qwen3.6-35b-a3b-gguf-ud-q4_k_m",
+                            "repo_id": "unsloth/Qwen3.6-35B-A3B-GGUF",
+                            "quant": "UD-Q4_K_M",
+                            "filename": "Qwen3.6-35B-A3B-UD-Q4_K_M-00001-of-00002.gguf",
+                            "local_path": str(models_dir / "Qwen3.6-35B-A3B-UD-Q4_K_M-00001-of-00002.gguf"),
+                        },
+                        {
+                            "model_id": "speculative-qwen3.6-35b-a3b-ud-q4_k_m",
+                            "repo_id": "unsloth/Qwen3.6-35B-A3B-GGUF",
+                            "quant": "UD-Q4_K_M",
+                            "filename": "Qwen3.6-35B-A3B-UD-Q4_K_M-00001-of-00002.gguf",
+                            "local_path": str(models_dir / "Qwen3.6-35B-A3B-UD-Q4_K_M-00001-of-00002.gguf"),
+                            "speculative": True,
+                            "spec_variant_of": "qwen3.6-35b-a3b-gguf-ud-q4_k_m",
+                            "spec_meta": {
+                                "base_model_id": "qwen3.6-35b-a3b-gguf-ud-q4_k_m",
+                                "draft_model_id": "qwen3.6-35b-a3b-ud-iq1_m",
+                            },
+                            "server_overrides": {
+                                "model_draft": str(models_dir / "Qwen3.6-35B-A3B-UD-IQ1_M.gguf"),
+                            },
+                        },
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            layout = InstallLayout(
+                mode="system",
+                state_dir=state_dir,
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=models_dir,
+                config_dir=root / "config",
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+
+            args = argparse.Namespace(migrate_model_ids=True, rerun_auto_ctx=False)
+            maybe_rerun_auto_ctx(layout, install_services=False, dry_run=False, args=args)
+
+            updated = json.loads(catalog_path.read_text(encoding="utf-8"))
+            model_ids = [str(item.get("model_id") or "") for item in updated]
+            self.assertIn("qwen3.6-35b-a3b-ud-q4_k_m", model_ids)
+            self.assertIn("speculative-qwen3.6-35b-a3b-ud-q4_k_m", model_ids)
+            self.assertNotIn("qwen3.6-35b-a3b-ud-q4_k_m-2", model_ids)
+
     def test_maybe_rerun_auto_ctx_migration_prefers_filename_over_repo_folder_slug(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2357,6 +2439,59 @@ class InstallHelpersTest(unittest.TestCase):
             refreshed = load_catalog(catalog_path)
             self.assertEqual(refreshed[0].ctx_size, 24576)
 
+    def test_update_config_ctx_override_refreshes_load_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            catalog_path = root / "catalog.json"
+            config_path = root / "config.yaml"
+            model_path = root / "models" / "model-q4.gguf"
+            model_path.parent.mkdir(parents=True)
+            model_path.write_bytes(b"gguf")
+            save_catalog(
+                catalog_path,
+                [
+                    ManagedModel(
+                        model_id="repo-q4",
+                        repo_id="org/repo",
+                        quant="Q4",
+                        filename="model-q4.gguf",
+                        local_path=str(model_path),
+                        ctx_size=24576,
+                    )
+                ],
+            )
+            args = Namespace(
+                repo=None,
+                hf=None,
+                model_id=None,
+                file=None,
+                ctx_override=4096,
+                auto_ctx=False,
+                preserve_ctx=False,
+                sync_gguf_ctx=False,
+                catalog=catalog_path,
+                config=config_path,
+                llama_server=root / "llama-server",
+                start_port=18080,
+                public_host="127.0.0.1",
+                public_port=11435,
+                idle_ttl=10,
+                server_config=root / SERVER_CONFIG_BASENAME,
+            )
+
+            response = mock.Mock(status_code=200)
+            response.json.return_value = {"data": []}
+
+            with (
+                mock.patch("llamacpp_stack.cli.refresh_model_load_capabilities") as refresh_mock,
+                mock.patch("llamacpp_stack.cli.time.sleep"),
+                mock.patch("llamacpp_stack.cli.requests.get", return_value=response),
+            ):
+                result = update_config(args)
+
+            self.assertEqual(result, "updated")
+            refresh_mock.assert_called()
+
     def test_update_config_auto_ctx_min_failed_prompts_and_deletes_models(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2439,6 +2574,68 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertEqual([m.model_id for m in remaining], ["ok-model"])
             self.assertFalse(fail_repo_dir.exists())
             self.assertTrue(ok_repo_dir.exists())
+
+    def test_update_config_auto_ctx_refreshes_load_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            repo_dir = models_dir / "org/repo"
+            repo_dir.mkdir(parents=True)
+            model_path = repo_dir / "ok.gguf"
+            model_path.write_bytes(b"gguf")
+
+            catalog_path = root / "catalog.json"
+            config_path = root / "config.yaml"
+            save_catalog(
+                catalog_path,
+                [
+                    ManagedModel(
+                        model_id="ok-model",
+                        repo_id="org/repo",
+                        quant="Q4_K_M",
+                        filename="ok.gguf",
+                        local_path=str(model_path),
+                        ctx_size=4096,
+                    ),
+                ],
+            )
+
+            args = Namespace(
+                repo=None,
+                hf=None,
+                model_id=None,
+                file=None,
+                ctx_override=None,
+                auto_ctx=True,
+                catalog=catalog_path,
+                config=config_path,
+                llama_server=root / "llama-server",
+                start_port=18080,
+                public_host="127.0.0.1",
+                public_port=11435,
+                idle_ttl=10,
+                server_config=root / SERVER_CONFIG_BASENAME,
+                models_dir=models_dir,
+            )
+
+            response = mock.Mock(status_code=200)
+            response.json.return_value = {"data": []}
+
+            with (
+                mock.patch("llamacpp_stack.cli.temporarily_unload_published_models"),
+                mock.patch(
+                    "llamacpp_stack.cli.choose_auto_ctx",
+                    return_value=(16384, "selected", {"selected_ctx": 16384}),
+                ),
+                mock.patch("llamacpp_stack.cli.resolve_llama_server_defaults", return_value={}),
+                mock.patch("llamacpp_stack.cli.refresh_model_load_capabilities") as refresh_mock,
+                mock.patch("llamacpp_stack.cli.time.sleep"),
+                mock.patch("llamacpp_stack.cli.requests.get", return_value=response),
+            ):
+                result = update_config(args)
+
+            self.assertEqual(result, "updated")
+            refresh_mock.assert_called()
 
     def test_desired_models_dir_owner_uses_service_identity_for_system_mode(self) -> None:
         layout = InstallLayout(
@@ -2528,6 +2725,66 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertFalse(model.jinja)
             self.assertEqual(model.description, "new")
 
+    def test_existing_model_default_ctx_emits_update_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            repo_dir = models_dir / "org/repo"
+            repo_dir.mkdir(parents=True)
+            model_path = repo_dir / "model-q4.gguf"
+            model_path.write_bytes(b"gguf")
+            catalog_path = root / "catalog.json"
+            config_path = root / "config.yaml"
+            save_catalog(
+                catalog_path,
+                [
+                    ManagedModel(
+                        model_id="repo-q4",
+                        repo_id="org/repo",
+                        quant="Q4",
+                        filename="model-q4.gguf",
+                        local_path=str(model_path),
+                        ctx_size=8192,
+                    )
+                ],
+            )
+            args = Namespace(
+                repo="org/repo:Q4",
+                hf=None,
+                model_id=None,
+                file=None,
+                catalog=catalog_path,
+                models_dir=models_dir,
+                force=False,
+                ctx_override=None,
+                auto_ctx=False,
+                skip_ctx=False,
+                ctx_size=8192,
+                config=config_path,
+                llama_server=root / "llama-server",
+                start_port=18080,
+                public_host="127.0.0.1",
+                public_port=11435,
+                n_gpu_layers=99,
+                tensor_split="1",
+                host="0.0.0.0",
+                idle_ttl=10,
+                no_jinja=False,
+                hf_token=None,
+                description="existing",
+                service="llamaswap",
+            )
+
+            with (
+                mock.patch("llamacpp_stack.cli.wait_for_model", return_value=True),
+                mock.patch("llamacpp_stack.cli._emit_message") as emit_mock,
+            ):
+                result = ensure_model_available(args)
+
+            self.assertEqual(result, "repo-q4")
+            rendered = "\n".join(str(call.args[0]) for call in emit_mock.call_args_list if call.args)
+            self.assertIn(f"{CLI_COMMAND} update --auto --model-id repo-q4", rendered)
+
     def test_render_config_uses_global_idle_ttl(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2581,6 +2838,7 @@ class InstallHelpersTest(unittest.TestCase):
       "split_mode": "layer",
       "mmap": true,
       "flash-attn": "on",
+            "reasoning-format": "none",
       "batch_size": "1024"
     }
   }
@@ -2591,7 +2849,7 @@ class InstallHelpersTest(unittest.TestCase):
             )
             with mock.patch("llamacpp_stack.cli.DEFAULT_SERVER_CONFIG_PATH", server_config):
                 model = load_catalog(catalog_path)[0]
-            self.assertEqual(model.server_overrides, {"flash_attn": "on", "batch_size": 1024})
+            self.assertEqual(model.server_overrides, {"flash_attn": "on", "reasoning_format": "none", "batch_size": 1024})
 
     def test_build_llama_server_command_emits_flash_attn_with_explicit_value(self) -> None:
         model = ManagedModel(
@@ -2610,6 +2868,24 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertIn("--flash-attn", cmd)
         idx = cmd.index("--flash-attn")
         self.assertEqual(cmd[idx + 1], "on")
+
+    def test_build_llama_server_command_emits_reasoning_format_with_explicit_value(self) -> None:
+        model = ManagedModel(
+            model_id="repo-q4",
+            repo_id="org/repo",
+            quant="Q4",
+            filename="model-q4.gguf",
+            local_path="/tmp/model-q4.gguf",
+            server_overrides={"reasoning_format": "none"},
+        )
+        cmd = build_llama_server_command(
+            model,
+            Path("/tmp/llama-server"),
+            port="12345",
+        )
+        self.assertIn("--reasoning-format", cmd)
+        idx = cmd.index("--reasoning-format")
+        self.assertEqual(cmd[idx + 1], "none")
 
     def test_load_catalog_reprocesses_when_server_defaults_change(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2962,7 +3238,7 @@ models:
         self.assertIn("Cannot load model 'model-b'", message)
         self.assertIn("model-a (pid 123, 4096 MiB)", message)
 
-    def test_get_gpu_conflict_message_reports_foreign_process(self) -> None:
+    def test_get_gpu_conflict_message_ignores_foreign_process(self) -> None:
         model = ManagedModel(
             model_id="model-b",
             repo_id="org/b",
@@ -2977,7 +3253,7 @@ models:
             mock.patch("llamacpp_stack.cli._describe_pid", return_value="python train.py"),
         ):
             message = get_gpu_conflict_message("model-b", [model])
-        self.assertIn("python train.py (pid 999, 2048 MiB)", message)
+        self.assertIsNone(message)
 
     def test_get_gpu_conflict_message_ignores_ollama_processes(self) -> None:
         model = ManagedModel(
@@ -3219,7 +3495,8 @@ models:
         ):
             selected, status, info = choose_auto_ctx(model, Path("/tmp/llama-server"))
 
-        self.assertEqual([call.args[2] for call in probe_mock.call_args_list], [8192, 16384, 65536])
+        # With a previous configured ctx present, we probe it first.
+        self.assertEqual([call.args[2] for call in probe_mock.call_args_list], [16384, 65536])
         self.assertEqual(status, "selected")
         self.assertEqual(selected, 65536)
         self.assertEqual(info["selected_ctx"], 65536)
@@ -3272,14 +3549,37 @@ models:
         self.assertEqual(metadata["api_context_length"], 16384)
         self.assertEqual(metadata["context_length"], 32768)
         self.assertEqual(metadata["gguf_context_length"], 65536)
+        self.assertIsNone(metadata["ctx_probe_read_s"])
+        self.assertIsNone(metadata["ctx_probe_tokens_s"])
+        self.assertIsNone(metadata["ctx_probe_totals_s"])
         self.assertIsNone(metadata["ctx_probe_latency_ms"])
         self.assertIsNone(metadata["ctx_probe_speed_tps"])
         self.assertIsNone(metadata["ctx_probe_kv_gb"])
+        self.assertEqual(metadata["ctx_probe_read"], "NC")
+        self.assertEqual(metadata["ctx_probe_tokens"], "NC")
+        self.assertEqual(metadata["ctx_probe_totals"], "NC")
         self.assertEqual(metadata["ctx_probe_latency"], "NC")
         self.assertEqual(metadata["ctx_probe_speed"], "NC")
         self.assertEqual(metadata["ctx_probe_kv"], "NC")
 
-    def test_render_models_table_shows_ctx_gb_and_speed_columns(self) -> None:
+    def test_build_ollama_model_payload_exposes_load_capabilities_for_api_and_ps(self) -> None:
+        model = ManagedModel(
+            model_id="repo-vl",
+            repo_id="org/repo-vl",
+            quant="Q4",
+            filename="model-vl.gguf",
+            local_path="/tmp/model-vl.gguf",
+            ctx_size=32768,
+            load_capabilities=["image", "image-text-to-text"],
+        )
+        with mock.patch("llamacpp_stack.cli.get_model_context_size", return_value=65536):
+            payload = build_ollama_model_payload(model, loaded=True, process={"pid": 1234}, gpu_process_map={})
+
+        self.assertEqual(payload["details"]["load_capabilities"], ["image", "image-text-to-text"])
+        self.assertEqual(payload["model_info"]["llamacpp.load_capabilities"], ["image", "image-text-to-text"])
+        self.assertTrue(payload["details"]["vision"])
+
+    def test_render_models_table_shows_ctx_gb_and_rate_columns(self) -> None:
         model = ManagedModel(
             model_id="repo-q4",
             repo_id="org/repo",
@@ -3287,7 +3587,9 @@ models:
             filename="model.gguf",
             local_path="/tmp/model.gguf",
             ctx_probe_kv_gb=3.25,
-            ctx_probe_speed_tps=118.4,
+            ctx_probe_read_s=118.4,
+            ctx_probe_tokens_s=56.2,
+            ctx_probe_totals_s=174.6,
         )
         with (
             mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value=set()),
@@ -3299,12 +3601,16 @@ models:
             table = render_models_table([model], host="127.0.0.1", port=11435, idle_ttl=10)
 
         self.assertIn("CTX_GB", table)
-        self.assertIn("SPEED", table)
+        self.assertIn("READ/S", table)
+        self.assertIn("TOKEN/S", table)
+        self.assertIn("TOTAL/S", table)
         self.assertIn("CFG_CTX", table)
         self.assertIn("API_CTX", table)
         self.assertNotIn("MAX_CTX", table)
         self.assertIn("3.25", table)
         self.assertIn("118.4 tok/s", table)
+        self.assertIn("56.2 tok/s", table)
+        self.assertIn("174.6 tok/s", table)
 
     def test_render_models_table_marks_error_for_failed_min_probe(self) -> None:
         model = ManagedModel(

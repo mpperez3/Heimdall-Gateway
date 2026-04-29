@@ -43,6 +43,8 @@ ENV_BASENAME = "llamacpp-superserver.env"
 LEGACY_ENV_BASENAME = "llamacpp-stack.env"
 LLAMA_CPP_MODES = ("native", "prebuilt", "source")
 ELEVATED_INSTALL_ENV = "LLAMACPP_INSTALL_ELEVATED"
+DEFAULT_GRAMMAR_MAX_REPETITION_THRESHOLD = 2_000_000
+GRAMMAR_MAX_REPETITION_THRESHOLD_ENV = "LLAMACPP_GRAMMAR_MAX_REPETITION_THRESHOLD"
 
 CONFIG_YAML_HEADER = textwrap.dedent(
     """\
@@ -156,6 +158,11 @@ def _load_llama_server_defaults_preset(config_dir: Path) -> dict[str, object]:
 def _merge_missing_llama_server_defaults(target: dict[str, object], config_dir: Path) -> bool:
     if not isinstance(target, dict):
         return False
+    # Record whether the caller already had any server defaults. If so,
+    # avoid adding higher-level bundled keys like `speculative_defaults`
+    # to preserve explicit user-provided defaults.
+    had_existing_defaults = bool(target)
+
     preset_defaults = _load_llama_server_defaults_preset(config_dir)
     if not preset_defaults:
         return False
@@ -164,6 +171,29 @@ def _merge_missing_llama_server_defaults(target: dict[str, object], config_dir: 
         if key not in target:
             target[key] = value
             changed = True
+    # Additionally merge any `speculative_defaults` mapping from the bundled
+    # `llama_server_defaults.yaml` into `target['speculative_defaults']` only
+    # when there were no existing server defaults present. This preserves
+    # explicit user/server-configured defaults and avoids surprising keys
+    # being injected into a pre-existing configuration.
+    if not had_existing_defaults:
+        try:
+            defaults_path = _ensure_llama_server_defaults_file(config_dir)
+            payload = yaml.safe_load(defaults_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            payload = {}
+        spec_defaults = payload.get("speculative_defaults")
+        if isinstance(spec_defaults, dict):
+            spec_target = target.get("speculative_defaults")
+            if not isinstance(spec_target, dict):
+                target["speculative_defaults"] = {}
+                spec_target = target["speculative_defaults"]
+                changed = True
+            for key, value in spec_defaults.items():
+                if key not in spec_target:
+                    spec_target[key] = value
+                    changed = True
+
     return changed
 
 
@@ -1469,6 +1499,39 @@ def determine_build_jobs() -> int:
     return max(1, os.cpu_count() or 1)
 
 
+def _resolve_grammar_max_repetition_threshold() -> int:
+    raw = os.environ.get(GRAMMAR_MAX_REPETITION_THRESHOLD_ENV, "").strip()
+    if not raw:
+        return DEFAULT_GRAMMAR_MAX_REPETITION_THRESHOLD
+    try:
+        parsed = int(raw)
+    except Exception:
+        return DEFAULT_GRAMMAR_MAX_REPETITION_THRESHOLD
+    return parsed if parsed > 0 else DEFAULT_GRAMMAR_MAX_REPETITION_THRESHOLD
+
+
+def _patch_llama_cpp_grammar_repetition_threshold(source_root: Path, threshold: int) -> bool:
+    grammar_path = source_root / "src" / "llama-grammar.cpp"
+    if not grammar_path.exists():
+        return False
+    try:
+        current = grammar_path.read_text(encoding="utf-8")
+    except Exception:
+        return False
+    updated, replacements = re.subn(
+        r"(?m)^(\s*#define\s+MAX_REPETITION_THRESHOLD\s+)\d+\b",
+        rf"\g<1>{int(threshold)}",
+        current,
+        count=1,
+    )
+    if replacements <= 0:
+        return False
+    if updated == current:
+        return True
+    grammar_path.write_text(updated, encoding="utf-8")
+    return True
+
+
 def _run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True, env=env)
 
@@ -1579,6 +1642,15 @@ def build_llama_cpp_from_source(
     if src_dir.exists():
         shutil.rmtree(src_dir)
     _extract_tarball(src_archive, install_root)
+    grammar_threshold = _resolve_grammar_max_repetition_threshold()
+    grammar_threshold_patched = _patch_llama_cpp_grammar_repetition_threshold(
+        src_dir,
+        grammar_threshold,
+    )
+    if grammar_threshold_patched:
+        print(f"[*] Ensured llama.cpp MAX_REPETITION_THRESHOLD is set to {grammar_threshold}.")
+    else:
+        print("[!] Warning: could not patch llama.cpp MAX_REPETITION_THRESHOLD (src/llama-grammar.cpp not found or unchanged pattern).")
 
     cmake_args = [
         "cmake",
@@ -1688,14 +1760,14 @@ def install_release_asset(asset: dict, install_root: Path, dry_run: bool) -> Pat
     return extract_root
 
 
-def write_manifest(layout: InstallLayout, llama_cpp_release: dict, llamaswap_release: dict, strategy: str, dry_run: bool) -> None:
+def write_manifest(layout: InstallLayout, llama_cpp_tag: str, llamaswap_tag: str, strategy: str, dry_run: bool) -> None:
     payload = {
         "mode": layout.mode,
         "models_dir": str(layout.models_dir),
         "public_host": layout.public_host,
         "public_port": layout.public_port,
-        "llama_cpp_tag": llama_cpp_release["tag_name"],
-        "llamaswap_tag": llamaswap_release["tag_name"],
+        "llama_cpp_tag": llama_cpp_tag,
+        "llamaswap_tag": llamaswap_tag,
         "llama_cpp_strategy": strategy,
     }
     if dry_run:
@@ -2123,6 +2195,32 @@ def _catalog_payload_for_import(catalog_path: Path) -> tuple[list[dict[str, obje
     return filtered, None
 
 
+def _is_speculative_catalog_entry(item: dict[str, object]) -> bool:
+    model_id = str(item.get("model_id") or "").strip().lower()
+    if model_id.startswith("speculative-"):
+        return True
+    if bool(item.get("speculative")):
+        return True
+    if str(item.get("spec_variant_of") or "").strip():
+        return True
+
+    spec_meta = item.get("spec_meta")
+    if isinstance(spec_meta, dict):
+        if str(spec_meta.get("base_model_id") or "").strip():
+            return True
+        if str(spec_meta.get("draft_model_id") or "").strip():
+            return True
+
+    server_overrides = item.get("server_overrides")
+    if isinstance(server_overrides, dict):
+        if str(server_overrides.get("model_draft") or "").strip():
+            return True
+        if str(server_overrides.get("hf_repo_draft") or "").strip():
+            return True
+
+    return False
+
+
 def _plan_model_id_migration(payload: list[dict[str, object]]) -> dict[str, str]:
     current_ids = {
         str(item.get("model_id") or "").strip()
@@ -2137,6 +2235,8 @@ def _plan_model_id_migration(payload: list[dict[str, object]]) -> dict[str, str]
             continue
         current = str(item.get("model_id") or "").strip()
         if not current:
+            continue
+        if _is_speculative_catalog_entry(item):
             continue
         target_base = _normalized_model_id_components(
             str(item.get("repo_id") or ""),
@@ -2739,7 +2839,32 @@ def install_stack(args: argparse.Namespace) -> int:
     else:
         update_binaries = True
         if is_existing_install(layout):
-            update_binaries = prompt_bool("Existing installation detected. Update llama.cpp and llama-swap binaries?", default=True)
+            # Read current installed tags (if any)
+            current_manifest = read_install_manifest(layout)
+            current_llama_cpp_tag = str(current_manifest.get("llama_cpp_tag") or "not installed")
+            current_llamaswap_tag = str(current_manifest.get("llamaswap_tag") or "not installed")
+            # Try to fetch latest tags to show the user and provide quick links
+            try:
+                latest_cpp = latest_release(DEFAULT_LLAMA_CPP_REPO)
+                latest_swap = latest_release(DEFAULT_LLAMASWAP_REPO)
+                latest_cpp_tag = str(latest_cpp.get("tag_name") or "unknown")
+                latest_swap_tag = str(latest_swap.get("tag_name") or "unknown")
+                cpp_url = f"https://github.com/{DEFAULT_LLAMA_CPP_REPO}/releases/latest"
+                swap_url = f"https://github.com/{DEFAULT_LLAMASWAP_REPO}/releases/latest"
+                prompt_msg = (
+                    "Existing installation detected.\n"
+                    f"llama.cpp: current {current_llama_cpp_tag}, latest {latest_cpp_tag} ({cpp_url})\n"
+                    f"llama-swap: current {current_llamaswap_tag}, latest {latest_swap_tag} ({swap_url})\n"
+                    "Update llama.cpp and llama-swap binaries?"
+                )
+            except Exception:
+                prompt_msg = (
+                    "Existing installation detected.\n"
+                    f"llama.cpp: current {current_llama_cpp_tag}\n"
+                    f"llama-swap: current {current_llamaswap_tag}\n"
+                    "Update llama.cpp and llama-swap binaries?"
+                )
+            update_binaries = prompt_bool(prompt_msg, default=True)
     # Preserve the interactive selection when re-executing in system mode via sudo.
     args.update_binaries = update_binaries
     stable_llama_server = layout.install_root / "llama-server"
@@ -3045,7 +3170,7 @@ def install_stack(args: argparse.Namespace) -> int:
             legacy_wrapper.symlink_to(target_wrapper)
         ensure_service_writable_dirs(layout, args.dry_run)
 
-    write_manifest(layout, llama_cpp_release, llamaswap_release, strategy, args.dry_run)
+    write_manifest(layout, target_llama_cpp_tag, target_llamaswap_tag, strategy, args.dry_run)
     if args.install_services:
         install_systemd_units(layout, args.dry_run)
         maybe_offer_ufw_ports(layout, args.dry_run)

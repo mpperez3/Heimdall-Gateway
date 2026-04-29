@@ -111,6 +111,27 @@ DEFAULT_N_GPU_LAYERS = 999
 DEFAULT_IDLE_TTL = int(os.environ.get("LLAMACPP_IDLE_TTL", os.environ.get("LLAMACPP_DEFAULT_TTL", "300")))
 
 
+def _default_ctx_update_command(model_id: str) -> str:
+    candidate = str(model_id or "").strip()
+    if candidate:
+        return f"{CLI_COMMAND} update --auto --model-id {candidate}"
+    return f"{CLI_COMMAND} update --auto"
+
+
+def _emit_default_ctx_update_hint(model_id: str, ctx_size: int | None, default_ctx: int, progress_callback = None) -> None:
+    try:
+        current_ctx = int(ctx_size) if ctx_size is not None else None
+        expected_default = int(default_ctx)
+    except Exception:
+        return
+    if current_ctx != expected_default:
+        return
+    _emit_message(
+        f"{model_id} is running with default ctx {expected_default}. To auto-tune it now, run: {_default_ctx_update_command(model_id)}",
+        progress_callback,
+    )
+
+
 def detect_cuda_device_count() -> int:
     try:
         result = subprocess.run(
@@ -319,6 +340,7 @@ class ManagedModel:
     local_path: str
     mmproj_filename: str | None = None
     mmproj_path: str | None = None
+    load_capabilities: list[str] = field(default_factory=list)
     aliases: list[str] = field(default_factory=list)
     ctx_size: int = DEFAULT_CTX_SIZE
     n_gpu_layers: int = DEFAULT_N_GPU_LAYERS
@@ -327,8 +349,15 @@ class ManagedModel:
     jinja: bool = True
     ttl: int = DEFAULT_IDLE_TTL
     description: str = ""
+    # Speculative/draft model metadata
+    speculative: bool = False
+    spec_variant_of: str | None = None
+    spec_meta: dict[str, object] = field(default_factory=dict)
     auto_ctx_failed: bool = False
     auto_ctx_error: str = ""
+    ctx_probe_read_s: float | None = None
+    ctx_probe_tokens_s: float | None = None
+    ctx_probe_totals_s: float | None = None
     ctx_probe_latency_ms: float | None = None
     ctx_probe_speed_tps: float | None = None
     ctx_probe_kv_gb: float | None = None
@@ -399,6 +428,20 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
         key = str(raw_key).strip().lower().replace("-", "_")
         if not key:
             continue
+        if key == "speculative_defaults":
+            if isinstance(raw_val, dict):
+                nested: dict[str, object] = {}
+                for nested_key, nested_val in raw_val.items():
+                    nested_name = str(nested_key).strip().lower().replace("-", "_")
+                    if not nested_name:
+                        continue
+                    if nested_name == "draft_max":
+                        nested_name = "draft"
+                    nested[nested_name] = nested_val
+                normalized[key] = nested
+            continue
+        if key == "draft_max":
+            key = "draft"
         if key == "gpu_layers":
             key = "n_gpu_layers"
             if isinstance(raw_val, str) and raw_val.strip().lower() == "all":
@@ -412,13 +455,49 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
             if bool_val is not None:
                 normalized[key] = bool_val
             continue
-        if key in {"ctx_size", "n_gpu_layers", "batch_size", "ubatch_size", "threads", "threads_batch", "fit_target", "keep", "mirostat"}:
+        if key == "fit":
+            bool_val = _normalize_bool_flag(raw_val)
+            if bool_val is not None:
+                normalized[key] = bool_val
+                continue
+            if isinstance(raw_val, str):
+                sval = raw_val.strip()
+                if sval:
+                    normalized[key] = sval
+            continue
+        if key in {"fitt", "fitc"}:
+            if isinstance(raw_val, bool):
+                normalized[key] = raw_val
+                continue
+            try:
+                normalized[key] = int(raw_val)
+            except (TypeError, ValueError):
+                try:
+                    normalized[key] = int(float(raw_val))
+                except (TypeError, ValueError):
+                    continue
+            continue
+        if key in {
+            "ctx_size",
+            "n_gpu_layers",
+            "batch_size",
+            "ubatch_size",
+            "threads",
+            "threads_batch",
+            "fit_target",
+            "keep",
+            "mirostat",
+            "draft",
+            "draft_min",
+            "ctx_size_draft",
+            "n_gpu_layers_draft",
+        }:
             try:
                 normalized[key] = int(raw_val)
             except (TypeError, ValueError):
                 continue
             continue
-        if key in {"mirostat_ent", "mirostat_lr"}:
+        if key in {"mirostat_ent", "mirostat_lr", "draft_p_min"}:
             try:
                 normalized[key] = float(raw_val)
             except (TypeError, ValueError):
@@ -436,7 +515,7 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
         if key == "tensor_split":
             normalized[key] = normalize_tensor_split(str(raw_val))
             continue
-        if key in {"split_mode", "numa", "cache_type_k", "cache_type_v", "host"}:
+        if key in {"split_mode", "numa", "cache_type_k", "cache_type_v", "host", "model_draft", "hf_repo_draft", "reasoning_format"}:
             normalized[key] = str(raw_val).strip()
     return normalized
 
@@ -520,6 +599,10 @@ def _format_ctx_probe_speed(value: float | None) -> str:
     return f"{value:.1f} tok/s"
 
 
+def _format_ctx_probe_rate(value: float | None) -> str:
+    return _format_ctx_probe_speed(value)
+
+
 def _format_ctx_probe_latency(value: float | None) -> str:
     if value is None:
         return "NC"
@@ -527,6 +610,9 @@ def _format_ctx_probe_latency(value: float | None) -> str:
 
 
 def clear_ctx_probe_metrics(model: ManagedModel) -> None:
+    model.ctx_probe_read_s = None
+    model.ctx_probe_tokens_s = None
+    model.ctx_probe_totals_s = None
     model.ctx_probe_latency_ms = None
     model.ctx_probe_speed_tps = None
     model.ctx_probe_kv_gb = None
@@ -535,22 +621,42 @@ def clear_ctx_probe_metrics(model: ManagedModel) -> None:
 
 def apply_ctx_probe_metrics(model: ManagedModel, info: dict[str, object] | None) -> None:
     payload = info or {}
+    model.ctx_probe_read_s = _to_float_or_none(payload.get("probe_read_s"))
+    model.ctx_probe_tokens_s = _to_float_or_none(payload.get("probe_tokens_s"))
+    model.ctx_probe_totals_s = _to_float_or_none(payload.get("probe_totals_s"))
     model.ctx_probe_latency_ms = _to_float_or_none(payload.get("probe_latency_ms"))
     model.ctx_probe_speed_tps = _to_float_or_none(payload.get("probe_speed_tps"))
+    if model.ctx_probe_speed_tps is None:
+        model.ctx_probe_speed_tps = model.ctx_probe_totals_s
+    if model.ctx_probe_totals_s is None:
+        model.ctx_probe_totals_s = model.ctx_probe_speed_tps
     model.ctx_probe_kv_gb = _to_float_or_none(payload.get("selected_ctx_gb"))
     model.ctx_probe_prompt_tokens = _to_int_or_none(payload.get("probe_prompt_tokens"))
 
 
 def _ctx_probe_api_metrics(model: ManagedModel) -> dict[str, object]:
+    read_s = _to_float_or_none(model.ctx_probe_read_s)
+    tokens_s = _to_float_or_none(model.ctx_probe_tokens_s)
+    totals_s = _to_float_or_none(model.ctx_probe_totals_s)
     latency_ms = _to_float_or_none(model.ctx_probe_latency_ms)
     speed_tps = _to_float_or_none(model.ctx_probe_speed_tps)
+    if speed_tps is None:
+        speed_tps = totals_s
+    if totals_s is None:
+        totals_s = speed_tps
     kv_gb = _to_float_or_none(model.ctx_probe_kv_gb)
     prompt_tokens = _to_int_or_none(model.ctx_probe_prompt_tokens)
     return {
+        "ctx_probe_read_s": read_s,
+        "ctx_probe_tokens_s": tokens_s,
+        "ctx_probe_totals_s": totals_s,
         "ctx_probe_latency_ms": latency_ms,
         "ctx_probe_speed_tps": speed_tps,
         "ctx_probe_kv_gb": kv_gb,
         "ctx_probe_prompt_tokens": prompt_tokens,
+        "ctx_probe_read": _format_ctx_probe_rate(read_s),
+        "ctx_probe_tokens": _format_ctx_probe_rate(tokens_s),
+        "ctx_probe_totals": _format_ctx_probe_rate(totals_s),
         "ctx_probe_latency": _format_ctx_probe_latency(latency_ms),
         "ctx_probe_speed": _format_ctx_probe_speed(speed_tps),
         "ctx_probe_kv": _format_ctx_probe_gb(kv_gb),
@@ -598,6 +704,11 @@ def load_catalog_with_diagnostics(path: Path, server_config_path: Path | None = 
         server_defaults = {}
 
     for item in items:
+        normalized_load_capabilities = _normalize_load_capabilities(item.load_capabilities)
+        if normalized_load_capabilities != item.load_capabilities:
+            item.load_capabilities = normalized_load_capabilities
+            changed = True
+
         normalized_aliases = normalize_aliases(item.aliases)
         if normalized_aliases != item.aliases:
             item.aliases = normalized_aliases
@@ -608,9 +719,31 @@ def load_catalog_with_diagnostics(path: Path, server_config_path: Path | None = 
             item.ctx_probe_latency_ms = normalized_probe_latency
             changed = True
 
+        normalized_probe_read = _to_float_or_none(item.ctx_probe_read_s)
+        if normalized_probe_read != item.ctx_probe_read_s:
+            item.ctx_probe_read_s = normalized_probe_read
+            changed = True
+
+        normalized_probe_tokens = _to_float_or_none(item.ctx_probe_tokens_s)
+        if normalized_probe_tokens != item.ctx_probe_tokens_s:
+            item.ctx_probe_tokens_s = normalized_probe_tokens
+            changed = True
+
+        normalized_probe_totals = _to_float_or_none(item.ctx_probe_totals_s)
+        if normalized_probe_totals != item.ctx_probe_totals_s:
+            item.ctx_probe_totals_s = normalized_probe_totals
+            changed = True
+
         normalized_probe_speed = _to_float_or_none(item.ctx_probe_speed_tps)
         if normalized_probe_speed != item.ctx_probe_speed_tps:
             item.ctx_probe_speed_tps = normalized_probe_speed
+            changed = True
+
+        if item.ctx_probe_speed_tps is None and item.ctx_probe_totals_s is not None:
+            item.ctx_probe_speed_tps = item.ctx_probe_totals_s
+            changed = True
+        if item.ctx_probe_totals_s is None and item.ctx_probe_speed_tps is not None:
+            item.ctx_probe_totals_s = item.ctx_probe_speed_tps
             changed = True
 
         normalized_probe_kv_gb = _to_float_or_none(item.ctx_probe_kv_gb)
@@ -701,23 +834,43 @@ def normalize_model_id(repo_id, quant, filename):
 
 def choose_gguf_file(api, repo_id, quant, explicit_file, token):
     info = api.model_info(repo_id=repo_id, token=token)
-    files = sorted(s.rfilename for s in info.siblings if s.rfilename and s.rfilename.lower().endswith(".gguf"))
-    if not files: raise RuntimeError(f"No GGUF in {repo_id}.")
+    all_files = sorted(s.rfilename for s in info.siblings if s.rfilename and s.rfilename.lower().endswith(".gguf"))
+    if not all_files: raise RuntimeError(f"No GGUF in {repo_id}.")
+    
+    # Exclude mmproj files from main model search (they're selected separately)
+    files = [f for f in all_files if "mmproj" not in f.lower()]
+    if not files: files = all_files  # Fallback if all are mmproj
+    
     if explicit_file:
         if explicit_file not in files: raise RuntimeError(f"File {explicit_file} not found.")
         return explicit_file
+    
     if quant:
         ql = quant.lower()
-        matches = [f for f in files if ql in f.lower()]
+        
+        # Extract quantization code: last component after . or - before .gguf
+        def extract_quant_code(filename):
+            stem = Path(filename).stem  # Remove .gguf
+            # Split by . or - and get last part
+            parts = re.split(r'[-.]', stem)
+            return parts[-1].lower() if parts else ""
+        
+        # Try exact quantization code match first (f16 != bf16)
+        exact_matches = [f for f in files if extract_quant_code(f) == ql]
+        if len(exact_matches) == 1: return exact_matches[0]
+        if len(exact_matches) > 1:
+            shards = sorted([f for f in exact_matches if "-00001-of-" in f])
+            if shards: return shards[0]
+            return exact_matches[0]  # Return first of multiple exact matches
+        
+        # Fallback: substring match on quant code
+        matches = [f for f in files if ql in extract_quant_code(f)]
         if len(matches) == 1: return matches[0]
         if len(matches) > 1:
-            # Handle sharded models: Pick first shard
             shards = sorted([f for f in matches if "-00001-of-" in f])
             if shards: return shards[0]
-            
-            exact = [f for f in matches if Path(f).stem.lower().endswith(ql)]
-            if len(exact) == 1: return exact[0]
             raise RuntimeError(f"Ambiguous quant '{quant}': {matches}")
+    
     q4 = [f for f in files if "q4_k_m" in f.lower()]
     if len(q4) == 1: return q4[0]
     return files[0]
@@ -930,8 +1083,29 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object) -> None:
         cmd.extend(["--threads-batch", str(int(value))])
     elif key == "numa":
         cmd.extend(["--numa", str(value)])
+    elif key == "reasoning_format":
+        sval = str(value).strip()
+        if sval:
+            cmd.extend(["--reasoning-format", sval])
     elif key == "fit_target":
         cmd.extend(["--fit-target", str(int(value))])
+    elif key == "model_draft":
+        cmd.extend(["--model-draft", str(value)])
+    elif key == "hf_repo_draft":
+        cmd.extend(["--hf-repo-draft", str(value)])
+    elif key == "draft":
+        # Map legacy --draft to new speculative decoding parameter
+        cmd.extend(["--spec-draft-n-max", str(int(value))])
+    elif key == "draft_min":
+        # draft_min was removed in newer llama.cpp API; skipping
+        pass
+    elif key == "draft_p_min":
+        # draft_p_min was removed in newer llama.cpp API; skipping
+        pass
+    elif key == "ctx_size_draft":
+        cmd.extend(["--ctx-size-draft", str(int(value))])
+    elif key == "n_gpu_layers_draft":
+        cmd.extend(["--n-gpu-layers-draft", str(int(value))])
     elif key == "keep":
         cmd.extend(["--keep", str(int(value))])
     elif key == "mirostat":
@@ -944,6 +1118,57 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object) -> None:
         cmd.extend(["--cache-type-k", str(value)])
     elif key == "cache_type_v":
         cmd.extend(["--cache-type-v", str(value)])
+    elif key == "fit":
+        valstr = None
+        if isinstance(value, bool):
+            valstr = "on" if value else "off"
+        else:
+            sval = str(value).strip()
+            if sval:
+                low = sval.lower()
+                if low in {"1", "true", "yes", "on"}:
+                    valstr = "on"
+                elif low in {"0", "false", "no", "off"}:
+                    valstr = "off"
+                else:
+                    valstr = sval
+        if valstr is not None:
+            # Upstream llama-server expects short (single-dash) fit flags
+            # to avoid being parsed as GNU-style long options. Emit the
+            # single-dash form to match the server's arg parsing.
+            cmd.extend(["-fit", valstr])
+    elif key == "fitt":
+        try:
+            # Use single-dash form for numeric fit target count
+            cmd.extend(["-fitt", str(int(value))])
+        except Exception:
+            pass
+    elif key == "fitc":
+        # The llama-server `-fitc` / `--fit-ctx` flag expects an integer N
+        # indicating the minimum ctx size that --fit may set. Accept boolean
+        # True as a shorthand to mean the default numeric value (4096), and
+        # coerce numeric/string inputs to int where possible.
+        try:
+            if isinstance(value, bool):
+                if value:
+                    cmd.extend(["-fitc", str(4096)])
+                # False -> do not emit the flag
+            else:
+                sval = str(value).strip()
+                if not sval:
+                    pass
+                else:
+                    try:
+                        cmd.extend(["-fitc", str(int(sval))])
+                    except Exception:
+                        # Try float->int, then fallback to default
+                        try:
+                            cmd.extend(["-fitc", str(int(float(sval)))])
+                        except Exception:
+                            cmd.extend(["-fitc", str(4096)])
+        except Exception:
+            # Defensive fallback to default numeric value
+            cmd.extend(["-fitc", str(4096)])
     elif key == "mmap":
         bool_val = _normalize_bool_flag(value)
         if bool_val is False:
@@ -962,27 +1187,97 @@ def build_llama_server_command(
     server_defaults: dict[str, object] | None = None,
 ) -> list[str]:
     effective = dict(normalize_server_overrides(server_defaults or {}))
+    # If this model is a speculative/draft variant, merge spec defaults first
+    # so they can be overridden by per-model server_overrides.
+    try:
+        if getattr(model, "speculative", False) and isinstance(server_defaults, dict):
+            spec_defaults = server_defaults.get("speculative_defaults")
+            if isinstance(spec_defaults, dict):
+                effective.update(normalize_server_overrides(spec_defaults))
+                # Propagate raw fit-related keys if provided in the speculative_defaults
+                for raw_key in ("fit", "fitt", "fitc"):
+                    if raw_key not in effective and raw_key in spec_defaults:
+                        effective[raw_key] = spec_defaults[raw_key]
+    except Exception:
+        pass
     effective.update(normalize_server_overrides(model.server_overrides))
+
+    # Resolve non-fit launch dimensions first so fit-mode can optionally move
+    # context control from --ctx-size into -fitc.
     ctx_size = int(effective.pop("ctx_size", model.ctx_size))
     n_gpu_layers = int(effective.pop("n_gpu_layers", model.n_gpu_layers))
     tensor_split = preferred_tensor_split(model, str(effective.pop("tensor_split", model.tensor_split)))
     resolved_host = str(effective.pop("host", host or model.host))
+
+    # Fit policy:
+    # - fit on  -> use -fitc for context, omit --ctx-size
+    # - fit off -> keep --ctx-size, omit -fitc/-fitt
+    have_autocontext = (getattr(model, "ctx_probe_kv_gb", None) is not None) or (getattr(model, "ctx_probe_read_s", None) is not None)
+    raw_fit = effective.get("fit", True)
+    fit_enabled = _normalize_bool_flag(raw_fit)
+    if fit_enabled is None:
+        if isinstance(raw_fit, str):
+            fit_enabled = bool(raw_fit.strip())
+        else:
+            fit_enabled = bool(raw_fit)
+
+    if fit_enabled:
+        effective["fit"] = True
+        if (not have_autocontext) and ("fitt" not in effective):
+            effective["fitt"] = int(effective.get("fitt", 1024))
+
+        fitc_value = effective.get("fitc")
+        parsed_fitc: int | None = None
+        if isinstance(fitc_value, bool):
+            parsed_fitc = None
+        elif fitc_value is not None:
+            try:
+                parsed_fitc = int(fitc_value)
+            except Exception:
+                try:
+                    parsed_fitc = int(float(str(fitc_value).strip()))
+                except Exception:
+                    parsed_fitc = None
+
+        # When fit is active, move configured ctx into -fitc unless a valid
+        # explicit fitc value is provided.
+        if parsed_fitc is None or parsed_fitc <= 0:
+            effective["fitc"] = ctx_size
+        else:
+            effective["fitc"] = parsed_fitc
+    else:
+        effective["fit"] = False
+        effective.pop("fitc", None)
+        effective.pop("fitt", None)
+
     cmd = [str(server_path), "--port", str(port)]
     if include_model_path:
         cmd.extend(["--model", str(model.local_path)])
-    cmd.extend(["--ctx-size", str(ctx_size)])
+    if not fit_enabled:
+        cmd.extend(["--ctx-size", str(ctx_size)])
     cmd.extend(["--n-gpu-layers", str(n_gpu_layers)])
     cmd.extend(["--tensor-split", tensor_split])
     cmd.extend(["--host", resolved_host])
     for key in (
         "split_mode",
         "flash_attn",
+        "reasoning_format",
         "batch_size",
         "ubatch_size",
         "threads",
         "threads_batch",
         "numa",
         "fit_target",
+        "model_draft",
+        "hf_repo_draft",
+        "draft",
+        "draft_min",
+        "draft_p_min",
+        "ctx_size_draft",
+        "n_gpu_layers_draft",
+        "fit",
+        "fitt",
+        "fitc",
         "keep",
         "mirostat",
         "mirostat_ent",
@@ -1097,7 +1392,14 @@ def should_reload_after_unexpected_unload(
         return False, age
     return True, age
 
+def _normalize_client_host(host: str | None) -> str:
+    normalized = str(host or "").strip()
+    if normalized in {"0.0.0.0", "::", "[::]"}:
+        return "127.0.0.1"
+    return normalized or "127.0.0.1"
+
 def wait_for_model(model_id, host, port, timeout=35):
+    host = _normalize_client_host(host)
     url = f"http://{host}:{port}/v1/models"
     deadline = time.time() + timeout
     spinner = Spinner(f"\033[36mWaiting for {model_id}...\033[0m ")
@@ -1192,7 +1494,24 @@ def _render_download_progress(label: str, downloaded: int, total: int | None, sp
         sys.stdout.write("\n")
     sys.stdout.flush()
 
-def _emit_message(message: str, progress_callback = None):
+def _emit_message(message: str, progress_callback = None, timestamp: bool = False):
+    if not timestamp:
+        try:
+            import inspect
+
+            for frame in inspect.stack():
+                if frame.function == "choose_auto_ctx":
+                    timestamp = True
+                    break
+        except Exception:
+            pass
+
+    if timestamp:
+        try:
+            ts = datetime.now(timezone.utc).astimezone().isoformat(sep=' ', timespec='milliseconds')
+        except Exception:
+            ts = datetime.now().isoformat(sep=' ', timespec='milliseconds')
+        message = f"[{ts}] {message}"
     if progress_callback:
         progress_callback({"type": "message", "message": message})
     else:
@@ -1408,6 +1727,10 @@ def _download_hf_file_parallel(repo_id: str, filename: str, token: str | None, t
             os.close(fd)
         except Exception:
             pass
+        # Clean up the truncated .part file after parallel download failure.
+        # The file was pre-allocated with ftruncate() but may have incomplete chunks.
+        # Retaining it causes confusion in sequential retry: it looks complete (byte count
+        # matches total size) but has no actual data. Better to restart from scratch.
         part_path.unlink(missing_ok=True)
         _emit_message(f"Parallel download failed for {filename}: {exc}. Falling back.", progress_callback)
         return None
@@ -1500,9 +1823,30 @@ def download_hf_file(
 
         with requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=(10, 120)) as resp:
             if resp.status_code == 416 and resume_from:
-                part_path.replace(dest_path)
-                _emit_message(f"{filename} already complete.", progress_callback)
-                return str(dest_path)
+                # HTTP 416 = Range Not Satisfiable. This can mean:
+                # A) The .part file is complete and matches server size (expected)
+                # B) The .part file is truncated by ftruncate() but has no real data (bug case)
+                # Only treat as complete if size matches expected_size.
+                part_size = part_path.stat().st_size if part_path.exists() else 0
+                if expected_size is not None and part_size == expected_size:
+                    part_path.replace(dest_path)
+                    _emit_message(f"{filename} already complete.", progress_callback)
+                    return str(dest_path)
+                elif expected_size is None:
+                    # No expected size to compare; assume it's complete if we got 416
+                    part_path.replace(dest_path)
+                    _emit_message(f"{filename} already complete.", progress_callback)
+                    return str(dest_path)
+                else:
+                    # 416 but size mismatch: .part is corrupted/truncated. Reset and retry.
+                    resp.close()
+                    part_path.unlink(missing_ok=True)
+                    resume_from = 0
+                    _emit_message(
+                        f"{filename}: incomplete .part detected (size mismatch), restarting from scratch.",
+                        progress_callback,
+                    )
+                    continue
 
             if resume_from and resp.status_code == 200:
                 resp.close()
@@ -1901,6 +2245,8 @@ def ensure_model_available(args, progress_callback = None):
         raise RuntimeError("Use either -ctx or --auto, not both.")
     if skip_ctx and force_auto_ctx:
         raise RuntimeError("Use either --skip-ctx or --auto, not both.")
+    defer_publish = bool(getattr(args, "defer_publish", False))
+    spec_draft_model_id = str(getattr(args, "spec_draft_model_id", "") or "").strip()
 
     api = HfApi()
     requested_model = None
@@ -1965,8 +2311,15 @@ def ensure_model_available(args, progress_callback = None):
     config_changed = False
     auto_ctx_failed = bool(existing.auto_ctx_failed) if existing else False
     auto_ctx_error = existing.auto_ctx_error if existing else ""
+    ctx_probe_read_s = _to_float_or_none(existing.ctx_probe_read_s) if existing else None
+    ctx_probe_tokens_s = _to_float_or_none(existing.ctx_probe_tokens_s) if existing else None
+    ctx_probe_totals_s = _to_float_or_none(existing.ctx_probe_totals_s) if existing else None
     ctx_probe_latency_ms = _to_float_or_none(existing.ctx_probe_latency_ms) if existing else None
     ctx_probe_speed_tps = _to_float_or_none(existing.ctx_probe_speed_tps) if existing else None
+    if ctx_probe_speed_tps is None:
+        ctx_probe_speed_tps = ctx_probe_totals_s
+    if ctx_probe_totals_s is None:
+        ctx_probe_totals_s = ctx_probe_speed_tps
     ctx_probe_kv_gb = _to_float_or_none(existing.ctx_probe_kv_gb) if existing else None
     ctx_probe_prompt_tokens = _to_int_or_none(existing.ctx_probe_prompt_tokens) if existing else None
     if existing and ctx_override is not None and (existing.ctx_size != ctx_override or existing.auto_ctx_failed or existing.auto_ctx_error):
@@ -1974,10 +2327,14 @@ def ensure_model_available(args, progress_callback = None):
         existing.auto_ctx_failed = False
         existing.auto_ctx_error = ""
         clear_ctx_probe_metrics(existing)
+        refresh_model_load_capabilities(existing)
         save_catalog(args.catalog, catalog)
         ctx_changed = True
         auto_ctx_failed = False
         auto_ctx_error = ""
+        ctx_probe_read_s = None
+        ctx_probe_tokens_s = None
+        ctx_probe_totals_s = None
         ctx_probe_latency_ms = None
         ctx_probe_speed_tps = None
         ctx_probe_kv_gb = None
@@ -1988,10 +2345,14 @@ def ensure_model_available(args, progress_callback = None):
         existing.auto_ctx_failed = False
         existing.auto_ctx_error = ""
         clear_ctx_probe_metrics(existing)
+        refresh_model_load_capabilities(existing)
         save_catalog(args.catalog, catalog)
         ctx_changed = True
         auto_ctx_failed = False
         auto_ctx_error = ""
+        ctx_probe_read_s = None
+        ctx_probe_tokens_s = None
+        ctx_probe_totals_s = None
         ctx_probe_latency_ms = None
         ctx_probe_speed_tps = None
         ctx_probe_kv_gb = None
@@ -2033,15 +2394,30 @@ def ensure_model_available(args, progress_callback = None):
             config_changed = True
             _emit_message(f"Applied mmproj path for {existing.model_id}: {desired_mmproj_path or 'none'}", progress_callback)
         if config_changed:
+            refresh_model_load_capabilities(existing)
             save_catalog(args.catalog, catalog)
 
     mid = args.model_id or (existing.model_id if existing else normalize_model_id(repo_id, quant, selected_file))
+    # Support speculative/draft variants: if requested, compute a unique speculative
+    # model id prefixed by the configured `speculative_defaults.id_prefix` and
+    # avoid short-circuiting early when a base catalog entry already exists.
+    is_speculative_request = bool(getattr(args, "speculative", False))
+    base_mid = mid
+    forced_base_mid = getattr(args, "spec_base_model_id", None)
+    if is_speculative_request and forced_base_mid:
+        forced_base_mid_str = str(forced_base_mid).strip()
+        if forced_base_mid_str:
+            base_mid = forced_base_mid_str
     files_ready = model_files_ready(target_dir, to_download, expected_sizes)
     completed_files, partial_files, missing_files = summarize_download_state(target_dir, to_download, expected_sizes)
 
-    if existing and not args.force and files_ready and mmproj_ready and not force_auto_ctx:
+    if existing and not is_speculative_request and not args.force and files_ready and mmproj_ready and not force_auto_ctx:
         _emit_message("All required model files already exist locally. Skipping download.", progress_callback)
+        if defer_publish:
+            _emit_message(f"Deferring publish/load for {existing.model_id}.", progress_callback)
+            return existing.model_id
         if not ctx_changed and not config_changed and wait_for_model(existing.model_id, args.public_host, args.public_port, timeout=2):
+            _emit_default_ctx_update_hint(existing.model_id, existing.ctx_size, default_ctx, progress_callback)
             return existing.model_id
         gpu_conflict = get_gpu_conflict_message(existing.model_id, catalog, args.public_host, args.public_port)
         if gpu_conflict:
@@ -2063,6 +2439,7 @@ def ensure_model_available(args, progress_callback = None):
             save_catalog(args.catalog, stable_catalog)
             restore_catalog_config(args, stable_catalog, progress_callback=progress_callback, restart_service=True)
             raise
+        _emit_default_ctx_update_hint(existing.model_id, existing.ctx_size, default_ctx, progress_callback)
         return existing.model_id
 
     if existing and not files_ready:
@@ -2107,10 +2484,14 @@ def ensure_model_available(args, progress_callback = None):
         )
         mmproj_path = mmproj_loc
 
+    probe_config_replaced = False
     desired_ctx = ctx_override if ctx_override is not None else (existing.ctx_size if existing and existing.auto_ctx_failed else default_ctx)
     if ctx_override is not None:
         auto_ctx_failed = False
         auto_ctx_error = ""
+        ctx_probe_read_s = None
+        ctx_probe_tokens_s = None
+        ctx_probe_totals_s = None
         ctx_probe_latency_ms = None
         ctx_probe_speed_tps = None
         ctx_probe_kv_gb = None
@@ -2119,6 +2500,9 @@ def ensure_model_available(args, progress_callback = None):
     elif skip_ctx:
         auto_ctx_failed = False
         auto_ctx_error = ""
+        ctx_probe_read_s = None
+        ctx_probe_tokens_s = None
+        ctx_probe_totals_s = None
         ctx_probe_latency_ms = None
         ctx_probe_speed_tps = None
         ctx_probe_kv_gb = None
@@ -2139,137 +2523,312 @@ def ensure_model_available(args, progress_callback = None):
             "Download complete. Next I will auto-adjust the context window for this model.",
             progress_callback,
         )
+        # Check if any partial .part files exist for THIS model in target_dir.
+        # Only skip auto-probe if THIS model has incomplete downloads, not due to
+        # other models being downloaded elsewhere. This avoids false positives when
+        # adding multiple models sequentially.
+        try:
+            model_partials = list(target_dir.glob('*.part'))
+        except Exception:
+            model_partials = []
+        if model_partials:
+            _emit_message(
+                "Detected partial downloads for this model; skipping automatic ctx probe. "
+                "Re-run with `llamacpp-superserver update --auto --model-id {}` after downloads finish.".format(mid),
+                progress_callback,
+            )
+            # Keep desired_ctx as-is (fallback or default) and avoid probing.
+            probe_config_replaced = False
+        else:
+            _emit_message(
+                "Process: start at 8192, try a few larger values, keep a practical stable ctx, and avoid exhaustive slow probing.",
+                progress_callback,
+            )
+            probe_model = ManagedModel(
+                model_id=mid,
+                repo_id=repo_id,
+                quant=quant,
+                filename=selected_file,
+                local_path=str(local_path),
+                mmproj_filename=mmproj_filename,
+                mmproj_path=mmproj_path,
+                ctx_size=default_ctx,
+                n_gpu_layers=int(args.n_gpu_layers),
+                tensor_split=args.tensor_split,
+                host=args.host,
+                jinja=not args.no_jinja,
+                ttl=resolve_idle_ttl(args),
+                description=args.description or f"{repo_id} / {selected_file}",
+            )
+            refresh_model_load_capabilities(probe_model)
+            probe_config_replaced = True
+            temporarily_unload_published_models(args, progress_callback=progress_callback)
+            try:
+                best_ctx, status, info = choose_auto_ctx(probe_model, args.llama_server, progress_callback=progress_callback)
+            except Exception:
+                if probe_config_replaced:
+                    save_catalog(args.catalog, stable_catalog)
+                    restore_catalog_config(args, stable_catalog, progress_callback=progress_callback, restart_service=True)
+                raise
+            if best_ctx is not None:
+                desired_ctx = best_ctx
+                auto_ctx_failed = False
+                auto_ctx_error = ""
+                selected_api_ctx = max(1, int(desired_ctx * resolve_api_ctx_factor(args)))
+                ctx_probe_read_s = _to_float_or_none(info.get("probe_read_s"))
+                ctx_probe_tokens_s = _to_float_or_none(info.get("probe_tokens_s"))
+                ctx_probe_totals_s = _to_float_or_none(info.get("probe_totals_s"))
+                ctx_probe_latency_ms = _to_float_or_none(info.get("probe_latency_ms"))
+                ctx_probe_speed_tps = _to_float_or_none(info.get("probe_speed_tps"))
+                if ctx_probe_speed_tps is None:
+                    ctx_probe_speed_tps = ctx_probe_totals_s
+                if ctx_probe_totals_s is None:
+                    ctx_probe_totals_s = ctx_probe_speed_tps
+                ctx_probe_kv_gb = _to_float_or_none(info.get("selected_ctx_gb"))
+                ctx_probe_prompt_tokens = _to_int_or_none(info.get("probe_prompt_tokens"))
+                _emit_message(f"Selected automatic ctx {desired_ctx} for {mid}.", progress_callback)
+                _emit_message(
+                    f"{mid}: probe metrics -> ctx_gb={_format_ctx_probe_gb(ctx_probe_kv_gb)} read/s={_format_ctx_probe_rate(ctx_probe_read_s)} token/s={_format_ctx_probe_rate(ctx_probe_totals_s)} latency={_format_ctx_probe_latency(ctx_probe_latency_ms)}.",
+                    progress_callback,
+                )
+                _emit_message(
+                    "Auto-ctx summary:\n" + render_auto_ctx_summary_table([
+                        {
+                            "MODEL": mid,
+                            "CFG_CTX": str(desired_ctx),
+                            "API_CTX": str(selected_api_ctx),
+                            "CTX_GB": _format_ctx_probe_gb(ctx_probe_kv_gb),
+                            "READ/S": _format_ctx_probe_rate(ctx_probe_read_s),
+                            "TOKEN/S": _format_ctx_probe_rate(ctx_probe_totals_s),
+                            "TOTAL/S": _format_ctx_probe_rate(ctx_probe_totals_s),
+                            "LATENCY": _format_ctx_probe_latency(ctx_probe_latency_ms),
+                            "STATUS": "selected",
+                        }
+                    ]),
+                    progress_callback,
+                )
+            elif status == "min-failed":
+                if probe_config_replaced:
+                    save_catalog(args.catalog, stable_catalog)
+                    restore_catalog_config(args, stable_catalog, progress_callback=progress_callback, restart_service=True)
+                desired_ctx = int(info.get("min_ctx") or default_ctx)
+                auto_ctx_failed = True
+                auto_ctx_error = f"min-failed:{info.get('reason') or status}"
+                ctx_probe_read_s = None
+                ctx_probe_tokens_s = None
+                ctx_probe_totals_s = None
+                ctx_probe_latency_ms = None
+                ctx_probe_speed_tps = None
+                ctx_probe_kv_gb = None
+                ctx_probe_prompt_tokens = None
+                _emit_message(
+                    f"{mid} failed the automatic probe at the minimum ctx {desired_ctx} ({auto_ctx_error}).",
+                    progress_callback,
+                )
+                _emit_message(
+                    "Auto-ctx summary:\n" + render_auto_ctx_summary_table([
+                        {
+                            "MODEL": mid,
+                            "CFG_CTX": "ERROR",
+                            "API_CTX": "ERROR",
+                            "CTX_GB": _format_ctx_probe_gb(None),
+                            "READ/S": _format_ctx_probe_rate(None),
+                            "TOKEN/S": _format_ctx_probe_rate(None),
+                            "TOTAL/S": _format_ctx_probe_rate(None),
+                            "LATENCY": _format_ctx_probe_latency(None),
+                            "STATUS": "ERROR",
+                        }
+                    ]),
+                    progress_callback,
+                )
+                if _ask_confirmation(
+                    f"{mid} did not pass the automatic ctx probe. Do you want to delete the downloaded model?",
+                    progress_callback=progress_callback,
+                    default=False,
+                ):
+                    removed = delete_downloaded_files(target_dir, to_download)
+                    _emit_message(f"Deleted {removed} downloaded files for {mid}.", progress_callback)
+                    raise RuntimeError(f"{mid} was deleted after failing the minimum ctx probe.")
+                _emit_message(
+                    f"I will add {mid} to the catalog and config anyway with fallback ctx {desired_ctx} so llama-swap can try loading it.",
+                    progress_callback,
+                )
+                _emit_message(
+                    f"Future runs will skip automatic probing for {mid} until you force it with update --auto or -ctx.",
+                    progress_callback,
+                )
+            else:
+                auto_ctx_failed = True
+                auto_ctx_error = status
+                ctx_probe_read_s = None
+                ctx_probe_tokens_s = None
+                ctx_probe_totals_s = None
+                ctx_probe_latency_ms = None
+                ctx_probe_speed_tps = None
+                ctx_probe_kv_gb = None
+                ctx_probe_prompt_tokens = None
+                _emit_message(
+                    f"Could not auto-tune ctx for {mid}. Keeping fallback ctx {desired_ctx} and disabling automatic re-probes for future runs.",
+                    progress_callback,
+                )
+                _emit_message(
+                    "Auto-ctx summary:\n" + render_auto_ctx_summary_table([
+                        {
+                            "MODEL": mid,
+                            "CFG_CTX": "ERROR",
+                            "API_CTX": "ERROR",
+                            "CTX_GB": _format_ctx_probe_gb(None),
+                            "READ/S": _format_ctx_probe_rate(None),
+                            "TOKEN/S": _format_ctx_probe_rate(None),
+                            "TOTAL/S": _format_ctx_probe_rate(None),
+                            "LATENCY": _format_ctx_probe_latency(None),
+                            "STATUS": "ERROR",
+                        }
+                    ]),
+                    progress_callback,
+                )
+
+    # If creating a speculative variant, derive a unique model id now and
+    # attribute the new catalog entry to the base model.
+    if is_speculative_request:
+        spec_cfg = (active_server_defaults or {}).get("speculative_defaults") if isinstance(active_server_defaults, dict) else None
+        prefix = str(spec_cfg.get("id_prefix")) if isinstance(spec_cfg, dict) and spec_cfg.get("id_prefix") else "speculative-"
+        candidate = f"{prefix}{base_mid}"
+        allow_multiple_variants = True
+        if isinstance(spec_cfg, dict) and "allow_multiple_variants" in spec_cfg:
+            allow_multiple_raw = _normalize_bool_flag(spec_cfg.get("allow_multiple_variants"))
+            if allow_multiple_raw is not None:
+                allow_multiple_variants = allow_multiple_raw
+        existing_ids = {m.model_id for m in catalog}
+        if candidate in existing_ids:
+            reuse_candidate = False
+            if spec_draft_model_id:
+                existing_candidate = next((m for m in catalog if m.model_id == candidate), None)
+                existing_draft_id = ""
+                if existing_candidate and isinstance(existing_candidate.spec_meta, dict):
+                    existing_draft_id = str(existing_candidate.spec_meta.get("draft_model_id") or "").strip()
+                if existing_draft_id and existing_draft_id == spec_draft_model_id:
+                    reuse_candidate = True
+            if not reuse_candidate and allow_multiple_variants:
+                i = 1
+                while f"{candidate}-{i}" in existing_ids:
+                    i += 1
+                candidate = f"{candidate}-{i}"
+        mid = candidate
+
+    paired_base_model = None
+    paired_probe_once = False
+    if is_speculative_request and spec_draft_model_id:
+        paired_base_model = next((m for m in catalog if m.model_id == base_mid), None)
+        if paired_base_model is not None:
+            paired_ctx = int(getattr(paired_base_model, "ctx_size", 0) or default_ctx)
+            if ctx_override is None and desired_ctx != paired_ctx:
+                desired_ctx = paired_ctx
+                _emit_message(
+                    f"Using master ctx {desired_ctx} for paired speculative model {mid}.",
+                    progress_callback,
+                )
+        paired_probe_once = bool(skip_ctx and ctx_override is None)
+
+    new_m = ManagedModel(
+        model_id=mid,
+        repo_id=repo_id,
+        quant=quant,
+        filename=selected_file,
+        local_path=str(local_path),
+        mmproj_filename=mmproj_filename,
+        mmproj_path=mmproj_path,
+        ctx_size=desired_ctx,
+        n_gpu_layers=int(args.n_gpu_layers),
+        tensor_split=args.tensor_split,
+        host=args.host,
+        jinja=not args.no_jinja,
+        ttl=resolve_idle_ttl(args),
+        description=args.description or f"{repo_id} / {selected_file}",
+        auto_ctx_failed=auto_ctx_failed,
+        auto_ctx_error=auto_ctx_error,
+        ctx_probe_read_s=ctx_probe_read_s,
+        ctx_probe_tokens_s=ctx_probe_tokens_s,
+        ctx_probe_totals_s=ctx_probe_totals_s,
+        ctx_probe_latency_ms=ctx_probe_latency_ms,
+        ctx_probe_speed_tps=ctx_probe_speed_tps,
+        ctx_probe_kv_gb=ctx_probe_kv_gb,
+        ctx_probe_prompt_tokens=ctx_probe_prompt_tokens,
+        speculative=is_speculative_request,
+        spec_variant_of=(base_mid if is_speculative_request else None),
+    )
+    if is_speculative_request:
+        # Avoid alias collisions between base and speculative entries.
+        new_m.aliases = []
+        if existing and existing.server_overrides:
+            new_m.server_overrides = dict(normalize_server_overrides(existing.server_overrides))
+
+        if spec_draft_model_id:
+            draft_model = next((m for m in catalog if m.model_id == spec_draft_model_id), None)
+            if draft_model is None:
+                raise RuntimeError(f"Speculative draft model '{spec_draft_model_id}' was not found in catalog.")
+
+            spec_overrides = dict(normalize_server_overrides(new_m.server_overrides))
+            spec_overrides["model_draft"] = str(draft_model.local_path)
+
+            spec_cfg = (active_server_defaults or {}).get("speculative_defaults") if isinstance(active_server_defaults, dict) else None
+            if isinstance(spec_cfg, dict):
+                normalized_spec_defaults = normalize_server_overrides(spec_cfg)
+                for key in ("draft", "draft_min", "draft_p_min", "ctx_size_draft", "n_gpu_layers_draft"):
+                    if key in normalized_spec_defaults and key not in spec_overrides:
+                        spec_overrides[key] = normalized_spec_defaults[key]
+            if "draft" not in spec_overrides:
+                spec_overrides["draft"] = 16
+
+            new_m.server_overrides = spec_overrides
+            new_m.spec_meta = dict(new_m.spec_meta or {})
+            new_m.spec_meta.update(
+                {
+                    "base_model_id": base_mid,
+                    "draft_model_id": draft_model.model_id,
+                    "draft_repo_id": draft_model.repo_id,
+                    "draft_filename": draft_model.filename,
+                    "draft_local_path": draft_model.local_path,
+                }
+            )
+
+    if paired_probe_once:
         _emit_message(
-            "Process: start at 8192, try a few larger values, keep a practical stable ctx, and avoid exhaustive slow probing.",
+            f"{new_m.model_id}: running one-shot paired speculative probe at ctx {new_m.ctx_size} for performance metrics.",
             progress_callback,
         )
-        probe_model = ManagedModel(
-            model_id=mid,
-            repo_id=repo_id,
-            quant=quant,
-            filename=selected_file,
-            local_path=str(local_path),
-            mmproj_filename=mmproj_filename,
-            mmproj_path=mmproj_path,
-            ctx_size=default_ctx,
-            n_gpu_layers=int(args.n_gpu_layers),
-            tensor_split=args.tensor_split,
-            host=args.host,
-            jinja=not args.no_jinja,
-            ttl=resolve_idle_ttl(args),
-            description=args.description or f"{repo_id} / {selected_file}",
-        )
-        probe_config_replaced = True
-        temporarily_unload_published_models(args, progress_callback=progress_callback)
-        try:
-            best_ctx, status, info = choose_auto_ctx(probe_model, args.llama_server, progress_callback=progress_callback)
-        except Exception:
-            if probe_config_replaced:
-                save_catalog(args.catalog, stable_catalog)
-                restore_catalog_config(args, stable_catalog, progress_callback=progress_callback, restart_service=True)
-            raise
-        if best_ctx is not None:
-            desired_ctx = best_ctx
-            auto_ctx_failed = False
-            auto_ctx_error = ""
-            selected_api_ctx = max(1, int(desired_ctx * resolve_api_ctx_factor(args)))
-            ctx_probe_latency_ms = _to_float_or_none(info.get("probe_latency_ms"))
-            ctx_probe_speed_tps = _to_float_or_none(info.get("probe_speed_tps"))
-            ctx_probe_kv_gb = _to_float_or_none(info.get("selected_ctx_gb"))
-            ctx_probe_prompt_tokens = _to_int_or_none(info.get("probe_prompt_tokens"))
-            _emit_message(f"Selected automatic ctx {desired_ctx} for {mid}.", progress_callback)
+        probe_ok, probe_reason, probe_info = _probe_fixed_ctx_metrics_once(new_m, args.llama_server, int(new_m.ctx_size))
+        if probe_ok:
+            new_m.auto_ctx_failed = False
+            new_m.auto_ctx_error = ""
+            apply_ctx_probe_metrics(new_m, probe_info)
             _emit_message(
-                f"{mid}: probe metrics -> ctx_gb={_format_ctx_probe_gb(ctx_probe_kv_gb)} speed={_format_ctx_probe_speed(ctx_probe_speed_tps)} latency={_format_ctx_probe_latency(ctx_probe_latency_ms)}.",
-                progress_callback,
-            )
-            _emit_message(
-                "Auto-ctx summary:\n" + render_auto_ctx_summary_table([
-                    {
-                        "MODEL": mid,
-                        "CFG_CTX": str(desired_ctx),
-                        "API_CTX": str(selected_api_ctx),
-                        "CTX_GB": _format_ctx_probe_gb(ctx_probe_kv_gb),
-                        "SPEED": _format_ctx_probe_speed(ctx_probe_speed_tps),
-                        "LATENCY": _format_ctx_probe_latency(ctx_probe_latency_ms),
-                        "STATUS": "selected",
-                    }
-                ]),
-                progress_callback,
-            )
-        elif status == "min-failed":
-            if probe_config_replaced:
-                save_catalog(args.catalog, stable_catalog)
-                restore_catalog_config(args, stable_catalog, progress_callback=progress_callback, restart_service=True)
-            desired_ctx = int(info.get("min_ctx") or default_ctx)
-            auto_ctx_failed = True
-            auto_ctx_error = f"min-failed:{info.get('reason') or status}"
-            ctx_probe_latency_ms = None
-            ctx_probe_speed_tps = None
-            ctx_probe_kv_gb = None
-            ctx_probe_prompt_tokens = None
-            _emit_message(
-                f"{mid} failed the automatic probe at the minimum ctx {desired_ctx} ({auto_ctx_error}).",
-                progress_callback,
-            )
-            _emit_message(
-                "Auto-ctx summary:\n" + render_auto_ctx_summary_table([
-                    {
-                        "MODEL": mid,
-                        "CFG_CTX": "ERROR",
-                        "API_CTX": "ERROR",
-                        "CTX_GB": _format_ctx_probe_gb(None),
-                        "SPEED": _format_ctx_probe_speed(None),
-                        "LATENCY": _format_ctx_probe_latency(None),
-                        "STATUS": "ERROR",
-                    }
-                ]),
-                progress_callback,
-            )
-            if _ask_confirmation(
-                f"{mid} did not pass the automatic ctx probe. Do you want to delete the downloaded model?",
-                progress_callback=progress_callback,
-                default=False,
-            ):
-                removed = delete_downloaded_files(target_dir, to_download)
-                _emit_message(f"Deleted {removed} downloaded files for {mid}.", progress_callback)
-                raise RuntimeError(f"{mid} was deleted after failing the minimum ctx probe.")
-            _emit_message(
-                f"I will add {mid} to the catalog and config anyway with fallback ctx {desired_ctx} so llama-swap can try loading it.",
-                progress_callback,
-            )
-            _emit_message(
-                f"Future runs will skip automatic probing for {mid} until you force it with update --auto or -ctx.",
+                (
+                    f"{new_m.model_id}: paired probe metrics -> "
+                    f"ctx_gb={_format_ctx_probe_gb(new_m.ctx_probe_kv_gb)} "
+                    f"read/s={_format_ctx_probe_rate(new_m.ctx_probe_read_s)} "
+                    f"token/s={_format_ctx_probe_rate(new_m.ctx_probe_totals_s)} "
+                    f"latency={_format_ctx_probe_latency(new_m.ctx_probe_latency_ms)}."
+                ),
                 progress_callback,
             )
         else:
-            auto_ctx_failed = True
-            auto_ctx_error = status
-            ctx_probe_latency_ms = None
-            ctx_probe_speed_tps = None
-            ctx_probe_kv_gb = None
-            ctx_probe_prompt_tokens = None
+            clear_ctx_probe_metrics(new_m)
+            new_m.auto_ctx_failed = False
+            new_m.auto_ctx_error = ""
             _emit_message(
-                f"Could not auto-tune ctx for {mid}. Keeping fallback ctx {desired_ctx} and disabling automatic re-probes for future runs.",
-                progress_callback,
-            )
-            _emit_message(
-                "Auto-ctx summary:\n" + render_auto_ctx_summary_table([
-                    {
-                        "MODEL": mid,
-                        "CFG_CTX": "ERROR",
-                        "API_CTX": "ERROR",
-                        "CTX_GB": _format_ctx_probe_gb(None),
-                        "SPEED": _format_ctx_probe_speed(None),
-                        "LATENCY": _format_ctx_probe_latency(None),
-                        "STATUS": "ERROR",
-                    }
-                ]),
+                f"{new_m.model_id}: paired probe for metrics failed ({probe_reason}). Keeping ctx {new_m.ctx_size} from master.",
                 progress_callback,
             )
 
-    new_m = ManagedModel(model_id=mid, repo_id=repo_id, quant=quant, filename=selected_file, local_path=str(local_path), mmproj_filename=mmproj_filename, mmproj_path=mmproj_path, ctx_size=desired_ctx, n_gpu_layers=int(args.n_gpu_layers), tensor_split=args.tensor_split, host=args.host, jinja=not args.no_jinja, ttl=resolve_idle_ttl(args), description=args.description or f"{repo_id} / {selected_file}", auto_ctx_failed=auto_ctx_failed, auto_ctx_error=auto_ctx_error, ctx_probe_latency_ms=ctx_probe_latency_ms, ctx_probe_speed_tps=ctx_probe_speed_tps, ctx_probe_kv_gb=ctx_probe_kv_gb, ctx_probe_prompt_tokens=ctx_probe_prompt_tokens)
+    refresh_model_load_capabilities(new_m)
     new_cat = [m for m in catalog if m.model_id != mid] + [new_m]
     save_catalog(args.catalog, new_cat)
+    if defer_publish:
+        _emit_message(f"Catalog updated for {mid}; publish/load deferred.", progress_callback)
+        if probe_config_replaced:
+            restore_catalog_config(args, stable_catalog, progress_callback=progress_callback, restart_service=False)
+        return mid
     gpu_conflict = get_gpu_conflict_message(mid, new_cat, args.public_host, args.public_port)
     if gpu_conflict:
         _emit_message(gpu_conflict, progress_callback)
@@ -2291,9 +2850,11 @@ def ensure_model_available(args, progress_callback = None):
         save_catalog(args.catalog, stable_catalog)
         restore_catalog_config(args, stable_catalog, progress_callback=progress_callback, restart_service=True)
         raise
+    _emit_default_ctx_update_hint(mid, new_m.ctx_size, default_ctx, progress_callback)
     return mid
 
 def wait_for_model_absent(model_id, host, port, timeout=35):
+    host = _normalize_client_host(host)
     url = f"http://{host}:{port}/v1/models"
     deadline = time.time() + timeout
     spinner = Spinner(f"\033[36mWaiting for {model_id} removal...\033[0m ")
@@ -2500,9 +3061,12 @@ def remove_model(args, progress_callback = None):
     try:
         model = resolve_catalog_model(catalog, target=args.repo, repo_ref=args.hf, model_id=args.model_id, filename=args.file)
     except RuntimeError as exc:
-        if str(exc) == "Model not found in catalog." and args.delete_files:
+        if str(exc) == "Model not found in catalog.":
             reference = args.repo or args.hf or args.model_id or args.file
             if reference:
+                # Attempt to remove orphan files even if --delete-files was not
+                # explicitly requested. This helps cleanup partially downloaded
+                # artifacts when the catalog entry is missing.
                 removed = _remove_orphan_files_by_reference(str(reference), args.models_dir, progress_callback)
                 if removed > 0:
                     _emit_message(
@@ -2628,6 +3192,93 @@ def _read_gguf_value(fh, value_type):
         raise EOFError("Unexpected EOF while reading GGUF value")
     return struct.unpack(fmt, raw)[0]
 
+
+def _normalize_load_capabilities(values: object) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        token = str(raw or "").strip().lower()
+        if not token:
+            continue
+        if token not in seen:
+            normalized.append(token)
+            seen.add(token)
+    return normalized
+
+
+def _extract_load_capabilities_from_value(value: object) -> list[str]:
+    tokens: list[str] = []
+    candidates: list[str] = []
+    if isinstance(value, str):
+        candidates.append(value)
+    elif isinstance(value, list):
+        candidates.extend(str(item) for item in value if isinstance(item, (str, int, float)))
+    for candidate in candidates:
+        lowered = candidate.strip().lower()
+        if not lowered:
+            continue
+        for match in re.findall(r"(?:image-text-to-text|text-to-text|image-to-text|image|vision)", lowered):
+            token = "image-text-to-text" if match == "vision" else match
+            tokens.append(token)
+    return _normalize_load_capabilities(tokens)
+
+
+def detect_model_load_capabilities(model: ManagedModel) -> list[str]:
+    local_path = Path(model.local_path) if model.local_path else None
+    if local_path is None or not local_path.exists():
+        return _normalize_load_capabilities(model.load_capabilities)
+
+    detected: list[str] = []
+    seen: set[str] = set()
+    try:
+        with local_path.open("rb") as fh:
+            if fh.read(4) != b"GGUF":
+                return _normalize_load_capabilities(model.load_capabilities)
+            version_raw = fh.read(4)
+            tensor_count_raw = fh.read(8)
+            kv_count_raw = fh.read(8)
+            if len(version_raw) != 4 or len(tensor_count_raw) != 8 or len(kv_count_raw) != 8:
+                return _normalize_load_capabilities(model.load_capabilities)
+            version = struct.unpack("<I", version_raw)[0]
+            if version not in (2, 3):
+                return _normalize_load_capabilities(model.load_capabilities)
+            kv_count = struct.unpack("<Q", kv_count_raw)[0]
+            for _ in range(kv_count):
+                key = _read_gguf_string(fh)
+                value_type_raw = fh.read(4)
+                if len(value_type_raw) != 4:
+                    break
+                value_type = struct.unpack("<I", value_type_raw)[0]
+                value = _read_gguf_value(fh, value_type)
+                lowered = key.lower()
+                if not any(hint in lowered for hint in ("architecture", "capabil", "modalit", "vision", "image")):
+                    continue
+                for token in _extract_load_capabilities_from_value(value):
+                    if token not in seen:
+                        detected.append(token)
+                        seen.add(token)
+    except Exception:
+        return _normalize_load_capabilities(model.load_capabilities)
+
+    if not detected and _has_vision_runtime(model):
+        detected.extend(["image", "image-text-to-text"])
+    if not detected:
+        detected.append("text-to-text")
+    return _normalize_load_capabilities(detected)
+
+
+def refresh_model_load_capabilities(model: ManagedModel) -> list[str]:
+    capabilities = detect_model_load_capabilities(model)
+    model.load_capabilities = capabilities
+    return capabilities
+
+
+def refresh_models_load_capabilities(models: list[ManagedModel]) -> None:
+    for model in models:
+        refresh_model_load_capabilities(model)
+
 def get_model_context_size(model: ManagedModel):
     local_path = Path(model.local_path) if model.local_path else None
     if local_path is None or not local_path.exists():
@@ -2690,6 +3341,7 @@ def _safe_realpath(path_str: str) -> str:
 
 def get_published_model_ids(host=DEFAULT_PUBLIC_HOST, port=DEFAULT_PUBLIC_PORT) -> set[str]:
     try:
+        host = _normalize_client_host(host)
         r = requests.get(f"http://{host}:{port}/v1/models", timeout=1.5)
         if r.status_code != 200:
             return set()
@@ -2801,14 +3453,13 @@ def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DE
         if _is_ollama_process(pid):
             continue
         process = process_by_pid.get(pid)
-        if process is not None:
-            running_model = model_by_path.get(process.get("model_path") or "")
-            if running_model == model_id:
-                continue
-            if running_model:
-                conflicts.append(f"{running_model} (pid {pid}, {used_mem} MiB)")
-                continue
-        conflicts.append(f"{_describe_pid(pid)} (pid {pid}, {used_mem} MiB)")
+        if process is None:
+            continue
+        running_model = model_by_path.get(process.get("model_path") or "")
+        if running_model == model_id:
+            continue
+        if running_model:
+            conflicts.append(f"{running_model} (pid {pid}, {used_mem} MiB)")
     if not conflicts:
         return None
     joined = "; ".join(conflicts[:4])
@@ -2876,6 +3527,7 @@ def render_models_table(catalog: list[ManagedModel], host=DEFAULT_PUBLIC_HOST, p
         loaded = process is not None
         runtime, planned = classify_runtime(model, loaded, process["pid"] if process else None, gpu_process_map)
         ctx_status = ctx_evaluation_status(model)
+        totals_num = _to_float_or_none(model.ctx_probe_totals_s)
         rows.append({
             "MODEL_ID": model.model_id,
             "PUBLISHED": "yes" if published else "no",
@@ -2886,12 +3538,18 @@ def render_models_table(catalog: list[ManagedModel], host=DEFAULT_PUBLIC_HOST, p
             "CFG_CTX": _display_cfg_ctx(model),
             "API_CTX": _display_api_ctx(model),
             "CTX_GB": _format_ctx_probe_gb(_to_float_or_none(model.ctx_probe_kv_gb)),
-            "SPEED": _format_ctx_probe_speed(_to_float_or_none(model.ctx_probe_speed_tps)),
+            "READ/S": _format_ctx_probe_rate(_to_float_or_none(model.ctx_probe_read_s)),
+            "TOKEN/S": _format_ctx_probe_rate(_to_float_or_none(model.ctx_probe_tokens_s)),
+            "TOTAL/S": _format_ctx_probe_rate(totals_num),
+            "__totals_s": totals_num or 0.0,
             "SIZE": _format_bytes(storage["size"]),
             "FILES": str(storage["file_count"]),
             "STATUS": ctx_status if ctx_status == "ERROR" else storage["status"],
             "REPO": model.repo_id,
         })
+
+    # Order rows so fastest (by total tokens/s) appear first; None/NC treated as 0.
+    rows.sort(key=lambda r: (r.get("__totals_s") or 0.0), reverse=True)
 
     columns = [
         ("MODEL_ID", 999),
@@ -2903,7 +3561,9 @@ def render_models_table(catalog: list[ManagedModel], host=DEFAULT_PUBLIC_HOST, p
         ("CFG_CTX", 8),
         ("API_CTX", 8),
         ("CTX_GB", 8),
-        ("SPEED", 12),
+        ("READ/S", 12),
+        ("TOKEN/S", 12),
+        ("TOTAL/S", 12),
         ("SIZE", 10),
         ("FILES", 5),
         ("STATUS", 8),
@@ -2934,7 +3594,9 @@ def render_auto_ctx_summary_table(rows: list[dict[str, str]]) -> str:
         ("CFG_CTX", 9),
         ("API_CTX", 9),
         ("CTX_GB", 8),
-        ("SPEED", 12),
+        ("READ/S", 12),
+        ("TOKEN/S", 12),
+        ("TOTAL/S", 12),
         ("LATENCY", 10),
         ("STATUS", 12),
     ]
@@ -2950,6 +3612,7 @@ def render_auto_ctx_summary_table(rows: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 def build_model_ctx_payload(model: ManagedModel) -> dict:
+    load_capabilities = refresh_model_load_capabilities(model)
     gguf_ctx = get_model_context_size(model)
     cfg_ctx = displayed_configured_ctx(model)
     api_ctx = displayed_api_ctx(model)
@@ -2968,12 +3631,16 @@ def build_model_ctx_payload(model: ManagedModel) -> dict:
             "api_ctx_status": ctx_status,
             "max_ctx": cfg_ctx if ctx_status != "ERROR" else None,
             "gguf_ctx": gguf_ctx,
+            "load_capabilities": load_capabilities,
+            "speculative": bool(getattr(model, "speculative", False)),
+            "spec_variant_of": getattr(model, "spec_variant_of", None),
             **probe_metrics,
         },
     }
 
 
 def build_openai_model_payload(model: ManagedModel) -> dict:
+    load_capabilities = refresh_model_load_capabilities(model)
     gguf_ctx = get_model_context_size(model)
     cfg_ctx = displayed_configured_ctx(model)
     api_ctx = displayed_api_ctx(model)
@@ -2990,7 +3657,10 @@ def build_openai_model_payload(model: ManagedModel) -> dict:
             "api_context_status": ctx_status,
             "context_length": cfg_ctx if ctx_status != "ERROR" else None,
             "gguf_context_length": gguf_ctx,
+            "load_capabilities": load_capabilities,
             "vision": _has_vision_runtime(model),
+            "speculative": bool(getattr(model, "speculative", False)),
+            "spec_variant_of": getattr(model, "spec_variant_of", None),
             **probe_metrics,
         },
     }
@@ -3009,7 +3679,10 @@ def _looks_like_vision_model(model: ManagedModel) -> bool:
 
 
 def _has_vision_runtime(model: ManagedModel) -> bool:
-    return bool(model.mmproj_path and Path(model.mmproj_path).exists())
+    if bool(model.mmproj_path and Path(model.mmproj_path).exists()):
+        return True
+    capabilities = _normalize_load_capabilities(getattr(model, "load_capabilities", []))
+    return any(token in capabilities for token in ("image", "image-text-to-text", "image-to-text", "vision"))
 
 
 def _infer_model_family(model: ManagedModel) -> str:
@@ -3035,6 +3708,7 @@ def _model_digest(model: ManagedModel) -> str:
 
 
 def build_ollama_model_payload(model: ManagedModel, loaded: bool = False, process: dict | None = None, gpu_process_map: dict[int, str] | None = None) -> dict:
+    load_capabilities = refresh_model_load_capabilities(model)
     storage = get_model_storage_info(model)
     gguf_ctx = get_model_context_size(model)
     cfg_ctx = displayed_configured_ctx(model)
@@ -3048,7 +3722,7 @@ def build_ollama_model_payload(model: ManagedModel, loaded: bool = False, proces
     except Exception:
         modified = datetime.now(timezone.utc).isoformat()
     details = {
-        "parent_model": "",
+        "parent_model": getattr(model, "spec_variant_of", "") or "",
         "format": "gguf",
         "family": _infer_model_family(model),
         "families": [_infer_model_family(model)],
@@ -3059,6 +3733,8 @@ def build_ollama_model_payload(model: ManagedModel, loaded: bool = False, proces
         "api_context_status": ctx_status,
         "context_length": cfg_ctx if ctx_status != "ERROR" else None,
         "gguf_context_length": gguf_ctx,
+        "load_capabilities": load_capabilities,
+        "speculative": bool(getattr(model, "speculative", False)),
         "vision": _has_vision_runtime(model),
         **probe_metrics,
     }
@@ -3075,9 +3751,16 @@ def build_ollama_model_payload(model: ManagedModel, loaded: bool = False, proces
             "llamacpp.api_context_status": ctx_status,
             "llamacpp.context_length": cfg_ctx if ctx_status != "ERROR" else None,
             "llamacpp.gguf_context_length": gguf_ctx,
+            "llamacpp.load_capabilities": load_capabilities,
+            "llamacpp.ctx_probe_read_s": probe_metrics["ctx_probe_read_s"],
+            "llamacpp.ctx_probe_tokens_s": probe_metrics["ctx_probe_tokens_s"],
+            "llamacpp.ctx_probe_totals_s": probe_metrics["ctx_probe_totals_s"],
             "llamacpp.ctx_probe_latency_ms": probe_metrics["ctx_probe_latency_ms"],
             "llamacpp.ctx_probe_speed_tps": probe_metrics["ctx_probe_speed_tps"],
             "llamacpp.ctx_probe_kv_gb": probe_metrics["ctx_probe_kv_gb"],
+            "llamacpp.ctx_probe_read": probe_metrics["ctx_probe_read"],
+            "llamacpp.ctx_probe_tokens": probe_metrics["ctx_probe_tokens"],
+            "llamacpp.ctx_probe_totals": probe_metrics["ctx_probe_totals"],
             "llamacpp.ctx_probe_latency": probe_metrics["ctx_probe_latency"],
             "llamacpp.ctx_probe_speed": probe_metrics["ctx_probe_speed"],
             "llamacpp.ctx_probe_kv": probe_metrics["ctx_probe_kv"],
@@ -3541,11 +4224,18 @@ def start_ctx_metadata_server(args):
             if model is None:
                 self._send_json({"error": f"model '{name}' not found"}, status=404)
                 return
+            previous_load_capabilities = list(model.load_capabilities)
             gguf_ctx = get_model_context_size(model)
             cfg_ctx = displayed_configured_ctx(model)
             api_ctx = displayed_api_ctx(model)
             ctx_status = ctx_evaluation_status(model)
             probe_metrics = _ctx_probe_api_metrics(model)
+            load_capabilities = refresh_model_load_capabilities(model)
+            if load_capabilities != previous_load_capabilities:
+                try:
+                    save_catalog(catalog_path, catalog)
+                except Exception:
+                    pass
             self._send_json({
                 "license": "",
                 "modelfile": f"FROM {model.model_id}\nPARAMETER num_ctx {model.ctx_size}\n",
@@ -3558,12 +4248,23 @@ def start_ctx_metadata_server(args):
                     "llamacpp.api_context_status": ctx_status,
                     "llamacpp.context_length": cfg_ctx if ctx_status != "ERROR" else None,
                     "llamacpp.gguf_context_length": gguf_ctx,
+                    "llamacpp.load_capabilities": load_capabilities,
+                    "llamacpp.ctx_probe_read_s": probe_metrics["ctx_probe_read_s"],
+                    "llamacpp.ctx_probe_tokens_s": probe_metrics["ctx_probe_tokens_s"],
+                    "llamacpp.ctx_probe_totals_s": probe_metrics["ctx_probe_totals_s"],
                     "llamacpp.ctx_probe_latency_ms": probe_metrics["ctx_probe_latency_ms"],
                     "llamacpp.ctx_probe_speed_tps": probe_metrics["ctx_probe_speed_tps"],
                     "llamacpp.ctx_probe_kv_gb": probe_metrics["ctx_probe_kv_gb"],
+                    "llamacpp.ctx_probe_read": probe_metrics["ctx_probe_read"],
+                    "llamacpp.ctx_probe_tokens": probe_metrics["ctx_probe_tokens"],
+                    "llamacpp.ctx_probe_totals": probe_metrics["ctx_probe_totals"],
                     "llamacpp.ctx_probe_latency": probe_metrics["ctx_probe_latency"],
                     "llamacpp.ctx_probe_speed": probe_metrics["ctx_probe_speed"],
                     "llamacpp.ctx_probe_kv": probe_metrics["ctx_probe_kv"],
+                },
+                "modalities": {
+                    "input": ["text", "image"] if _has_vision_runtime(model) else ["text"],
+                    "output": ["text"],
                 },
                 "capabilities": ["completion", "vision"] if _has_vision_runtime(model) else ["completion"],
             })
@@ -4084,6 +4785,89 @@ def list_models(args):
     return 0
 
 
+def run_command(args):
+    """Handle `run` subcommand with support for multiple `-hf` values.
+
+    Semantics:
+    - If multiple HF entries are provided and `--speculative` is set, the
+            first HF is treated as the master and the second as draft. Both are
+            ensured/downloaded first, then a speculative pair entry is created
+            that serves the master with the draft model wired as `--model-draft`.
+    - Otherwise falls back to default single-model behavior.
+    """
+    raw_hf = getattr(args, "hf", None)
+    hf_list = []
+    if raw_hf is None:
+        hf_list = []
+    elif isinstance(raw_hf, (list, tuple)):
+        for group in raw_hf:
+            if isinstance(group, (list, tuple)):
+                hf_list.extend(group)
+            else:
+                hf_list.append(group)
+    else:
+        hf_list = [raw_hf]
+
+    if len(hf_list) >= 2 and bool(getattr(args, "speculative", False)):
+        # Ensure master model (first HF) without forcing an immediate publish.
+        master_args = argparse.Namespace(**vars(args))
+        master_args.hf = hf_list[0]
+        master_args.repo = None
+        master_args.model_id = None
+        master_args.speculative = False
+        master_args.defer_publish = True
+        master_mid = ensure_model_available(master_args)
+
+        # Ensure draft model (second HF) without immediate publish.
+        draft_args = argparse.Namespace(**vars(args))
+        draft_args.hf = hf_list[1]
+        draft_args.repo = None
+        draft_args.model_id = None
+        draft_args.speculative = False
+        draft_args.defer_publish = True
+        draft_args.auto_ctx = False
+        if getattr(draft_args, "ctx_override", None) is None:
+            draft_args.skip_ctx = True
+        draft_mid = ensure_model_available(draft_args)
+
+        # Create/publish the speculative pair using master as target model and
+        # draft as --model-draft.
+        spec_args = argparse.Namespace(**vars(args))
+        spec_args.hf = None
+        spec_args.repo = None
+        spec_args.file = None
+        spec_args.model_id = master_mid
+        spec_args.speculative = True
+        spec_args.spec_base_model_id = master_mid
+        spec_args.spec_draft_model_id = draft_mid
+        spec_args.auto_ctx = False
+        if getattr(spec_args, "ctx_override", None) is None:
+            spec_args.skip_ctx = True
+        spec_mid = ensure_model_available(spec_args)
+
+        # Any remaining HF entries: ensure they're downloaded as regular models
+        for extra in hf_list[2:]:
+            extra_args = argparse.Namespace(**vars(args))
+            extra_args.hf = extra
+            extra_args.repo = None
+            extra_args.model_id = None
+            extra_args.speculative = False
+            ensure_model_available(extra_args)
+
+        if args.no_chat:
+            return 0
+        return start_chat(spec_mid, args.public_host, args.public_port)
+
+    # Default single-model path
+    effective_args = argparse.Namespace(**vars(args))
+    if hf_list:
+        effective_args.hf = hf_list[0]
+    mid = ensure_model_available(effective_args)
+    if args.no_chat:
+        return 0
+    return start_chat(mid, args.public_host, args.public_port)
+
+
 def show_request_log(args):
     print(_tail_text_file(DEFAULT_REQUESTS_LOG_PATH, lines=int(args.lines)))
     return 0
@@ -4190,7 +4974,8 @@ def temporarily_unload_published_models(args, progress_callback = None, timeout 
     )
     _emit_message("Temporary empty config written. Waiting for llama-swap --watch-config...", progress_callback)
     time.sleep(3.0)
-    url = f"http://{args.public_host}:{args.public_port}/v1/models"
+    host = _normalize_client_host(args.public_host)
+    url = f"http://{host}:{args.public_port}/v1/models"
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -4375,7 +5160,7 @@ def _probe_request_payload(model: ManagedModel, prompt: str):
             {
                 "messages": multimodal_messages,
                 "stream": False,
-                "max_tokens": 1,
+                "max_tokens": 10,
                 "temperature": 0,
             },
         )]
@@ -4664,14 +5449,33 @@ def probe_model_ctx(model: ManagedModel, llama_server: Path, ctx_size: int, time
                                 continue
                             usage = body.get("usage") if isinstance(body, dict) else {}
                             prompt_tokens = _to_int_or_none((usage or {}).get("prompt_tokens") if isinstance(usage, dict) else None)
+                            completion_tokens = _to_int_or_none((usage or {}).get("completion_tokens") if isinstance(usage, dict) else None)
+                            total_tokens = _to_int_or_none((usage or {}).get("total_tokens") if isinstance(usage, dict) else None)
+                            read_s = None
+                            tokens_s = None
+                            totals_s = None
                             speed_tps = None
-                            if prompt_tokens is not None and elapsed_ms > 0:
-                                speed_tps = prompt_tokens / (elapsed_ms / 1000.0)
+                            elapsed_s = elapsed_ms / 1000.0 if elapsed_ms > 0 else None
+                            if elapsed_s is not None:
+                                if prompt_tokens is not None:
+                                    read_s = prompt_tokens / elapsed_s
+                                if completion_tokens is not None:
+                                    tokens_s = completion_tokens / elapsed_s
+                                if total_tokens is None and (prompt_tokens is not None or completion_tokens is not None):
+                                    total_tokens = int((prompt_tokens or 0) + (completion_tokens or 0))
+                                if total_tokens is not None:
+                                    totals_s = total_tokens / elapsed_s
+                            speed_tps = totals_s
                             probe_metrics = {
                                 "probe_ctx": int(ctx_size),
                                 "probe_endpoint": endpoint,
                                 "probe_latency_ms": elapsed_ms,
                                 "probe_prompt_tokens": prompt_tokens,
+                                "probe_completion_tokens": completion_tokens,
+                                "probe_total_tokens": total_tokens,
+                                "probe_read_s": read_s,
+                                "probe_tokens_s": tokens_s,
+                                "probe_totals_s": totals_s,
                                 "probe_speed_tps": speed_tps,
                             }
                         except Exception:
@@ -4767,60 +5571,541 @@ def _ctx_gb_from_reason(reason: str | None) -> float | None:
     metrics = _parse_probe_trace_metrics(trace_path)
     return _ctx_gb_from_metrics(metrics)
 
+
+def _probe_fixed_ctx_metrics_once(model: ManagedModel, llama_server: Path, ctx_size: int) -> tuple[bool, str, dict[str, object]]:
+    ok, reason, payload = _normalize_probe_result(probe_model_ctx(model, llama_server, int(ctx_size)))
+    info = dict(payload or {})
+    info["selected_ctx"] = int(ctx_size)
+
+    speed_tps = _to_float_or_none(info.get("probe_speed_tps"))
+    totals_s = _to_float_or_none(info.get("probe_totals_s"))
+    if speed_tps is None:
+        speed_tps = totals_s
+        info["probe_speed_tps"] = speed_tps
+    if totals_s is None:
+        totals_s = speed_tps
+        info["probe_totals_s"] = totals_s
+
+    if "selected_ctx_gb" not in info:
+        info["selected_ctx_gb"] = _ctx_gb_from_reason(reason)
+
+    trace_path = _trace_path_from_reason(reason)
+    if trace_path is not None:
+        try:
+            trace_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    return ok, reason, info
+
 def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback = None):
     max_ctx = get_model_context_size(model)
     if max_ctx is None:
-        _emit_message(f"{model.model_id}: could not read GGUF max context, skipping.", progress_callback)
+        _emit_message(f"{model.model_id}: could not read GGUF max context, skipping.", progress_callback, timestamp=True)
         return None, "metadata-missing", {"max_ctx": None}
 
     start_ctx = min(8192, max_ctx)
     if start_ctx <= 0:
-        _emit_message(f"{model.model_id}: invalid max context {max_ctx}, skipping.", progress_callback)
+        _emit_message(f"{model.model_id}: invalid max context {max_ctx}, skipping.", progress_callback, timestamp=True)
         return None, "metadata-missing", {"max_ctx": max_ctx}
 
     _emit_message(
-        f"{model.model_id}: GGUF max ctx {max_ctx}. Auto-fit will calibrate memory once, probe the GGUF maximum, and then refine downward using memory-fit hints.",
+        f"{model.model_id}: GGUF max ctx {max_ctx}. Auto-fit will calibrate memory and probe boundaries.",
         progress_callback,
+        timestamp=True,
     )
-    _emit_message(f"{model.model_id}: each probe now sends a conservative long prompt sized for that ctx candidate.", progress_callback)
+    _emit_message(f"{model.model_id}: each probe now sends a conservative long prompt sized for that ctx candidate.", progress_callback, timestamp=True)
     if _has_vision_runtime(model):
-        _emit_message(f"{model.model_id}: vision runtime detected, each ctx probe will include a valid image plus text.", progress_callback)
+        _emit_message(f"{model.model_id}: vision runtime detected, each ctx probe will include a valid image plus text.", progress_callback, timestamp=True)
 
+    probe_max_first = os.environ.get("LLAMACPP_AUTO_CTX_MAX_FIRST", "").lower() in ("1", "true", "yes", "on")
+
+    # Detect whether a previous configured ctx value or prior probe metrics exist.
+    prev_ctx_present = False
+    try:
+        prev_ctx_present = bool(int(model.ctx_size) and int(model.ctx_size) != DEFAULT_CTX_SIZE)
+    except Exception:
+        prev_ctx_present = False
+    if model.ctx_probe_kv_gb is not None or model.ctx_probe_totals_s is not None or model.auto_ctx_failed:
+        prev_ctx_present = True
+
+    # Resolve a safely aligned hint from previous config, if any.
+    max_probe_ctx = _align_ctx(max_ctx)
+    known_ctx_hint = None
+    try:
+        known_ctx_hint = _align_ctx(int(model.ctx_size))
+    except Exception:
+        known_ctx_hint = None
+    if known_ctx_hint is not None and (known_ctx_hint <= 0 or known_ctx_hint > max_probe_ctx):
+        known_ctx_hint = None
+
+    if not probe_max_first:
+        free_vram_mib = _query_gpu_free_memory_mib()
+        # If a previous cfg ctx exists, test it first before the conservative calibration probe.
+        prior_ok = False
+        if prev_ctx_present and known_ctx_hint is not None:
+            _emit_message(f"{model.model_id}: testing previously configured ctx {known_ctx_hint} first.", progress_callback, timestamp=True)
+            ok_hint, hint_reason, hint_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, known_ctx_hint))
+            if ok_hint:
+                prior_ok = True
+                calibration_ctx = known_ctx_hint
+                calibration_probe_metrics = hint_metrics
+                calibration_trace = _trace_path_from_reason(hint_reason)
+                metrics = _parse_probe_trace_metrics(calibration_trace)
+                if calibration_trace is not None:
+                    try:
+                        calibration_trace.unlink()
+                    except FileNotFoundError:
+                        pass
+
+                selected_probe_latency_ms = _to_float_or_none(calibration_probe_metrics.get("probe_latency_ms"))
+                selected_probe_read_s = _to_float_or_none(calibration_probe_metrics.get("probe_read_s"))
+                selected_probe_tokens_s = _to_float_or_none(calibration_probe_metrics.get("probe_tokens_s"))
+                selected_probe_totals_s = _to_float_or_none(calibration_probe_metrics.get("probe_totals_s"))
+                selected_probe_speed_tps = _to_float_or_none(calibration_probe_metrics.get("probe_speed_tps"))
+                if selected_probe_speed_tps is None:
+                    selected_probe_speed_tps = selected_probe_totals_s
+                if selected_probe_totals_s is None:
+                    selected_probe_totals_s = selected_probe_speed_tps
+                selected_probe_prompt_tokens = _to_int_or_none(calibration_probe_metrics.get("probe_prompt_tokens"))
+                selected_ctx_gb = _ctx_gb_from_metrics(metrics)
+
+                if calibration_ctx >= max_probe_ctx:
+                    return calibration_ctx, "selected", {
+                        "max_ctx": max_ctx,
+                        "calibration_ctx": calibration_ctx,
+                        "estimated_ctx": calibration_ctx,
+                        "first_failure": None,
+                        "selected_ctx": calibration_ctx,
+                        "probe_latency_ms": selected_probe_latency_ms,
+                        "probe_read_s": selected_probe_read_s,
+                        "probe_tokens_s": selected_probe_tokens_s,
+                        "probe_totals_s": selected_probe_totals_s,
+                        "probe_speed_tps": selected_probe_speed_tps,
+                        "probe_prompt_tokens": selected_probe_prompt_tokens,
+                        "selected_ctx_gb": selected_ctx_gb,
+                    }
+            else:
+                _emit_message(f"{model.model_id}: previous ctx {known_ctx_hint} no longer works ({hint_reason}).", progress_callback, timestamp=True)
+
+        if not prior_ok:
+            calibration_ctx = start_ctx
+            _emit_message(f"{model.model_id}: calibration probe at ctx {calibration_ctx}...", progress_callback, timestamp=True)
+            ok, reason, calibration_probe_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, calibration_ctx))
+            if not ok:
+                _emit_message(f"{model.model_id}: failed even at calibration ctx {calibration_ctx} ({reason}), skipping.", progress_callback, timestamp=True)
+                return None, "min-failed", {"max_ctx": max_ctx, "min_ctx": calibration_ctx, "reason": reason}
+
+        if not prior_ok:
+            calibration_trace = _trace_path_from_reason(reason)
+            metrics = _parse_probe_trace_metrics(calibration_trace)
+            if calibration_trace is not None:
+                try:
+                    calibration_trace.unlink()
+                except FileNotFoundError:
+                    pass
+
+        selected_probe_latency_ms = _to_float_or_none(calibration_probe_metrics.get("probe_latency_ms"))
+        selected_probe_read_s = _to_float_or_none(calibration_probe_metrics.get("probe_read_s"))
+        selected_probe_tokens_s = _to_float_or_none(calibration_probe_metrics.get("probe_tokens_s"))
+        selected_probe_totals_s = _to_float_or_none(calibration_probe_metrics.get("probe_totals_s"))
+        selected_probe_speed_tps = _to_float_or_none(calibration_probe_metrics.get("probe_speed_tps"))
+        if selected_probe_speed_tps is None:
+            selected_probe_speed_tps = selected_probe_totals_s
+        if selected_probe_totals_s is None:
+            selected_probe_totals_s = selected_probe_speed_tps
+        selected_probe_prompt_tokens = _to_int_or_none(calibration_probe_metrics.get("probe_prompt_tokens"))
+        selected_ctx_gb = _ctx_gb_from_metrics(metrics)
+
+        estimated_ctx = _estimate_ctx_ceiling(model, calibration_ctx, metrics, free_vram_mib) or calibration_ctx
+        estimated_ctx = max(calibration_ctx, min(_align_ctx(max_ctx), estimated_ctx))
+        _emit_message(f"{model.model_id}: estimated stable ctx ceiling from memory fit = {estimated_ctx}.", progress_callback, timestamp=True)
+
+        low = calibration_ctx
+        max_probe_ctx = _align_ctx(max_ctx)
+        high = None
+        last_success = calibration_ctx
+        first_failure = None
+        tested = {calibration_ctx}
+        min_ctx_rechecked = False
+
+        known_ctx_hint = _align_ctx(int(model.ctx_size))
+        if known_ctx_hint <= calibration_ctx or known_ctx_hint > max_probe_ctx:
+            known_ctx_hint = None
+
+        candidate_order: list[int] = []
+        if known_ctx_hint is not None:
+            candidate_order.append(known_ctx_hint)
+            _emit_message(
+                f"{model.model_id}: refresh hint using previous cfg ctx {known_ctx_hint} as first upper probe.",
+                progress_callback,
+                timestamp=True,
+            )
+        if max_probe_ctx > calibration_ctx:
+            candidate_order.append(max_probe_ctx)
+        if estimated_ctx > calibration_ctx and estimated_ctx < max_probe_ctx:
+            candidate_order.append(estimated_ctx)
+            optimistic_ctx = _align_ctx(min(max_probe_ctx, max(estimated_ctx + 1024, int(estimated_ctx * 1.2))))
+            if optimistic_ctx > estimated_ctx and optimistic_ctx < max_probe_ctx:
+                candidate_order.append(optimistic_ctx)
+
+        for candidate in candidate_order:
+            if candidate in tested:
+                continue
+            tested.add(candidate)
+            _emit_message(f"{model.model_id}: testing ctx {candidate}...", progress_callback, timestamp=True)
+            ok, reason, probe_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, candidate))
+            if ok:
+                low = candidate
+                last_success = candidate
+                selected_probe_latency_ms = _to_float_or_none(probe_metrics.get("probe_latency_ms"))
+                selected_probe_read_s = _to_float_or_none(probe_metrics.get("probe_read_s"))
+                selected_probe_tokens_s = _to_float_or_none(probe_metrics.get("probe_tokens_s"))
+                selected_probe_totals_s = _to_float_or_none(probe_metrics.get("probe_totals_s"))
+                selected_probe_speed_tps = _to_float_or_none(probe_metrics.get("probe_speed_tps"))
+                if selected_probe_speed_tps is None:
+                    selected_probe_speed_tps = selected_probe_totals_s
+                if selected_probe_totals_s is None:
+                    selected_probe_totals_s = selected_probe_speed_tps
+                selected_probe_prompt_tokens = _to_int_or_none(probe_metrics.get("probe_prompt_tokens"))
+                selected_ctx_gb = _ctx_gb_from_reason(reason) or selected_ctx_gb
+                if candidate == max_probe_ctx:
+                    return last_success, "selected", {
+                        "max_ctx": max_ctx,
+                        "calibration_ctx": calibration_ctx,
+                        "estimated_ctx": estimated_ctx,
+                        "first_failure": first_failure,
+                        "selected_ctx": last_success,
+                        "probe_latency_ms": selected_probe_latency_ms,
+                        "probe_read_s": selected_probe_read_s,
+                        "probe_tokens_s": selected_probe_tokens_s,
+                        "probe_totals_s": selected_probe_totals_s,
+                        "probe_speed_tps": selected_probe_speed_tps,
+                        "probe_prompt_tokens": selected_probe_prompt_tokens,
+                        "selected_ctx_gb": selected_ctx_gb,
+                    }
+                continue
+            if high is None or candidate < high:
+                high = candidate
+            first_failure = candidate
+            _emit_message(f"{model.model_id}: ctx {candidate} failed ({reason}).", progress_callback, timestamp=True)
+            if not min_ctx_rechecked and candidate > calibration_ctx:
+                min_ctx_rechecked = True
+                _emit_message(
+                    f"{model.model_id}: guard probe at minimum ctx {calibration_ctx} after upper-bound failure...",
+                    progress_callback,
+                    timestamp=True,
+                )
+                min_ok, min_reason, _min_probe_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, calibration_ctx))
+                if not min_ok:
+                    _emit_message(
+                        f"{model.model_id}: minimum ctx {calibration_ctx} failed on guard probe ({min_reason}).",
+                        progress_callback,
+                        timestamp=True,
+                    )
+                    return None, "min-failed", {
+                        "max_ctx": max_ctx,
+                        "min_ctx": calibration_ctx,
+                        "reason": min_reason,
+                        "guard_failed_after": candidate,
+                    }
+            if candidate != max_probe_ctx:
+                break
+
+        if high is None and low < max_probe_ctx:
+            high = max_probe_ctx
+
+        while high is not None and high - low >= 4096:
+            midpoint = _align_ctx((low + high) // 2)
+            if midpoint <= low or midpoint >= high or midpoint in tested:
+                break
+            tested.add(midpoint)
+            _emit_message(f"{model.model_id}: refinement probe at {midpoint}...", progress_callback, timestamp=True)
+            ok, reason, probe_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, midpoint))
+            if ok:
+                low = midpoint
+                last_success = midpoint
+                selected_probe_latency_ms = _to_float_or_none(probe_metrics.get("probe_latency_ms"))
+                selected_probe_read_s = _to_float_or_none(probe_metrics.get("probe_read_s"))
+                selected_probe_tokens_s = _to_float_or_none(probe_metrics.get("probe_tokens_s"))
+                selected_probe_totals_s = _to_float_or_none(probe_metrics.get("probe_totals_s"))
+                selected_probe_speed_tps = _to_float_or_none(probe_metrics.get("probe_speed_tps"))
+                if selected_probe_speed_tps is None:
+                    selected_probe_speed_tps = selected_probe_totals_s
+                if selected_probe_totals_s is None:
+                    selected_probe_totals_s = selected_probe_speed_tps
+                selected_probe_prompt_tokens = _to_int_or_none(probe_metrics.get("probe_prompt_tokens"))
+                selected_ctx_gb = _ctx_gb_from_reason(reason) or selected_ctx_gb
+            else:
+                high = midpoint
+                first_failure = midpoint
+                _emit_message(f"{model.model_id}: refinement ctx {midpoint} failed ({reason}).", progress_callback, timestamp=True)
+
+        return last_success, "selected", {
+            "max_ctx": max_ctx,
+            "calibration_ctx": calibration_ctx,
+            "estimated_ctx": estimated_ctx,
+            "first_failure": first_failure,
+            "selected_ctx": last_success,
+            "probe_latency_ms": selected_probe_latency_ms,
+            "probe_read_s": selected_probe_read_s,
+            "probe_tokens_s": selected_probe_tokens_s,
+            "probe_totals_s": selected_probe_totals_s,
+            "probe_speed_tps": selected_probe_speed_tps,
+            "probe_prompt_tokens": selected_probe_prompt_tokens,
+            "selected_ctx_gb": selected_ctx_gb,
+        }
+
+    # probe_max_first branch
     free_vram_mib = _query_gpu_free_memory_mib()
-    calibration_ctx = start_ctx
-    _emit_message(f"{model.model_id}: calibration probe at ctx {calibration_ctx}...", progress_callback)
-    ok, reason, calibration_probe_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, calibration_ctx))
-    if not ok:
-        _emit_message(f"{model.model_id}: failed even at calibration ctx {calibration_ctx} ({reason}), skipping.", progress_callback)
-        return None, "min-failed", {"max_ctx": max_ctx, "min_ctx": calibration_ctx, "reason": reason}
+    max_probe_ctx = _align_ctx(max_ctx)
+    min_probe_ctx = _align_ctx(1024)
 
-    calibration_trace = _trace_path_from_reason(reason)
-    metrics = _parse_probe_trace_metrics(calibration_trace)
-    if calibration_trace is not None:
+    prev_ctx_present = False
+    try:
+        prev_ctx_present = bool(int(model.ctx_size) and int(model.ctx_size) != DEFAULT_CTX_SIZE)
+    except Exception:
+        prev_ctx_present = False
+    if model.ctx_probe_kv_gb is not None or model.ctx_probe_totals_s is not None or model.auto_ctx_failed:
+        prev_ctx_present = True
+
+    selected_probe_latency_ms = None
+    selected_probe_read_s = None
+    selected_probe_tokens_s = None
+    selected_probe_totals_s = None
+    selected_probe_speed_tps = None
+    selected_probe_prompt_tokens = None
+    selected_ctx_gb = None
+
+    if not prev_ctx_present:
+        _emit_message(f"{model.model_id}: no previous ctx probe found — testing max ctx {max_probe_ctx} first.", progress_callback)
+        ok, reason, probe_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, max_probe_ctx))
+        if ok:
+            calibration_ctx = max_probe_ctx
+            last_success = max_probe_ctx
+            selected_probe_latency_ms = _to_float_or_none(probe_metrics.get("probe_latency_ms"))
+            selected_probe_read_s = _to_float_or_none(probe_metrics.get("probe_read_s"))
+            selected_probe_tokens_s = _to_float_or_none(probe_metrics.get("probe_tokens_s"))
+            selected_probe_totals_s = _to_float_or_none(probe_metrics.get("probe_totals_s"))
+            selected_probe_speed_tps = _to_float_or_none(probe_metrics.get("probe_speed_tps"))
+            if selected_probe_speed_tps is None:
+                selected_probe_speed_tps = selected_probe_totals_s
+            if selected_probe_totals_s is None:
+                selected_probe_totals_s = selected_probe_speed_tps
+            selected_probe_prompt_tokens = _to_int_or_none(probe_metrics.get("probe_prompt_tokens"))
+            trace = _trace_path_from_reason(reason)
+            metrics = _parse_probe_trace_metrics(trace)
+            selected_ctx_gb = _ctx_gb_from_metrics(metrics) or selected_ctx_gb
+            if trace is not None:
+                try:
+                    trace.unlink()
+                except FileNotFoundError:
+                    pass
+            return last_success, "selected", {
+                "max_ctx": max_ctx,
+                "calibration_ctx": calibration_ctx,
+                "estimated_ctx": calibration_ctx,
+                "first_failure": None,
+                "selected_ctx": last_success,
+                "probe_latency_ms": selected_probe_latency_ms,
+                "probe_read_s": selected_probe_read_s,
+                "probe_tokens_s": selected_probe_tokens_s,
+                "probe_totals_s": selected_probe_totals_s,
+                "probe_speed_tps": selected_probe_speed_tps,
+                "probe_prompt_tokens": selected_probe_prompt_tokens,
+                "selected_ctx_gb": selected_ctx_gb,
+            }
+
+        _emit_message(f"{model.model_id}: max ctx {max_probe_ctx} failed ({reason}). Trying minimum ctx {min_probe_ctx}...", progress_callback)
+        ok_min, min_reason, min_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, min_probe_ctx))
+        if not ok_min:
+            _emit_message(f"{model.model_id}: minimum ctx {min_probe_ctx} failed ({min_reason}).", progress_callback)
+            return None, "min-failed", {"max_ctx": max_ctx, "min_ctx": min_probe_ctx, "reason": min_reason}
+
+        calibration_ctx = min_probe_ctx
+        calibration_probe_metrics = min_metrics
+        calibration_trace = _trace_path_from_reason(min_reason)
+        metrics = _parse_probe_trace_metrics(calibration_trace)
+        if calibration_trace is not None:
+            try:
+                calibration_trace.unlink()
+            except FileNotFoundError:
+                pass
+
+        selected_probe_latency_ms = _to_float_or_none(calibration_probe_metrics.get("probe_latency_ms"))
+        selected_probe_read_s = _to_float_or_none(calibration_probe_metrics.get("probe_read_s"))
+        selected_probe_tokens_s = _to_float_or_none(calibration_probe_metrics.get("probe_tokens_s"))
+        selected_probe_totals_s = _to_float_or_none(calibration_probe_metrics.get("probe_totals_s"))
+        selected_probe_speed_tps = _to_float_or_none(calibration_probe_metrics.get("probe_speed_tps"))
+        if selected_probe_speed_tps is None:
+            selected_probe_speed_tps = selected_probe_totals_s
+        if selected_probe_totals_s is None:
+            selected_probe_totals_s = selected_probe_speed_tps
+        selected_probe_prompt_tokens = _to_int_or_none(calibration_probe_metrics.get("probe_prompt_tokens"))
+        selected_ctx_gb = _ctx_gb_from_metrics(metrics)
+
+    prev_ctx_present = False
+    try:
+        prev_ctx_present = bool(int(model.ctx_size) and int(model.ctx_size) != DEFAULT_CTX_SIZE)
+    except Exception:
+        prev_ctx_present = False
+    if model.ctx_probe_kv_gb is not None or model.ctx_probe_totals_s is not None or model.auto_ctx_failed:
+        prev_ctx_present = True
+
+    selected_probe_latency_ms = None
+    selected_probe_read_s = None
+    selected_probe_tokens_s = None
+    selected_probe_totals_s = None
+    selected_probe_speed_tps = None
+    selected_probe_prompt_tokens = None
+    selected_ctx_gb = None
+
+    if not prev_ctx_present:
+        _emit_message(f"{model.model_id}: no previous ctx probe found — testing max ctx {max_probe_ctx} first.", progress_callback)
+        ok, reason, probe_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, max_probe_ctx))
+        if ok:
+            calibration_ctx = max_probe_ctx
+            last_success = max_probe_ctx
+            selected_probe_latency_ms = _to_float_or_none(probe_metrics.get("probe_latency_ms"))
+            selected_probe_read_s = _to_float_or_none(probe_metrics.get("probe_read_s"))
+            selected_probe_tokens_s = _to_float_or_none(probe_metrics.get("probe_tokens_s"))
+            selected_probe_totals_s = _to_float_or_none(probe_metrics.get("probe_totals_s"))
+            selected_probe_speed_tps = _to_float_or_none(probe_metrics.get("probe_speed_tps"))
+            if selected_probe_speed_tps is None:
+                selected_probe_speed_tps = selected_probe_totals_s
+            if selected_probe_totals_s is None:
+                selected_probe_totals_s = selected_probe_speed_tps
+            selected_probe_prompt_tokens = _to_int_or_none(probe_metrics.get("probe_prompt_tokens"))
+            trace = _trace_path_from_reason(reason)
+            metrics = _parse_probe_trace_metrics(trace)
+            selected_ctx_gb = _ctx_gb_from_metrics(metrics) or selected_ctx_gb
+            if trace is not None:
+                try:
+                    trace.unlink()
+                except FileNotFoundError:
+                    pass
+            return last_success, "selected", {
+                "max_ctx": max_ctx,
+                "calibration_ctx": calibration_ctx,
+                "estimated_ctx": calibration_ctx,
+                "first_failure": None,
+                "selected_ctx": last_success,
+                "probe_latency_ms": selected_probe_latency_ms,
+                "probe_read_s": selected_probe_read_s,
+                "probe_tokens_s": selected_probe_tokens_s,
+                "probe_totals_s": selected_probe_totals_s,
+                "probe_speed_tps": selected_probe_speed_tps,
+                "probe_prompt_tokens": selected_probe_prompt_tokens,
+                "selected_ctx_gb": selected_ctx_gb,
+            }
+
+        _emit_message(f"{model.model_id}: max ctx {max_probe_ctx} failed ({reason}). Trying minimum ctx {min_probe_ctx}...", progress_callback)
+        ok_min, min_reason, min_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, min_probe_ctx))
+        if not ok_min:
+            _emit_message(f"{model.model_id}: minimum ctx {min_probe_ctx} failed ({min_reason}).", progress_callback)
+            return None, "min-failed", {"max_ctx": max_ctx, "min_ctx": min_probe_ctx, "reason": min_reason}
+
+        calibration_ctx = min_probe_ctx
+        calibration_probe_metrics = min_metrics
+        calibration_trace = _trace_path_from_reason(min_reason)
+        metrics = _parse_probe_trace_metrics(calibration_trace)
+        if calibration_trace is not None:
+            try:
+                calibration_trace.unlink()
+            except FileNotFoundError:
+                pass
+
+        selected_probe_latency_ms = _to_float_or_none(calibration_probe_metrics.get("probe_latency_ms"))
+        selected_probe_read_s = _to_float_or_none(calibration_probe_metrics.get("probe_read_s"))
+        selected_probe_tokens_s = _to_float_or_none(calibration_probe_metrics.get("probe_tokens_s"))
+        selected_probe_totals_s = _to_float_or_none(calibration_probe_metrics.get("probe_totals_s"))
+        selected_probe_speed_tps = _to_float_or_none(calibration_probe_metrics.get("probe_speed_tps"))
+        if selected_probe_speed_tps is None:
+            selected_probe_speed_tps = selected_probe_totals_s
+        if selected_probe_totals_s is None:
+            selected_probe_totals_s = selected_probe_speed_tps
+        selected_probe_prompt_tokens = _to_int_or_none(calibration_probe_metrics.get("probe_prompt_tokens"))
+        selected_ctx_gb = _ctx_gb_from_metrics(metrics)
+
+    else:
+        known_ctx_hint = None
         try:
-            calibration_trace.unlink()
-        except FileNotFoundError:
-            pass
+            known_ctx_hint = _align_ctx(int(model.ctx_size))
+        except Exception:
+            known_ctx_hint = None
+        if known_ctx_hint is None or known_ctx_hint <= 0 or known_ctx_hint > max_probe_ctx:
+            known_ctx_hint = None
 
-    selected_probe_latency_ms = _to_float_or_none(calibration_probe_metrics.get("probe_latency_ms"))
-    selected_probe_speed_tps = _to_float_or_none(calibration_probe_metrics.get("probe_speed_tps"))
-    selected_probe_prompt_tokens = _to_int_or_none(calibration_probe_metrics.get("probe_prompt_tokens"))
-    selected_ctx_gb = _ctx_gb_from_metrics(metrics)
+        if known_ctx_hint is not None:
+            _emit_message(f"{model.model_id}: testing previously configured ctx {known_ctx_hint} first.", progress_callback)
+            ok_hint, hint_reason, hint_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, known_ctx_hint))
+            if ok_hint:
+                calibration_ctx = known_ctx_hint
+                calibration_probe_metrics = hint_metrics
+                calibration_trace = _trace_path_from_reason(hint_reason)
+                metrics = _parse_probe_trace_metrics(calibration_trace)
+                if calibration_trace is not None:
+                    try:
+                        calibration_trace.unlink()
+                    except FileNotFoundError:
+                        pass
+
+                selected_probe_latency_ms = _to_float_or_none(calibration_probe_metrics.get("probe_latency_ms"))
+                selected_probe_read_s = _to_float_or_none(calibration_probe_metrics.get("probe_read_s"))
+                selected_probe_tokens_s = _to_float_or_none(calibration_probe_metrics.get("probe_tokens_s"))
+                selected_probe_totals_s = _to_float_or_none(calibration_probe_metrics.get("probe_totals_s"))
+                selected_probe_speed_tps = _to_float_or_none(calibration_probe_metrics.get("probe_speed_tps"))
+                if selected_probe_speed_tps is None:
+                    selected_probe_speed_tps = selected_probe_totals_s
+                if selected_probe_totals_s is None:
+                    selected_probe_totals_s = selected_probe_speed_tps
+                selected_probe_prompt_tokens = _to_int_or_none(calibration_probe_metrics.get("probe_prompt_tokens"))
+                selected_ctx_gb = _ctx_gb_from_metrics(metrics)
+
+                if calibration_ctx >= max_probe_ctx:
+                    return calibration_ctx, "selected", {
+                        "max_ctx": max_ctx,
+                        "calibration_ctx": calibration_ctx,
+                        "estimated_ctx": calibration_ctx,
+                        "first_failure": None,
+                        "selected_ctx": calibration_ctx,
+                        "probe_latency_ms": selected_probe_latency_ms,
+                        "probe_read_s": selected_probe_read_s,
+                        "probe_tokens_s": selected_probe_tokens_s,
+                        "probe_totals_s": selected_probe_totals_s,
+                        "probe_speed_tps": selected_probe_speed_tps,
+                        "probe_prompt_tokens": selected_probe_prompt_tokens,
+                        "selected_ctx_gb": selected_ctx_gb,
+                    }
+            else:
+                _emit_message(f"{model.model_id}: previous ctx {known_ctx_hint} no longer works ({hint_reason}).", progress_callback)
+                calibration_ctx = start_ctx
+                calibration_probe_metrics = None
+                metrics = ProbeTraceMetrics()
+
+        else:
+            calibration_ctx = start_ctx
+            calibration_probe_metrics = None
+            metrics = ProbeTraceMetrics()
 
     estimated_ctx = _estimate_ctx_ceiling(model, calibration_ctx, metrics, free_vram_mib) or calibration_ctx
     estimated_ctx = max(calibration_ctx, min(_align_ctx(max_ctx), estimated_ctx))
     _emit_message(f"{model.model_id}: estimated stable ctx ceiling from memory fit = {estimated_ctx}.", progress_callback)
 
     low = calibration_ctx
+    last_success = calibration_ctx
     max_probe_ctx = _align_ctx(max_ctx)
     high = None
-    last_success = calibration_ctx
     first_failure = None
     tested = {calibration_ctx}
     min_ctx_rechecked = False
 
-    known_ctx_hint = _align_ctx(int(model.ctx_size))
-    if known_ctx_hint <= calibration_ctx or known_ctx_hint > max_probe_ctx:
+    known_ctx_hint = None
+    try:
+        known_ctx_hint = _align_ctx(int(model.ctx_size))
+    except Exception:
+        known_ctx_hint = None
+    if known_ctx_hint is not None and (known_ctx_hint <= calibration_ctx or known_ctx_hint > max_probe_ctx):
         known_ctx_hint = None
 
     candidate_order: list[int] = []
@@ -4848,7 +6133,14 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
             low = candidate
             last_success = candidate
             selected_probe_latency_ms = _to_float_or_none(probe_metrics.get("probe_latency_ms"))
+            selected_probe_read_s = _to_float_or_none(probe_metrics.get("probe_read_s"))
+            selected_probe_tokens_s = _to_float_or_none(probe_metrics.get("probe_tokens_s"))
+            selected_probe_totals_s = _to_float_or_none(probe_metrics.get("probe_totals_s"))
             selected_probe_speed_tps = _to_float_or_none(probe_metrics.get("probe_speed_tps"))
+            if selected_probe_speed_tps is None:
+                selected_probe_speed_tps = selected_probe_totals_s
+            if selected_probe_totals_s is None:
+                selected_probe_totals_s = selected_probe_speed_tps
             selected_probe_prompt_tokens = _to_int_or_none(probe_metrics.get("probe_prompt_tokens"))
             selected_ctx_gb = _ctx_gb_from_reason(reason) or selected_ctx_gb
             if candidate == max_probe_ctx:
@@ -4859,6 +6151,9 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
                     "first_failure": first_failure,
                     "selected_ctx": last_success,
                     "probe_latency_ms": selected_probe_latency_ms,
+                    "probe_read_s": selected_probe_read_s,
+                    "probe_tokens_s": selected_probe_tokens_s,
+                    "probe_totals_s": selected_probe_totals_s,
                     "probe_speed_tps": selected_probe_speed_tps,
                     "probe_prompt_tokens": selected_probe_prompt_tokens,
                     "selected_ctx_gb": selected_ctx_gb,
@@ -4903,7 +6198,14 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
             low = midpoint
             last_success = midpoint
             selected_probe_latency_ms = _to_float_or_none(probe_metrics.get("probe_latency_ms"))
+            selected_probe_read_s = _to_float_or_none(probe_metrics.get("probe_read_s"))
+            selected_probe_tokens_s = _to_float_or_none(probe_metrics.get("probe_tokens_s"))
+            selected_probe_totals_s = _to_float_or_none(probe_metrics.get("probe_totals_s"))
             selected_probe_speed_tps = _to_float_or_none(probe_metrics.get("probe_speed_tps"))
+            if selected_probe_speed_tps is None:
+                selected_probe_speed_tps = selected_probe_totals_s
+            if selected_probe_totals_s is None:
+                selected_probe_totals_s = selected_probe_speed_tps
             selected_probe_prompt_tokens = _to_int_or_none(probe_metrics.get("probe_prompt_tokens"))
             selected_ctx_gb = _ctx_gb_from_reason(reason) or selected_ctx_gb
         else:
@@ -4918,6 +6220,9 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
         "first_failure": first_failure,
         "selected_ctx": last_success,
         "probe_latency_ms": selected_probe_latency_ms,
+        "probe_read_s": selected_probe_read_s,
+        "probe_tokens_s": selected_probe_tokens_s,
+        "probe_totals_s": selected_probe_totals_s,
         "probe_speed_tps": selected_probe_speed_tps,
         "probe_prompt_tokens": selected_probe_prompt_tokens,
         "selected_ctx_gb": selected_ctx_gb,
@@ -5088,13 +6393,104 @@ def update_config(args, progress_callback = None):
         if target_models:
             probe_config_replaced = True
             temporarily_unload_published_models(args, progress_callback=progress_callback)
-        total_models = len(target_models)
+        paired_spec_by_model: dict[str, tuple[str, str]] = {}
+        paired_draft_model_ids: set[str] = set()
+        for item in target_models:
+            if not bool(getattr(item, "speculative", False)):
+                continue
+            spec_meta = item.spec_meta if isinstance(item.spec_meta, dict) else {}
+            base_model_id = str(spec_meta.get("base_model_id") or item.spec_variant_of or "").strip()
+            draft_model_id = str(spec_meta.get("draft_model_id") or "").strip()
+            if base_model_id and draft_model_id:
+                paired_spec_by_model[item.model_id] = (base_model_id, draft_model_id)
+                paired_draft_model_ids.add(draft_model_id)
+
+        ordered_models = [m for m in target_models if not bool(getattr(m, "speculative", False))]
+        ordered_models.extend([m for m in target_models if bool(getattr(m, "speculative", False))])
+        total_models = len(ordered_models)
         updated_ctx = 0
         missing_ctx = 0
         min_failed_models: list[ManagedModel] = []
         try:
-            for idx, model in enumerate(target_models, start=1):
-                _emit_message(f"[{idx}/{total_models}] Probing {model.model_id}...", progress_callback)
+            for idx, model in enumerate(ordered_models, start=1):
+                if model.model_id in paired_draft_model_ids and model.model_id not in paired_spec_by_model:
+                    _emit_message(
+                        f"[{idx}/{total_models}] Skipping draft-only auto-ctx probe for paired speculative draft {model.model_id}.",
+                        progress_callback,
+                        timestamp=True,
+                    )
+                    auto_ctx_rows.append(
+                        {
+                            "MODEL": model.model_id,
+                            "CFG_CTX": _display_cfg_ctx(model),
+                            "API_CTX": _display_api_ctx(model),
+                            "CTX_GB": _format_ctx_probe_gb(model.ctx_probe_kv_gb),
+                            "READ/S": _format_ctx_probe_rate(model.ctx_probe_read_s),
+                            "TOKENS/S": _format_ctx_probe_rate(model.ctx_probe_tokens_s),
+                            "TOTALS/S": _format_ctx_probe_rate(model.ctx_probe_totals_s),
+                            "LATENCY": _format_ctx_probe_latency(model.ctx_probe_latency_ms),
+                            "STATUS": "paired-draft-skip",
+                        }
+                    )
+                    continue
+
+                paired_spec_info = paired_spec_by_model.get(model.model_id)
+                if paired_spec_info is not None:
+                    base_model_id, _draft_model_id = paired_spec_info
+                    base_model = next((item for item in catalog if item.model_id == base_model_id), None)
+                    if base_model is not None:
+                        paired_ctx = int(getattr(base_model, "ctx_size", 0) or model.ctx_size or DEFAULT_CTX_SIZE)
+                        if model.ctx_size != paired_ctx:
+                            model.ctx_size = paired_ctx
+                            updated_ctx += 1
+                        model.auto_ctx_failed = False
+                        model.auto_ctx_error = ""
+                        _emit_message(
+                            (
+                                f"[{idx}/{total_models}] Probing paired speculative model {model.model_id} "
+                                f"at master ctx {paired_ctx} (metrics only)."
+                            ),
+                            progress_callback,
+                            timestamp=True,
+                        )
+                        probe_ok, probe_reason, probe_info = _probe_fixed_ctx_metrics_once(model, args.llama_server, paired_ctx)
+                        if probe_ok:
+                            apply_ctx_probe_metrics(model, probe_info)
+                            status_label = "paired-metrics"
+                            _emit_message(
+                                f"{model.model_id}: paired metrics captured at ctx {paired_ctx}.",
+                                progress_callback,
+                                timestamp=True,
+                            )
+                        else:
+                            clear_ctx_probe_metrics(model)
+                            status_label = "paired-metrics-failed"
+                            _emit_message(
+                                (
+                                    f"{model.model_id}: paired metrics probe failed at master ctx {paired_ctx} "
+                                    f"({probe_reason})."
+                                ),
+                                progress_callback,
+                                timestamp=True,
+                            )
+                        refresh_model_load_capabilities(model)
+                        save_catalog(args.catalog, catalog)
+                        auto_ctx_rows.append(
+                            {
+                                "MODEL": model.model_id,
+                                "CFG_CTX": str(model.ctx_size),
+                                "API_CTX": str(displayed_api_ctx(model, args)),
+                                "CTX_GB": _format_ctx_probe_gb(model.ctx_probe_kv_gb),
+                                "READ/S": _format_ctx_probe_rate(model.ctx_probe_read_s),
+                                "TOKENS/S": _format_ctx_probe_rate(model.ctx_probe_tokens_s),
+                                "TOTALS/S": _format_ctx_probe_rate(model.ctx_probe_totals_s),
+                                "LATENCY": _format_ctx_probe_latency(model.ctx_probe_latency_ms),
+                                "STATUS": status_label,
+                            }
+                        )
+                        continue
+
+                _emit_message(f"[{idx}/{total_models}] Probing {model.model_id}...", progress_callback, timestamp=True)
                 best_ctx, status, info = choose_auto_ctx(model, args.llama_server, progress_callback=progress_callback)
                 if best_ctx is None:
                     missing_ctx += 1
@@ -5103,6 +6499,7 @@ def update_config(args, progress_callback = None):
                     model.auto_ctx_failed = True
                     model.auto_ctx_error = f"min-failed:{failure_reason}" if status == "min-failed" else failure_reason
                     clear_ctx_probe_metrics(model)
+                    refresh_model_load_capabilities(model)
                     if status == "min-failed":
                         min_ctx = int(details.get("min_ctx") or model.ctx_size or DEFAULT_CTX_SIZE)
                         model.ctx_size = min_ctx
@@ -5110,18 +6507,22 @@ def update_config(args, progress_callback = None):
                         _emit_message(
                             f"{model.model_id}: failed even at minimum ctx {min_ctx} ({failure_reason}).",
                             progress_callback,
+                            timestamp=True,
                         )
                     else:
                         _emit_message(
                             f"{model.model_id}: automatic ctx probing failed ({failure_reason}).",
                             progress_callback,
+                            timestamp=True,
                         )
                     auto_ctx_rows.append({
                         "MODEL": model.model_id,
                         "CFG_CTX": _display_cfg_ctx(model),
                         "API_CTX": _display_api_ctx(model),
                         "CTX_GB": _format_ctx_probe_gb(None),
-                        "SPEED": _format_ctx_probe_speed(None),
+                        "READ/S": _format_ctx_probe_rate(None),
+                        "TOKENS/S": _format_ctx_probe_rate(None),
+                        "TOTALS/S": _format_ctx_probe_rate(None),
                         "LATENCY": _format_ctx_probe_latency(None),
                         "STATUS": status,
                     })
@@ -5133,14 +6534,17 @@ def update_config(args, progress_callback = None):
                 model.auto_ctx_failed = False
                 model.auto_ctx_error = ""
                 apply_ctx_probe_metrics(model, info)
+                refresh_model_load_capabilities(model)
                 save_catalog(args.catalog, catalog)
-                _emit_message(f"{model.model_id}: selected cfg ctx {model.ctx_size}.", progress_callback)
+                _emit_message(f"{model.model_id}: selected cfg ctx {model.ctx_size}.", progress_callback, timestamp=True)
                 auto_ctx_rows.append({
                     "MODEL": model.model_id,
                     "CFG_CTX": str(model.ctx_size),
                     "API_CTX": str(displayed_api_ctx(model, args)),
                     "CTX_GB": _format_ctx_probe_gb(model.ctx_probe_kv_gb),
-                    "SPEED": _format_ctx_probe_speed(model.ctx_probe_speed_tps),
+                    "READ/S": _format_ctx_probe_rate(model.ctx_probe_read_s),
+                    "TOKENS/S": _format_ctx_probe_rate(model.ctx_probe_tokens_s),
+                    "TOTALS/S": _format_ctx_probe_rate(model.ctx_probe_totals_s),
                     "LATENCY": _format_ctx_probe_latency(model.ctx_probe_latency_ms),
                     "STATUS": "selected",
                 })
@@ -5202,6 +6606,7 @@ def update_config(args, progress_callback = None):
             model.ctx_size = ctx_override
             model.auto_ctx_failed = False
             model.auto_ctx_error = ""
+            refresh_model_load_capabilities(model)
         updated_ctx = len(target_models)
         missing_ctx = 0
         if len(target_models) == 1:
@@ -5215,6 +6620,7 @@ def update_config(args, progress_callback = None):
             for model in target_models:
                 if model.ctx_size != previous_ctx_by_model.get(model.model_id):
                     clear_ctx_probe_metrics(model)
+                    refresh_model_load_capabilities(model)
         else:
             updated_ctx = 0
             missing_ctx = 0
@@ -5253,10 +6659,11 @@ def update_config(args, progress_callback = None):
     _emit_message("Config updated from catalog. Waiting for llama-swap --watch-config...", progress_callback)
     time.sleep(3.0)
     try:
-        r = requests.get(f"http://{args.public_host}:{args.public_port}/v1/models", timeout=2)
+        host = _normalize_client_host(args.public_host)
+        r = requests.get(f"http://{host}:{args.public_port}/v1/models", timeout=2)
         if r.status_code == 200:
             _emit_message(
-                f"Public API reachable on http://{args.public_host}:{args.public_port} ({len(r.json().get('data', []))} published models).",
+                f"Public API reachable on http://{host}:{args.public_port} ({len(r.json().get('data', []))} published models).",
                 progress_callback,
             )
         else:
@@ -5266,29 +6673,45 @@ def update_config(args, progress_callback = None):
             )
     except Exception as e:
         _emit_message(
-            f"Config updated, but could not verify public API on http://{args.public_host}:{args.public_port} ({e.__class__.__name__}).",
+            f"Config updated, but could not verify public API on http://{_normalize_client_host(args.public_host)}:{args.public_port} ({e.__class__.__name__}).",
             progress_callback,
         )
     return "updated"
 
 def warmup_model(model_id, host, port, timeout=600):
+    host = _normalize_client_host(host)
     url = f"http://{host}:{port}/v1/chat/completions"
     print(f"\033[35;1mWarming model {model_id} before opening the chat...\033[0m")
     loader = LoadingBar("\033[35;1mLoading model:\033[0m ")
     loader.start()
+    deadline = time.time() + timeout
+    last_error = None
     try:
-        r = requests.post(
-            url,
-            json={
-                "model": model_id,
-                "messages": [{"role": "user", "content": "."}],
-                "stream": False,
-                "max_tokens": 1,
-                "temperature": 0,
-            },
-            timeout=timeout,
-        )
-        r.raise_for_status()
+        while time.time() < deadline:
+            try:
+                r = requests.post(
+                    url,
+                    json={
+                        "model": model_id,
+                        "messages": [{"role": "user", "content": "."}],
+                        "stream": False,
+                        "max_tokens": 1,
+                        "temperature": 0,
+                    },
+                    timeout=(10, 30),
+                )
+                r.raise_for_status()
+                return
+            except requests.HTTPError as exc:
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                if status_code not in {502, 503, 504}:
+                    raise
+                last_error = exc
+            except Exception as exc:
+                last_error = exc
+            time.sleep(1.5)
+        if last_error is not None:
+            raise last_error
     finally:
         loader.stop()
 
@@ -5408,16 +6831,16 @@ def daemon_mode(args):
     
     while True:
         conn, _ = server.accept()
-        def handle():
+        def handle(client_conn=conn):
             sock_in = None
             try:
-                sock_in = conn.makefile("r", encoding="utf-8")
+                sock_in = client_conn.makefile("r", encoding="utf-8")
                 data = sock_in.readline()
                 if not data: return
                 req = json.loads(data)
 
                 def send_event(event):
-                    conn.sendall((json.dumps(event) + "\n").encode())
+                    client_conn.sendall((json.dumps(event) + "\n").encode())
                     if event.get("type") == "question":
                         raw = sock_in.readline()
                         if not raw:
@@ -5468,7 +6891,7 @@ def daemon_mode(args):
                         sock_in.close()
                     except Exception:
                         pass
-                conn.close()
+                client_conn.close()
         threading.Thread(target=handle).start()
 
 
@@ -5657,6 +7080,7 @@ def build_help_epilog():
         "  run [repo|-hf HF] [--auto] [--no-chat]\n"
         "    Ensure model exists and start chat (or only preload with --no-chat).\n"
         f"    Example: {CLI_COMMAND} run -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M --auto\n"
+        f"    Pair example: {CLI_COMMAND} run -hf org/master:Q4 --speculative -hf org/draft:IQ1\n"
         "  remove [repo ...|-hf HF ...] [--keep-files]\n"
         "    Remove models from config/catalog and delete files by default.\n"
         f"    Example: {CLI_COMMAND} remove qwen2.5-32b-instruct-q4_k_m\n"
@@ -5751,6 +7175,7 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     p_add.add_argument("--force", action="store_true")
     p_add.add_argument("--hf-token")
     p_add.add_argument("--description")
+    p_add.add_argument("--speculative", action="store_true", help="Create/download a speculative draft variant (speculative-<base_id>)")
     
     p_run = sub.add_parser(
         "run",
@@ -5758,15 +7183,17 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
         description="Ensure model availability and run chat unless --no-chat is used.",
     )
     subparsers["run"] = p_run
-    p_run.set_defaults(
-        func=lambda a: (
-            (ensure_model_available(a) and 0)
-            if a.no_chat
-            else start_chat(ensure_model_available(a), a.public_host, a.public_port)
-        )
-    )
+    p_run.set_defaults(func=run_command)
     p_run.add_argument("--no-chat", action="store_true")
     p_run.add_argument("-ctx", "--ctx", dest="ctx_override", type=int, help="Override ctx size for this run")
+    p_run.add_argument(
+        "--speculative",
+        action="store_true",
+        help=(
+            "Run against a speculative draft variant (speculative-<base_id>). "
+            "With two -hf values, first is base/master and second is draft."
+        ),
+    )
 
     p_remove = sub.add_parser(
         "remove",
@@ -5821,6 +7248,7 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
         action="store_true",
         help="Keep existing CFG_CTX values while regenerating config",
     )
+    p_update.add_argument("--speculative", action="store_true", help="Update/probe a speculative draft variant (speculative-<base_id>)")
     p_update.add_argument(
         "--sync-gguf-ctx",
         action="store_true",
@@ -5855,6 +7283,7 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     p_validate.add_argument("--no-jinja", action="store_true")
     p_validate.add_argument("--hf-token")
     p_validate.add_argument("--description")
+    p_validate.add_argument("--speculative", action="store_true", help="Validate a speculative draft variant (speculative-<base_id>)")
     
     p_daemon = sub.add_parser(
         "daemon",
@@ -5866,7 +7295,9 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     
     for p in [p_run]:
         p.add_argument("repo", nargs="?", help="HF repo[:QUANT]")
-        p.add_argument("-hf", "--hf", help="HF repo")
+        # Allow specifying multiple HF entries. Use append+nargs so the
+        # user can pass either a space-separated group or repeat the flag.
+        p.add_argument("-hf", "--hf", nargs="+", action="append", help="HF repo")
         p.add_argument("--file")
         p.add_argument("--model-id")
         p.add_argument("--ctx-size", default=DEFAULT_CTX_SIZE)

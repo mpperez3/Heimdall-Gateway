@@ -16,6 +16,7 @@ default:
   cache_type_v: q8_0
   flash-attn: on
 
+
 presets:
   "2":
     tensor_split: "0.94,1"
@@ -32,3 +33,17 @@ presets:
     threads-batch: 16
     numa: distribute
     fit-target: 1536
+
+speculative_defaults:
+  # Global defaults for speculative/draft model variants.
+  # Set `enabled` to true to enable installer/CLI creation of speculative entries.
+  enabled: false
+  # Prefix used when generating speculative model catalog IDs: "speculative-<base_id>"
+  id_prefix: speculative-
+  # Flags applied to speculative model server runs when autocontext is not available.
+  # `fit` is emitted as a string to match existing flag style (on/off).
+  fit: on
+  # `fitt` default value (integer tokens) when `fit` is used.
+  fitt: 1024
+  # Allow multiple speculative variants per base model when true.
+  allow_multiple_variants: true
