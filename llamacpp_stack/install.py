@@ -42,6 +42,7 @@ LEGACY_SERVER_CONFIG_BASENAME = "llamacpp-server.json"
 ENV_BASENAME = "llamacpp-superserver.env"
 LEGACY_ENV_BASENAME = "llamacpp-stack.env"
 LLAMA_CPP_MODES = ("native", "prebuilt", "source")
+BACKEND_OPTIONS = ("llama.cpp", "vllm-beta")  # Beta: vLLM as alternative backend
 ELEVATED_INSTALL_ENV = "LLAMACPP_INSTALL_ELEVATED"
 DEFAULT_GRAMMAR_MAX_REPETITION_THRESHOLD = 2_000_000
 GRAMMAR_MAX_REPETITION_THRESHOLD_ENV = "LLAMACPP_GRAMMAR_MAX_REPETITION_THRESHOLD"
@@ -215,6 +216,7 @@ class InstallLayout:
     runtime_venv: Path
     cuda_root: Path
     nccl_root: Path = Path()
+    backend: str = "llama.cpp"
 
 
 def prompt_bool(message: str, default: bool = True) -> bool:
@@ -286,6 +288,23 @@ def resolve_llama_cpp_mode(requested_mode: str | None) -> str:
             ("native", "use a system-wide llama.cpp already installed on the machine"),
         ],
         default="source",
+    )
+
+
+def resolve_backend_choice(requested_backend: str | None) -> str:
+    """Allow user to choose between llama.cpp (stable) or vLLM (beta) backend."""
+    if requested_backend:
+        if requested_backend not in BACKEND_OPTIONS:
+            raise ValueError(f"Unknown backend: {requested_backend}. Options: {', '.join(BACKEND_OPTIONS)}")
+        return requested_backend
+    
+    return prompt_choice(
+        "Which inference backend would you like to use?",
+        [
+            ("llama.cpp", "llama.cpp (stable, optimized for GGUF models)"),
+            ("vllm-beta", "vLLM beta (OpenAI API compatible, recommended for HuggingFace models)"),
+        ],
+        default="llama.cpp",
     )
 
 
@@ -542,6 +561,8 @@ def _args_to_cli(argv: argparse.Namespace, chosen_mode: str, chosen_llama_cpp_mo
     cmd = [
         "--mode",
         chosen_mode,
+        "--backend",
+        str(getattr(argv, "backend", "llama.cpp")),
         "--llama-cpp-mode",
         chosen_llama_cpp_mode,
         "--models-dir",
@@ -944,7 +965,14 @@ def derive_models_dir(base: Path | None, mode: str) -> Path:
     return Path.home() / ".local/share/llamacpp-superserver/models"
 
 
-def choose_layout(mode: str | None, public_host: str, public_port: int | None, models_dir: Path | None = None, args: argparse.Namespace | None = None) -> InstallLayout:
+def choose_layout(
+    mode: str | None,
+    public_host: str,
+    public_port: int | None,
+    models_dir: Path | None = None,
+    args: argparse.Namespace | None = None,
+    backend: str = "llama.cpp",
+) -> InstallLayout:
     resolved_mode = mode or detect_existing_mode() or ("system" if os.geteuid() == 0 else "user")
     resolved_port = choose_default_swap_port(public_host, resolved_mode, public_port, args=args)
     ollama_models = detect_ollama_models_dir()
@@ -982,6 +1010,7 @@ def choose_layout(mode: str | None, public_host: str, public_port: int | None, m
         runtime_venv=install_root / "venv",
         cuda_root=install_root / "cuda",
         nccl_root=install_root / "nccl",
+        backend=backend,
     )
 
 
@@ -1226,6 +1255,9 @@ def _render_env(
             LLAMACPP_NCCL_ROOT={nccl_root}
             """
         )
+    backend_extra = ""
+    if layout.backend == "vllm-beta":
+        backend_extra = "VLLM_WORKER_MULTIPROC_METHOD=spawn\n"
     return ENV_FILE_HEADER + textwrap.dedent(
         f"""\
         LLAMACPP_STACK_ROOT={layout.install_root}
@@ -1241,10 +1273,11 @@ def _render_env(
         LLAMACPP_API_PORT={layout.public_port - 1}
         LLAMACPP_IDLE_TTL={idle_ttl}
         LLAMACPP_INSTALL_MODE={layout.mode}
+        LLAMACPP_BACKEND={layout.backend}
         LLAMACPP_SERVICE_NAME={SWAP_SERVICE_NAME}
         PYTHON_BIN={python_exec}
         LLAMACPP_PYTHONPATH={python_path}
-        {extra}"""
+        {backend_extra}{extra}"""
     )
 
 
@@ -1377,6 +1410,96 @@ def render_llamaswap_wrapper(layout: InstallLayout) -> str:
           --watch-config
         """
     )
+
+
+def render_vllm_server_wrapper(layout: InstallLayout) -> str:
+        env_file = layout.config_dir / ENV_BASENAME
+        return textwrap.dedent(
+                f"""\
+                #!/usr/bin/env bash
+                set -euo pipefail
+                set -a
+                source {env_file}
+                set +a
+                export VLLM_WORKER_MULTIPROC_METHOD="${{VLLM_WORKER_MULTIPROC_METHOD:-spawn}}"
+
+                port="8000"
+                host="0.0.0.0"
+                model_path=""
+                ctx_size=""
+                dtype="float16"
+                gpu_memory="0.9"
+
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        --model)
+                            model_path="$2"
+                            shift 2
+                            ;;
+                        --port)
+                            port="$2"
+                            shift 2
+                            ;;
+                        --host)
+                            host="$2"
+                            shift 2
+                            ;;
+                        --ctx-size)
+                            ctx_size="$2"
+                            shift 2
+                            ;;
+                        --f16|--float16)
+                            dtype="float16"
+                            shift
+                            ;;
+                        --f32|--float32)
+                            dtype="float32"
+                            shift
+                            ;;
+                        --bf16|--bfloat16)
+                            dtype="bfloat16"
+                            shift
+                            ;;
+                        --fit|--fitc|--fitt|-fitc|-fitt|-fit)
+                            shift 2 2>/dev/null || shift
+                            ;;
+                        --threads|--threads-batch|--mirostat|--mirostat-ent|--mirostat-lr|--cache-type-k|--cache-type-v|--keep|--draft|--spec-draft-n-max)
+                            shift 2
+                            ;;
+                        --mmap|--mlock|--no-mmap|--no-mlock)
+                            shift
+                            ;;
+                        --n-gpu-layers|-ngl)
+                            shift 2
+                            ;;
+                        *)
+                            shift
+                            ;;
+                    esac
+                done
+
+                if [[ -z "$model_path" ]]; then
+                    echo "Error: --model is required" >&2
+                    exit 1
+                fi
+
+                cmd=(
+                    "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server
+                    --model "$model_path"
+                    --port "$port"
+                    --host "$host"
+                    --dtype "$dtype"
+                    --gpu-memory-utilization "$gpu_memory"
+                    --no-enable-log-requests
+                )
+
+                if [[ -n "$ctx_size" ]]; then
+                    cmd+=(--max-model-len "$ctx_size")
+                fi
+
+                exec "${{cmd[@]}}"
+                """
+        )
 
 
 def render_initial_config(config_path: Path, start_port: int = 18080) -> None:
@@ -1549,6 +1672,8 @@ def ensure_runtime_python(layout: InstallLayout, dry_run: bool) -> tuple[Path, P
     if dry_run:
         print(f"[dry-run] would create runtime venv at {layout.runtime_venv}")
         print(f"[dry-run] would copy Python package to {python_path / 'llamacpp_stack'}")
+        if layout.backend == "vllm-beta":
+            print("[dry-run] would install vLLM into the runtime venv with uv")
         return runtime_python, python_path
 
     if uv_bin is None:
@@ -1573,7 +1698,10 @@ def ensure_runtime_python(layout: InstallLayout, dry_run: bool) -> tuple[Path, P
 
     if layout.runtime_venv.exists():
         shutil.rmtree(layout.runtime_venv)
-    _run([uv_bin, "venv", "--python", sys.executable, str(layout.runtime_venv)])
+    if layout.backend == "vllm-beta":
+        _run([uv_bin, "venv", "--python", "3.12", "--seed", "--managed-python", str(layout.runtime_venv)])
+    else:
+        _run([uv_bin, "venv", "--python", sys.executable, str(layout.runtime_venv)])
     _run(
         [
             uv_bin,
@@ -1587,6 +1715,21 @@ def ensure_runtime_python(layout: InstallLayout, dry_run: bool) -> tuple[Path, P
             "hf_transfer",
         ]
     )
+    if layout.backend == "vllm-beta":
+        vllm_env = os.environ.copy()
+        vllm_env["UV_TORCH_BACKEND"] = "auto"
+        _run(
+            [
+                uv_bin,
+                "pip",
+                "install",
+                "--python",
+                str(runtime_python),
+                "--torch-backend=auto",
+                "vllm",
+            ],
+            env=vllm_env,
+        )
     return runtime_python, python_path
 
 
@@ -1760,7 +1903,7 @@ def install_release_asset(asset: dict, install_root: Path, dry_run: bool) -> Pat
     return extract_root
 
 
-def write_manifest(layout: InstallLayout, llama_cpp_tag: str, llamaswap_tag: str, strategy: str, dry_run: bool) -> None:
+def write_manifest(layout: InstallLayout, llama_cpp_tag: str, llamaswap_tag: str, strategy: str, backend: str, dry_run: bool) -> None:
     payload = {
         "mode": layout.mode,
         "models_dir": str(layout.models_dir),
@@ -1769,6 +1912,7 @@ def write_manifest(layout: InstallLayout, llama_cpp_tag: str, llamaswap_tag: str
         "llama_cpp_tag": llama_cpp_tag,
         "llamaswap_tag": llamaswap_tag,
         "llama_cpp_strategy": strategy,
+        "backend": backend,
     }
     if dry_run:
         print(json.dumps(payload, indent=2))
@@ -1834,6 +1978,14 @@ def detect_existing_llama_cpp_mode(layout: InstallLayout) -> str:
     if strategy.startswith("source-build"):
         return "source"
     return "source"
+
+
+def detect_existing_backend(layout: InstallLayout) -> str | None:
+    payload = read_install_manifest(layout)
+    backend = str(payload.get("backend") or "").strip()
+    if backend in BACKEND_OPTIONS:
+        return backend
+    return None
 
 
 def is_existing_install(layout: InstallLayout) -> bool:
@@ -2833,6 +2985,9 @@ def install_stack(args: argparse.Namespace) -> int:
 
     # 2. Re-calculate layout (specifically ports) after services are stopped
     layout = choose_layout(pre_mode, chosen_public_host, args.public_port, chosen_models_dir, args=args)
+    existing_backend = detect_existing_backend(layout)
+    backend = resolve_backend_choice(getattr(args, "backend", None) or existing_backend)
+    layout.backend = backend
 
     if args.update_binaries is not None:
         update_binaries = bool(args.update_binaries)
@@ -2875,7 +3030,9 @@ def install_stack(args: argparse.Namespace) -> int:
         )
         update_binaries = True
         args.update_binaries = True
-    if update_binaries:
+    if backend == "vllm-beta":
+        llama_cpp_mode = "source"
+    elif update_binaries:
         llama_cpp_mode = resolve_llama_cpp_mode(args.llama_cpp_mode)
     else:
         llama_cpp_mode = detect_existing_llama_cpp_mode(layout)
@@ -2899,15 +3056,15 @@ def install_stack(args: argparse.Namespace) -> int:
         llama_cpp_release = dry_run_release_placeholder(DEFAULT_LLAMA_CPP_REPO)
         llamaswap_release = dry_run_release_placeholder(DEFAULT_LLAMASWAP_REPO)
     else:
-        llama_cpp_release = latest_release(DEFAULT_LLAMA_CPP_REPO)
+        llama_cpp_release = dry_run_release_placeholder(DEFAULT_LLAMA_CPP_REPO) if backend == "vllm-beta" else latest_release(DEFAULT_LLAMA_CPP_REPO)
         llamaswap_release = latest_release(DEFAULT_LLAMASWAP_REPO)
     llamaswap_asset = choose_llamaswap_asset(llamaswap_release)
-    llama_cpp_asset = choose_llamacpp_linux_asset(llama_cpp_release)
+    llama_cpp_asset = choose_llamacpp_linux_asset(llama_cpp_release) if backend != "vllm-beta" else None
 
     gpu_present = detect_nvidia_gpu()
     nvcc_path = locate_nvcc()
     cuda_toolkit_present = nvcc_path is not None
-    if llama_cpp_mode == "source" and update_binaries and gpu_present and not cuda_toolkit_present:
+    if backend != "vllm-beta" and llama_cpp_mode == "source" and update_binaries and gpu_present and not cuda_toolkit_present:
         cuda_toolkit_present = maybe_install_cuda_toolkit(
             gpu_present=gpu_present,
             dry_run=args.dry_run,
@@ -2915,26 +3072,27 @@ def install_stack(args: argparse.Namespace) -> int:
             python_exec=sys.executable,
         )
         nvcc_path = locate_nvcc()
-    if llama_cpp_mode == "source" and update_binaries and gpu_present:
+    if backend != "vllm-beta" and llama_cpp_mode == "source" and update_binaries and gpu_present:
         maybe_install_nccl_via_uv(sys.executable, args.dry_run)
-    if llama_cpp_mode == "source" and update_binaries:
+    if backend != "vllm-beta" and llama_cpp_mode == "source" and update_binaries:
         maybe_install_source_build_prereqs(args.dry_run)
 
     current_manifest = read_install_manifest(layout)
     current_llama_cpp_tag = str(current_manifest.get("llama_cpp_tag") or "not installed")
     current_llamaswap_tag = str(current_manifest.get("llamaswap_tag") or "not installed")
-    target_llama_cpp_tag = llama_cpp_release["tag_name"] if update_binaries else current_llama_cpp_tag
+    target_llama_cpp_tag = backend if backend == "vllm-beta" else (llama_cpp_release["tag_name"] if update_binaries else current_llama_cpp_tag)
     target_llamaswap_tag = llamaswap_release["tag_name"] if update_binaries else current_llamaswap_tag
     print(f"llama.cpp target: {target_llama_cpp_tag}")
     print(f"llama-swap target: {target_llamaswap_tag}")
     print(f"llama.cpp current: {current_llama_cpp_tag}")
     print(f"llama-swap current: {current_llamaswap_tag}")
     print(f"installation mode: {layout.mode}")
+    print(f"backend: {backend}")
     print(f"models directory: {layout.models_dir}")
     print(f"llama-swap UI/backend: http://{layout.public_host}:{layout.public_port}")
     print(f"Superserver API:     http://{layout.public_host}:{layout.public_port - 1}")
     print(f"llama.cpp mode: {llama_cpp_mode}")
-    if llama_cpp_mode == "source" and update_binaries and gpu_present and not cuda_toolkit_present:
+    if backend != "vllm-beta" and llama_cpp_mode == "source" and update_binaries and gpu_present and not cuda_toolkit_present:
         print("NVIDIA GPU detected but no nvcc/CUDA toolkit was found; falling back to prebuilt llama.cpp binary.")
 
     if update_binaries:
@@ -2979,10 +3137,13 @@ def install_stack(args: argparse.Namespace) -> int:
         else:
             llamaswap_bin = layout.install_root / "llama-swap"
 
-    prefer_cuda_build = llama_cpp_mode == "source" and sys.platform.startswith("linux") and gpu_present and cuda_toolkit_present and args.prefer_source_cuda
+    prefer_cuda_build = backend != "vllm-beta" and llama_cpp_mode == "source" and sys.platform.startswith("linux") and gpu_present and cuda_toolkit_present and args.prefer_source_cuda
 
     strategy = "binary"
-    if llama_cpp_mode == "native":
+    if backend == "vllm-beta":
+        strategy = "vllm"
+        llama_server_bin = layout.install_root / "vllm-server"
+    elif llama_cpp_mode == "native":
         strategy = "native"
         native_llama_server = detect_native_llama_server()
         if update_binaries and native_llama_server is None:
@@ -3080,7 +3241,8 @@ def install_stack(args: argparse.Namespace) -> int:
         )
 
     runtime_python, runtime_python_path = ensure_runtime_python(layout, args.dry_run)
-    installed_cuda_root = sync_cuda_runtime(layout, sys.executable, args.dry_run)
+    cuda_probe_python = str(runtime_python) if backend == "vllm-beta" else sys.executable
+    installed_cuda_root = sync_cuda_runtime(layout, cuda_probe_python, args.dry_run)
     env_text = _render_env(
         layout,
         llama_server_bin,
@@ -3089,7 +3251,7 @@ def install_stack(args: argparse.Namespace) -> int:
         runtime_python_path,
         args.idle_ttl,
         installed_cuda_root,
-        sync_nccl_runtime(layout, sys.executable, args.dry_run),
+        sync_nccl_runtime(layout, cuda_probe_python, args.dry_run),
     )
     manager_unit = render_manager_service(layout)
     swap_unit = render_llamaswap_service(layout)
@@ -3146,6 +3308,10 @@ def install_stack(args: argparse.Namespace) -> int:
         swap_wrapper = layout.bin_dir / SWAP_WRAPPER_NAME
         swap_wrapper.write_text(render_llamaswap_wrapper(layout), encoding="utf-8")
         swap_wrapper.chmod(0o755)
+        if backend == "vllm-beta":
+            vllm_wrapper = layout.bin_dir / "vllm-server"
+            vllm_wrapper.write_text(render_vllm_server_wrapper(layout), encoding="utf-8")
+            vllm_wrapper.chmod(0o755)
         target_wrapper = layout.bin_dir / CLI_COMMAND
         target_wrapper.write_text(
             "#!/usr/bin/env bash\n"
@@ -3170,7 +3336,7 @@ def install_stack(args: argparse.Namespace) -> int:
             legacy_wrapper.symlink_to(target_wrapper)
         ensure_service_writable_dirs(layout, args.dry_run)
 
-    write_manifest(layout, target_llama_cpp_tag, target_llamaswap_tag, strategy, args.dry_run)
+    write_manifest(layout, target_llama_cpp_tag, target_llamaswap_tag, strategy, backend, args.dry_run)
     if args.install_services:
         install_systemd_units(layout, args.dry_run)
         maybe_offer_ufw_ports(layout, args.dry_run)
@@ -3186,6 +3352,7 @@ def install_stack(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Install llama.cpp + llama-swap stack.")
     parser.add_argument("--mode", choices=("system", "user"))
+    parser.add_argument("--backend", choices=BACKEND_OPTIONS, help="Inference backend to install: llama.cpp or vLLM beta.")
     parser.add_argument(
         "--llama-cpp-mode",
         choices=LLAMA_CPP_MODES,

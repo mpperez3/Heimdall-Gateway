@@ -1,6 +1,6 @@
 # llamacpp-superserver
 
-Manager for a local llama.cpp / llama-swap stack.
+Manager for a local llama.cpp / llama-swap stack with **optional vLLM beta support**.
 
 It provides:
 
@@ -8,6 +8,38 @@ It provides:
 - install/uninstall entry points for the full stack.
 - a bundled shell installer in `llamacpp_stack/bundle/`.
 - helpers for Hugging Face GGUF downloads, model cataloguing, runtime validation, llama-swap config rendering, and Ollama-compatible endpoints.
+- **[BETA] vLLM integration** — alternative inference backend for HuggingFace models.
+
+## Backends
+
+### llama.cpp (Stable)
+- Optimized for GGUF quantized models
+- Excellent CPU and GPU support
+- Native Flash Attention
+
+### vLLM (Beta)
+- OpenAI API compatible
+- Optimized for HuggingFace format models
+- High-throughput inference with batching
+- See [docs/VLLM-BETA.md](docs/VLLM-BETA.md) for details
+
+## Quick Start
+
+### With llama.cpp (default)
+```bash
+llamacpp-superserver install
+llamacpp-superserver run -hf meta-llama/Llama-2-7b-hf:Q4_K_M
+```
+
+### With vLLM (beta)
+```bash
+# Option 1: Docker (recommended for testing)
+./test-vllm.sh
+
+# Option 2: System install
+llamacpp-superserver install  # Select "vllm-beta" when prompted
+llamacpp-superserver run -hf meta-llama/Llama-2-7b-hf
+```
 
 ## Install For Development
 
