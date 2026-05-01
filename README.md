@@ -72,3 +72,39 @@ Notes:
 ```bash
 python -m pytest -q
 ```
+
+## Development Docker: prueba rápida con llama.cpp
+
+Para desarrollar y probar funcionalidades sobre `llama.cpp` (por ejemplo `refresh-templates`) sin reinstalar o compilar todo en el host, hay un Dockerfile preparado llamado `Dockerfile.llamacpp` que construye una imagen con `llama-server` listo para pruebas.
+
+- Construir la imagen (en el directorio raíz del proyecto):
+
+```bash
+docker build -t llamacpp-templates-test -f Dockerfile.llamacpp .
+```
+
+- Ejecutar un contenedor montando el workspace para probar comandos de la CLI y los archivos de ejemplo `test_*` y `templates/`:
+
+```bash
+docker run --rm -it \
+	-v "$PWD":/workspace \
+	-w /workspace \
+	llamacpp-templates-test \
+	/bin/bash
+```
+
+Dentro del contenedor puedes ejecutar el comando de refresco usando las rutas montadas. Ejemplo:
+
+```bash
+python -m llamacpp_stack.cli refresh-templates \
+	--catalog /workspace/test_catalog.json \
+	--server-config /workspace/test_server.json \
+	--config /workspace/test_config.yaml \
+	--llama-server /usr/local/bin/llama-server
+```
+
+Notas y buenas prácticas:
+- La imagen compila `llama.cpp` en el momento de construirla; una vez construida sirve para iterar rápidamente sin recompilar.
+- Si vas a desarrollar mucho tiempo, considera crear una imagen base y reutilizarla para acelerar iteraciones.
+- Asegúrate de que los archivos en `templates/` sean accesibles por el usuario que corre el servicio en producción (permisos/propiedad). Esta imagen sirve sólo para pruebas de desarrollo.
+

@@ -38,6 +38,7 @@ SWAP_WRAPPER_NAME = "llamacpp-superserver-swap-start"
 OLLAMA_DEFAULT_PORT = 11434
 SERVER_CONFIG_BASENAME = "conf.json"
 LLAMA_SERVER_DEFAULTS_BASENAME = "llama_server_defaults.yaml"
+TEMPLATES_BASENAME = "templates"
 LEGACY_SERVER_CONFIG_BASENAME = "llamacpp-server.json"
 ENV_BASENAME = "llamacpp-superserver.env"
 LEGACY_ENV_BASENAME = "llamacpp-stack.env"
@@ -196,6 +197,143 @@ def _merge_missing_llama_server_defaults(target: dict[str, object], config_dir: 
                     changed = True
 
     return changed
+
+
+def _bundle_llamacpp_cmake_flags_path() -> Path:
+    """Get path to the CMake flags configuration file."""
+    return Path(__file__).resolve().parent / "bundle" / "llamacpp_cmake_flags.yaml"
+
+
+def _load_cmake_flags_config() -> dict:
+    """Load CMake compilation flags from bundled configuration file."""
+    flags_path = _bundle_llamacpp_cmake_flags_path()
+    try:
+        if not flags_path.exists():
+            print(f"[!] Warning: CMake flags config not found at {flags_path}, using hardcoded defaults")
+            return {}
+        payload = yaml.safe_load(flags_path.read_text(encoding="utf-8")) or {}
+        return payload if isinstance(payload, dict) else {}
+    except Exception as e:
+        print(f"[!] Warning: Failed to load CMake flags config: {e}")
+        return {}
+
+
+def _build_cmake_args_from_config(
+    src_dir: Path,
+    build_dir: Path,
+    enable_cuda: bool,
+    enable_tls: bool,
+    arch: str | None = None,
+    cuda_toolkit_root: Path | None = None,
+    nccl_root: Path | None = None,
+    nvcc_compiler: Path | None = None,
+    rpath_dirs: list[str] | None = None,
+) -> list[str]:
+    """Build CMake arguments from configuration file and parameters."""
+    config = _load_cmake_flags_config()
+    
+    cmake_args = [
+        "cmake",
+        "-S",
+        str(src_dir),
+        "-B",
+        str(build_dir),
+    ]
+    
+    # Add base flags from config, with verification for flags that may not be supported
+    base_flags = config.get("base_flags", {})
+    if isinstance(base_flags, dict):
+        for key, value in base_flags.items():
+            # Verify flag support for specific flags that may not be available in all versions
+            if key in ("GGML_LTO",):
+                if source_tree_supports_flag(src_dir, key):
+                    cmake_args.append(f"-D{key}={value}")
+            else:
+                cmake_args.append(f"-D{key}={value}")
+    
+    # Add conditional CUDA flags
+    if enable_cuda:
+        cmake_args.append("-DGGML_CUDA=ON")
+        if arch:
+            cmake_args.append(f"-DCMAKE_CUDA_ARCHITECTURES={arch}")
+        if nvcc_compiler:
+            cmake_args.append(f"-DCMAKE_CUDA_COMPILER={nvcc_compiler}")
+        if cuda_toolkit_root:
+            cmake_args.append(f"-DCUDAToolkit_ROOT={cuda_toolkit_root}")
+        if nccl_root:
+            include_dir = nccl_root / "include"
+            library = None
+            for lib_dir in (nccl_root / "lib64", nccl_root / "lib"):
+                if lib_dir.exists():
+                    library = next(iter(lib_dir.glob("libnccl.so*")), None)
+                    if library:
+                        break
+            if include_dir.exists() and library:
+                cmake_args.append(f"-DNCCL_INCLUDE_DIR={include_dir}")
+                cmake_args.append(f"-DNCCL_LIBRARY={library}")
+        
+        # Add conditional CUDA-specific flags from configuration
+        conditional_flags = config.get("conditional_flags", {})
+        cuda_flags = ("GGML_CUDA_F16", "GGML_CUDA_FORCE_MMQ", "GGML_CUDA_GRAPHS", "GGML_CUDA_FA_ALL_QUANTS")
+        for flag in cuda_flags:
+            if flag in conditional_flags:
+                flag_config = conditional_flags[flag]
+                # Handle both simple string values and complex config objects
+                if isinstance(flag_config, dict):
+                    value = flag_config.get("default", "ON")
+                else:
+                    value = flag_config
+                
+                if source_tree_supports_flag(src_dir, flag):
+                    cmake_args.append(f"-D{flag}={value}")
+    else:
+        cmake_args.append("-DGGML_CUDA=OFF")
+    
+    # Add TLS flags if enabled
+    if enable_tls:
+        conditional_flags = config.get("conditional_flags", {})
+        tls_flags = ("LLAMA_CURL", "LLAMA_HTTP_SERVER")
+        for flag in tls_flags:
+            if source_tree_supports_flag(src_dir, flag):
+                # TLS flags are always ON when enabled
+                value = "ON"
+                if flag in conditional_flags:
+                    flag_config = conditional_flags[flag]
+                    if isinstance(flag_config, dict):
+                        value = flag_config.get("default", "ON")
+                cmake_args.append(f"-D{flag}={value}")
+    
+    # Add CMake generator if ninja is available
+    cmake_generator = config.get("cmake_generator", "Ninja")
+    if cmake_generator == "Ninja" and shutil.which("ninja"):
+        cmake_args.extend(["-G", "Ninja"])
+    
+    # Add RPATH flags if needed
+    if rpath_dirs:
+        rpath_flags = config.get("rpath_flags", {})
+        if isinstance(rpath_flags, dict):
+            rpath_value = ";".join(dict.fromkeys(rpath_dirs))
+            if rpath_flags.get("CMAKE_BUILD_RPATH"):
+                cmake_args.append(f"-DCMAKE_BUILD_RPATH={rpath_value}")
+            if rpath_flags.get("CMAKE_INSTALL_RPATH"):
+                cmake_args.append(f"-DCMAKE_INSTALL_RPATH={rpath_value}")
+            if rpath_flags.get("CMAKE_BUILD_RPATH_USE_ORIGIN"):
+                cmake_args.append(f"-DCMAKE_BUILD_RPATH_USE_ORIGIN={rpath_flags['CMAKE_BUILD_RPATH_USE_ORIGIN']}")
+            if rpath_flags.get("CMAKE_INSTALL_RPATH_USE_LINK_PATH"):
+                cmake_args.append(f"-DCMAKE_INSTALL_RPATH_USE_LINK_PATH={rpath_flags['CMAKE_INSTALL_RPATH_USE_LINK_PATH']}")
+    
+    return cmake_args
+
+
+def _cleanup_cmake_flags_file() -> None:
+    """Delete the CMake flags configuration file after build completion."""
+    flags_path = _bundle_llamacpp_cmake_flags_path()
+    try:
+        if flags_path.exists():
+            flags_path.unlink()
+            print(f"[*] Cleaned up CMake flags file: {flags_path}")
+    except Exception as e:
+        print(f"[!] Warning: Failed to clean up CMake flags file: {e}")
 
 
 @dataclass
@@ -1529,6 +1667,11 @@ def ensure_dirs(layout: InstallLayout) -> None:
         layout.python_root,
     ):
         path.mkdir(parents=True, exist_ok=True)
+    # Ensure a folder for chat templates so users can drop per-model templates.
+    try:
+        (layout.config_dir / TEMPLATES_BASENAME).mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
 
 
 def chown_tree(path: Path, user: str, group: str) -> None:
@@ -1546,7 +1689,7 @@ def chown_tree(path: Path, user: str, group: str) -> None:
 def ensure_service_writable_dirs(layout: InstallLayout, dry_run: bool) -> None:
     if layout.mode != "system":
         return
-    targets = [layout.state_dir, layout.run_dir]
+    targets = [layout.state_dir, layout.run_dir, layout.config_dir / TEMPLATES_BASENAME]
     if dry_run:
         print(
             "[dry-run] would chown service-writable dirs to "
@@ -1665,7 +1808,7 @@ def _systemctl_cmd(mode: str, *args: str) -> list[str]:
     return ["systemctl", "--user", *args]
 
 
-def ensure_runtime_python(layout: InstallLayout, dry_run: bool) -> tuple[Path, Path]:
+def ensure_runtime_python(layout: InstallLayout, dry_run: bool, skip_pip_install: bool = False) -> tuple[Path, Path]:
     runtime_python = layout.runtime_venv / "bin" / "python"
     python_path = layout.python_root
     uv_bin = resolve_uv_executable()
@@ -1695,6 +1838,10 @@ def ensure_runtime_python(layout: InstallLayout, dry_run: bool) -> tuple[Path, P
             ".mypy_cache",
         ),
     )
+
+    if skip_pip_install and layout.runtime_venv.exists():
+        print(f"Skipping venv recreation as requested: {layout.runtime_venv}")
+        return runtime_python, python_path
 
     if layout.runtime_venv.exists():
         shutil.rmtree(layout.runtime_venv)
@@ -1795,74 +1942,54 @@ def build_llama_cpp_from_source(
     else:
         print("[!] Warning: could not patch llama.cpp MAX_REPETITION_THRESHOLD (src/llama-grammar.cpp not found or unchanged pattern).")
 
-    cmake_args = [
-        "cmake",
-        "-S",
-        str(src_dir),
-        "-B",
-        str(build_dir),
-        "-DLLAMA_BUILD_SERVER=ON",
-        "-DCMAKE_BUILD_TYPE=Release",
-        "-DGGML_NATIVE=ON",
-    ]
-    if source_tree_supports_flag(src_dir, "GGML_LTO"):
-        cmake_args.append("-DGGML_LTO=ON")
-    if enable_cuda:
-        cmake_args.append("-DGGML_CUDA=ON")
-    else:
-        cmake_args.append("-DGGML_CUDA=OFF")
-    if shutil.which("ninja"):
-        cmake_args.extend(["-G", "Ninja"])
-    if enable_cuda and (arch := detect_cuda_arch()):
-        cmake_args.append(f"-DCMAKE_CUDA_ARCHITECTURES={arch}")
+    # Prepare auxiliary build parameters
     build_env = os.environ.copy()
-    nvcc_path = build_env.get("CUDACXX") or locate_nvcc() or locate_nvcc_for_python(python_exec)
-    if enable_cuda and nvcc_path:
-        _export_nvcc_path(nvcc_path)
+    arch = detect_cuda_arch() if enable_cuda else None
+    nvcc_path: Path | None = None
+    nvcc_path_raw = build_env.get("CUDACXX") or locate_nvcc() or locate_nvcc_for_python(python_exec)
+    if enable_cuda and nvcc_path_raw:
+        _export_nvcc_path(nvcc_path_raw)
         build_env = os.environ.copy()
-        cmake_args.append(f"-DCMAKE_CUDA_COMPILER={Path(nvcc_path).resolve()}")
+        nvcc_path = Path(nvcc_path_raw).resolve() if isinstance(nvcc_path_raw, str) else nvcc_path_raw
+    
     rpath_dirs: list[str] = []
     cuda_root = Path(build_env["CUDAToolkit_ROOT"]) if build_env.get("CUDAToolkit_ROOT") else locate_cuda_root_for_python(python_exec)
     if enable_cuda and cuda_root:
         normalize_python_cuda_layout(cuda_root)
         _export_cuda_root(cuda_root)
         build_env = os.environ.copy()
-        cmake_args.append(f"-DCUDAToolkit_ROOT={cuda_root}")
         for lib_dir in (cuda_root / "lib64", cuda_root / "lib", cuda_root / "targets" / "x86_64-linux" / "lib"):
             if lib_dir.exists():
                 rpath_dirs.append(str(lib_dir))
+    
     nccl_root = locate_nccl_root_for_python(python_exec)
     if enable_cuda and nccl_root:
         _export_nccl_root(nccl_root)
         build_env = os.environ.copy()
-        include_dir = nccl_root / "include"
-        library = None
         for lib_dir in (nccl_root / "lib64", nccl_root / "lib"):
             if lib_dir.exists():
                 rpath_dirs.append(str(lib_dir))
-                library = next(iter(lib_dir.glob("libnccl.so*")), None)
-                if library:
-                    break
-        if include_dir.exists() and library:
-            cmake_args.append(f"-DNCCL_INCLUDE_DIR={include_dir}")
-            cmake_args.append(f"-DNCCL_LIBRARY={library}")
-    if rpath_dirs:
-        rpath_value = ";".join(dict.fromkeys(rpath_dirs))
-        cmake_args.append(f"-DCMAKE_BUILD_RPATH={rpath_value}")
-        cmake_args.append(f"-DCMAKE_INSTALL_RPATH={rpath_value}")
-        cmake_args.append("-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON")
-        cmake_args.append("-DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON")
-    if enable_cuda:
-        for flag in ("GGML_CUDA_GRAPHS", "GGML_CUDA_FA_ALL_QUANTS"):
-            if source_tree_supports_flag(src_dir, flag):
-                cmake_args.append(f"-D{flag}=ON")
-    if enable_tls:
-        for flag in ("LLAMA_CURL", "LLAMA_HTTP_SERVER"):
-            if source_tree_supports_flag(src_dir, flag):
-                cmake_args.append(f"-D{flag}=ON")
+    
+    # Build CMake arguments from configuration file
+    cmake_args = _build_cmake_args_from_config(
+        src_dir=src_dir,
+        build_dir=build_dir,
+        enable_cuda=enable_cuda,
+        enable_tls=enable_tls,
+        arch=arch,
+        cuda_toolkit_root=cuda_root if enable_cuda else None,
+        nccl_root=nccl_root if enable_cuda else None,
+        nvcc_compiler=nvcc_path if (enable_cuda and nvcc_path) else None,
+        rpath_dirs=rpath_dirs if rpath_dirs else None,
+    )
+    
     build_jobs = determine_build_jobs()
     _run(cmake_args, env=build_env)
     _run(["cmake", "--build", str(build_dir), "--target", "llama-server", "-j", str(build_jobs)], env=build_env)
+    
+    # Clean up CMake flags file after successful build
+    _cleanup_cmake_flags_file()
+    
     return build_dir / "bin/llama-server"
 
 
@@ -2160,6 +2287,12 @@ def print_install_summary(layout: InstallLayout, install_services: bool) -> None
     print(f"Superserver API:     {api_url}")
     print(f"UI activity:         {ui_url}")
     print(f"llama-swap UI/backend: {ui_base_url}")
+    # Inform user where to drop per-model chat templates
+    try:
+        templates_dir = layout.config_dir / TEMPLATES_BASENAME
+        print(f"Templates directory:  {templates_dir}  (drop per-model templates here)")
+    except Exception:
+        pass
     if install_services:
         print(f"Services enabled and running. Check status with: {status_cmd}")
         print(f"Restart them with: {restart_cmd}")
@@ -2988,6 +3121,8 @@ def install_stack(args: argparse.Namespace) -> int:
     existing_backend = detect_existing_backend(layout)
     backend = resolve_backend_choice(getattr(args, "backend", None) or existing_backend)
     layout.backend = backend
+    # Preserve the interactive selection when re-executing in system mode via sudo.
+    args.backend = backend
 
     if args.update_binaries is not None:
         update_binaries = bool(args.update_binaries)
@@ -3240,7 +3375,7 @@ def install_stack(args: argparse.Namespace) -> int:
             else _link_stable_binary(llama_server_real, layout.install_root / "llama-server", args.dry_run)
         )
 
-    runtime_python, runtime_python_path = ensure_runtime_python(layout, args.dry_run)
+    runtime_python, runtime_python_path = ensure_runtime_python(layout, args.dry_run, skip_pip_install=args.skip_venv_install)
     cuda_probe_python = str(runtime_python) if backend == "vllm-beta" else sys.executable
     installed_cuda_root = sync_cuda_runtime(layout, cuda_probe_python, args.dry_run)
     env_text = _render_env(
@@ -3396,6 +3531,11 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="During install, optionally rename legacy model IDs to the cleaner API naming format.",
+    )
+    parser.add_argument(
+        "--skip-venv-install",
+        action="store_true",
+        help="Skip recreating and installing packages into the runtime Python virtual environment.",
     )
     parser.add_argument("--dry-run", action="store_true")
     return parser

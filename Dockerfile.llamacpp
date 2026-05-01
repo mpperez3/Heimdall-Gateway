@@ -1,0 +1,26 @@
+# Dockerfile to build llama.cpp and provide a runnable llama-server
+# Use python:3.12-slim for portable Python 3.12 (no need to install from apt/ppa)
+FROM python:3.12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential git curl cmake ninja-build pkg-config wget ca-certificates \
+    libssl-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt
+# Clone a known stable commit for llama.cpp to avoid unexpected failures
+RUN git clone --depth 1 https://github.com/ggerganov/llama.cpp.git
+WORKDIR /opt/llama.cpp
+RUN mkdir -p build && cd build && cmake .. -DLLAMA_CUBLAS=OFF && cmake --build . -j$(nproc)
+
+# Ensure llama-server binary is available in PATH
+RUN mkdir -p /usr/local/bin && cp build/bin/llama-server /usr/local/bin/ && chmod +x /usr/local/bin/llama-server || true
+
+# Copy repository code into container for quick tests
+WORKDIR /workspace
+COPY . /workspace
+ENV PATH=/usr/local/bin:$PATH
+
+CMD ["/bin/bash"]

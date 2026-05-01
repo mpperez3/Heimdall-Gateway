@@ -8,31 +8,73 @@
 # not found, the `default` block is used.
 
 default:
-  keep: 512
+  keep: 1024
   mirostat: 2
   mirostat_ent: 4.5
   mirostat_lr: 0.1
   cache_type_k: q8_0
   cache_type_v: q8_0
-  flash-attn: on
+  flash_attn: on
+  mul_mat_q: true
 
 
 presets:
+  "1":
+    # Single GPU: smaller batches, conservative memory
+    tensor_split: "1"
+    batch_size: 512
+    ubatch_size: 256
+    threads: 8
+    threads_batch: 4
+    keep: 512
+    cache_type_k: q8_0
+    cache_type_v: q8_0
+    grp_attn_n: 4
+
   "2":
+    # Dual GPU: balanced performance
     tensor_split: "0.94,1"
-    batch-size: 1024
-    ubatch-size: 512
+    batch_size: 1024
+    ubatch_size: 512
     threads: 16
-    threads-batch: 16
+    threads_batch: 8
+    keep: 1024
+    cache_type_k: q8_0
+    cache_type_v: q8_0
+    grp_attn_n: 8
+    parallel: 2
+
+  "4":
+    # Quad GPU: higher throughput
+    tensor_split: "0.94,0.97,0.97,1"
+    batch_size: 2048
+    ubatch_size: 1024
+    threads: 16
+    threads_batch: 8
+    keep: 2048
+    cache_type_k: q8_0
+    cache_type_v: q8_0
+    grp_attn_n: 12
+    parallel: 4
+    defrag_threshold: 0.1
 
   "7":
+    # 7+ GPUs: maximum throughput configuration (169 GB VRAM available)
+    # Note: batch_size and ubatch_size reduced to allow large KV caches
+    # (fit will calibrate the actual ctx_seq available on the system)
     tensor_split: "0.94,1,1,1,1,1,0.94"
-    batch-size: 2048
-    ubatch-size: 1024
+    batch_size: 2048
+    ubatch_size: 1024
     threads: 16
-    threads-batch: 16
+    threads_batch: 8
     numa: distribute
-    fit-target: 1536
+    fit_target: 16384
+    keep: 8192
+    cache_type_k: q8_0
+    cache_type_v: q8_0
+    grp_attn_n: 16
+    parallel: 4
+    defrag_threshold: 0.05
 
 speculative_defaults:
   # Global defaults for speculative/draft model variants.

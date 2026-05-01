@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  # vLLM service with CUDA support - OpenAI API compatible
+  # Replaces llama-server for beta testing
+  vllm:
+    build:
+      context: .
+      dockerfile: Dockerfile.vllm
+    image: llamacpp-stack:vllm-cuda
+    container_name: vllm-api-server
+    
+    # GPU support - requires nvidia-docker or docker compose with gpu runtime
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+    # Environment variables
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - VLLM_ATTENTION_BACKEND=flash_attn
+      - TOKENIZERS_PARALLELISM=false
+    
+    # Volumes for models
+    volumes:
+      # Mount HuggingFace model cache
+      - ~/.cache/huggingface:/root/.cache/huggingface:ro
+      # Optional: mount models directory
+      - ./models:/models:ro
+    
+    # Port mapping - expose on localhost
+    ports:
+      - "8000:8000"    # vLLM API (OpenAI compatible)
+      - "8001:8001"    # Prometheus metrics (if enabled)
+    
+    # Resource limits
+    shm_size: '16gb'
+    
+    # Command will be overridden by compose profile or docker run
+    # Example: --model meta-llama/Llama-2-7b-hf --dtype float16 --gpu-memory-utilization 0.9
+    command: [
+      "--model", "meta-llama/Llama-2-7b-hf",
+      "--dtype", "float16",
+      "--gpu-memory-utilization", "0.9",
+      "--enforce-eager"
+    ]
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/models"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "10"
+
+  # Optional: llama-swap (unchanged from original setup)
+  # llama-swap:
+  #   image: llamaswap:latest
+  #   ports:
+  #     - "5000:5000"
+  #   environment:
+  #     - LLAMACPP_SERVER_URL=http://vllm:8000
+  #   depends_on:
+  #     - vllm
+
+# Named volume for persistent model cache
+volumes:
+  hf_cache:
+    driver: local

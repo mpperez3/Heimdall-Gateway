@@ -13,3 +13,6 @@ wheels/
 .history/
 uv.lock
 
+/.venv/
+/.venv-vllm-test/
+/build_test_outputs/

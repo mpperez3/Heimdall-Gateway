@@ -1,0 +1,41 @@
+# CMake compilation flags for llamacpp
+# This file is automatically deleted after build completion
+# Each flag will be converted to -DFLAG=VALUE format
+
+base_flags:
+  LLAMA_BUILD_SERVER: "ON"
+  CMAKE_BUILD_TYPE: Release
+  GGML_NATIVE: "ON"
+  GGML_LTO: "ON"
+
+conditional_flags:
+  # CUDA flags (enabled when enable_cuda=true)
+  GGML_CUDA: "ON"
+  GGML_CUDA_F16:
+    requires_flag: true
+    default: "ON"
+  GGML_CUDA_FORCE_MMQ:
+    requires_flag: true
+    default: "ON"
+  GGML_CUDA_GRAPHS:
+    requires_flag: true
+    default: "OFF"
+  GGML_CUDA_FA_ALL_QUANTS:
+    requires_flag: true
+    default: "ON"
+
+  # TLS flags (enabled when enable_tls=true)
+  LLAMA_CURL:
+    requires_flag: true
+    default: "ON"
+  LLAMA_HTTP_SERVER:
+    requires_flag: true
+    default: "ON"
+
+cmake_generator: "Ninja"  # Will be used if ninja is available
+
+rpath_flags:
+  CMAKE_BUILD_RPATH: true
+  CMAKE_INSTALL_RPATH: true
+  CMAKE_BUILD_RPATH_USE_ORIGIN: "ON"
+  CMAKE_INSTALL_RPATH_USE_LINK_PATH: "ON"

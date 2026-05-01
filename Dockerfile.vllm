@@ -1,0 +1,74 @@
+# VLLM beta integration - OpenAI-compatible API server with CUDA acceleration
+# Intended as drop-in replacement for llama-server in llamacpp-stack
+
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    VLLM_WORKER_MULTIPROC_METHOD=spawn \
+    LLAMACPP_BACKEND=vllm-beta \
+    DEBUG_LLAMACPP=1
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    wget \
+    curl \
+    build-essential \
+    cmake \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set Python 3.12 as default
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
+
+# Install uv for fast dependency management
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+# 1. Create virtual environment using Python 3.12
+RUN python3.12 -m venv /opt/llamacpp-superserver/venv
+ENV PATH="/opt/llamacpp-superserver/venv/bin:${PATH}"
+
+# 2. Install heavy dependencies in the venv (cached)
+RUN uv pip install \
+    vllm==0.6.3.post1 \
+    "transformers<5.0.0" \
+    peft==0.13.2 \
+    bitsandbytes==0.43.3 \
+    "huggingface-hub<1.0"
+
+# 3. Pre-download Qwen model for smoke testing (cached)
+RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2.5-0.5B-Instruct')"
+
+# 4. Install package dependencies (cached)
+WORKDIR /app
+COPY . /app
+RUN uv pip install -e .
+
+# 6. Run stack installer (skip llama.cpp build for faster vLLM certification)
+RUN touch /usr/bin/llama-server && chmod +x /usr/bin/llama-server
+RUN python3 -m llamacpp_stack.install --skip-venv-install --no-install-services --llama-cpp-mode native --backend vllm-beta
+
+# 7. Setup vLLM wrapper
+COPY vllm-server.sh /usr/local/bin/vllm-server
+RUN chmod +x /usr/local/bin/vllm-server
+COPY vllm-server.sh /opt/llamacpp-superserver/vllm-server
+RUN chmod +x /opt/llamacpp-superserver/vllm-server
+
+# 8. Setup test script
+ARG TEST_BUST=1
+COPY test_vllm_integration.sh /usr/local/bin/test-vllm
+RUN chmod +x /usr/local/bin/test-vllm
+
+EXPOSE 11435 11436 18080
+
+ENTRYPOINT ["/opt/llamacpp-superserver/venv/bin/python", "-m", "llamacpp_stack.cli"]
+CMD ["daemon"]

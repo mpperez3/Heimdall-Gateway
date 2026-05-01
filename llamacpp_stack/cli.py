@@ -42,7 +42,7 @@ from urllib.parse import parse_qs, quote, urlparse
 try:
     import yaml
     import requests
-    from huggingface_hub import HfApi, hf_hub_download
+    from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 except ImportError:
     print("Error: Missing dependencies. Run: pip install requests pyyaml huggingface_hub")
     sys.exit(1)
@@ -99,6 +99,12 @@ LEGACY_CLI_COMMAND = "llamacpp-server"
 MANAGER_SERVICE_NAME = "llamacpp-superserver-manager"
 SWAP_SERVICE_NAME = "llamacpp-superserver-swap"
 DEFAULT_LLAMA_SERVER = _env_path("LLAMA_SERVER_BIN", "/opt/llamacpp-superserver/llama.cpp/build/bin/llama-server")
+def _is_vllm_backend() -> bool:
+    backend = os.environ.get("LLAMACPP_BACKEND")
+    # Debug print to stderr so it shows up in logs even if stdout is captured
+    if os.environ.get("DEBUG_LLAMACPP"):
+        print(f"DEBUG: _is_vllm_backend check. LLAMACPP_BACKEND='{backend}'", file=sys.stderr)
+    return backend == "vllm-beta"
 
 DEFAULT_CTX_SIZE = 8192
 try:
@@ -420,6 +426,51 @@ def _normalize_bool_flag(value: object) -> bool | None:
     return None
 
 
+def _is_vllm_backend() -> bool:
+    return os.environ.get("LLAMACPP_BACKEND") == "vllm-beta"
+
+
+# Cache of parsed help flags per server binary path
+_SERVER_FLAG_CACHE: dict[str, set[str]] = {}
+
+
+def get_server_supported_flags(server_path: Path | str | None) -> set[str]:
+    """Return set of supported flags (e.g. '--mul-mat-q', '-fit').
+
+    This runs the server binary with `--help` once and caches the result.
+    If the binary cannot be executed, returns an empty set.
+    """
+    try:
+        p = Path(server_path) if server_path is not None else Path(DEFAULT_LLAMA_SERVER)
+        key = str(p)
+    except Exception:
+        key = str(server_path or "")
+    if key in _SERVER_FLAG_CACHE:
+        return _SERVER_FLAG_CACHE[key]
+    flags: set[str] = set()
+    try:
+        # Prefer --help, but some binaries accept -h too
+        proc = subprocess.run([key, "--help"], capture_output=True, text=True, timeout=8)
+        text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    except Exception:
+        _SERVER_FLAG_CACHE[key] = set()
+        return set()
+    # Find long and multi-letter single-dash flags
+    for match in re.findall(r"(--[A-Za-z0-9-]+)", text):
+        flags.add(match)
+    for match in re.findall(r"(?<!-)(-[A-Za-z][A-Za-z0-9-]+)\b", text):
+        flags.add(match)
+    _SERVER_FLAG_CACHE[key] = flags
+    return flags
+
+
+def server_supports_flag(server_path: Path | str | None, flag: str) -> bool:
+    try:
+        flags = get_server_supported_flags(server_path)
+        return flag in flags
+    except Exception:
+        return False
+
 def normalize_server_overrides(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         return {}
@@ -452,6 +503,11 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
             bool_val = _normalize_bool_flag(raw_val)
             if bool_val is True:
                 continue
+            if bool_val is not None:
+                normalized[key] = bool_val
+            continue
+        if key in {"mul_mat_q"}:
+            bool_val = _normalize_bool_flag(raw_val)
             if bool_val is not None:
                 normalized[key] = bool_val
             continue
@@ -491,13 +547,15 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
             "draft_min",
             "ctx_size_draft",
             "n_gpu_layers_draft",
+            "grp_attn_n",
+            "parallel",
         }:
             try:
                 normalized[key] = int(raw_val)
             except (TypeError, ValueError):
                 continue
             continue
-        if key in {"mirostat_ent", "mirostat_lr", "draft_p_min"}:
+        if key in {"mirostat_ent", "mirostat_lr", "draft_p_min", "defrag_threshold"}:
             try:
                 normalized[key] = float(raw_val)
             except (TypeError, ValueError):
@@ -515,7 +573,7 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
         if key == "tensor_split":
             normalized[key] = normalize_tensor_split(str(raw_val))
             continue
-        if key in {"split_mode", "numa", "cache_type_k", "cache_type_v", "host", "model_draft", "hf_repo_draft", "reasoning_format"}:
+        if key in {"split_mode", "numa", "cache_type_k", "cache_type_v", "host", "model_draft", "hf_repo_draft", "reasoning_format", "chat_template_file", "chat_template"}:
             normalized[key] = str(raw_val).strip()
     return normalized
 
@@ -821,7 +879,7 @@ def _append_quant_suffix_if_missing(base_id: str, quant: str | None) -> str:
 
 
 def normalize_model_id(repo_id, quant, filename):
-    filename_seed = Path(filename).stem if filename else ""
+    filename_seed = Path(filename).stem if filename and filename != "hf-native" else ""
     mid = _normalize_model_id_token(filename_seed)
     if not mid:
         base = (repo_id or "").split("/")[-1].strip()
@@ -835,7 +893,12 @@ def normalize_model_id(repo_id, quant, filename):
 def choose_gguf_file(api, repo_id, quant, explicit_file, token):
     info = api.model_info(repo_id=repo_id, token=token)
     all_files = sorted(s.rfilename for s in info.siblings if s.rfilename and s.rfilename.lower().endswith(".gguf"))
-    if not all_files: raise RuntimeError(f"No GGUF in {repo_id}.")
+    if not all_files:
+        if _is_vllm_backend():
+            if os.environ.get("DEBUG_LLAMACPP"):
+                print(f"DEBUG: No GGUF files found in {repo_id}, but vLLM backend is active. Returning None.", file=sys.stderr)
+            return None
+        raise RuntimeError(f"No GGUF in {repo_id}. If you want to use a native HuggingFace model, set LLAMACPP_BACKEND=vllm-beta")
     
     # Exclude mmproj files from main model search (they're selected separately)
     files = [f for f in all_files if "mmproj" not in f.lower()]
@@ -899,25 +962,82 @@ def render_llamaswap_config(
 ):
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {
-        "healthCheckTimeout": 600, "logLevel": "info", "logToStdout": "proxy", "startPort": start_port,
-        "sendLoadingState": True, "includeAliasesInList": True, "models": {},
+        "healthCheckTimeout": 600,
+        "logLevel": "info",
+        "logToStdout": "proxy",
+        "startPort": start_port,
+        "sendLoadingState": True,
+        "includeAliasesInList": True,
+        "models": {},
     }
     resolved_defaults = normalize_server_overrides(server_defaults or resolve_llama_server_defaults())
+
+    # Count how many catalog entries reference the same local_path so that
+    # we can create on-disk variant files at render time if necessary
+    # (e.g., templated variants pointing to the same GGUF) to avoid
+    # duplicate-publishing conflicts when swap consumes the YAML.
+    path_usage: dict[str, int] = {}
+    resolved_paths: dict[str, Path] = {}
+    for m in catalog:
+        try:
+            p = Path(m.local_path).resolve()
+            key = str(p)
+        except Exception:
+            key = str(m.local_path or "")
+        path_usage[key] = path_usage.get(key, 0) + 1
+        resolved_paths[key] = Path(m.local_path) if m.local_path else Path("")
+
     for m in sorted(catalog, key=lambda x: x.model_id):
-        cmd = build_llama_server_command(m, server_path, port="${PORT}", server_defaults=resolved_defaults)
-        data["models"][m.model_id] = {"cmd": " \\\n  ".join(shell_quote(part) for part in cmd), "checkEndpoint": "/health", "ttl": int(idle_ttl)}
-        if m.aliases: data["models"][m.model_id]["aliases"] = m.aliases
-        if m.description: data["models"][m.model_id]["description"] = m.description
+        # Respect user's preference: do NOT create on-disk GGUF variants.
+        # Use the original model file for rendering; duplicate catalog
+        # entries will reference the same local_path. Note: this may
+        # cause duplicate alias conflicts upstream if the backend refuses
+        # same-GGUF multiple publishes. The catalog will still contain
+        # separate entries (one with chat template override) but no new
+        # files are created on disk.
+        use_model = m
+
+        cmd = build_llama_server_command(use_model, server_path, port="${PORT}", server_defaults=resolved_defaults)
+        # If this is a derived entry (template/speculative) that points to the
+        # same GGUF, try to force a distinct published name/ID so backends that
+        # key off internal GGUF aliases won't treat it as a duplicate. We
+        # probe common flags and append the first supported one.
+        try:
+            derived = str(m.model_id).endswith("+template") or str(m.model_id).endswith("+spec") or bool(m.speculative)
+            if derived:
+                name_flags = ["--model-id", "--model-name", "--name", "--publish-name", "--publish-id"]
+                chosen_flag = None
+                for f in name_flags:
+                    if server_supports_flag(server_path, f):
+                        chosen_flag = f
+                        break
+                if chosen_flag:
+                    # Use a canonical safe id derived from model_id
+                    safe_name = _canonical_model_ref(m.model_id)
+                    cmd.extend([chosen_flag, safe_name])
+        except Exception:
+            pass
+        data["models"][m.model_id] = {
+            "cmd": " ".join(shell_quote(part) for part in cmd),
+            "checkEndpoint": "/health",
+            "ttl": int(idle_ttl),
+        }
+        if m.aliases:
+            data["models"][m.model_id]["aliases"] = m.aliases
+        if m.description:
+            data["models"][m.model_id]["description"] = m.description
     tmp = path.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         f.write(LLAMASWAP_CONFIG_HEADER)
         yaml.safe_dump(data, f, sort_keys=False)
     tmp.replace(path)
 
+
 def shell_quote(v):
     if re.fullmatch(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", v):
         return v
-    if re.fullmatch(r"[A-Za-z0-9_./:=,+-]+", v): return v
+    if re.fullmatch(r"[A-Za-z0-9_./:=,+-]+", v):
+        return v
     return "'" + v.replace("'", "'\"'\"'") + "'"
 
 
@@ -944,6 +1064,84 @@ def _load_server_config_payload(args = None) -> dict:
         except Exception:
             continue
     return {}
+
+
+def _template_variant_path(base_path: Path) -> Path | None:
+    try:
+        if not base_path:
+            return None
+        stem = base_path.stem
+        suffix = base_path.suffix
+        if not stem:
+            return None
+        return base_path.with_name(f"{stem}+template{suffix}")
+    except Exception:
+        return None
+
+
+def _ensure_template_variant_file(base_path: Path) -> Path | None:
+    variant_path = _template_variant_path(base_path)
+    if variant_path is None:
+        return None
+    try:
+        if variant_path.exists() or variant_path.is_symlink():
+            return variant_path
+        target = base_path.resolve()
+        try:
+            variant_path.symlink_to(target)
+            return variant_path
+        except Exception:
+            pass
+        try:
+            os.link(target, variant_path)
+            return variant_path
+        except Exception:
+            pass
+        # Fallback to a safe chunked copy to avoid long blocking sendfile
+        if _safe_copy_file(target, variant_path):
+            return variant_path
+        return None
+    except Exception:
+        return None
+
+
+def _safe_copy_file(src: Path, dst: Path, chunk_size: int = 4 * 1024 * 1024) -> bool:
+    """Copy `src` -> `dst` using chunked reads/writes and atomic replace.
+
+    Returns True on success, False on failure. Removes partial files on error
+    so repeated attempts do not leave garbage. This avoids long blocking
+    `shutil.copy2` sendfile operations that are hard to interrupt.
+    """
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    try:
+        # Ensure parent exists
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        with src.open("rb") as fsrc, tmp.open("wb") as fdst:
+            while True:
+                chunk = fsrc.read(chunk_size)
+                if not chunk:
+                    break
+                fdst.write(chunk)
+        try:
+            shutil.copystat(src, tmp)
+        except Exception:
+            pass
+        os.replace(str(tmp), str(dst))
+        return True
+    except KeyboardInterrupt:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        raise
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        return False
 
 
 def resolve_api_ctx_factor(args = None) -> float:
@@ -1050,7 +1248,7 @@ def _args_server_config_path(args) -> Path | None:
     return Path(value)
 
 
-def _append_llama_server_flag(cmd: list[str], key: str, value: object) -> None:
+def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_path: Path | str | None = None) -> None:
     if key == "split_mode":
         cmd.extend(["--split-mode", str(value)])
     elif key == "flash_attn":
@@ -1173,6 +1371,40 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object) -> None:
         bool_val = _normalize_bool_flag(value)
         if bool_val is False:
             cmd.append("--no-mmap")
+    elif key in {"float16", "bfloat16", "float32"}:
+        if _normalize_bool_flag(value):
+            cmd.append(f"--{key}")
+    elif key == "gpu_memory_utilization":
+        if value is not None:
+            cmd.extend(["--gpu-memory-utilization", str(float(value))])
+    elif key == "mul_mat_q":
+        if _normalize_bool_flag(value):
+            if server_supports_flag(server_path, "--mul-mat-q"):
+                cmd.append("--mul-mat-q")
+            else:
+                # skip unsupported flag
+                pass
+    elif key == "grp_attn_n":
+        try:
+            flag = "--grp-attn-n"
+            if server_supports_flag(server_path, flag):
+                cmd.extend([flag, str(int(value))])
+        except (TypeError, ValueError):
+            pass
+    elif key == "parallel":
+        try:
+            flag = "--parallel"
+            if server_supports_flag(server_path, flag):
+                cmd.extend([flag, str(int(value))])
+        except (TypeError, ValueError):
+            pass
+    elif key == "defrag_threshold":
+        try:
+            flag = "--defrag-threshold"
+            if server_supports_flag(server_path, flag):
+                cmd.extend([flag, str(float(value))])
+        except (TypeError, ValueError):
+            pass
 
 
 def build_llama_server_command(
@@ -1250,6 +1482,34 @@ def build_llama_server_command(
         effective.pop("fitc", None)
         effective.pop("fitt", None)
 
+    if _is_vllm_backend():
+        # vLLM launch logic
+        vllm_bin = os.environ.get("VLLM_SERVER_BIN", "vllm-server")
+        vllm_cmd = [vllm_bin, "--model", str(model.local_path), "--port", str(port)]
+        
+        # Map some common overrides
+        vllm_map = {
+            "gpu_memory_utilization": "--gpu-memory-utilization",
+            "tensor_parallel_size": "--tensor-parallel-size",
+            "max_model_len": "--max-model-len",
+            "block_size": "--block-size",
+            "dtype": "--dtype",
+            "device": "--device",
+            "enable_chunked_prefill": "--enable-chunked-prefill",
+        }
+        
+        for k, v in effective.items():
+            if k in vllm_map:
+                vllm_cmd.extend([vllm_map[k], str(v)])
+            elif k.startswith("--"): # Direct passthrough of double-dash flags
+                vllm_cmd.extend([k, str(v)])
+                
+        # Handle host if provided
+        if resolved_host and resolved_host not in {"0.0.0.0", "::", "[::]"}:
+            vllm_cmd.extend(["--host", resolved_host])
+
+        return vllm_cmd
+
     cmd = [str(server_path), "--port", str(port)]
     if include_model_path:
         cmd.extend(["--model", str(model.local_path)])
@@ -1285,14 +1545,55 @@ def build_llama_server_command(
         "cache_type_k",
         "cache_type_v",
         "mmap",
+        "mul_mat_q",
+        "grp_attn_n",
+        "parallel",
+        "defrag_threshold",
     ):
         if key in effective:
-            _append_llama_server_flag(cmd, key, effective[key])
+            _append_llama_server_flag(cmd, key, effective[key], server_path)
     if include_mmproj and model.mmproj_path:
         cmd.extend(["--mmproj", str(model.mmproj_path)])
     if include_jinja and model.jinja:
         cmd.append("--jinja")
+    # Chat template handling is explicit: refresh-templates creates a
+    # template-backed catalog entry with chat_template_file set.
+    tmpl = effective.get("chat_template_file") or effective.get("chat_template")
+    if tmpl:
+        cmd.extend(["--chat-template-file", str(tmpl)])
     return cmd
+
+
+def _find_chat_template_for_model(model_id: str, templates_dir: Path) -> Path | None:
+    """Search templates_dir for a file matching model_id or its family.
+
+    Matching rules:
+    - exact filename (without extension) == model_id
+    - filename is a substring of model_id (family match)
+    - model_id startswith filename (family match)
+    Returns first reasonable match or None.
+    """
+    try:
+        if not templates_dir.exists() or not templates_dir.is_dir():
+            return None
+        files = [p for p in templates_dir.iterdir() if p.is_file()]
+        # Try exact base name match first
+        for p in files:
+            if p.stem == model_id:
+                return p
+        # Try normalized matches (ignore separators)
+        norm = re.sub(r"[^A-Za-z0-9]+", "", model_id).lower()
+        for p in files:
+            if re.sub(r"[^A-Za-z0-9]+", "", p.stem).lower() == norm:
+                return p
+        # Fallback: family substring match
+        for p in files:
+            stem = p.stem.lower()
+            if stem and (stem in model_id.lower() or model_id.lower().startswith(stem)):
+                return p
+    except Exception:
+        return None
+    return None
 
 
 def resolve_api_port(args = None) -> int:
@@ -2215,7 +2516,7 @@ def resolve_catalog_model(catalog: list[ManagedModel], target: str | None = None
 def ensure_model_available(args, progress_callback = None):
     # CLIENT MODE: Send to socket if not owner
     try:
-        is_owner = (os.getuid() == os.stat(args.catalog.parent).st_uid)
+        is_owner = (os.getuid() == 0 or os.getuid() == os.stat(args.catalog.parent).st_uid)
     except:
         is_owner = False
 
@@ -2280,7 +2581,16 @@ def ensure_model_available(args, progress_callback = None):
         repo_id, quant = parse_hf_input(ref)
         selected_file = choose_gguf_file(api, repo_id, quant, args.file, token)
 
-        to_download = [selected_file]
+        if selected_file is None and _is_vllm_backend():
+            # For vLLM, if no GGUF is found, we assume it's a native HF model
+            # We'll use a virtual filename to represent the HF repo
+            selected_file = "hf-native"
+            to_download = [s.rfilename for s in api.model_info(repo_id=repo_id, token=token).siblings if s.rfilename]
+            # Exclude large blobs if they are not needed? No, vLLM needs them.
+        else:
+            if selected_file is None:
+                raise RuntimeError(f"No GGUF found in {repo_id} and backend is not vLLM.")
+            to_download = [selected_file]
         if "-00001-of-" in selected_file:
             _emit_message("Detected sharded model. Resolving all parts...", progress_callback)
             prefix = selected_file.split("-00001-of-")[0]
@@ -2385,6 +2695,13 @@ def ensure_model_available(args, progress_callback = None):
             existing.description = desired_description
             config_changed = True
             _emit_message(f"Applied description for {existing.model_id}.", progress_callback)
+        for key in ("float16", "bfloat16", "float32", "gpu_memory_utilization"):
+            val = getattr(args, key, None)
+            if val:
+                if existing.server_overrides.get(key) != val:
+                    existing.server_overrides[key] = val
+                    config_changed = True
+                    _emit_message(f"Applied {key} override for {existing.model_id}: {val}", progress_callback)
         if existing.mmproj_filename != desired_mmproj_filename:
             existing.mmproj_filename = desired_mmproj_filename
             config_changed = True
@@ -2459,6 +2776,8 @@ def ensure_model_available(args, progress_callback = None):
     local_path = ""
     total_files = len(to_download)
     for idx, f in enumerate(to_download, start=1):
+        if f == "hf-native":
+            continue
         label = f"[{idx}/{total_files}] {Path(f).name}" if total_files > 1 else Path(f).name
         loc = download_hf_file(
             repo_id=repo_id,
@@ -2471,6 +2790,14 @@ def ensure_model_available(args, progress_callback = None):
         )
         if f == selected_file:
             local_path = loc
+    if selected_file == "hf-native":
+        _emit_message(f"Populating native HF repo {repo_id}...", progress_callback)
+        local_path = snapshot_download(
+            repo_id=repo_id,
+            token=token,
+            local_dir=target_dir,
+            local_dir_use_symlinks=False
+        )
     if mmproj_filename:
         mmproj_label = f"mmproj {Path(mmproj_filename).name}"
         mmproj_loc = download_hf_file(
@@ -3045,7 +3372,7 @@ def _remove_orphan_files_by_reference(reference: str, models_dir: Path, progress
 
 def remove_model(args, progress_callback = None):
     try:
-        is_owner = (os.getuid() == os.stat(args.catalog.parent).st_uid)
+        is_owner = (os.getuid() == 0 or os.getuid() == os.stat(args.catalog.parent).st_uid)
     except:
         is_owner = False
 
@@ -3063,7 +3390,7 @@ def remove_model(args, progress_callback = None):
     except RuntimeError as exc:
         if str(exc) == "Model not found in catalog.":
             reference = args.repo or args.hf or args.model_id or args.file
-            if reference:
+            if reference and getattr(args, "delete_files", True):
                 # Attempt to remove orphan files even if --delete-files was not
                 # explicitly requested. This helps cleanup partially downloaded
                 # artifacts when the catalog entry is missing.
@@ -4131,7 +4458,17 @@ def start_ctx_metadata_server(args):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
-            self.wfile.write(encoded)
+            try:
+                self.wfile.write(encoded)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                # Client closed connection before or during write. Don't
+                # propagate — the server should continue serving other
+                # requests. Swallow the exception silently.
+                try:
+                    # Best-effort close socket to free resources.
+                    self.connection.shutdown(2)
+                except Exception:
+                    pass
 
         def log_message(self, format, *args):
             return
@@ -4757,7 +5094,7 @@ def start_ctx_metadata_server(args):
 
 def list_models(args):
     try:
-        is_owner = (os.getuid() == os.stat(args.catalog.parent).st_uid)
+        is_owner = (os.getuid() == 0 or os.getuid() == os.stat(args.catalog.parent).st_uid)
     except:
         is_owner = False
 
@@ -4816,6 +5153,8 @@ def run_command(args):
         master_args.model_id = None
         master_args.speculative = False
         master_args.defer_publish = True
+        master_args.auto_ctx = False
+        master_args.skip_ctx = True
         master_mid = ensure_model_available(master_args)
 
         # Ensure draft model (second HF) without immediate publish.
@@ -4826,8 +5165,7 @@ def run_command(args):
         draft_args.speculative = False
         draft_args.defer_publish = True
         draft_args.auto_ctx = False
-        if getattr(draft_args, "ctx_override", None) is None:
-            draft_args.skip_ctx = True
+        draft_args.skip_ctx = True
         draft_mid = ensure_model_available(draft_args)
 
         # Create/publish the speculative pair using master as target model and
@@ -4840,9 +5178,8 @@ def run_command(args):
         spec_args.speculative = True
         spec_args.spec_base_model_id = master_mid
         spec_args.spec_draft_model_id = draft_mid
-        spec_args.auto_ctx = False
-        if getattr(spec_args, "ctx_override", None) is None:
-            spec_args.skip_ctx = True
+        spec_args.auto_ctx = bool(getattr(args, "auto_ctx", False))
+        spec_args.skip_ctx = not spec_args.auto_ctx
         spec_mid = ensure_model_available(spec_args)
 
         # Any remaining HF entries: ensure they're downloaded as regular models
@@ -5026,6 +5363,115 @@ def restore_catalog_config(args, catalog, progress_callback = None, settle_time 
         restart_service_to_free_vram(args.service, progress_callback=progress_callback, settle_time=settle_time)
     else:
         time.sleep(settle_time)
+
+
+def remove_templates(args) -> None:
+    """Remove all template-backed model entries from the catalog.
+
+    Deletes any catalog entry whose model_id ends with '+template'.
+    Saves the updated catalog and restores the swap configuration.
+    """
+    catalog = load_catalog(args.catalog, _args_server_config_path(args))
+    original_count = len(catalog)
+    removed: list[str] = []
+    
+    # Filter out all entries ending with '+template'
+    filtered = [m for m in catalog if not m.model_id.endswith("+template")]
+    
+    for m in catalog:
+        if m.model_id.endswith("+template"):
+            removed.append(m.model_id)
+    
+    if not removed:
+        print("No template-backed models found in catalog.")
+        return
+    
+    save_catalog(args.catalog, filtered)
+    print(f"Removed {len(removed)} template-backed models: {', '.join(removed)}")
+    
+    try:
+        restore_catalog_config(args, filtered, progress_callback=None, restart_service=True)
+    except Exception as e:
+        print(f"Catalog updated but failed to restore config: {e}")
+
+
+def refresh_templates(args) -> None:
+    """Scan templates directory and add template-backed catalog entries.
+
+    For each model in the catalog, if a template file exists in the
+    templates folder, create a duplicate catalog entry with model_id
+    '<base>+template' and a server_overrides key `chat_template_file`
+    pointing to the template. After changes, save and restore config.
+    Speculative models are not affected by this operation.
+    """
+    templates_dir = None
+    if os.environ.get("LLAMACPP_TEMPLATES_DIR"):
+        templates_dir = Path(os.environ.get("LLAMACPP_TEMPLATES_DIR")).expanduser()
+    else:
+        server_conf = Path(args.server_config) if getattr(args, "server_config", None) else Path(DEFAULT_SERVER_CONFIG_PATH)
+        templates_dir = server_conf.expanduser().parent / "templates"
+
+    if not templates_dir.exists():
+        print(f"Templates folder not found: {templates_dir}")
+        return
+
+    catalog = load_catalog(args.catalog, _args_server_config_path(args))
+    added: list[str] = []
+    updated: list[str] = []
+    existing_ids = {m.model_id for m in catalog}
+    for base in list(catalog):
+        # Skip speculative models (do not create template variants of drafts)
+        # and models that already have a +template suffix
+        if getattr(base, "speculative", False) or base.model_id.endswith("+template"):
+            continue
+        try:
+            found = _find_chat_template_for_model(base.model_id, templates_dir)
+        except Exception:
+            found = None
+        if not found:
+            continue
+        new_id = f"{base.model_id}+template"
+        try:
+            base_local_path = Path(base.local_path) if base.local_path else None
+            if base_local_path is None or not base_local_path.exists():
+                print(f"Skipping {base.model_id}: local model file not found.")
+                continue
+
+            # Create a minimal catalog entry: same local_path, only difference
+            # is a chat template override. Do NOT create on-disk variant here;
+            # independent files are created later when rendering swap YAML.
+            duplicate = next((m for m in catalog if m.model_id == new_id), None)
+            if duplicate is None:
+                duplicate = ManagedModel(**asdict(base))
+                duplicate.model_id = new_id
+                catalog.append(duplicate)
+                added.append(new_id)
+                existing_ids.add(new_id)
+
+            duplicate.filename = base.filename
+            duplicate.local_path = str(base_local_path)
+            duplicate.aliases = []
+            duplicate.server_overrides = dict(duplicate.server_overrides or {})
+            # Store the template file name (relative or absolute) so build command
+            # can emit --chat-template-file. Keep the catalog lightweight.
+            duplicate.server_overrides["chat_template_file"] = str(found)
+            updated.append(new_id)
+        except Exception:
+            continue
+
+    if not added and not updated:
+        print("No new template-backed models found.")
+        return
+
+    save_catalog(args.catalog, catalog)
+    if added:
+        print(f"Added {len(added)} template-backed models: {', '.join(added)}")
+    if updated and not added:
+        print(f"Updated {len(updated)} template-backed models: {', '.join(updated)}")
+    try:
+        restore_catalog_config(args, catalog, progress_callback=None, restart_service=True)
+    except Exception as e:
+        print(f"Catalog updated but failed to restore config: {e}")
 
 def _find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -5755,6 +6201,39 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
             tested.add(candidate)
             _emit_message(f"{model.model_id}: testing ctx {candidate}...", progress_callback, timestamp=True)
             ok, reason, probe_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, candidate))
+            # If context probing fails due to n_ctx_seq limit, reduce batch/ubatch to allow larger context
+            if not ok and "exceeds the available context size" in str(reason):
+                _emit_message(f"{model.model_id}: ctx {candidate} failed due to batch memory; reducing batch_size to prioritize context...", progress_callback, timestamp=True)
+                # Reduce batch parameters and retry once
+                if not hasattr(model, 'server_overrides'):
+                    model.server_overrides = {}
+                original_batch = model.server_overrides.get("batch_size")
+                original_ubatch = model.server_overrides.get("ubatch_size")
+                original_parallel = model.server_overrides.get("parallel")
+                
+                # Aggressively reduce batch/ubatch to maximize context over throughput
+                model.server_overrides["batch_size"] = 512
+                model.server_overrides["ubatch_size"] = 256
+                model.server_overrides["parallel"] = 1
+                
+                ok, reason, probe_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, candidate))
+                if not ok:
+                    # Restore originals if still failing
+                    if original_batch is not None:
+                        model.server_overrides["batch_size"] = original_batch
+                    else:
+                        model.server_overrides.pop("batch_size", None)
+                    if original_ubatch is not None:
+                        model.server_overrides["ubatch_size"] = original_ubatch
+                    else:
+                        model.server_overrides.pop("ubatch_size", None)
+                    if original_parallel is not None:
+                        model.server_overrides["parallel"] = original_parallel
+                    else:
+                        model.server_overrides.pop("parallel", None)
+                    _emit_message(f"{model.model_id}: ctx {candidate} still failed after batch reduction ({reason}).", progress_callback, timestamp=True)
+                else:
+                    _emit_message(f"{model.model_id}: ctx {candidate} success after reducing batch_size.", progress_callback, timestamp=True)
             if ok:
                 low = candidate
                 last_success = candidate
@@ -5822,6 +6301,38 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
             tested.add(midpoint)
             _emit_message(f"{model.model_id}: refinement probe at {midpoint}...", progress_callback, timestamp=True)
             ok, reason, probe_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, midpoint))
+            # If refinement fails due to n_ctx_seq limit, reduce batch/ubatch to allow larger context
+            if not ok and "exceeds the available context size" in str(reason):
+                _emit_message(f"{model.model_id}: ctx {midpoint} failed due to batch memory; reducing batch_size to prioritize context...", progress_callback, timestamp=True)
+                # Reduce batch parameters and retry
+                if not hasattr(model, 'server_overrides'):
+                    model.server_overrides = {}
+                original_batch = model.server_overrides.get("batch_size")
+                original_ubatch = model.server_overrides.get("ubatch_size")
+                original_parallel = model.server_overrides.get("parallel")
+                
+                # Aggressively reduce batch/ubatch to maximize context over throughput
+                model.server_overrides["batch_size"] = 512
+                model.server_overrides["ubatch_size"] = 256
+                model.server_overrides["parallel"] = 1
+                
+                ok, reason, probe_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, midpoint))
+                if not ok:
+                    if original_batch is not None:
+                        model.server_overrides["batch_size"] = original_batch
+                    else:
+                        model.server_overrides.pop("batch_size", None)
+                    if original_ubatch is not None:
+                        model.server_overrides["ubatch_size"] = original_ubatch
+                    else:
+                        model.server_overrides.pop("ubatch_size", None)
+                    if original_parallel is not None:
+                        model.server_overrides["parallel"] = original_parallel
+                    else:
+                        model.server_overrides.pop("parallel", None)
+                    _emit_message(f"{model.model_id}: ctx {midpoint} still failed after batch reduction ({reason}).", progress_callback, timestamp=True)
+                else:
+                    _emit_message(f"{model.model_id}: ctx {midpoint} success after reducing batch_size.", progress_callback, timestamp=True)
             if ok:
                 low = midpoint
                 last_success = midpoint
@@ -6348,7 +6859,7 @@ def delete_downloaded_files(target_dir: Path, filenames: list[str]):
 
 def update_config(args, progress_callback = None):
     try:
-        is_owner = (os.getuid() == os.stat(args.catalog.parent).st_uid)
+        is_owner = (os.getuid() == 0 or os.getuid() == os.stat(args.catalog.parent).st_uid)
     except:
         is_owner = False
 
@@ -7027,6 +7538,12 @@ def build_info_text(args = None) -> str:
     server_config_path = _args_server_config_path(args)
     llama_server_path = Path(getattr(args, "llama_server", DEFAULT_LLAMA_SERVER))
     install_root = _install_root_from_llama_server(llama_server_path)
+    # Templates directory: can be overridden with LLAMACPP_TEMPLATES_DIR
+    templates_env = os.environ.get("LLAMACPP_TEMPLATES_DIR")
+    if templates_env:
+        templates_dir = Path(templates_env).expanduser()
+    else:
+        templates_dir = Path(server_config_path).expanduser().parent / "templates"
 
     return (
         "Default endpoints:\n"
@@ -7041,6 +7558,7 @@ def build_info_text(args = None) -> str:
         f"  llama-swap config:   {config_path}\n"
         f"  Catalog:             {catalog_path}\n"
         f"  App config:          {server_config_path}\n"
+        f"  Templates dir:       {templates_dir}\n"
         f"  llama-server binary: {llama_server_path}\n"
         f"  Requests log:        {DEFAULT_REQUESTS_LOG_PATH}\n"
         f"  UI activity:         {ui_url}/ui/#/activity\n"
@@ -7176,6 +7694,10 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     p_add.add_argument("--hf-token")
     p_add.add_argument("--description")
     p_add.add_argument("--speculative", action="store_true", help="Create/download a speculative draft variant (speculative-<base_id>)")
+    p_add.add_argument("--float16", "--f16", action="store_true", help="Use float16 precision (vLLM)")
+    p_add.add_argument("--bfloat16", "--bf16", action="store_true", help="Use bfloat16 precision (vLLM)")
+    p_add.add_argument("--float32", "--f32", action="store_true", help="Use float32 precision (vLLM)")
+    p_add.add_argument("--defer-publish", action="store_true", help="Do not try to publish the model to the proxy immediately")
     
     p_run = sub.add_parser(
         "run",
@@ -7186,14 +7708,11 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     p_run.set_defaults(func=run_command)
     p_run.add_argument("--no-chat", action="store_true")
     p_run.add_argument("-ctx", "--ctx", dest="ctx_override", type=int, help="Override ctx size for this run")
-    p_run.add_argument(
-        "--speculative",
-        action="store_true",
-        help=(
-            "Run against a speculative draft variant (speculative-<base_id>). "
-            "With two -hf values, first is base/master and second is draft."
-        ),
-    )
+    p_run.add_argument("--speculative", action="store_true", help="Run against a speculative draft variant (speculative-<base_id>). With two -hf values, first is base/master and second is draft.")
+    p_run.add_argument("--float16", "--f16", action="store_true", help="Use float16 precision (vLLM)")
+    p_run.add_argument("--bfloat16", "--bf16", action="store_true", help="Use bfloat16 precision (vLLM)")
+    p_run.add_argument("--float32", "--f32", action="store_true", help="Use float32 precision (vLLM)")
+    p_run.add_argument("--gpu-memory-utilization", type=float, help="GPU memory utilization (0.0 to 1.0, vLLM)")
 
     p_remove = sub.add_parser(
         "remove",
@@ -7243,6 +7762,22 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
         action="store_true",
         help="Probe and set a practical ctx size per model automatically",
     )
+
+    p_refresh = sub.add_parser(
+        "refresh-templates",
+        help="Scan templates folder and add template-backed model entries to catalog",
+        description="Detect chat template files and create duplicate catalog entries (model_id+template) so models can be launched with or without templates.",
+    )
+    subparsers["refresh-templates"] = p_refresh
+    p_refresh.set_defaults(func=lambda args: refresh_templates(args))
+    
+    p_remove_templates = sub.add_parser(
+        "remove-templates",
+        help="Remove all template-backed model entries from catalog",
+        description="Delete all model entries whose ID ends with '+template' from the catalog.",
+    )
+    subparsers["remove-templates"] = p_remove_templates
+    p_remove_templates.set_defaults(func=lambda args: remove_templates(args))
     p_update.add_argument(
         "--preserve-ctx",
         action="store_true",
@@ -7254,6 +7789,7 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
         action="store_true",
         help="Overwrite CFG_CTX values from GGUF metadata",
     )
+    p_update.add_argument("--defer-publish", action="store_true", help="Do not try to publish the model to the proxy immediately")
 
     p_validate = sub.add_parser(
         "validate",
