@@ -41,6 +41,28 @@ llamacpp-superserver install  # Select "vllm-beta" when prompted
 llamacpp-superserver run -hf meta-llama/Llama-2-7b-hf
 ```
 
+### With Ollama (Local Testing)
+For quick local testing without Docker overhead, use Ollama with lightweight models:
+
+```bash
+# Install Ollama (macOS: brew install ollama, Linux: see docs)
+ollama serve  # Start in one terminal
+
+# In another terminal, pull a test model:
+ollama pull tinystories  # ~27MB lightweight model
+
+# Use in your code or tests (service runs on http://localhost:11434)
+# See docs/LOCAL_OLLAMA_SETUP.md for full integration guide
+```
+
+**When to use Ollama:**
+- ✅ Local development and iteration
+- ✅ Fast testing cycles (TinyStories: ~100ms latency)
+- ✅ Low-resource environments
+- ❌ Production deployments (use llamacpp-superserver instead)
+
+See [docs/LOCAL_OLLAMA_SETUP.md](docs/LOCAL_OLLAMA_SETUP.md) for detailed setup instructions.
+
 ## Install For Development
 
 ```bash
@@ -61,6 +83,10 @@ The standalone bundle can be run directly:
 ```bash
 ./llamacpp_stack/bundle/install_llamacpp_stack.sh --dry-run
 ```
+
+Note: The interactive installer now asks whether to run the full installer by default (`Y`), and answering `n`/`no` will perform a package-only update of `llamacpp-superserver` (leaving binaries, config, and auto-ctx untouched).
+
+Installer-managed llama-server defaults are written using the project's kebab-case config keys, matching the runtime flags used by the local llamacpp stack.
 
 Notes:
 

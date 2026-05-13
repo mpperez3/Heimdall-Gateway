@@ -161,17 +161,26 @@ def _merge_missing_llama_server_defaults(target: dict[str, object], config_dir: 
     if not isinstance(target, dict):
         return False
     # Record whether the caller already had any server defaults. If so,
-    # avoid adding higher-level bundled keys like `speculative_defaults`
-    # to preserve explicit user-provided defaults.
+    # preserve explicit user-provided defaults and do not merge bundled
+    # preset keys into an already-managed config.
     had_existing_defaults = bool(target)
+
+    # If the config already has batch sizing defaults, treat it as fully
+    # managed by the project/user and avoid overriding or extending it.
+    if "batch-size" in target or "batch_size" in target:
+        return False
 
     preset_defaults = _load_llama_server_defaults_preset(config_dir)
     if not preset_defaults:
         return False
     changed = False
     for key, value in preset_defaults.items():
-        if key not in target:
-            target[key] = value
+        # Persist installer-managed defaults using the project's kebab-case
+        # config keys so the generated server config matches runtime flags.
+        target_key = key.replace("_", "-") if isinstance(key, str) else key
+        # Preserve any existing user-provided value under either naming style.
+        if target_key not in target and key not in target:
+            target[target_key] = value
             changed = True
     # Additionally merge any `speculative_defaults` mapping from the bundled
     # `llama_server_defaults.yaml` into `target['speculative_defaults']` only
@@ -310,11 +319,12 @@ def _build_cmake_args_from_config(
     
     # Add RPATH flags if needed
     if rpath_dirs:
+        rpath_value = ";".join(dict.fromkeys(rpath_dirs))
+        # Always add CMAKE_BUILD_RPATH when rpath_dirs are provided
+        cmake_args.append(f"-DCMAKE_BUILD_RPATH={rpath_value}")
+        # Also check config for additional rpath settings
         rpath_flags = config.get("rpath_flags", {})
         if isinstance(rpath_flags, dict):
-            rpath_value = ";".join(dict.fromkeys(rpath_dirs))
-            if rpath_flags.get("CMAKE_BUILD_RPATH"):
-                cmake_args.append(f"-DCMAKE_BUILD_RPATH={rpath_value}")
             if rpath_flags.get("CMAKE_INSTALL_RPATH"):
                 cmake_args.append(f"-DCMAKE_INSTALL_RPATH={rpath_value}")
             if rpath_flags.get("CMAKE_BUILD_RPATH_USE_ORIGIN"):
@@ -399,6 +409,23 @@ def prompt_choice(message: str, options: list[tuple[str, str]], default: str) ->
         if choice in labels:
             return choice
         print(f"Choose one of: {', '.join(numeric_to_key)} or {', '.join(labels)}")
+
+
+def prompt_existing_install_action() -> str:
+    return prompt_choice(
+        "Existing installation detected. What do you want to do?",
+        [
+            (
+                "full",
+                "Run the full installer and refresh llama.cpp, llama-swap, config, and auto-ctx.",
+            ),
+            (
+                "package-only",
+                "Only update llamacpp-superserver itself; leave binaries, config, and auto-ctx untouched.",
+            ),
+        ],
+        default="full",
+    )
 
 
 def resolve_install_mode(requested_mode: str | None) -> str:
@@ -720,6 +747,9 @@ def _args_to_cli(argv: argparse.Namespace, chosen_mode: str, chosen_llama_cpp_mo
     update_binaries = getattr(argv, "update_binaries", None)
     if update_binaries is not None:
         cmd.append("--update-binaries" if update_binaries else "--no-update-binaries")
+    package_only_update = getattr(argv, "package_only_update", None)
+    if package_only_update is not None:
+        cmd.append("--package-only-update" if package_only_update else "--no-package-only-update")
     migrate_model_ids = getattr(argv, "migrate_model_ids", None)
     if migrate_model_ids is not None:
         cmd.append("--migrate-model-ids" if migrate_model_ids else "--no-migrate-model-ids")
@@ -1080,6 +1110,17 @@ def detect_existing_mode() -> str | None:
     if env_path_for_mode("user").exists() or legacy_env_path_for_mode("user").exists():
         return "user"
     return None
+
+
+
+
+def _same_models_dir(selected: Path, existing: Path | None) -> bool:
+    if existing is None:
+        return False
+    try:
+        return selected.expanduser().resolve(strict=False) == existing.expanduser().resolve(strict=False)
+    except Exception:
+        return Path(selected).expanduser().absolute() == Path(existing).expanduser().absolute()
 
 
 def existing_models_dir(mode: str) -> Path | None:
@@ -1717,9 +1758,43 @@ def _sudo_prefix() -> list[str]:
     return [] if os.geteuid() == 0 else ["sudo"]
 
 
+
+
+def _models_dir_already_ready_for_owner(models_dir: Path, owner_user: str, owner_group: str, *, system_mode: bool) -> bool:
+    """Return True when the existing models dir needs no sudo fix.
+
+    In system mode the directory is intentionally owned by the service account,
+    so the invoking user may not be able to write to it. For updates, that is
+    fine: if the path already exists with the desired owner and service-writable
+    permissions, do not ask for sudo just because the current user lacks write
+    access.
+    """
+    try:
+        st = models_dir.stat()
+        if not stat.S_ISDIR(st.st_mode):
+            return False
+        if system_mode:
+            try:
+                expected_uid = pwd.getpwnam(owner_user).pw_uid
+            except KeyError:
+                return False
+            try:
+                expected_gid = grp.getgrnam(owner_group).gr_gid
+            except KeyError:
+                return False
+            mode = stat.S_IMODE(st.st_mode)
+            return st.st_uid == expected_uid and st.st_gid == expected_gid and (mode & 0o770) == 0o770
+        return os.access(models_dir, os.W_OK | os.X_OK)
+    except Exception:
+        return False
+
+
 def ensure_models_dir_ready(layout: InstallLayout, dry_run: bool) -> None:
     owner_user, owner_group = desired_models_dir_owner(layout)
     models_dir = layout.models_dir
+    if _models_dir_already_ready_for_owner(models_dir, owner_user, owner_group, system_mode=(layout.mode == "system")):
+        return
+
     local_ready = False
     try:
         models_dir.mkdir(parents=True, exist_ok=True)
@@ -1860,6 +1935,7 @@ def ensure_runtime_python(layout: InstallLayout, dry_run: bool, skip_pip_install
             "pyyaml",
             "huggingface_hub",
             "hf_transfer",
+            "optuna",
         ]
     )
     if layout.backend == "vllm-beta":
@@ -3071,6 +3147,16 @@ def maybe_rerun_auto_ctx(layout: InstallLayout, install_services: bool, dry_run:
     _run_auto_ctx_update()
 
 
+def maybe_refresh_runtime_package_only(layout: InstallLayout, dry_run: bool, args: argparse.Namespace) -> None:
+    if dry_run:
+        print(f"[dry-run] would refresh the llamacpp-superserver runtime package at {layout.install_root}")
+        return
+    ensure_runtime_python(layout, dry_run, skip_pip_install=args.skip_venv_install)
+    print("\n✓ Updated llamacpp-superserver Python package with latest features and fixes.")
+    print("  (Binaries, config, and auto-ctx settings were left untouched.)")
+    print("  Run the full installer if you need to refresh llama.cpp binaries or reconfigure the system.\n")
+
+
 def maybe_migrate_existing_install(target_mode: str, public_host: str, public_port: int | None, dry_run: bool) -> None:
     existing_mode = detect_existing_mode()
     if not existing_mode or existing_mode == target_mode:
@@ -3105,8 +3191,10 @@ def maybe_migrate_existing_install(target_mode: str, public_host: str, public_po
 def install_stack(args: argparse.Namespace) -> int:
     pre_mode = resolve_install_mode(args.mode)
     chosen_public_host = resolve_public_host(args.public_host)
-    suggested_models_dir = existing_models_dir(pre_mode) or derive_models_dir(detect_ollama_models_dir(), pre_mode)
+    previous_models_dir = existing_models_dir(pre_mode)
+    suggested_models_dir = previous_models_dir or derive_models_dir(detect_ollama_models_dir(), pre_mode)
     chosen_models_dir = Path(args.models_dir).expanduser() if args.models_dir else prompt_path("Models directory", suggested_models_dir)
+    models_dir_unchanged = _same_models_dir(chosen_models_dir, previous_models_dir)
     maybe_migrate_existing_install(pre_mode, chosen_public_host, args.public_port, args.dry_run)
     args.public_host = chosen_public_host
 
@@ -3118,45 +3206,29 @@ def install_stack(args: argparse.Namespace) -> int:
 
     # 2. Re-calculate layout (specifically ports) after services are stopped
     layout = choose_layout(pre_mode, chosen_public_host, args.public_port, chosen_models_dir, args=args)
-    existing_backend = detect_existing_backend(layout)
-    backend = resolve_backend_choice(getattr(args, "backend", None) or existing_backend)
-    layout.backend = backend
-    # Preserve the interactive selection when re-executing in system mode via sudo.
+    backend = getattr(args, "backend", None) or detect_existing_backend(layout) or "llama.cpp"
+    # Preserve backend for re-execution in system mode via sudo.
     args.backend = backend
+
+    package_only_update = getattr(args, "package_only_update", None)
 
     if args.update_binaries is not None:
         update_binaries = bool(args.update_binaries)
     else:
         update_binaries = True
         if is_existing_install(layout):
-            # Read current installed tags (if any)
-            current_manifest = read_install_manifest(layout)
-            current_llama_cpp_tag = str(current_manifest.get("llama_cpp_tag") or "not installed")
-            current_llamaswap_tag = str(current_manifest.get("llamaswap_tag") or "not installed")
-            # Try to fetch latest tags to show the user and provide quick links
-            try:
-                latest_cpp = latest_release(DEFAULT_LLAMA_CPP_REPO)
-                latest_swap = latest_release(DEFAULT_LLAMASWAP_REPO)
-                latest_cpp_tag = str(latest_cpp.get("tag_name") or "unknown")
-                latest_swap_tag = str(latest_swap.get("tag_name") or "unknown")
-                cpp_url = f"https://github.com/{DEFAULT_LLAMA_CPP_REPO}/releases/latest"
-                swap_url = f"https://github.com/{DEFAULT_LLAMASWAP_REPO}/releases/latest"
-                prompt_msg = (
-                    "Existing installation detected.\n"
-                    f"llama.cpp: current {current_llama_cpp_tag}, latest {latest_cpp_tag} ({cpp_url})\n"
-                    f"llama-swap: current {current_llamaswap_tag}, latest {latest_swap_tag} ({swap_url})\n"
-                    "Update llama.cpp and llama-swap binaries?"
+            if package_only_update is None:
+                # The interactive default is package-only; answering yes here
+                # runs the full installer (binaries/config/auto-ctx refresh).
+                run_full_installer = prompt_bool(
+                    "Run the full installer? (y=refresh llama.cpp, llama-swap, config, auto-ctx; n=package-only)",
+                    default=False,
                 )
-            except Exception:
-                prompt_msg = (
-                    "Existing installation detected.\n"
-                    f"llama.cpp: current {current_llama_cpp_tag}\n"
-                    f"llama-swap: current {current_llamaswap_tag}\n"
-                    "Update llama.cpp and llama-swap binaries?"
-                )
-            update_binaries = prompt_bool(prompt_msg, default=True)
+                package_only_update = not run_full_installer
+            update_binaries = not package_only_update
     # Preserve the interactive selection when re-executing in system mode via sudo.
     args.update_binaries = update_binaries
+    args.package_only_update = package_only_update
     stable_llama_server = layout.install_root / "llama-server"
     if not update_binaries and _is_self_referential_symlink(stable_llama_server):
         print(
@@ -3176,6 +3248,19 @@ def install_stack(args: argparse.Namespace) -> int:
     if reexec_status is not None:
         return reexec_status
 
+    if package_only_update:
+        maybe_refresh_runtime_package_only(layout, args.dry_run, args)
+        # Ensure services are restarted to use the new package code
+        if args.install_services:
+            restart_systemd_units(layout, args.dry_run)
+        return 0
+
+    existing_backend = detect_existing_backend(layout)
+    backend = resolve_backend_choice(getattr(args, "backend", None) or existing_backend)
+    layout.backend = backend
+    # Preserve the interactive selection when re-executing in system mode via sudo.
+    args.backend = backend
+
     if is_existing_install(layout):
         _backup_existing_model_configuration(layout, args.dry_run)
 
@@ -3184,7 +3269,10 @@ def install_stack(args: argparse.Namespace) -> int:
     else:
         ensure_system_identity(layout, args.dry_run)
         ensure_dirs(layout)
-    ensure_models_dir_ready(layout, args.dry_run)
+    if models_dir_unchanged and is_existing_install(layout):
+        print(f"Models directory unchanged and already configured: {layout.models_dir}; skipping sudo ownership check.")
+    else:
+        ensure_models_dir_ready(layout, args.dry_run)
     ensure_service_writable_dirs(layout, args.dry_run)
 
     if args.dry_run:
@@ -3476,9 +3564,15 @@ def install_stack(args: argparse.Namespace) -> int:
         install_systemd_units(layout, args.dry_run)
         maybe_offer_ufw_ports(layout, args.dry_run)
     if args.install_services:
+        # Initial restart to ensure services are running for any post-install tasks
         restart_systemd_units(layout, args.dry_run)
     if not args.dry_run:
         maybe_rerun_auto_ctx(layout, args.install_services, args.dry_run, args)
+
+    # Final mandatory restart as requested by user to ensure everything is fresh
+    if args.install_services:
+        restart_systemd_units(layout, args.dry_run)
+
     if not args.dry_run:
         print_install_summary(layout, args.install_services)
     return 0
@@ -3525,6 +3619,12 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Force whether installer updates llama.cpp and llama-swap binaries on existing installs.",
+    )
+    parser.add_argument(
+        "--package-only-update",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--migrate-model-ids",

@@ -187,6 +187,61 @@ LLAMASWAP_CONFIG_HEADER = (
 )
 
 
+DEBUG_GATE_LOCK = threading.Lock()
+DEBUG_GATE_STATE = {"active": False, "owner": "", "expires_at": 0.0}
+DEBUG_GATE_TTL_S = 10.0
+
+
+def _enable_debug_gate(owner: str, ttl_s: float | None = None) -> bool:
+    if not owner:
+        return False
+    ttl_value = float(ttl_s or DEBUG_GATE_TTL_S)
+    ttl_value = max(2.0, ttl_value)
+    with DEBUG_GATE_LOCK:
+        if DEBUG_GATE_STATE["active"] and DEBUG_GATE_STATE["owner"] not in {"", owner}:
+            return False
+        DEBUG_GATE_STATE["active"] = True
+        DEBUG_GATE_STATE["owner"] = owner
+        DEBUG_GATE_STATE["expires_at"] = time.monotonic() + ttl_value
+        return True
+
+
+def _refresh_debug_gate(owner: str, ttl_s: float | None = None) -> bool:
+    return _enable_debug_gate(owner, ttl_s)
+
+
+def _disable_debug_gate(owner: str | None = None) -> bool:
+    with DEBUG_GATE_LOCK:
+        if owner and DEBUG_GATE_STATE["owner"] not in {"", owner}:
+            return False
+        DEBUG_GATE_STATE["active"] = False
+        DEBUG_GATE_STATE["owner"] = ""
+        DEBUG_GATE_STATE["expires_at"] = 0.0
+    try:
+        from llamacpp_stack.debug_manager import DEBUG_SESSION_MANAGER
+
+        DEBUG_SESSION_MANAGER.stop_session()
+    except Exception:
+        pass
+    return True
+
+
+def _is_debug_gate_active() -> bool:
+    expired = False
+    with DEBUG_GATE_LOCK:
+        if not DEBUG_GATE_STATE["active"]:
+            return False
+        if DEBUG_GATE_STATE["expires_at"] and time.monotonic() > float(DEBUG_GATE_STATE["expires_at"]):
+            expired = True
+            DEBUG_GATE_STATE["active"] = False
+            DEBUG_GATE_STATE["owner"] = ""
+            DEBUG_GATE_STATE["expires_at"] = 0.0
+    if expired:
+        _disable_debug_gate()
+        return False
+    return True
+
+
 def _ensure_server_config_metadata(payload: dict[str, object]) -> dict[str, object]:
     meta = payload.get("_meta")
     if not isinstance(meta, dict):
@@ -434,6 +489,35 @@ def _is_vllm_backend() -> bool:
 _SERVER_FLAG_CACHE: dict[str, set[str]] = {}
 
 
+def _server_help_env(server_path: Path | str | None) -> dict[str, str]:
+    env = os.environ.copy()
+    try:
+        p = Path(server_path) if server_path is not None else Path(DEFAULT_LLAMA_SERVER)
+        resolved = p.resolve()
+        lib_dirs = [
+            p.parent,
+            resolved.parent,
+            p.parent.parent / "lib",
+            p.parent.parent / "lib64",
+            p.parent / "cuda" / "lib",
+            p.parent.parent / "cuda" / "lib",
+            p.parent / "nccl" / "lib",
+            p.parent.parent / "nccl" / "lib",
+            p.parent.parent / "build" / "bin",
+            Path.home() / ".local" / "opt" / "llamacpp-superserver" / "cuda" / "lib",
+            Path.home() / ".local" / "opt" / "llamacpp-superserver" / "nccl" / "lib",
+        ]
+        existing = env.get("LD_LIBRARY_PATH", "")
+        parts = [str(d) for d in lib_dirs if d.exists()]
+        if existing:
+            parts.append(existing)
+        if parts:
+            env["LD_LIBRARY_PATH"] = os.pathsep.join(dict.fromkeys(parts))
+    except Exception:
+        pass
+    return env
+
+
 def get_server_supported_flags(server_path: Path | str | None) -> set[str]:
     """Return set of supported flags (e.g. '--mul-mat-q', '-fit').
 
@@ -450,7 +534,7 @@ def get_server_supported_flags(server_path: Path | str | None) -> set[str]:
     flags: set[str] = set()
     try:
         # Prefer --help, but some binaries accept -h too
-        proc = subprocess.run([key, "--help"], capture_output=True, text=True, timeout=8)
+        proc = subprocess.run([key, "--help"], capture_output=True, text=True, timeout=8, env=_server_help_env(p))
         text = (proc.stdout or "") + "\n" + (proc.stderr or "")
     except Exception:
         _SERVER_FLAG_CACHE[key] = set()
@@ -475,9 +559,14 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         return {}
     normalized: dict[str, object] = {}
+    # Internal orchestration fields used by auto-tuning; should never reach CLI
+    internal_keys = {"gpu_set", "gpu_set_idx", "ts_strategy", "tensor_split_strategy", "main_gpu_raw", "auto_performance"}
     for raw_key, raw_val in value.items():
         key = str(raw_key).strip().lower().replace("-", "_")
         if not key:
+            continue
+        # Filter out internal orchestration fields
+        if key in internal_keys:
             continue
         if key == "speculative_defaults":
             if isinstance(raw_val, dict):
@@ -533,6 +622,17 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
                 except (TypeError, ValueError):
                     continue
             continue
+        if key == "n_gpu_layers_draft":
+            if isinstance(raw_val, str):
+                sval = raw_val.strip().lower()
+                if sval in {"all", "auto"}:
+                    normalized[key] = sval
+                    continue
+            try:
+                normalized[key] = int(raw_val)
+            except (TypeError, ValueError):
+                continue
+            continue
         if key in {
             "ctx_size",
             "n_gpu_layers",
@@ -546,9 +646,12 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
             "draft",
             "draft_min",
             "ctx_size_draft",
-            "n_gpu_layers_draft",
             "grp_attn_n",
             "parallel",
+            "main_gpu",
+            "ctx_checkpoints",
+            "cache_ram",
+            "n_cpu_moe",
         }:
             try:
                 normalized[key] = int(raw_val)
@@ -570,11 +673,30 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
                 if bool_val is not None:
                     normalized[key] = bool_val
             continue
+        if key in {"kv_offload", "cont_batching", "op_offload", "cpu_moe", "kv_unified", "cache_idle_slots", "direct_io"}:
+            bool_val = _normalize_bool_flag(raw_val)
+            if bool_val is not None:
+                normalized[key] = bool_val
+            continue
         if key == "tensor_split":
             normalized[key] = normalize_tensor_split(str(raw_val))
             continue
-        if key in {"split_mode", "numa", "cache_type_k", "cache_type_v", "host", "model_draft", "hf_repo_draft", "reasoning_format", "chat_template_file", "chat_template"}:
+        if key == "numa":
+            # numa can be None (omit flag) or a string like "distribute"/"isolate"
+            if raw_val is None or (isinstance(raw_val, str) and raw_val.strip().lower() == "none"):
+                continue  # Skip: None means omit the flag
             normalized[key] = str(raw_val).strip()
+            continue
+        if key in {"split_mode", "cache_type_k", "cache_type_v", "host", "model_draft", "hf_repo_draft", "reasoning_format", "chat_template_file", "chat_template", "device"}:
+            normalized[key] = str(raw_val).strip()
+            continue
+        # Generic passthrough: include other override keys as-is so callers
+        # can provide custom flags (e.g. custom_flag -> --custom-flag).
+        try:
+            normalized[key] = raw_val
+        except Exception:
+            normalized[key] = str(raw_val)
+        continue
     return normalized
 
 
@@ -818,6 +940,9 @@ def load_catalog_with_diagnostics(path: Path, server_config_path: Path | None = 
         if normalized != item.tensor_split:
             item.tensor_split = normalized
             changed = True
+        raw_auto_performance = None
+        if isinstance(item.server_overrides, dict):
+            raw_auto_performance = item.server_overrides.get("auto_performance")
         normalized_overrides = normalize_server_overrides(item.server_overrides)
 
         # Remove keys from per-model overrides when they are identical to global defaults
@@ -827,6 +952,11 @@ def load_catalog_with_diagnostics(path: Path, server_config_path: Path | None = 
                 changed = True
                 continue
             pruned_overrides[k] = v
+        if isinstance(raw_auto_performance, dict):
+            # Persistent auto-performance metadata belongs in catalog config,
+            # but normalize_server_overrides intentionally strips it so it can
+            # never be emitted as a llama-server flag.
+            pruned_overrides["auto_performance"] = raw_auto_performance
 
         if pruned_overrides != item.server_overrides:
             item.server_overrides = pruned_overrides
@@ -1274,13 +1404,46 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
     elif key == "batch_size":
         cmd.extend(["--batch-size", str(int(value))])
     elif key == "ubatch_size":
-        cmd.extend(["--ubatch-size", str(int(value))])
+        cmd.extend(["--ubatch-size", str(max(256, int(value)))])
     elif key == "threads":
-        cmd.extend(["--threads", str(int(value))])
+        # Accept numeric or string hints 'physical'/'logical'
+        try:
+            if isinstance(value, str):
+                pc = os.cpu_count() or 1
+                if value.strip().lower() == "physical":
+                    v = max(1, pc // 2)
+                elif value.strip().lower() == "logical":
+                    v = pc * 2
+                else:
+                    v = int(value)
+            else:
+                v = int(value)
+            cmd.extend(["--threads", str(v)])
+        except Exception:
+            pass
     elif key == "threads_batch":
-        cmd.extend(["--threads-batch", str(int(value))])
+        try:
+            if isinstance(value, str):
+                pc = os.cpu_count() or 1
+                if value.strip().lower() == "physical":
+                    v = max(1, pc // 2)
+                elif value.strip().lower() == "logical":
+                    v = pc * 2
+                else:
+                    v = int(value)
+            else:
+                v = int(value)
+            cmd.extend(["--threads-batch", str(v)])
+        except Exception:
+            pass
+    elif key == "main_gpu":
+        cmd.extend(["--main-gpu", str(int(value))])
     elif key == "numa":
-        cmd.extend(["--numa", str(value)])
+        if value is None:
+            return
+        sval = str(value).strip()
+        if sval and sval.lower() != "none":
+            cmd.extend(["--numa", sval])
     elif key == "reasoning_format":
         sval = str(value).strip()
         if sval:
@@ -1288,12 +1451,23 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
     elif key == "fit_target":
         cmd.extend(["--fit-target", str(int(value))])
     elif key == "model_draft":
-        cmd.extend(["--model-draft", str(value)])
+        sval = str(value or "").strip()
+        if sval and sval.lower() not in {"none", "null"}:
+            cmd.extend(["--model-draft", sval])
     elif key == "hf_repo_draft":
         cmd.extend(["--hf-repo-draft", str(value)])
     elif key == "draft":
-        # Map legacy --draft to new speculative decoding parameter
-        cmd.extend(["--spec-draft-n-max", str(int(value))])
+        # Current llama.cpp accepts --draft/--draft-n/--draft-max. Older
+        # --spec-draft-n-max is not universally supported.
+        draft_flag = next(
+            (
+                flag
+                for flag in ("--spec-draft-n-max", "--draft-max", "--draft", "--draft-n")
+                if server_supports_flag(server_path, flag)
+            ),
+            "--draft-max",
+        )
+        cmd.extend([draft_flag, str(int(value))])
     elif key == "draft_min":
         # draft_min was removed in newer llama.cpp API; skipping
         pass
@@ -1303,7 +1477,16 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
     elif key == "ctx_size_draft":
         cmd.extend(["--ctx-size-draft", str(int(value))])
     elif key == "n_gpu_layers_draft":
-        cmd.extend(["--n-gpu-layers-draft", str(int(value))])
+        try:
+            if isinstance(value, str) and value.strip().lower() == "all":
+                v = 999
+            elif isinstance(value, str) and value.strip().lower() == "auto":
+                v = -1
+            else:
+                v = int(value)
+            cmd.extend(["--n-gpu-layers-draft", str(v)])
+        except Exception:
+            pass
     elif key == "keep":
         cmd.extend(["--keep", str(int(value))])
     elif key == "mirostat":
@@ -1398,12 +1581,93 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
                 cmd.extend([flag, str(int(value))])
         except (TypeError, ValueError):
             pass
+    elif key == "ctx_checkpoints":
+        try:
+            flag = "--ctx-checkpoints"
+            if server_supports_flag(server_path, flag):
+                cmd.extend([flag, str(int(value))])
+        except (TypeError, ValueError):
+            pass
+    elif key == "cache_ram":
+        try:
+            flag = "--cache-ram"
+            if server_supports_flag(server_path, flag):
+                cmd.extend([flag, str(int(value))])
+        except (TypeError, ValueError):
+            pass
+    elif key == "kv_offload":
+        bool_val = _normalize_bool_flag(value)
+        if bool_val is True:
+            cmd.append("--kv-offload")
+        elif bool_val is False:
+            cmd.append("--no-kv-offload")
+    elif key == "cont_batching":
+        bool_val = _normalize_bool_flag(value)
+        if bool_val is True:
+            cmd.append("--cont-batching")
+        elif bool_val is False:
+            cmd.append("--no-cont-batching")
+    elif key == "op_offload":
+        bool_val = _normalize_bool_flag(value)
+        if bool_val is True:
+            cmd.append("--op-offload")
+        elif bool_val is False:
+            cmd.append("--no-op-offload")
+    elif key == "direct_io":
+        bool_val = _normalize_bool_flag(value)
+        if bool_val is True:
+            cmd.append("--direct-io")
+        elif bool_val is False:
+            cmd.append("--no-direct-io")
+    elif key == "kv_unified":
+        bool_val = _normalize_bool_flag(value)
+        if bool_val is True and server_supports_flag(server_path, "--kv-unified"):
+            cmd.append("--kv-unified")
+        elif bool_val is False and server_supports_flag(server_path, "--no-kv-unified"):
+            cmd.append("--no-kv-unified")
+    elif key == "cache_idle_slots":
+        bool_val = _normalize_bool_flag(value)
+        if bool_val is True and server_supports_flag(server_path, "--cache-idle-slots"):
+            cmd.append("--cache-idle-slots")
+        elif bool_val is False and server_supports_flag(server_path, "--no-cache-idle-slots"):
+            cmd.append("--no-cache-idle-slots")
+    elif key == "cpu_moe":
+        bool_val = _normalize_bool_flag(value)
+        if bool_val:
+            cmd.append("--cpu-moe")
+    elif key == "n_cpu_moe":
+        try:
+            cmd.extend(["--n-cpu-moe", str(int(value))])
+        except (TypeError, ValueError):
+            pass
+    elif key == "device":
+        sval = str(value).strip()
+        if sval:
+            cmd.extend(["--device", sval])
     elif key == "defrag_threshold":
         try:
             flag = "--defrag-threshold"
             if server_supports_flag(server_path, flag):
                 cmd.extend([flag, str(float(value))])
         except (TypeError, ValueError):
+            pass
+    else:
+        # Generic fallback: map unknown keys to --kebab-case and append value.
+        try:
+            flag = key if str(key).startswith("-") else f"--{str(key).replace('_', '-')}"
+            if isinstance(value, bool):
+                if value:
+                    cmd.append(flag)
+                else:
+                    cmd.extend([flag, "false"])
+            elif value is None:
+                cmd.append(flag)
+            elif isinstance(value, (list, tuple)):
+                for v in value:
+                    cmd.extend([flag, str(v)])
+            else:
+                cmd.extend([flag, str(value)])
+        except Exception:
             pass
 
 
@@ -1417,6 +1681,7 @@ def build_llama_server_command(
     include_mmproj: bool = True,
     include_jinja: bool = True,
     server_defaults: dict[str, object] | None = None,
+    extra_flags: list[str] | None = None,
 ) -> list[str]:
     effective = dict(normalize_server_overrides(server_defaults or {}))
     # If this model is a speculative/draft variant, merge spec defaults first
@@ -1526,6 +1791,7 @@ def build_llama_server_command(
         "ubatch_size",
         "threads",
         "threads_batch",
+        "main_gpu",
         "numa",
         "fit_target",
         "model_draft",
@@ -1548,10 +1814,29 @@ def build_llama_server_command(
         "mul_mat_q",
         "grp_attn_n",
         "parallel",
+        "ctx_checkpoints",
+        "cache_ram",
+        "kv_offload",
+        "cont_batching",
+        "op_offload",
+        "direct_io",
+        "cpu_moe",
+        "n_cpu_moe",
+        "device",
         "defrag_threshold",
     ):
         if key in effective:
             _append_llama_server_flag(cmd, key, effective[key], server_path)
+            # Mark as handled so it won't be appended again in the leftover pass
+            try:
+                effective.pop(key, None)
+            except Exception:
+                pass
+    # Append any remaining unknown server_overrides as generic flags
+    for extra_key, extra_val in list(effective.items()):
+        # skip keys already handled above via _append_llama_server_flag
+        # (they were removed or processed), but emit any left-over entries
+        _append_llama_server_flag(cmd, extra_key, extra_val, server_path)
     if include_mmproj and model.mmproj_path:
         cmd.extend(["--mmproj", str(model.mmproj_path)])
     if include_jinja and model.jinja:
@@ -1561,6 +1846,8 @@ def build_llama_server_command(
     tmpl = effective.get("chat_template_file") or effective.get("chat_template")
     if tmpl:
         cmd.extend(["--chat-template-file", str(tmpl)])
+    if extra_flags:
+        cmd.extend(list(extra_flags))
     return cmd
 
 
@@ -2279,6 +2566,9 @@ def run_manager_command(command: str, args):
         req["args"] = {k: str(v) if isinstance(v, Path) else v for k, v in req["args"].items() if k != 'func'}
         s.sendall((json.dumps(req) + "\n").encode())
         print("\033[33mRequest sent to background manager...\033[0m")
+        if command == "auto-performance":
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            print(f"{ts} ─ auto-performance ─ request queued; next: manager resolves baseline and starts tuning", flush=True)
 
         with s.makefile("r", encoding="utf-8") as sock_in:
             while True:
@@ -2314,7 +2604,16 @@ def run_manager_command(command: str, args):
                         raise RuntimeError(f"Manager finished {command} without returning a result.")
                     return model_id
                 elif etype == "error":
-                    raise RuntimeError(event.get("message", "Unknown manager error."))
+                    # If the manager failed to include a message, include the
+                    # full event payload to aid diagnostics instead of raising
+                    # a cryptic empty message.
+                    msg = event.get("message")
+                    if not msg:
+                        try:
+                            msg = f"Manager error: {json.dumps(event)}"
+                        except Exception:
+                            msg = "Manager error with no message"
+                    raise RuntimeError(msg)
                 else:
                     raise RuntimeError(f"Unexpected response from manager: {event}")
 
@@ -3147,6 +3446,12 @@ def ensure_model_available(args, progress_callback = None):
                 f"{new_m.model_id}: paired probe for metrics failed ({probe_reason}). Keeping ctx {new_m.ctx_size} from master.",
                 progress_callback,
             )
+            trace_tail = _trace_tail_from_reason(probe_reason, lines=30)
+            if trace_tail:
+                _emit_message(
+                    f"{new_m.model_id}: paired probe trace tail:\n{trace_tail}",
+                    progress_callback,
+                )
 
     refresh_model_load_capabilities(new_m)
     new_cat = [m for m in catalog if m.model_id != mid] + [new_m]
@@ -3154,7 +3459,7 @@ def ensure_model_available(args, progress_callback = None):
     if defer_publish:
         _emit_message(f"Catalog updated for {mid}; publish/load deferred.", progress_callback)
         if probe_config_replaced:
-            restore_catalog_config(args, stable_catalog, progress_callback=progress_callback, restart_service=False)
+            restore_catalog_config(args, stable_catalog, progress_callback=progress_callback, restart_service=True)
         return mid
     gpu_conflict = get_gpu_conflict_message(mid, new_cat, args.public_host, args.public_port)
     if gpu_conflict:
@@ -3766,6 +4071,11 @@ def _is_ollama_process(pid: int) -> bool:
 
 
 def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DEFAULT_PUBLIC_HOST, port=DEFAULT_PUBLIC_PORT) -> str | None:
+    """Generate a user-friendly error message for GPU conflicts.
+    
+    Uses only the local llamacpp-superserver installation for model management.
+    If a GPU conflict is detected, suggests using 'llamacpp-superserver unload' to free resources.
+    """
     published_models = get_published_model_ids(host, port)
     if model_id in published_models:
         return None
@@ -3794,7 +4104,7 @@ def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DE
         joined += f"; +{len(conflicts) - 4} more"
     return (
         f"Cannot load model '{model_id}' because the GPU is already in use: {joined}. "
-        "Wait for those workloads to finish or unload them first."
+        "Use 'llamacpp-superserver unload <model>' to free resources, or wait for those workloads to finish."
     )
 
 
@@ -5092,6 +5402,88 @@ def start_ctx_metadata_server(args):
     print(f"[*] Ctx metadata API listening on http://{host}:{port}")
     return server
 
+
+def debug_mode(args):
+    """Start the debug API in the foreground and keep it alive until Ctrl+C."""
+    debug_args = argparse.Namespace(**vars(args))
+    server = None
+    # Prefer connecting to a running manager via socket; if unavailable,
+    # start a local debug API on a free port.
+    if getattr(debug_args, "api_port", None) is None:
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.connect(SOCKET_PATH)
+                print("[*] Connected to manager; forwarding debug session to manager.")
+                # Keep alive until interrupted (tests patch time.sleep to raise KeyboardInterrupt)
+                while True:
+                    time.sleep(1)
+            finally:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        except KeyboardInterrupt:
+            # User interrupted via Ctrl+C (or test mock) while socket was connected;
+            # this is the successful case: we connected and were interrupted.
+            return 0
+        except Exception:
+            # Manager not available — pick a free port and serve locally
+            debug_args.api_port = _find_free_port()
+            try:
+                server = start_ctx_metadata_server(debug_args)
+                if server is None:
+                    return 1
+                print(f"[*] Debug mode active on http://{debug_args.public_host}:{resolve_api_port(debug_args)}")
+                print("[*] Use the /api/debug/* endpoints while this command is running.")
+                server.serve_forever(poll_interval=0.5)
+            except KeyboardInterrupt:
+                print("\n[*] Debug mode interrupted, shutting down.")
+            finally:
+                try:
+                    from llamacpp_stack.debug_manager import DEBUG_SESSION_MANAGER
+
+                    DEBUG_SESSION_MANAGER.stop_session()
+                except Exception:
+                    pass
+                if server is not None:
+                    try:
+                        server.shutdown()
+                    except Exception:
+                        pass
+                    try:
+                        server.server_close()
+                    except Exception:
+                        pass
+            return 0
+    # If api_port was provided, fall through and start a local server (same as above)
+    try:
+        server = start_ctx_metadata_server(debug_args)
+        if server is None:
+            return 1
+        print(f"[*] Debug mode active on http://{debug_args.public_host}:{resolve_api_port(debug_args)}")
+        print("[*] Use the /api/debug/* endpoints while this command is running.")
+        server.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        print("\n[*] Debug mode interrupted, shutting down.")
+    finally:
+        try:
+            from llamacpp_stack.debug_manager import DEBUG_SESSION_MANAGER
+
+            DEBUG_SESSION_MANAGER.stop_session()
+        except Exception:
+            pass
+        if server is not None:
+            try:
+                server.shutdown()
+            except Exception:
+                pass
+            try:
+                server.server_close()
+            except Exception:
+                pass
+    return 0
+
 def list_models(args):
     try:
         is_owner = (os.getuid() == 0 or os.getuid() == os.stat(args.catalog.parent).st_uid)
@@ -5120,6 +5512,43 @@ def list_models(args):
     else:
         print("No models registered yet.")
     return 0
+
+
+def _rollback_failed_run_publication(args, model_id: str, *, reason: str = "") -> None:
+    """Remove a just-published transient run model after load/warmup failure."""
+    try:
+        catalog = load_catalog(args.catalog, _args_server_config_path(args))
+        if not any(item.model_id == model_id for item in catalog):
+            return
+        remaining = [item for item in catalog if item.model_id != model_id]
+        save_catalog(args.catalog, remaining)
+        _emit_message(
+            f"{model_id}: removed from catalog/config after failed run{f' ({reason})' if reason else ''}.",
+            None,
+        )
+        try:
+            apply_config_and_wait_absent(
+                remaining,
+                args.config,
+                args.llama_server,
+                args.start_port,
+                model_id,
+                args.public_host,
+                args.public_port,
+                progress_callback=None,
+                server_defaults=resolve_llama_server_defaults(args),
+                timeout=20.0,
+            )
+        except Exception as exc:
+            _emit_message(
+                f"{model_id}: catalog entry removed, but publication cleanup could not be verified ({type(exc).__name__}: {exc}).",
+                None,
+            )
+    except Exception as exc:
+        _emit_message(
+            f"{model_id}: could not rollback failed run publication ({type(exc).__name__}: {exc}).",
+            None,
+        )
 
 
 def run_command(args):
@@ -5153,8 +5582,11 @@ def run_command(args):
         master_args.model_id = None
         master_args.speculative = False
         master_args.defer_publish = True
-        master_args.auto_ctx = False
-        master_args.skip_ctx = True
+        # Propagate user's auto/skip intent to the ensured master model so
+        # an explicit --auto requested by the caller will trigger auto-tuning
+        # instead of being silently skipped for speculative setup.
+        master_args.auto_ctx = bool(getattr(args, "auto_ctx", False))
+        master_args.skip_ctx = bool(getattr(args, "skip_ctx", False))
         master_mid = ensure_model_available(master_args)
 
         # Ensure draft model (second HF) without immediate publish.
@@ -5164,7 +5596,9 @@ def run_command(args):
         draft_args.model_id = None
         draft_args.speculative = False
         draft_args.defer_publish = True
-        draft_args.auto_ctx = False
+        # The draft model is only used as a speculative companion, so keep
+        # it on the skip-ctx path regardless of caller auto/skip defaults.
+        draft_args.auto_ctx = bool(getattr(args, "auto_ctx", False))
         draft_args.skip_ctx = True
         draft_mid = ensure_model_available(draft_args)
 
@@ -5179,7 +5613,7 @@ def run_command(args):
         spec_args.spec_base_model_id = master_mid
         spec_args.spec_draft_model_id = draft_mid
         spec_args.auto_ctx = bool(getattr(args, "auto_ctx", False))
-        spec_args.skip_ctx = not spec_args.auto_ctx
+        spec_args.skip_ctx = True
         spec_mid = ensure_model_available(spec_args)
 
         # Any remaining HF entries: ensure they're downloaded as regular models
@@ -5193,7 +5627,10 @@ def run_command(args):
 
         if args.no_chat:
             return 0
-        return start_chat(spec_mid, args.public_host, args.public_port)
+        chat_status = start_chat(spec_mid, args.public_host, args.public_port)
+        if chat_status:
+            _rollback_failed_run_publication(args, spec_mid, reason="warmup failed")
+        return chat_status
 
     # Default single-model path
     effective_args = argparse.Namespace(**vars(args))
@@ -5203,6 +5640,9 @@ def run_command(args):
     if args.no_chat:
         return 0
     return start_chat(mid, args.public_host, args.public_port)
+
+
+
 
 
 def show_request_log(args):
@@ -5257,8 +5697,11 @@ def add_models(args):
             cloned.hf = None
             cloned.model_id = None
             ensure_model_available(cloned)
+        restart_service_to_free_vram(getattr(args, "service", DEFAULT_SERVICE_NAME))
         return 0
-    return ensure_model_available(_normalize_single_ref_args(args)) and 0
+    res = ensure_model_available(_normalize_single_ref_args(args))
+    restart_service_to_free_vram(getattr(args, "service", DEFAULT_SERVICE_NAME))
+    return res and 0
 
 
 def remove_models(args):
@@ -5277,8 +5720,61 @@ def remove_models(args):
             cloned.model_id = None
             cloned.file = None
             remove_model(cloned)
+        restart_service_to_free_vram(getattr(effective_args, "service", DEFAULT_SERVICE_NAME))
         return 0
-    return remove_model(_normalize_single_ref_args(effective_args)) and 0
+    res = remove_model(_normalize_single_ref_args(effective_args))
+    restart_service_to_free_vram(getattr(effective_args, "service", DEFAULT_SERVICE_NAME))
+    return res and 0
+
+
+def unload_models(args):
+    effective_args = _clone_namespace(args)
+    refs = _collect_model_references(effective_args)
+    unload_all = False
+    if refs:
+        normalized_refs = [str(ref).strip().lower() for ref in refs]
+        if "all" in normalized_refs:
+            if len(refs) > 1:
+                raise RuntimeError("Use either 'all' or specific model references, not both.")
+            unload_all = True
+    else:
+        unload_all = True
+
+    catalog = load_catalog(effective_args.catalog, _args_server_config_path(effective_args))
+    if unload_all:
+        target_ids = [model.model_id for model in catalog]
+        remaining_catalog = []
+    else:
+        target_ids = []
+        for ref in refs:
+            cloned = _clone_namespace(effective_args)
+            cloned.repo = ref
+            cloned.hf = None
+            cloned.model_id = None
+            cloned.file = None
+            model = resolve_catalog_model(
+                catalog,
+                target=getattr(cloned, "repo", None),
+                repo_ref=getattr(cloned, "hf", None),
+                model_id=getattr(cloned, "model_id", None),
+                filename=getattr(cloned, "file", None),
+            )
+            if model.model_id not in target_ids:
+                target_ids.append(model.model_id)
+        remaining_catalog = [model for model in catalog if model.model_id not in target_ids]
+
+    render_llamaswap_config(
+        remaining_catalog,
+        effective_args.config,
+        effective_args.llama_server,
+        effective_args.start_port,
+        resolve_idle_ttl(effective_args),
+        server_defaults=resolve_llama_server_defaults(effective_args),
+    )
+    _emit_message("Unloaded all models." if unload_all else f"Unloaded model(s): {', '.join(target_ids)}.", None)
+    if wait_for_models_absent(target_ids if not unload_all else [], effective_args.public_host, effective_args.public_port):
+        return 0
+    raise RuntimeError("Unload request was sent, but the target model(s) are still visible in /v1/models.")
 
 
 def update_models(args):
@@ -5293,8 +5789,11 @@ def update_models(args):
             cloned.model_id = None
             cloned.file = None
             update_config(cloned)
+        restart_service_to_free_vram(getattr(args, "service", DEFAULT_SERVICE_NAME))
         return 0
-    return update_config(_normalize_single_ref_args(args)) and 0
+    res = update_config(_normalize_single_ref_args(args))
+    restart_service_to_free_vram(getattr(args, "service", DEFAULT_SERVICE_NAME))
+    return res and 0
 
 def temporarily_unload_published_models(args, progress_callback = None, timeout = 45):
     _emit_message(
@@ -5474,9 +5973,15 @@ def refresh_templates(args) -> None:
         print(f"Catalog updated but failed to restore config: {e}")
 
 def _find_free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
 
 def create_llamacpp_trace_file(model_id: str, ctx_size: int) -> tuple[Path, object]:
     safe_model = re.sub(r"[^a-zA-Z0-9._-]+", "-", model_id).strip("-") or "model"
@@ -5705,6 +6210,35 @@ def _wait_for_probe_server_ready(proc, port: int, trace_path: Path, timeout: int
         time.sleep(1.0)
     raise RuntimeError(f"Validation server health timeout. trace: {trace_path}")
 
+
+
+def wait_for_models_absent(model_ids, host, port, timeout=35):
+    host = _normalize_client_host(host)
+    url = f"http://{host}:{port}/v1/models"
+    target_ids = {str(model_id).strip() for model_id in model_ids if str(model_id).strip()}
+    deadline = time.time() + timeout
+    label = "all models" if not target_ids else ", ".join(sorted(target_ids))
+    spinner = Spinner(f"\033[36mWaiting for unload: {label}...\033[0m ")
+    spinner.start()
+    while time.time() < deadline:
+        try:
+            r = requests.get(url, timeout=2)
+            if r.status_code == 200:
+                data = r.json().get("data", [])
+                published_ids = {str(model.get("id") or "").strip() for model in data if isinstance(model, dict)}
+                if not target_ids and not published_ids:
+                    spinner.stop()
+                    print("\033[32mAll models are unloaded.\033[0m")
+                    return True
+                if target_ids and target_ids.isdisjoint(published_ids):
+                    spinner.stop()
+                    print(f"\033[32mModel(s) unloaded: {label}.\033[0m")
+                    return True
+        except Exception:
+            pass
+        time.sleep(1.5)
+    spinner.stop()
+    return False
 
 def _parse_last_trace_value(trace_path: Path, pattern: str) -> int | None:
     try:
@@ -5995,6 +6529,15 @@ def _trace_path_from_reason(reason: str | None) -> Path | None:
     return Path(match.group(1))
 
 
+def _trace_tail_from_reason(reason: str | None, *, lines: int = 25) -> str:
+    trace_path = _trace_path_from_reason(reason)
+    if trace_path is None:
+        return ""
+    if not trace_path.exists():
+        return f"Trace file not found: {trace_path}"
+    return _tail_text_file(trace_path, lines=lines)
+
+
 def _ctx_gb_from_metrics(metrics: ProbeTraceMetrics) -> float | None:
     kv_buffers = getattr(metrics, "kv_buffers_mib", None)
     if not isinstance(kv_buffers, dict) or not kv_buffers:
@@ -6036,7 +6579,7 @@ def _probe_fixed_ctx_metrics_once(model: ManagedModel, llama_server: Path, ctx_s
         info["selected_ctx_gb"] = _ctx_gb_from_reason(reason)
 
     trace_path = _trace_path_from_reason(reason)
-    if trace_path is not None:
+    if ok and trace_path is not None:
         try:
             trace_path.unlink()
         except FileNotFoundError:
@@ -6951,6 +7494,40 @@ def update_config(args, progress_callback = None):
                     base_model = next((item for item in catalog if item.model_id == base_model_id), None)
                     if base_model is not None:
                         paired_ctx = int(getattr(base_model, "ctx_size", 0) or model.ctx_size or DEFAULT_CTX_SIZE)
+                        # If the master entry still has the default ctx or a prior
+                        # auto-ctx probe failed, run a full auto-probe on the master
+                        # so we can obtain a concrete selected ctx to apply to the
+                        # speculative pair. Previously we only captured metrics at
+                        # the master ctx which left catalog ctx unchanged (0 updates).
+                        if (paired_ctx == DEFAULT_CTX_SIZE) or bool(getattr(base_model, "auto_ctx_failed", False)):
+                            _emit_message(
+                                f"[{idx}/{total_models}] Master {base_model_id} appears unprobed or previously failed; running full auto-probe on master.",
+                                progress_callback,
+                                timestamp=True,
+                            )
+                            try:
+                                best_base_ctx, base_status, base_info = choose_auto_ctx(base_model, args.llama_server, progress_callback=progress_callback)
+                            except Exception as e:
+                                best_base_ctx = None
+                                base_status = "error"
+                                base_info = {"reason": str(e)}
+                            if best_base_ctx is not None:
+                                if base_model.ctx_size != best_base_ctx:
+                                    base_model.ctx_size = best_base_ctx
+                                    updated_ctx += 1
+                                base_model.auto_ctx_failed = False
+                                base_model.auto_ctx_error = ""
+                                apply_ctx_probe_metrics(base_model, base_info)
+                                refresh_model_load_capabilities(base_model)
+                                save_catalog(args.catalog, catalog)
+                                paired_ctx = best_base_ctx
+                            else:
+                                # keep existing paired_ctx but record failure on master
+                                base_err = base_info.get("reason") if isinstance(base_info, dict) else base_status
+                                base_model.auto_ctx_failed = True
+                                base_model.auto_ctx_error = str(base_err)
+                                refresh_model_load_capabilities(base_model)
+                                save_catalog(args.catalog, catalog)
                         if model.ctx_size != paired_ctx:
                             model.ctx_size = paired_ctx
                             updated_ctx += 1
@@ -7189,6 +7766,19 @@ def update_config(args, progress_callback = None):
         )
     return "updated"
 
+def _http_error_snippet(exc: requests.HTTPError) -> str:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return str(exc)
+    try:
+        text = (response.text or "").strip()
+    except Exception:
+        text = ""
+    if len(text) > 500:
+        text = text[:500] + "..."
+    return text or str(exc)
+
+
 def warmup_model(model_id, host, port, timeout=600):
     host = _normalize_client_host(host)
     url = f"http://{host}:{port}/v1/chat/completions"
@@ -7227,6 +7817,24 @@ def warmup_model(model_id, host, port, timeout=600):
         loader.stop()
 
 
+def _print_warmup_failure(model_id: str, host: str, port: int, exc: Exception) -> None:
+    print(f"\n\033[31;1mCould not warm model {model_id} through http://{host}:{port}.\033[0m")
+    if isinstance(exc, requests.HTTPError):
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        print(f"HTTP status: {status_code or 'unknown'}")
+        snippet = _http_error_snippet(exc)
+        if snippet:
+            print(f"Response: {snippet}")
+        if status_code in {502, 503, 504}:
+            print("The proxy was reachable but the backend llama-server failed to load or respond.")
+    else:
+        print(f"{type(exc).__name__}: {exc}")
+    print(f"Recent request log: {DEFAULT_REQUESTS_LOG_PATH}")
+    print("Run for details:")
+    print("  llamacpp-superserver requests-log --lines 80")
+    print(f"  sudo journalctl -u {SWAP_SERVICE_NAME} -u {MANAGER_SERVICE_NAME} -n 120 --no-pager")
+
+
 def flush_stdin_buffer() -> None:
     try:
         if sys.stdin.isatty():
@@ -7235,7 +7843,12 @@ def flush_stdin_buffer() -> None:
         pass
 
 def start_chat(model_id, host, port):
-    warmup_model(model_id, host, port)
+    host = _normalize_client_host(host)
+    try:
+        warmup_model(model_id, host, port)
+    except Exception as exc:
+        _print_warmup_failure(model_id, host, port, exc)
+        return 1
     flush_stdin_buffer()
     print(f"\n\033[35;1m--- Chat: {model_id} ---\033[0m\nCommands: /exit, /clear, /help\n")
     url = f"http://{host}:{port}/v1/chat/completions"
@@ -7391,6 +8004,17 @@ def daemon_mode(args):
                     mock_args.server_config = Path(getattr(mock_args, "server_config", DEFAULT_SERVER_CONFIG_PATH))
                     model_id = remove_model(mock_args, progress_callback=send_event)
                     send_event({"type": "done", "model_id": model_id})
+                elif req["command"] == "unload":
+                    mock_args = argparse.Namespace(**req["args"])
+                    mock_args.catalog = Path(mock_args.catalog)
+                    mock_args.config = Path(mock_args.config)
+                    mock_args.llama_server = Path(mock_args.llama_server)
+                    mock_args.server_config = Path(getattr(mock_args, "server_config", DEFAULT_SERVER_CONFIG_PATH))
+                    result = unload_models(mock_args)
+                    send_event({"type": "done", "result": result})
+                elif req["command"] == "auto-performance":
+                    from llamacpp_stack.auto_perf_runner import prepare_auto_perf_daemon_handler
+                    prepare_auto_perf_daemon_handler(req, send_event, sock_in)
             except Exception as e:
                 try:
                     conn.sendall((json.dumps({"type": "error", "message": str(e)}) + "\n").encode())
@@ -7741,6 +8365,18 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
         help="Keep local model files on disk.",
     )
 
+    p_unload = sub.add_parser(
+        "unload",
+        help="Unload model(s) from llama-swap",
+        description="Rewrite llama-swap config to unload one model or all currently published models without deleting files.",
+    )
+    subparsers["unload"] = p_unload
+    p_unload.set_defaults(func=unload_models)
+    p_unload.add_argument("repo", nargs="*", help="Model id, HF repo[:QUANT], or 'all' to unload everything")
+    p_unload.add_argument("-hf", "--hf", nargs="+", help="HF repo list")
+    p_unload.add_argument("--file")
+    p_unload.add_argument("--model-id")
+
     p_update = sub.add_parser(
         "update",
         help="Refresh model configuration",
@@ -7790,7 +8426,6 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
         help="Overwrite CFG_CTX values from GGUF metadata",
     )
     p_update.add_argument("--defer-publish", action="store_true", help="Do not try to publish the model to the proxy immediately")
-
     p_validate = sub.add_parser(
         "validate",
         help="Probe/validate model ctx",
@@ -7829,6 +8464,14 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     subparsers["daemon"] = p_daemon
     p_daemon.set_defaults(func=daemon_mode)
     
+    p_debug = sub.add_parser(
+        "debug",
+        help="Start debug mode",
+        description="Start the debug API in the foreground. The session is only available while this command is running.",
+    )
+    subparsers["debug"] = p_debug
+    p_debug.set_defaults(func=debug_mode)
+    
     for p in [p_run]:
         p.add_argument("repo", nargs="?", help="HF repo[:QUANT]")
         # Allow specifying multiple HF entries. Use append+nargs so the
@@ -7855,6 +8498,31 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
         p.add_argument("--hf-token")
         p.add_argument("--description")
 
+    p_auto_perf = sub.add_parser(
+        "auto-performance",
+        help="Run auto-tuner to find best performance config",
+        description="Uses Optuna to find the best hardware configuration for a given model.",
+    )
+    subparsers["auto-performance"] = p_auto_perf
+    
+    def run_auto_perf_lazy(args):
+        from llamacpp_stack.auto_perf_runner import run_auto_perf_command
+        return run_auto_perf_command(args)
+        
+    p_auto_perf.set_defaults(func=run_auto_perf_lazy)
+    p_auto_perf.add_argument("repo", nargs="?", help="Model id or HF repo[:QUANT]")
+    p_auto_perf.add_argument("-hf", "--hf", help="HF repo")
+    p_auto_perf.add_argument("--file")
+    p_auto_perf.add_argument("--model-id")
+    p_auto_perf.add_argument("--mock", action="store_true", help="Run with mock metrics without starting the real server")
+    p_auto_perf.add_argument("--server-api", action="store_true", help="Benchmark server-side concurrent request handling instead of a single raw completion")
+    p_auto_perf.add_argument("--load-concurrency", type=int, default=1, help="Concurrent requests to issue during server-api benchmarking")
+    p_auto_perf.add_argument("--load-requests", type=int, default=1, help="Total requests to issue during server-api benchmarking")
+    p_auto_perf.add_argument("--trials-per-phase", type=int, default=None, help="Number of trials to execute per optimization phase (default: auto-calculated based on GPU count)")
+    p_auto_perf.add_argument("--unattended", action="store_true", help="Non-interactive tuning: answer Yes to tuning/refresh/phase prompts, but keep final catalog overwrite as No")
+    p_auto_perf.add_argument("--assume-no", action="store_true", help="Non-interactive mode: answer 'No' to all follow-up prompts")
+    p_auto_perf.add_argument("--no-prompt", action="store_true", help="Alias of --assume-no")
+
     p_list = sub.add_parser(
         "list",
         help="List configured models",
@@ -7868,6 +8536,7 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
         description="Alias of list for compatibility with process-style listing.",
     )
     subparsers["ps"] = p_ps
+    p_ps.set_defaults(func=list_models)
     p_ps.set_defaults(func=list_models)
     p_requests = sub.add_parser(
         "requests",

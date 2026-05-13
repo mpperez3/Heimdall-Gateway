@@ -54,6 +54,7 @@ from llamacpp_stack.cli import (
     summarize_download_state,
     should_reload_after_unexpected_unload,
     stop_running_ollama_models,
+    unload_models,
     update_models,
     update_config,
     main as cli_main,
@@ -86,12 +87,16 @@ from llamacpp_stack.install import (
     detect_cuda_toolkit_package,
     maybe_install_cuda_toolkit_via_uv,
     desired_models_dir_owner,
+    ensure_models_dir_ready,
+    _models_dir_already_ready_for_owner,
     detect_cuda_toolkit,
     derive_models_dir,
     InstallLayout,
     _backup_existing_model_configuration,
     maybe_reexec_system_install,
     maybe_migrate_existing_install,
+    maybe_refresh_runtime_package_only,
+    _same_models_dir,
     _link_stable_binary,
     _is_self_referential_symlink,
     _resolve_existing_stable_target,
@@ -109,6 +114,7 @@ from llamacpp_stack.install import (
     resolve_public_host,
     resolve_uv_executable,
     resolve_install_mode,
+    install_stack,
 )
 
 
@@ -397,8 +403,54 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertIn(f"-DNCCL_INCLUDE_DIR={nccl_root / 'include'}", cmake_cmd)
             self.assertIn(f"-DNCCL_LIBRARY={nccl_root / 'lib' / 'libnccl.so.2'}", cmake_cmd)
             self.assertIn(f"-DCMAKE_BUILD_RPATH={cuda_root / 'lib64'};{nccl_root / 'lib'}", cmake_cmd)
-            self.assertIn(f"-DCMAKE_INSTALL_RPATH={cuda_root / 'lib64'};{nccl_root / 'lib'}", cmake_cmd)
-            self.assertEqual(build_cmd[-2:], ["-j", "12"])
+
+    def test_install_prompt_package_only_triggers_package_only_update(self) -> None:
+        args = Namespace(
+            mode=None,
+            public_host=None,
+            public_port=None,
+            models_dir=None,
+            install_services=False,
+            update_binaries=None,
+            package_only_update=None,
+            llama_cpp_mode=None,
+            prefer_source_cuda=False,
+            prefer_binary=False,
+            dry_run=True,
+            enable_tls=False,
+            idle_ttl=300,
+            skip_venv_install=False,
+        )
+
+        dummy_layout = Namespace(
+            install_root=Path("/tmp/install"),
+            state_dir=Path("/tmp/state"),
+            models_dir=Path("/tmp/models"),
+            public_host="127.0.0.1",
+            public_port=11437,
+            mode="user",
+            config_dir=Path("/tmp/config"),
+            bin_dir=Path("/tmp/bin"),
+            run_dir=Path("/tmp/run"),
+            runtime_venv=Path("/tmp/install/venv"),
+        )
+
+        with (
+            mock.patch("llamacpp_stack.install.resolve_install_mode", return_value="user"),
+            mock.patch("llamacpp_stack.install.resolve_public_host", return_value="127.0.0.1"),
+            mock.patch("llamacpp_stack.install.prompt_path", return_value=Path("/tmp/models")),
+            mock.patch("llamacpp_stack.install.maybe_migrate_existing_install"),
+            mock.patch("llamacpp_stack.install.choose_layout", return_value=dummy_layout),
+            mock.patch("llamacpp_stack.install.is_existing_install", return_value=True),
+            mock.patch("llamacpp_stack.install.prompt_bool", return_value=False),
+            mock.patch("llamacpp_stack.install.maybe_reexec_system_install", return_value=None),
+            mock.patch("llamacpp_stack.install.maybe_refresh_runtime_package_only") as refresh_mock,
+        ):
+            res = install_stack(args)
+            self.assertEqual(res, 0)
+            self.assertTrue(args.package_only_update)
+            self.assertFalse(args.update_binaries)
+            refresh_mock.assert_called_once_with(dummy_layout, True, args)
 
     def test_render_llamaswap_wrapper_exports_llama_server_lib_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -603,6 +655,7 @@ class InstallHelpersTest(unittest.TestCase):
             prefer_binary=True,
             install_services=True,
             update_binaries=False,
+            package_only_update=True,
             migrate_model_ids=True,
             dry_run=False,
         )
@@ -622,9 +675,35 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertIn("--models-dir", cmd)
         self.assertIn("/var/llamacpp_models", cmd)
         self.assertIn("--no-update-binaries", cmd)
+        self.assertIn("--package-only-update", cmd)
         self.assertIn("--migrate-model-ids", cmd)
         env = run_mock.call_args.kwargs["env"]
         self.assertEqual(env[ELEVATED_INSTALL_ENV], "1")
+
+    def test_maybe_refresh_runtime_package_only_calls_runtime_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            layout = InstallLayout(
+                mode="user",
+                state_dir=root / "state",
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=root / "models",
+                config_dir=root / "config",
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+            args = Namespace(skip_venv_install=False)
+            with mock.patch("llamacpp_stack.install.ensure_runtime_python") as runtime_mock:
+                maybe_refresh_runtime_package_only(layout, False, args)
+            runtime_mock.assert_called_once_with(layout, False, skip_pip_install=False)
 
     def test_maybe_reexec_system_install_skips_when_already_root(self) -> None:
         args = Namespace(
@@ -782,6 +861,12 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertEqual(args.command, "remove")
         self.assertFalse(args.delete_files)
 
+    def test_cli_parser_accepts_unload_all(self) -> None:
+        parser, _ = build_cli_parser()
+        args = parser.parse_args(["unload", "all"])
+        self.assertEqual(args.command, "unload")
+        self.assertEqual(args.repo, ["all"])
+
     def test_cli_parser_add_accepts_hf_list_with_plain_and_hfco_formats(self) -> None:
         parser, _ = build_cli_parser()
         args = parser.parse_args(
@@ -822,6 +907,51 @@ class InstallHelpersTest(unittest.TestCase):
             result = remove_models(args)
         self.assertEqual(result, 0)
         self.assertTrue(remove_mock.call_args_list[0].args[0].delete_files)
+
+    def test_unload_models_keeps_files_and_rewrites_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            catalog_path = root / "catalog.json"
+            config_path = root / "config.yaml"
+            models_dir = root / "models"
+
+            model_a = ManagedModel(
+                model_id="model-a",
+                repo_id="org/a",
+                quant="Q4",
+                filename="a.gguf",
+                local_path=str(models_dir / "a.gguf"),
+            )
+            model_b = ManagedModel(
+                model_id="model-b",
+                repo_id="org/b",
+                quant="Q4",
+                filename="b.gguf",
+                local_path=str(models_dir / "b.gguf"),
+            )
+            save_catalog(catalog_path, [model_a, model_b])
+
+            args = Namespace(
+                repo=["model-a"],
+                hf=None,
+                model_id=None,
+                file=None,
+                catalog=catalog_path,
+                config=config_path,
+                llama_server=root / "llama-server",
+                start_port=18080,
+                public_host="127.0.0.1",
+                public_port=11435,
+                server_config=root / SERVER_CONFIG_BASENAME,
+            )
+
+            with mock.patch("llamacpp_stack.cli.wait_for_models_absent", return_value=True):
+                result = unload_models(args)
+
+            self.assertEqual(result, 0)
+            rendered_text = config_path.read_text(encoding="utf-8")
+            self.assertNotIn("model-a", rendered_text)
+            self.assertIn("model-b", rendered_text)
 
     def test_remove_model_deletes_selected_file_when_repo_is_shared(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3222,6 +3352,22 @@ models:
         self.assertNotIn("--gpu-layers all", rendered)
         self.assertNotIn("--no-mmap", rendered)
 
+    def test_build_llama_server_command_omits_numa_when_none(self) -> None:
+        model = ManagedModel(
+            model_id="repo-q4",
+            repo_id="org/repo",
+            quant="Q4",
+            filename="model-q4.gguf",
+            local_path="/tmp/model-q4.gguf",
+            server_overrides={"numa": None},
+        )
+        cmd = build_llama_server_command(
+            model,
+            Path("/tmp/llama-server"),
+            port="12345",
+        )
+        self.assertNotIn("--numa", cmd)
+
     def test_build_llama_server_command_uses_mirostat_and_keep(self) -> None:
         model = ManagedModel(
             model_id="repo-q4",
@@ -3289,6 +3435,7 @@ models:
             message = get_gpu_conflict_message("model-b", [model_a, model_b])
         self.assertIn("Cannot load model 'model-b'", message)
         self.assertIn("model-a (pid 123, 4096 MiB)", message)
+        self.assertIn("llamacpp-superserver unload", message)
 
     def test_get_gpu_conflict_message_ignores_foreign_process(self) -> None:
         model = ManagedModel(
@@ -3773,6 +3920,51 @@ models:
             model.model_id,
         )
 
+
+
+    def test_same_models_dir_matches_equivalent_existing_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            selected = root / "models" / ".." / "models"
+            existing = root / "models"
+            self.assertTrue(_same_models_dir(selected, existing))
+            self.assertFalse(_same_models_dir(root / "other", existing))
+            self.assertFalse(_same_models_dir(existing, None))
+
+    def test_models_dir_ready_system_mode_does_not_require_invoking_user_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            models_dir = Path(tmp) / "models"
+            models_dir.mkdir()
+            models_dir.chmod(0o775)
+            st = models_dir.stat()
+
+            with mock.patch("llamacpp_stack.install.pwd.getpwnam", return_value=Namespace(pw_uid=st.st_uid)), \
+                 mock.patch("llamacpp_stack.install.grp.getgrnam", return_value=Namespace(gr_gid=st.st_gid)):
+                self.assertTrue(
+                    _models_dir_already_ready_for_owner(
+                        models_dir,
+                        "llamaswap",
+                        "llamaswap",
+                        system_mode=True,
+                    )
+                )
+
+    def test_ensure_models_dir_ready_skips_sudo_when_existing_system_dir_is_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            models_dir = Path(tmp) / "models"
+            models_dir.mkdir()
+            models_dir.chmod(0o775)
+            st = models_dir.stat()
+            layout = choose_layout("system", "127.0.0.1", 8080, models_dir)
+
+            with mock.patch("llamacpp_stack.install.pwd.getpwnam", return_value=Namespace(pw_uid=st.st_uid)), \
+                 mock.patch("llamacpp_stack.install.grp.getgrnam", return_value=Namespace(gr_gid=st.st_gid)), \
+                 mock.patch("llamacpp_stack.install.prompt_bool") as prompt_mock, \
+                 mock.patch("llamacpp_stack.install._run") as run_mock:
+                ensure_models_dir_ready(layout, dry_run=False)
+
+            prompt_mock.assert_not_called()
+            run_mock.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

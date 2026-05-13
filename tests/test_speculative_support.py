@@ -126,10 +126,117 @@ class SpeculativeSupportTest(unittest.TestCase):
         cmd = build_llama_server_command(model, Path("/bin/llama-server"), port="12345")
         joined = " ".join(cmd)
         self.assertIn("--model-draft /models/foo-draft.gguf", joined)
-        self.assertIn("--spec-draft-n-max 12", joined)
+        self.assertIn("--draft-max 12", joined)
         # draft_min and draft_p_min were removed in newer llama.cpp API
         self.assertNotIn("--draft-min", joined)
         self.assertNotIn("--draft-p-min", joined)
+
+    def test_real_llama_server_help_is_used_for_optional_flags_when_available(self) -> None:
+        project_real_server = Path(__file__).resolve().parents[1] / "llama.cpp-source" / "build-cuda" / "bin" / "llama-server"
+        real_server = project_real_server if project_real_server.exists() else cli.DEFAULT_LLAMA_SERVER
+        if not real_server.exists():
+            self.skipTest(f"real llama-server not found at {real_server}")
+
+        cli._SERVER_FLAG_CACHE.clear()
+        flags = cli.get_server_supported_flags(real_server)
+        self.assertIn("--model-draft", flags)
+
+        model = ManagedModel(
+            model_id="foo-spec",
+            repo_id="org/foo",
+            quant=None,
+            filename="foo.gguf",
+            local_path="/models/foo.gguf",
+            ctx_size=8192,
+            server_overrides={
+                "model_draft": "/models/foo-draft.gguf",
+                "draft": 12,
+                "cache_idle_slots": False,
+                "kv_unified": False,
+            },
+        )
+        cmd = build_llama_server_command(model, real_server, port="12345")
+        joined = " ".join(cmd)
+        self.assertIn("--model-draft /models/foo-draft.gguf", joined)
+        self.assertRegex(joined, r"--(?:spec-draft-n-max|draft(?:-max|-n)?) 12")
+        if "--no-cache-idle-slots" not in flags:
+            self.assertNotIn("--no-cache-idle-slots", joined)
+
+    def test_speculative_phase_keeps_baseline_draft_defaults_when_best_core_is_phase1_only(self) -> None:
+        from llamacpp_stack.auto_performance import _merge_speculative_phase_defaults
+
+        baseline = {
+            "model_draft": "/models/draft.gguf",
+            "draft": 16,
+            "ctx_size_draft": 2048,
+            "n_gpu_layers_draft": "auto",
+            "cache_type_k_draft": "q8_0",
+            "cache_type_v_draft": "q8_0",
+            "split_mode": "layer",
+            "batch_size": 2048,
+            "ubatch_size": 512,
+        }
+        phase1_best = {
+            "gpu_set_idx": 8,
+            "split_mode": "row",
+            "batch_size": 4096,
+            "model_draft": None,
+            "draft": 0,
+        }
+
+        merged = _merge_speculative_phase_defaults(phase1_best, baseline)
+
+        self.assertEqual(merged["model_draft"], "/models/draft.gguf")
+        self.assertEqual(merged["draft"], 16)
+        self.assertEqual(merged["ctx_size_draft"], 2048)
+        self.assertEqual(merged["n_gpu_layers_draft"], "auto")
+        self.assertEqual(merged["cache_type_k_draft"], "q8_0")
+        self.assertEqual(merged["cache_type_v_draft"], "q8_0")
+        self.assertEqual(merged["gpu_set_idx"], 8)
+        self.assertEqual(merged["split_mode"], "row")
+        self.assertEqual(merged["batch_size"], 4096)
+
+    def test_speculative_phase1_test_core_config_is_fixed_to_baseline(self) -> None:
+        from llamacpp_stack.auto_performance import _speculative_phase1_test_core_config
+
+        baseline = {
+            "gpu_set_idx": 8,
+            "split_mode": "layer",
+            "tensor_split_strategy": "skewed",
+            "n_gpu_layers": "auto",
+            "fit": "on",
+            "fit_target": 4096,
+            "batch_size": 512,
+            "ubatch_size": 256,
+            "flash_attn": "off",
+            "kv_offload": True,
+            "numa": "distribute",
+            "op_offload": False,
+            "threads": 16,
+            "threads_batch": 8,
+            "model_draft": "/models/draft.gguf",
+            "draft": 16,
+            "ctx_size_draft": 2048,
+            "n_gpu_layers_draft": "auto",
+            "cache_type_k": "q8_0",
+            "cache_type_v": "q8_0",
+            "cache_type_k_draft": "q8_0",
+            "cache_type_v_draft": "q8_0",
+        }
+
+        config = _speculative_phase1_test_core_config(baseline)
+
+        self.assertEqual(config["gpu_set_idx"], 8)
+        self.assertEqual(config["split_mode"], "layer")
+        self.assertEqual(config["tensor_split_strategy"], "skewed")
+        self.assertEqual(config["n_gpu_layers"], "auto")
+        self.assertEqual(config["fit_target"], 4096)
+        self.assertEqual(config["batch_size"], 512)
+        self.assertEqual(config["ubatch_size"], 256)
+        self.assertEqual(config["model_draft"], "/models/draft.gguf")
+        self.assertEqual(config["draft"], 16)
+        self.assertEqual(config["ctx_size_draft"], 2048)
+        self.assertEqual(config["n_gpu_layers_draft"], "auto")
 
     def test_run_parser_accepts_repeated_hf_for_speculative_pair(self) -> None:
         parser, _ = build_cli_parser()

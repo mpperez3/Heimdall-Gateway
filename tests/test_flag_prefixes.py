@@ -1,3 +1,7 @@
+import pytest
+
+from pathlib import Path
+
 from llamacpp_stack import cli
 
 
@@ -23,3 +27,202 @@ def test_normalize_server_overrides_preserves_fit_keys():
     assert normalized["fit"] is False
     assert normalized["fitt"] == 1024
     assert normalized["fitc"] == 131072
+
+
+def test_normalize_server_overrides_drops_tuning_internals_but_keeps_draft_layers_sentinel():
+    normalized = cli.normalize_server_overrides({
+        "gpu_set": [0, 1],
+        "gpu_set_idx": 12,
+        "main_gpu_raw": 2,
+        "tensor_split_strategy": "equal",
+        "ts_strategy": "even",
+        "n_gpu_layers_draft": "all",
+        "batch_size": 256,
+    })
+
+    assert normalized == {"n_gpu_layers_draft": "all", "batch_size": 256}
+
+
+def test_normalize_server_overrides_drops_auto_performance_metadata():
+    normalized = cli.normalize_server_overrides({
+        "auto_performance": {"baselines": {"CORE:abc": {"score": 1.0}}},
+        "batch_size": 512,
+    })
+    assert "auto_performance" not in normalized
+    assert normalized["batch_size"] == 512
+
+
+def test_load_catalog_preserves_auto_performance_metadata(tmp_path):
+    catalog = tmp_path / "catalog.json"
+    cache_payload = {"baselines": {"CORE:abc": {"role": "baseline", "score": 1.0}}}
+    catalog.write_text(
+        __import__("json").dumps([
+            {
+                "model_id": "m",
+                "repo_id": "org/repo",
+                "quant": None,
+                "filename": "model.gguf",
+                "local_path": "/tmp/model.gguf",
+                "server_overrides": {
+                    "auto_performance": cache_payload,
+                    "batch_size": 512,
+                },
+            }
+        ]),
+        encoding="utf-8",
+    )
+
+    loaded = cli.load_catalog(catalog)
+
+    assert loaded[0].server_overrides["auto_performance"] == cache_payload
+    assert "auto_performance" in __import__("json").loads(catalog.read_text("utf-8"))[0]["server_overrides"]
+
+
+def test_normalize_server_overrides_omits_numa_when_none():
+    # numa=None should be omitted from normalized overrides (not converted to string "None")
+    normalized = cli.normalize_server_overrides({"numa": None})
+    assert "numa" not in normalized
+    
+    # numa with string "none" should also be omitted
+    normalized = cli.normalize_server_overrides({"numa": "none"})
+    assert "numa" not in normalized
+    
+    # numa with valid values should be preserved
+    normalized = cli.normalize_server_overrides({"numa": "distribute"})
+    assert normalized["numa"] == "distribute"
+    
+    normalized = cli.normalize_server_overrides({"numa": "isolate"})
+    assert normalized["numa"] == "isolate"
+
+
+def test_normalize_server_overrides_preserves_direct_io_and_emits_flags():
+    normalized = cli.normalize_server_overrides({"direct_io": True})
+    assert normalized["direct_io"] is True
+
+    model = cli.ManagedModel(
+        model_id="test",
+        repo_id="test/repo",
+        quant=None,
+        filename="model.gguf",
+        local_path="/tmp/model.gguf",
+        mmproj_filename=None,
+        mmproj_path=None,
+        load_capabilities=[],
+        aliases=[],
+        ctx_size=4096,
+        n_gpu_layers=999,
+        tensor_split="1",
+        host="127.0.0.1",
+        jinja=False,
+        description="",
+        speculative=False,
+        spec_variant_of=None,
+        spec_meta={},
+        auto_ctx_failed=False,
+        auto_ctx_error="",
+        ctx_probe_read_s=None,
+        ctx_probe_tokens_s=None,
+        ctx_probe_totals_s=None,
+        ctx_probe_latency_ms=None,
+        ctx_probe_speed_tps=None,
+        ctx_probe_kv_gb=None,
+        ctx_probe_prompt_tokens=None,
+        server_overrides={"direct_io": True},
+    )
+
+    cmd = cli.build_llama_server_command(model, Path("/tmp/llama-server"), port="18090")
+    assert "--direct-io" in cmd
+
+
+def test_build_llama_server_command_clamps_unsupported_ubatch_size():
+    model = cli.ManagedModel(
+        model_id="test",
+        repo_id="test/repo",
+        quant=None,
+        filename="model.gguf",
+        local_path="/tmp/model.gguf",
+        mmproj_filename=None,
+        mmproj_path=None,
+        load_capabilities=[],
+        aliases=[],
+        ctx_size=4096,
+        n_gpu_layers=999,
+        tensor_split="1",
+        host="127.0.0.1",
+        jinja=False,
+        description="",
+        speculative=False,
+        spec_variant_of=None,
+        spec_meta={},
+        auto_ctx_failed=False,
+        auto_ctx_error="",
+        ctx_probe_read_s=None,
+        ctx_probe_tokens_s=None,
+        ctx_probe_totals_s=None,
+        ctx_probe_latency_ms=None,
+        ctx_probe_speed_tps=None,
+        ctx_probe_kv_gb=None,
+        ctx_probe_prompt_tokens=None,
+        server_overrides={
+            "batch_size": 1024,
+            "ubatch_size": 128,
+        },
+    )
+
+    cmd = cli.build_llama_server_command(model, Path("/tmp/llama-server"), port="18090")
+    ubatch_idx = cmd.index("--ubatch-size")
+    assert cmd[ubatch_idx + 1] == "256"
+
+
+def test_emitted_flags_are_supported_by_local_llama_server():
+    server_bin = Path("/home/martin/Developments/PycharmProjects/OpenCodeAutoModelDiscover/projects/llamacpp-stack/llama.cpp-source/build/bin/llama-server")
+    if not server_bin.exists():
+        pytest.skip("local llama-server binary not available")
+
+    supported = cli.get_server_supported_flags(server_bin)
+    assert supported, "expected help output to expose supported flags"
+
+    model = cli.ManagedModel(
+        model_id="test",
+        repo_id="test/repo",
+        quant=None,
+        filename="model.gguf",
+        local_path="/tmp/model.gguf",
+        mmproj_filename=None,
+        mmproj_path=None,
+        load_capabilities=[],
+        aliases=[],
+        ctx_size=4096,
+        n_gpu_layers=999,
+        tensor_split="1,1",
+        host="127.0.0.1",
+        jinja=False,
+        description="",
+        speculative=False,
+        spec_variant_of=None,
+        spec_meta={},
+        auto_ctx_failed=False,
+        auto_ctx_error="",
+        ctx_probe_read_s=None,
+        ctx_probe_tokens_s=None,
+        ctx_probe_totals_s=None,
+        ctx_probe_latency_ms=None,
+        ctx_probe_speed_tps=None,
+        ctx_probe_kv_gb=None,
+        ctx_probe_prompt_tokens=None,
+        server_overrides={
+            "direct_io": True,
+            "fit": False,
+            "batch_size": 1024,
+            "ubatch_size": 256,
+            "cache_type_k": "q8_0",
+            "cache_type_v": "q8_0",
+            "kv_offload": True,
+            "op_offload": False,
+            "cont_batching": True,
+        },
+    )
+
+    cmd = cli.build_llama_server_command(model, server_bin, port="18090")
+    emitted_flags = {token for token in cmd if token.startswith("-")}
+    assert emitted_flags <= supported

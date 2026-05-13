@@ -16,3 +16,13 @@ uv.lock
 /.venv/
 /.venv-vllm-test/
 /build_test_outputs/
+
+# Local model storage (do not commit downloaded/cached models)
+/.ollama/
+/models/
+/test_models/
+/ollama/
+/.cache/
+
+# Compiled llama.cpp (source and build artifacts)
+/llama.cpp-source/
