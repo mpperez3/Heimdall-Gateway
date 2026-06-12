@@ -29,14 +29,17 @@ from llamacpp_stack.cli import (
     build_llama_server_command,
     build_help_epilog,
     build_cli_parser,
+    choose_gguf_file,
     ensure_model_available,
     get_gpu_conflict_message,
     list_models,
     list_running_ollama_models,
     load_catalog,
     normalize_server_overrides,
+    normalize_server_config_payload,
     model_files_ready,
     model_name_aliases,
+    migrate_server_config,
     normalize_model_id,
     resolve_catalog_model,
     persist_server_config,
@@ -46,9 +49,16 @@ from llamacpp_stack.cli import (
     remove_models,
     render_models_table,
     render_llamaswap_config,
+    iter_catalog_with_replicas,
+    resolve_request_affinity_key,
+    select_replica_for_request,
+    sync_replica_runtime_state,
+    replica_model_id,
+    REPLICA_ROUTER_STATE,
     resolve_llama_server_defaults,
     resolve_idle_ttl,
     resolve_catalog_model_name,
+    restart_service_to_free_vram,
     service_commands_for_mode,
     save_catalog,
     summarize_download_state,
@@ -71,7 +81,6 @@ from llamacpp_stack.install import (
     determine_build_jobs,
     build_parser,
     build_llama_cpp_from_source,
-    _patch_llama_cpp_grammar_repetition_threshold,
     choose_default_swap_port,
     choose_layout,
     choose_llamacpp_linux_asset,
@@ -82,6 +91,8 @@ from llamacpp_stack.install import (
     locate_nccl_root_for_python,
     maybe_install_nccl_via_uv,
     normalize_python_cuda_layout,
+    resolve_llama_cpp_mode,
+    resolve_llama_cpp_ref,
     sync_cuda_runtime,
     sync_nccl_runtime,
     detect_cuda_toolkit_package,
@@ -154,6 +165,27 @@ class InstallHelpersTest(unittest.TestCase):
             file_path.write_bytes(b"1234")
             completed, partial, missing = summarize_download_state(model_dir, ["model.gguf", "missing.gguf"], {"model.gguf": 8})
             self.assertEqual((completed, partial, missing), (0, 1, 1))
+
+    def test_choose_gguf_file_matches_bf16_sharded_subdirectory(self) -> None:
+        sibling_names = [
+            "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+            "BF16/Qwen3.6-35B-A3B-BF16-00001-of-00002.gguf",
+            "BF16/Qwen3.6-35B-A3B-BF16-00002-of-00002.gguf",
+        ]
+        api = mock.MagicMock()
+        api.model_info.return_value.siblings = [
+            mock.Mock(rfilename=name) for name in sibling_names
+        ]
+
+        selected = choose_gguf_file(
+            api,
+            "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+            "BF16",
+            None,
+            None,
+        )
+
+        self.assertEqual(selected, "BF16/Qwen3.6-35B-A3B-BF16-00001-of-00002.gguf")
 
     def test_download_hf_file_resumes_truncated_final_file_using_expected_size(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -341,19 +373,28 @@ class InstallHelpersTest(unittest.TestCase):
                 self.assertEqual(Path(os.environ["CUDACXX"]), nvcc.resolve())
                 self.assertTrue(os.environ["PATH"].startswith(str(nvcc.parent.resolve())))
 
-    def test_patch_llama_cpp_grammar_repetition_threshold_updates_define(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "llama.cpp-b9999"
-            grammar = root / "src" / "llama-grammar.cpp"
-            grammar.parent.mkdir(parents=True)
-            grammar.write_text(
-                "// test\n#define MAX_REPETITION_THRESHOLD 2000\n",
-                encoding="utf-8",
+    def test_resolve_llama_cpp_ref_prompts_for_specific_commit(self) -> None:
+        with (
+            mock.patch.dict("os.environ", {"LLAMACPP_LLAMA_CPP_REF_PROMPTED": ""}, clear=False),
+            mock.patch("sys.stdin.isatty", return_value=True),
+            mock.patch("builtins.input", side_effect=["2", "e8023568d05ffdb9d0ac65695c521ea7e72c6b75"]),
+        ):
+            os.environ.pop("LLAMACPP_LLAMA_CPP_REF_PROMPTED", None)
+            self.assertEqual(
+                resolve_llama_cpp_ref(None, "source"),
+                "e8023568d05ffdb9d0ac65695c521ea7e72c6b75",
             )
-            changed = _patch_llama_cpp_grammar_repetition_threshold(root, 2_000_000)
-            self.assertTrue(changed)
-            rendered = grammar.read_text(encoding="utf-8")
-            self.assertIn("#define MAX_REPETITION_THRESHOLD 2000000", rendered)
+
+    def test_resolve_llama_cpp_ref_latest_returns_empty_ref(self) -> None:
+        with (
+            mock.patch("sys.stdin.isatty", return_value=True),
+            mock.patch("builtins.input", return_value=""),
+        ):
+            self.assertEqual(resolve_llama_cpp_ref(None, "source"), "")
+
+    def test_resolve_llama_cpp_ref_uses_env_default(self) -> None:
+        with mock.patch.dict("os.environ", {"LLAMACPP_LLAMA_CPP_REF": "abc123"}, clear=False):
+            self.assertEqual(resolve_llama_cpp_ref(None, "source"), "abc123")
 
     def test_build_llama_cpp_from_source_passes_cuda_compiler(self) -> None:
         release = {"tag_name": "b9999"}
@@ -561,6 +602,25 @@ class InstallHelpersTest(unittest.TestCase):
         parser = build_parser()
         help_text = parser.format_help()
         self.assertIn("build from source", help_text.lower())
+
+    def test_resolve_llama_cpp_mode_prompts_source_ref_before_reexec(self) -> None:
+        with (
+            mock.patch.dict("os.environ", {}, clear=True),
+            mock.patch("sys.stdin.isatty", return_value=True),
+            mock.patch("builtins.input", side_effect=["1", "2", "e8023568"]),
+        ):
+            self.assertEqual(resolve_llama_cpp_mode(None), "source")
+            self.assertEqual(os.environ.get("LLAMACPP_LLAMA_CPP_REF"), "e8023568")
+
+    def test_resolve_llama_cpp_ref_does_not_reprompt_after_latest_choice(self) -> None:
+        with (
+            mock.patch.dict("os.environ", {}, clear=True),
+            mock.patch("sys.stdin.isatty", return_value=True),
+            mock.patch("builtins.input", side_effect=["1", "1"]) as input_mock,
+        ):
+            self.assertEqual(resolve_llama_cpp_mode(None), "source")
+            self.assertEqual(resolve_llama_cpp_ref(None, "source"), "")
+            self.assertEqual(input_mock.call_count, 2)
 
     def test_prompt_choice_renders_multiline_options(self) -> None:
         prompts: list[str] = []
@@ -1457,17 +1517,23 @@ class InstallHelpersTest(unittest.TestCase):
                 runtime_venv=root / "venv",
                 cuda_root=root / "cuda",
             )
+            def _failing_run(cmd, **kwargs):
+                if cmd == [str(layout.bin_dir / CLI_COMMAND), "update", "--auto"]:
+                    raise subprocess.CalledProcessError(1, cmd)
+                # allow config-migrate to pass
+
             with (
                 mock.patch("llamacpp_stack.install.prompt_bool", return_value=True),
                 mock.patch("llamacpp_stack.install.wait_for_manager_socket", return_value=True),
                 mock.patch("llamacpp_stack.install.sys.stdin.isatty", return_value=True),
                 mock.patch(
                     "llamacpp_stack.install._run",
-                    side_effect=subprocess.CalledProcessError(1, [str(layout.bin_dir / CLI_COMMAND), "update", "--auto"]),
+                    side_effect=_failing_run,
                 ) as run_mock,
             ):
                 maybe_rerun_auto_ctx(layout, install_services=True, dry_run=False, args=argparse.Namespace())
-            run_mock.assert_called_once_with([str(layout.bin_dir / CLI_COMMAND), "update", "--auto"])
+            run_mock.assert_any_call([str(layout.bin_dir / CLI_COMMAND), "update", "--auto"])
+            run_mock.assert_any_call([str(layout.bin_dir / CLI_COMMAND), "config-migrate"])
 
     def test_maybe_rerun_auto_ctx_sync_uses_preserve_ctx(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1512,7 +1578,8 @@ class InstallHelpersTest(unittest.TestCase):
                     args=argparse.Namespace(migrate_model_ids=False, rerun_auto_ctx=False),
                 )
 
-            run_mock.assert_called_once_with([str(layout.bin_dir / CLI_COMMAND), "update", "--preserve-ctx"])
+            run_mock.assert_any_call([str(layout.bin_dir / CLI_COMMAND), "update", "--preserve-ctx"])
+            run_mock.assert_any_call([str(layout.bin_dir / CLI_COMMAND), "config-migrate"])
 
     def test_maybe_rerun_auto_ctx_repairs_stale_server_config_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1581,7 +1648,9 @@ class InstallHelpersTest(unittest.TestCase):
             )
 
             payload = json.loads(server_config.read_text(encoding="utf-8"))
-            model_cfg = payload["models"]["qwen3-coder-next-ud-q5_k_xl"]
+            self.assertNotIn("models", payload)
+            catalog_payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+            model_cfg = catalog_payload[0]
             self.assertEqual(model_cfg["ctx_size"], 260096)
             self.assertEqual(model_cfg["n_gpu_layers"], 128)
 
@@ -1641,7 +1710,8 @@ class InstallHelpersTest(unittest.TestCase):
             )
             payload = json.loads(server_config.read_text(encoding="utf-8"))
             self.assertIn("_meta", payload)
-            self.assertIn("example", payload["_meta"])
+            self.assertNotIn("example", payload["_meta"])
+            self.assertIn("Active settings are top-level keys only", payload["_meta"]["note"])
 
     def test_maybe_rerun_auto_ctx_preserves_existing_llama_server_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1727,7 +1797,97 @@ class InstallHelpersTest(unittest.TestCase):
             )
 
             payload = json.loads(server_config.read_text(encoding="utf-8"))
-            self.assertEqual(payload["llama_server_defaults"], existing_defaults)
+            self.assertNotIn("models", payload)
+            defaults = payload["llama_server_defaults"]
+            self.assertEqual(defaults["tensor_split"], "0.94,1,1,1,1,1,0.94")
+            self.assertEqual(defaults["batch_size"], 3064)
+            self.assertEqual(defaults["ubatch_size"], 1024)
+            self.assertEqual(defaults["threads_batch"], 32)
+            self.assertEqual(defaults["fit_target"], 1536)
+            self.assertEqual(defaults["flash_attn"], "on")
+
+    def test_maybe_rerun_auto_ctx_migrates_legacy_conf_models_to_catalog_and_removes_them(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            models_dir.mkdir(parents=True)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True)
+            catalog_path = state_dir / "catalog.json"
+            catalog_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "model_id": "repo-q4",
+                            "repo_id": "org/repo",
+                            "quant": "Q4",
+                            "filename": "model-q4.gguf",
+                            "local_path": str(models_dir / "model-q4.gguf"),
+                        }
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config_dir = root / "config"
+            config_dir.mkdir(parents=True)
+            server_config = config_dir / SERVER_CONFIG_BASENAME
+            server_config.write_text(
+                json.dumps(
+                    {
+                        "idle_ttl": 300,
+                        "api_port": 11436,
+                        "llama_server_defaults": {},
+                        "models": {
+                            "repo-q4": {
+                                "ctx_size": 32768,
+                                "n_gpu_layers": 777,
+                                "tensor_split": "1,1,1",
+                                "aliases": ["legacy-alias"],
+                                "description": "legacy description",
+                            }
+                        },
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            layout = InstallLayout(
+                mode="system",
+                state_dir=state_dir,
+                bin_dir=root / "bin",
+                install_root=root / "install",
+                models_dir=models_dir,
+                config_dir=config_dir,
+                run_dir=root / "run",
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=root / "venv",
+                cuda_root=root / "cuda",
+            )
+
+            maybe_rerun_auto_ctx(
+                layout,
+                install_services=False,
+                dry_run=False,
+                args=argparse.Namespace(migrate_model_ids=False, rerun_auto_ctx=False),
+            )
+
+            payload = json.loads(server_config.read_text(encoding="utf-8"))
+            self.assertNotIn("models", payload)
+            catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            model = catalog[0]
+            self.assertEqual(model["ctx_size"], 32768)
+            self.assertEqual(model["n_gpu_layers"], 777)
+            self.assertEqual(model["tensor_split"], "1,1,1")
+            self.assertIn("legacy-alias", model["aliases"])
+            self.assertEqual(model["description"], "legacy description")
 
     def test_maybe_rerun_auto_ctx_merges_missing_llama_server_defaults_without_overwriting(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1804,11 +1964,12 @@ class InstallHelpersTest(unittest.TestCase):
             llama_defaults = payload["llama_server_defaults"]
             self.assertEqual(llama_defaults["keep"], 256)
             self.assertEqual(llama_defaults["cache_type_k"], "q4_0")
-            self.assertEqual(llama_defaults["batch-size"], 2048)
-            self.assertEqual(llama_defaults["ubatch-size"], 1024)
-            self.assertEqual(llama_defaults["threads-batch"], 16)
-            self.assertEqual(llama_defaults["fit-target"], 1536)
-            self.assertTrue(llama_defaults["flash-attn"])
+            self.assertNotIn("models", payload)
+            self.assertEqual(llama_defaults["batch_size"], 2048)
+            self.assertEqual(llama_defaults["ubatch_size"], 1024)
+            self.assertEqual(llama_defaults["threads_batch"], 8)
+            self.assertEqual(llama_defaults["fit_target"], 16384)
+            self.assertTrue(llama_defaults["flash_attn"])
 
     def test_maybe_rerun_auto_ctx_refreshes_server_config_after_auto_update(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1870,6 +2031,8 @@ class InstallHelpersTest(unittest.TestCase):
             )
 
             def _fake_run(cmd, **kwargs):
+                if cmd == [str(layout.bin_dir / CLI_COMMAND), "config-migrate"]:
+                    return
                 if cmd == [str(layout.bin_dir / CLI_COMMAND), "update", "--auto"]:
                     updated_catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
                     updated_catalog[0]["ctx_size"] = 260096
@@ -1889,7 +2052,8 @@ class InstallHelpersTest(unittest.TestCase):
                     args=argparse.Namespace(migrate_model_ids=False, rerun_auto_ctx=True),
                 )
 
-            run_mock.assert_called_once_with([str(layout.bin_dir / CLI_COMMAND), "update", "--auto"])
+            run_mock.assert_any_call([str(layout.bin_dir / CLI_COMMAND), "update", "--auto"])
+            run_mock.assert_any_call([str(layout.bin_dir / CLI_COMMAND), "config-migrate"])
 
         def test_maybe_rerun_auto_ctx_seeds_editable_llama_server_defaults_file(self) -> None:
             with tempfile.TemporaryDirectory() as tmp:
@@ -1968,7 +2132,9 @@ class InstallHelpersTest(unittest.TestCase):
                 self.assertEqual(llama_defaults["mirostat_ent"], 4.5)
                 self.assertEqual(llama_defaults["mirostat_lr"], 0.1)
             payload = json.loads(server_config.read_text(encoding="utf-8"))
-            model_cfg = payload["models"]["qwen3-coder-next-ud-q5_k_xl"]
+            self.assertNotIn("models", payload)
+            catalog_payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+            model_cfg = catalog_payload[0]
             self.assertEqual(model_cfg["ctx_size"], 260096)
             self.assertEqual(model_cfg["n_gpu_layers"], 128)
 
@@ -2569,6 +2735,343 @@ class InstallHelpersTest(unittest.TestCase):
             manager_mock.assert_called_once()
             self.assertEqual(result, "updated")
 
+    def test_unsupported_global_defaults_are_filtered_but_explicit_overrides_emit(self) -> None:
+        model = ManagedModel(
+            model_id="repo-q4",
+            repo_id="org/repo",
+            quant="Q4",
+            filename="model-q4.gguf",
+            local_path="/tmp/model-q4.gguf",
+            server_overrides={"parallel": 2},
+        )
+        with mock.patch("llamacpp_stack.cli.server_supports_flag", return_value=False):
+            rendered = " ".join(
+                build_llama_server_command(
+                    model,
+                    Path("/opt/llama-server"),
+                    port="18080",
+                    server_defaults={"mul_mat_q": True, "grp_attn_n": 1},
+                )
+            )
+        self.assertIn("--parallel 2", rendered)
+        self.assertNotIn("--mul-mat-q", rendered)
+        self.assertNotIn("--grp-attn-n", rendered)
+
+    def test_server_override_tensor_split_is_migrated_to_model_field(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            catalog_path = root / "catalog.json"
+            catalog_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "model_id": "repo-q4",
+                            "repo_id": "org/repo",
+                            "quant": "Q4",
+                            "filename": "model-q4.gguf",
+                            "local_path": str(root / "model-q4.gguf"),
+                            "tensor_split": "1,1,1,1,1,1,1",
+                            "server_overrides": {"parallel": 2, "tensor_split": "1,1,1"},
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            model = load_catalog(catalog_path)[0]
+            rendered = " ".join(build_llama_server_command(model, root / "llama-server", port="18080"))
+
+            self.assertEqual(model.tensor_split, "1,1,1")
+            self.assertEqual(model.server_overrides, {"parallel": 2})
+            self.assertIn("--tensor-split 1,1,1", rendered)
+            self.assertIn("--parallel 2", rendered)
+            saved = json.loads(catalog_path.read_text(encoding="utf-8"))[0]
+            self.assertEqual(saved["tensor_split"], "1,1,1")
+            self.assertNotIn("tensor_split", saved["server_overrides"])
+
+    def test_catalog_tensor_split_is_preserved_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            catalog_path = root / "catalog.json"
+            catalog_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "model_id": "repo-q4",
+                            "repo_id": "org/repo",
+                            "quant": "Q4",
+                            "filename": "model-q4.gguf",
+                            "local_path": str(root / "model-q4.gguf"),
+                            "tensor_split": "1,1,1",
+                            "parallel": 2,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=7):
+                model = load_catalog(catalog_path)[0]
+                rendered = " ".join(build_llama_server_command(model, root / "llama-server", port="18080"))
+
+            self.assertEqual(model.tensor_split, "1,1,1")
+            self.assertIn("--tensor-split 1,1,1", rendered)
+            self.assertIn("/usr/bin/env CUDA_VISIBLE_DEVICES=0,1,2", rendered)
+            self.assertIn("--parallel 2", rendered)
+            self.assertNotIn("--tensor-split 1,1,1,1,1,1,1", rendered)
+
+    def test_unknown_catalog_keys_become_llama_server_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            catalog_path = root / "catalog.json"
+            catalog_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "model_id": "repo-q4",
+                            "repo_id": "org/repo",
+                            "quant": "Q4",
+                            "filename": "model-q4.gguf",
+                            "local_path": str(root / "model-q4.gguf"),
+                            "parallel": 2,
+                            "example": None,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            model = load_catalog(catalog_path)[0]
+            self.assertEqual(model.server_overrides["parallel"], 2)
+            self.assertIsNone(model.server_overrides["example"])
+            rendered = " ".join(build_llama_server_command(model, root / "llama-server", port="18080"))
+            self.assertIn("--parallel 2", rendered)
+            self.assertIn("--example", rendered)
+
+    def test_server_config_payload_adds_replicas_and_canonicalizes_defaults(self) -> None:
+        payload = {
+            "idle_ttl": 600,
+            "api_port": 11435,
+            "llama_server_defaults": {
+                "batch-size": 4048,
+                "batch_size": 4096,
+                "threads-batch": 16,
+                "threads_batch": 8,
+                "flash-attn": True,
+                "flash_attn": True,
+                "n-gpu-layers": -1,
+                "grp_attn_n": 16,
+            },
+        }
+        normalized, changed = normalize_server_config_payload(payload)
+        self.assertTrue(changed)
+        self.assertIn("replicas", normalized)
+        self.assertEqual(normalized["replicas"]["enabled"], False)
+        self.assertNotIn("example", normalized["_meta"])
+        defaults = normalized["llama_server_defaults"]
+        self.assertEqual(defaults["batch_size"], 4096)
+        self.assertEqual(defaults["threads_batch"], 8)
+        self.assertEqual(defaults["n_gpu_layers"], -1)
+        self.assertIn("flash_attn", defaults)
+        self.assertNotIn("batch-size", defaults)
+        self.assertNotIn("threads-batch", defaults)
+        self.assertNotIn("flash-attn", defaults)
+        self.assertNotIn("n-gpu-layers", defaults)
+
+    def test_config_migrate_rewrites_old_metadata_and_adds_replicas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            server_config = Path(tmp) / SERVER_CONFIG_BASENAME
+            server_config.write_text(
+                json.dumps(
+                    {
+                        "idle_ttl": 600,
+                        "api_port": 11435,
+                        "llama_server_defaults": {
+                            "batch-size": 4048,
+                            "batch_size": 4096,
+                            "flash-attn": True,
+                            "n-gpu-layers": -1,
+                        },
+                        "_meta": {
+                            "purpose": "old",
+                            "example": {
+                                "idle_ttl": 300,
+                                "api_port": 11436,
+                                "llama_server_defaults": {"ctx_size": 65536},
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = Namespace(
+                server_config=server_config,
+                idle_ttl=None,
+                api_port=None,
+                api_ctx_factor=None,
+            )
+
+            self.assertEqual(migrate_server_config(args), 0)
+
+            payload = json.loads(server_config.read_text(encoding="utf-8"))
+            self.assertIn("replicas", payload)
+            self.assertEqual(payload["replicas"]["placement"], "exclusive_gpus")
+            self.assertNotIn("example", payload["_meta"])
+            defaults = payload["llama_server_defaults"]
+            self.assertEqual(defaults["batch_size"], 4096)
+            self.assertEqual(defaults["flash_attn"], True)
+            self.assertEqual(defaults["n_gpu_layers"], -1)
+            self.assertNotIn("batch-size", defaults)
+            self.assertNotIn("flash-attn", defaults)
+            self.assertNotIn("n-gpu-layers", defaults)
+
+    def test_update_config_migrates_server_config_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            catalog_path = root / "catalog.json"
+            config_path = root / "config.yaml"
+            server_config = root / SERVER_CONFIG_BASENAME
+            save_catalog(catalog_path, [ManagedModel("repo-q4", "org/repo", "Q4", "model.gguf", "/tmp/model.gguf")])
+            server_config.write_text(
+                json.dumps(
+                    {
+                        "idle_ttl": 600,
+                        "api_port": 11435,
+                        "llama_server_defaults": {
+                            "batch-size": 4048,
+                            "batch_size": 4096,
+                            "threads-batch": 16,
+                            "threads_batch": 8,
+                            "flash-attn": True,
+                            "flash_attn": True,
+                            "n-gpu-layers": -1,
+                        },
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            args = Namespace(
+                repo=None,
+                hf=None,
+                model_id=None,
+                file=None,
+                ctx_override=None,
+                auto_ctx=False,
+                preserve_ctx=False,
+                sync_gguf_ctx=False,
+                catalog=catalog_path,
+                config=config_path,
+                llama_server=root / "llama-server",
+                start_port=18080,
+                public_host="127.0.0.1",
+                public_port=11435,
+                idle_ttl=None,
+                api_port=None,
+                api_ctx_factor=None,
+                server_config=server_config,
+            )
+            response = mock.Mock(status_code=200)
+            response.json.return_value = {"data": []}
+            with (
+                mock.patch("llamacpp_stack.cli.time.sleep"),
+                mock.patch("llamacpp_stack.cli.requests.get", return_value=response),
+            ):
+                self.assertEqual(update_config(args), "updated")
+            payload = json.loads(server_config.read_text(encoding="utf-8"))
+            self.assertIn("replicas", payload)
+            defaults = payload["llama_server_defaults"]
+            self.assertEqual(defaults["batch_size"], 4096)
+            self.assertEqual(defaults["threads_batch"], 8)
+            self.assertEqual(defaults["flash_attn"], True)
+            self.assertEqual(defaults["n_gpu_layers"], -1)
+            self.assertNotIn("batch-size", defaults)
+            self.assertNotIn("threads-batch", defaults)
+            self.assertNotIn("flash-attn", defaults)
+            self.assertNotIn("n-gpu-layers", defaults)
+
+    def test_update_config_refuses_invalid_catalog_without_overwriting_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            catalog_path = root / "catalog.json"
+            config_path = root / "config.yaml"
+            catalog_path.write_text('[{"model_id": "broken", bad json]', encoding="utf-8")
+            config_path.write_text("sentinel: keep\n", encoding="utf-8")
+            args = Namespace(
+                repo=None,
+                hf=None,
+                model_id=None,
+                file=None,
+                ctx_override=None,
+                auto_ctx=False,
+                preserve_ctx=False,
+                sync_gguf_ctx=False,
+                catalog=catalog_path,
+                config=config_path,
+                llama_server=root / "llama-server",
+                start_port=18080,
+                public_host="127.0.0.1",
+                public_port=11435,
+                idle_ttl=10,
+                server_config=root / SERVER_CONFIG_BASENAME,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "Refusing to update from an invalid catalog"):
+                update_config(args)
+
+            self.assertEqual(catalog_path.read_text(encoding="utf-8"), '[{"model_id": "broken", bad json]')
+            self.assertEqual(config_path.read_text(encoding="utf-8"), "sentinel: keep\n")
+
+    def test_update_config_renders_parallel_override_from_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            catalog_path = root / "catalog.json"
+            config_path = root / "config.yaml"
+            save_catalog(
+                catalog_path,
+                [
+                    ManagedModel(
+                        model_id="repo-q4",
+                        repo_id="org/repo",
+                        quant="Q4",
+                        filename="model-q4.gguf",
+                        local_path=str(root / "models" / "model-q4.gguf"),
+                        server_overrides={"parallel": 2},
+                    )
+                ],
+            )
+            args = Namespace(
+                repo=None,
+                hf=None,
+                model_id=None,
+                file=None,
+                ctx_override=None,
+                auto_ctx=False,
+                preserve_ctx=False,
+                sync_gguf_ctx=False,
+                catalog=catalog_path,
+                config=config_path,
+                llama_server=root / "llama-server",
+                start_port=18080,
+                public_host="127.0.0.1",
+                public_port=11435,
+                idle_ttl=10,
+                server_config=root / SERVER_CONFIG_BASENAME,
+            )
+            response = mock.Mock(status_code=200)
+            response.json.return_value = {"data": []}
+
+            with (
+                mock.patch("llamacpp_stack.cli.time.sleep"),
+                mock.patch("llamacpp_stack.cli.requests.get", return_value=response),
+                mock.patch("llamacpp_stack.cli.server_supports_flag", return_value=True),
+            ):
+                result = update_config(args)
+
+            self.assertEqual(result, "updated")
+            rendered = config_path.read_text(encoding="utf-8")
+            self.assertIn("--parallel 2", rendered)
+
     def test_update_config_preserves_ctx_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2991,6 +3494,460 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertIn("ttl: 10", rendered_text)
             self.assertTrue(rendered_text.startswith("# llamacpp-superserver config.yaml"))
 
+
+    def test_global_replica_enabled_ignores_stale_per_model_disabled_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = Path(tmp) / "model.gguf"
+            model_path.write_bytes(b"x" * 1024)
+            model = ManagedModel(
+                "large",
+                "org/large",
+                "Q4",
+                "large.gguf",
+                str(model_path),
+                tensor_split="1,1",
+                server_overrides={"replicas": {"enabled": False}},
+            )
+            with mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=4):
+                entries = iter_catalog_with_replicas(
+                    [model],
+                    {"enabled": True, "max": "auto", "placement": "exclusive_gpus"},
+                )
+            replica_ids = [entry[0].model_id for entry in entries if entry[1] == "large"]
+            self.assertEqual(replica_ids, ["large__replica_0", "large__replica_1"])
+
+    def test_global_replica_config_generates_model_replicas_automatically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_path = root / "model.gguf"
+            model_path.write_bytes(b"x" * 1024)
+            model = ManagedModel(
+                model_id="repo-q4",
+                repo_id="org/repo",
+                quant="Q4",
+                filename="model.gguf",
+                local_path=str(model_path),
+                tensor_split="1,1,1",
+            )
+            global_replicas = {"enabled": True, "max": "auto", "placement": "exclusive_gpus"}
+            with mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=7):
+                entries = iter_catalog_with_replicas([model], global_replicas)
+            self.assertEqual([entry[0].model_id for entry in entries], ["repo-q4", "repo-q4__replica_0", "repo-q4__replica_1"])
+            self.assertEqual(entries[1][2], [0, 1, 2])
+            self.assertEqual(entries[2][2], [3, 4, 5])
+
+    def test_render_config_uses_global_replica_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_path = root / "model.gguf"
+            model_path.write_bytes(b"x" * 1024)
+            config_path = root / "config.yaml"
+            model = ManagedModel(
+                model_id="repo-q4",
+                repo_id="org/repo",
+                quant="Q4",
+                filename="model.gguf",
+                local_path=str(model_path),
+                tensor_split="1,1,1",
+            )
+            with mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=7):
+                render_llamaswap_config(
+                    [model],
+                    config_path,
+                    root / "llama-server",
+                    18080,
+                    idle_ttl=10,
+                    replica_defaults={"enabled": True, "max": "auto", "placement": "exclusive_gpus"},
+                )
+            rendered = config_path.read_text(encoding="utf-8")
+            self.assertIn("repo-q4__replica_0", rendered)
+            self.assertIn("repo-q4__replica_1", rendered)
+            self.assertIn("CUDA_VISIBLE_DEVICES=0,1,2", rendered)
+            self.assertIn("CUDA_VISIBLE_DEVICES=3,4,5", rendered)
+
+    def test_render_config_generates_internal_replicas_with_cuda_visible_devices(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_path = root / "model.gguf"
+            model_path.write_bytes(b"x" * 1024)
+            config_path = root / "config.yaml"
+            model = ManagedModel(
+                model_id="repo-q4",
+                repo_id="org/repo",
+                quant="Q4",
+                filename="model.gguf",
+                local_path=str(model_path),
+                tensor_split="1,1",
+                server_overrides={
+                    "replicas": {"enabled": True, "max": 2, "gpus_per_replica": 2},
+                },
+                aliases=["public-alias"],
+            )
+            with mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=4):
+                render_llamaswap_config([model], config_path, root / "llama-server", 18080, idle_ttl=10)
+
+            rendered = yaml.safe_load("\n".join(line for line in config_path.read_text(encoding="utf-8").splitlines() if not line.startswith("#")))
+            models = rendered["models"]
+            self.assertIn("repo-q4", models)
+            self.assertIn("repo-q4__replica_0", models)
+            self.assertIn("repo-q4__replica_1", models)
+            self.assertIn("/usr/bin/env CUDA_VISIBLE_DEVICES=0,1", models["repo-q4__replica_0"]["cmd"])
+            self.assertIn("/usr/bin/env CUDA_VISIBLE_DEVICES=2,3", models["repo-q4__replica_1"]["cmd"])
+            self.assertIn("--tensor-split 1,1", models["repo-q4__replica_0"]["cmd"])
+            self.assertIn("--device CUDA0,CUDA1", models["repo-q4__replica_0"]["cmd"])
+            self.assertNotIn("--tensor-split 1,1,1,1", models["repo-q4__replica_0"]["cmd"])
+            self.assertNotIn("aliases", models["repo-q4__replica_0"])
+            self.assertEqual(models["repo-q4"]["aliases"], ["public-alias"])
+            matrix = rendered["matrix"]
+            vars_map = matrix["vars"]
+            self.assertTrue(vars_map)
+            replica_vars = {model_id: var_id for var_id, model_id in vars_map.items() if model_id.startswith("repo-q4__replica_")}
+            self.assertIn("repo-q4__replica_0", replica_vars)
+            self.assertIn("repo-q4__replica_1", replica_vars)
+            sets = matrix["sets"]
+            packables = sets.get("packables", "")
+            self.assertIn(replica_vars["repo-q4__replica_0"], packables.split(" & "))
+            self.assertIn(replica_vars["repo-q4__replica_1"], packables.split(" & "))
+            self.assertNotIn("repo-q4__replica_0", packables)
+            self.assertIn(replica_vars["repo-q4__replica_0"], matrix["evict_costs"])
+
+
+    def test_replica_tensor_split_is_local_to_visible_devices_on_many_gpu_host(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_path = root / "model.gguf"
+            model_path.write_bytes(b"x" * 1024)
+            config_path = root / "config.yaml"
+            model = ManagedModel(
+                model_id="seven-gpu-model",
+                repo_id="org/repo",
+                quant="Q4",
+                filename="model.gguf",
+                local_path=str(model_path),
+                tensor_split="1,1,1,1,1,1,1",
+                server_overrides={"replicas": {"enabled": True, "max": 1, "gpus_per_replica": 2}},
+            )
+            with mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=7):
+                render_llamaswap_config([model], config_path, root / "llama-server", 18080, idle_ttl=10)
+            rendered = yaml.safe_load("\n".join(line for line in config_path.read_text(encoding="utf-8").splitlines() if not line.startswith("#")))
+            cmd = rendered["models"]["seven-gpu-model__replica_0"]["cmd"]
+            self.assertIn("/usr/bin/env CUDA_VISIBLE_DEVICES=0,1", cmd)
+            self.assertIn("--tensor-split 1,1", cmd)
+            self.assertIn("--device CUDA0,CUDA1", cmd)
+            self.assertNotIn("--tensor-split 1,1,1,1,1,1,1", cmd)
+            self.assertIn("--main-gpu 0", cmd)
+
+
+    def test_base_model_with_short_tensor_split_emits_device_limit(self) -> None:
+        model = ManagedModel(
+            model_id="two-of-seven",
+            repo_id="org/repo",
+            quant="Q4",
+            filename="model.gguf",
+            local_path="/tmp/model.gguf",
+            tensor_split="1,1",
+        )
+        with mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=7):
+            cmd = build_llama_server_command(model, Path("/opt/llama-server"), port="18080")
+        rendered = " ".join(cmd)
+        self.assertIn("/usr/bin/env CUDA_VISIBLE_DEVICES=0,1", rendered)
+        self.assertIn("--tensor-split 1,1", rendered)
+        self.assertIn("--device CUDA0,CUDA1", rendered)
+
+    def test_tensor_split_is_enforced_even_when_detected_gpu_count_matches_parts(self) -> None:
+        model = ManagedModel(
+            model_id="three-gpu-model",
+            repo_id="org/repo",
+            quant="Q4",
+            filename="model.gguf",
+            local_path="/tmp/model.gguf",
+            tensor_split="1,1,1",
+        )
+        with mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=3):
+            cmd = build_llama_server_command(model, Path("/opt/llama-server"), port="18080")
+        rendered = " ".join(cmd)
+        self.assertIn("/usr/bin/env CUDA_VISIBLE_DEVICES=0,1,2", rendered)
+        self.assertIn("--tensor-split 1,1,1", rendered)
+        self.assertIn("--device CUDA0,CUDA1,CUDA2", rendered)
+
+    def test_server_defaults_tensor_split_does_not_override_model_placement(self) -> None:
+        model = ManagedModel(
+            model_id="two-of-seven",
+            repo_id="org/repo",
+            quant="Q4",
+            filename="model.gguf",
+            local_path="/tmp/model.gguf",
+            tensor_split="1,1",
+        )
+        with mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=7):
+            cmd = build_llama_server_command(
+                model,
+                Path("/opt/llama-server"),
+                port="18080",
+                server_defaults={"tensor_split": "1,1,1,1,1,1,1"},
+            )
+        rendered = " ".join(cmd)
+        self.assertIn("/usr/bin/env CUDA_VISIBLE_DEVICES=0,1", rendered)
+        self.assertIn("--tensor-split 1,1", rendered)
+        self.assertIn("--device CUDA0,CUDA1", rendered)
+        self.assertNotIn("--tensor-split 1,1,1,1,1,1,1", rendered)
+
+    def test_affinity_key_uses_codex_thread_and_opencode_agent(self) -> None:
+        payload = {"model": "repo-q4", "messages": [{"role": "user", "content": "hello"}]}
+        codex_key = resolve_request_affinity_key("repo-q4", payload, {"thread-id": "thread-a", "session-id": "session-a"})
+        agent_a = resolve_request_affinity_key("repo-q4", payload, {"Helicone-Session-Id": "sess", "x-agent-id": "agent-a"})
+        agent_b = resolve_request_affinity_key("repo-q4", payload, {"Helicone-Session-Id": "sess", "x-agent-id": "agent-b"})
+        self.assertIn("thread-a", codex_key)
+        self.assertNotEqual(agent_a, agent_b)
+
+
+    def test_select_replica_enabled_with_missing_route_falls_back_to_base(self) -> None:
+        REPLICA_ROUTER_STATE.records.clear()
+        REPLICA_ROUTER_STATE.affinity.clear()
+        model = ManagedModel(
+            model_id="repo-q4",
+            repo_id="org/repo",
+            quant="Q4",
+            filename="model.gguf",
+            local_path="/tmp/model.gguf",
+            server_overrides={"replicas": {"enabled": True, "max": 1, "gpus_per_replica": 1}},
+        )
+        with (
+            mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=1),
+            mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value=set()),
+            mock.patch("llamacpp_stack.cli._query_gpu_memory_snapshot_cached", return_value={}),
+        ):
+            selected, _, is_replica = select_replica_for_request(model, {"messages": [{"role": "user", "content": "a"}]}, {"thread-id": "t"})
+        self.assertFalse(is_replica)
+        self.assertEqual(selected, "repo-q4")
+
+    def test_select_replica_falls_back_to_base_when_enabled_routes_blacklisted(self) -> None:
+        REPLICA_ROUTER_STATE.records.clear()
+        REPLICA_ROUTER_STATE.affinity.clear()
+        model = ManagedModel(
+            model_id="repo-q4",
+            repo_id="org/repo",
+            quant="Q4",
+            filename="model.gguf",
+            local_path="/tmp/model.gguf",
+            server_overrides={"replicas": {"enabled": True, "max": 1, "gpus_per_replica": 1}},
+        )
+        with (
+            mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=1),
+            mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value={"repo-q4__replica_0"}),
+            mock.patch("llamacpp_stack.cli._query_gpu_memory_snapshot_cached", return_value={}),
+        ):
+            select_replica_for_request(model, {"messages": [{"role": "user", "content": "prime"}]}, {"thread-id": "prime"})
+            REPLICA_ROUTER_STATE.records["repo-q4__replica_0"].blacklist_until = time.monotonic() + 60
+            selected, _, is_replica = select_replica_for_request(model, {"messages": [{"role": "user", "content": "next"}]}, {"thread-id": "next"})
+        self.assertFalse(is_replica)
+        self.assertEqual(selected, "repo-q4")
+
+    def test_select_replica_uses_ready_empty_then_sticky(self) -> None:
+        REPLICA_ROUTER_STATE.records.clear()
+        REPLICA_ROUTER_STATE.affinity.clear()
+        model = ManagedModel(
+            model_id="repo-q4",
+            repo_id="org/repo",
+            quant="Q4",
+            filename="model.gguf",
+            local_path="/tmp/model.gguf",
+            server_overrides={"replicas": {"enabled": True, "max": 2, "gpus_per_replica": 1}},
+        )
+        with (
+            mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=2),
+            mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value={"repo-q4__replica_0"}),
+        ):
+            selected, affinity, is_replica = select_replica_for_request(model, {"messages": [{"role": "user", "content": "a"}]}, {"thread-id": "t1"})
+            selected_again, _, _ = select_replica_for_request(model, {"messages": [{"role": "user", "content": "b"}]}, {"thread-id": "t1"})
+        self.assertTrue(is_replica)
+        self.assertEqual(selected, "repo-q4__replica_0")
+        self.assertEqual(selected_again, selected)
+        self.assertIn("t1", affinity)
+
+
+    def test_select_replica_scales_new_affinity_to_cold_before_ready_empty_when_fits(self) -> None:
+        REPLICA_ROUTER_STATE.records.clear()
+        REPLICA_ROUTER_STATE.affinity.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = Path(tmp) / "small.gguf"
+            model_path.write_bytes(b"x" * 1024 * 1024)
+            model = ManagedModel(
+                model_id="small",
+                repo_id="org/small",
+                quant="Q4",
+                filename="small.gguf",
+                local_path=str(model_path),
+                server_overrides={"replicas": {"enabled": True, "max": 2, "gpus_per_replica": 1, "safety_vram_mib": 1}},
+            )
+            with (
+                mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=2),
+                mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value={"small__replica_0", "small__replica_1"}),
+                mock.patch("llamacpp_stack.cli._query_gpu_memory_snapshot_cached", return_value={0: {"free_mib": 10000, "total_mib": 10000}, 1: {"free_mib": 10000, "total_mib": 10000}}),
+            ):
+                selected0, _, _ = select_replica_for_request(model, {"messages": [{"role": "user", "content": "prime"}]}, {"thread-id": "prime"})
+                self.assertEqual(selected0, "small__replica_0")
+                REPLICA_ROUTER_STATE.records["small__replica_0"].status = "ready"
+                selected, _, is_replica = select_replica_for_request(model, {"messages": [{"role": "user", "content": "new conversation"}]}, {"thread-id": "new"})
+        self.assertTrue(is_replica)
+        self.assertEqual(selected, "small__replica_1")
+
+    def test_select_replica_uses_previous_response_id_mapping(self) -> None:
+        REPLICA_ROUTER_STATE.records.clear()
+        REPLICA_ROUTER_STATE.affinity.clear()
+        REPLICA_ROUTER_STATE.response_to_replica.clear()
+        model = ManagedModel(
+            model_id="repo-q4",
+            repo_id="org/repo",
+            quant="Q4",
+            filename="model.gguf",
+            local_path="/tmp/model.gguf",
+            server_overrides={"replicas": {"enabled": True, "max": 2, "gpus_per_replica": 1}},
+        )
+        REPLICA_ROUTER_STATE.bind_response("resp_123", "repo-q4__replica_1")
+        with (
+            mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=2),
+            mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value={"repo-q4__replica_0", "repo-q4__replica_1"}),
+        ):
+            selected, _, is_replica = select_replica_for_request(model, {"previous_response_id": "resp_123", "messages": [{"role": "user", "content": "continue"}]}, {})
+        self.assertTrue(is_replica)
+        self.assertEqual(selected, "repo-q4__replica_1")
+
+    def test_sync_replica_runtime_state_maps_ports_to_actual_gpu_memory(self) -> None:
+        REPLICA_ROUTER_STATE.records.clear()
+        REPLICA_ROUTER_STATE.affinity.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.yaml"
+            config_path.write_text(
+                "startPort: 18080\n"
+                "models:\n"
+                "  base:\n"
+                "    cmd: base\n"
+                "  base__replica_0:\n"
+                "    cmd: r0\n"
+                "  base__replica_1:\n"
+                "    cmd: r1\n",
+                encoding="utf-8",
+            )
+            model = ManagedModel(
+                model_id="base",
+                repo_id="org/base",
+                quant="Q4",
+                filename="base.gguf",
+                local_path=str(root / "base.gguf"),
+                tensor_split="1,1,1",
+                server_overrides={"replicas": {"enabled": True, "max": 2, "gpus_per_replica": 3}},
+            )
+            with (
+                mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=7),
+                mock.patch("llamacpp_stack.cli.get_llama_server_processes", return_value=[{"pid": 1234, "port": 18082, "model_path": str(root / "base.gguf"), "cmdline": "llama-server --port 18082"}]),
+                mock.patch("llamacpp_stack.cli.get_gpu_process_memory_by_pid", return_value={1234: {3: 11000.0, 4: 11200.0, 5: 10900.0}}),
+            ):
+                sync_replica_runtime_state([model], config_path)
+
+            rec0 = REPLICA_ROUTER_STATE.records["base__replica_0"]
+            rec1 = REPLICA_ROUTER_STATE.records["base__replica_1"]
+            self.assertIsNone(rec0.pid)
+            self.assertEqual(rec1.pid, 1234)
+            self.assertEqual(rec1.port, 18082)
+            self.assertEqual(rec1.status, "ready")
+            self.assertEqual(rec1.gpu_actual_mib, {3: 11000.0, 4: 11200.0, 5: 10900.0})
+            self.assertEqual(rec1.actual_mib, 33100.0)
+
+    def test_multi_gpu_replica_placement_uses_per_gpu_memory_estimate(self) -> None:
+        REPLICA_ROUTER_STATE.records.clear()
+        REPLICA_ROUTER_STATE.affinity.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = Path(tmp) / "large.gguf"
+            # 21 GiB-like model: total process estimate is larger than a single
+            # 24 GiB GPU with safety, but a 3-way tensor split should fit.
+            with model_path.open("wb") as f:
+                f.truncate(21 * 1024 * 1024 * 1024)
+            model = ManagedModel(
+                model_id="large",
+                repo_id="org/large",
+                quant="Q4",
+                filename="large.gguf",
+                local_path=str(model_path),
+                tensor_split="1,1,1",
+                server_overrides={"replicas": {"enabled": True, "max": 2, "gpus_per_replica": 3, "safety_vram_mib": 2048}},
+            )
+            with (
+                mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=7),
+                mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value={"large__replica_0", "large__replica_1"}),
+                mock.patch("llamacpp_stack.cli._query_gpu_memory_snapshot_cached", return_value={i: {"free_mib": 24000, "total_mib": 24576} for i in range(7)}),
+            ):
+                selected0, _, _ = select_replica_for_request(model, {"messages": [{"role": "user", "content": "prime"}]}, {"thread-id": "prime"})
+                self.assertEqual(selected0, "large__replica_0")
+                REPLICA_ROUTER_STATE.records["large__replica_0"].status = "ready"
+                selected, _, is_replica = select_replica_for_request(model, {"messages": [{"role": "user", "content": "new"}]}, {"thread-id": "new"})
+        self.assertTrue(is_replica)
+        self.assertEqual(selected, "large__replica_1")
+
+    def test_select_replica_starts_cold_when_capacity_fits_else_least_loaded(self) -> None:
+        REPLICA_ROUTER_STATE.records.clear()
+        REPLICA_ROUTER_STATE.affinity.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = Path(tmp) / "small.gguf"
+            model_path.write_bytes(b"x" * 1024 * 1024)
+            model = ManagedModel(
+                model_id="small",
+                repo_id="org/small",
+                quant="Q4",
+                filename="small.gguf",
+                local_path=str(model_path),
+                server_overrides={"replicas": {"enabled": True, "max": 2, "gpus_per_replica": 1, "safety_vram_mib": 1}},
+            )
+            with (
+                mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=2),
+                mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value={"small__replica_0", "small__replica_1"}),
+                mock.patch("llamacpp_stack.cli._query_gpu_memory_snapshot_cached", return_value={0: {"free_mib": 1000, "total_mib": 1000}, 1: {"free_mib": 10000, "total_mib": 10000}}),
+            ):
+                select_replica_for_request(model, {"messages": [{"role": "user", "content": "prime"}]}, {"thread-id": "prime"})
+                REPLICA_ROUTER_STATE.records["small__replica_0"].status = "ready"
+                REPLICA_ROUTER_STATE.records["small__replica_0"].in_flight = 1
+                selected, _, _ = select_replica_for_request(model, {"messages": [{"role": "user", "content": "new"}]}, {"thread-id": "new"})
+            self.assertEqual(selected, "small__replica_1")
+
+            REPLICA_ROUTER_STATE.records.clear()
+            REPLICA_ROUTER_STATE.affinity.clear()
+            with (
+                mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=2),
+                mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value={"small__replica_0", "small__replica_1"}),
+                mock.patch("llamacpp_stack.cli._query_gpu_memory_snapshot_cached", return_value={}),
+            ):
+                # Prime records as loaded and assign different loads.
+                select_replica_for_request(model, {"messages": [{"role": "user", "content": "p"}]}, {"thread-id": "p"})
+                REPLICA_ROUTER_STATE.records["small__replica_0"].in_flight = 5
+                REPLICA_ROUTER_STATE.records["small__replica_1"].in_flight = 1
+                selected2, _, _ = select_replica_for_request(model, {"messages": [{"role": "user", "content": "q"}]}, {"thread-id": "q"})
+            self.assertEqual(selected2, "small__replica_1")
+
+    def test_pack_small_models_requires_opt_in(self) -> None:
+        REPLICA_ROUTER_STATE.records.clear()
+        REPLICA_ROUTER_STATE.affinity.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = Path(tmp) / "small.gguf"
+            model_path.write_bytes(b"x" * 1024 * 1024)
+            base = dict(enabled=True, max=2, gpus_per_replica=1, safety_vram_mib=1)
+            exclusive = ManagedModel("m", "o/m", "Q4", "small.gguf", str(model_path), server_overrides={"replicas": base})
+            packed = ManagedModel("p", "o/p", "Q4", "small.gguf", str(model_path), server_overrides={"replicas": {**base, "placement": "pack_small_models", "max_pack_fraction": 1.0}})
+            with (
+                mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=1),
+                mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value={"m__replica_0"}),
+            ):
+                self.assertEqual(replica_model_id("m", 0), select_replica_for_request(exclusive, {"messages": [{"role": "user", "content": "a"}]}, {"thread-id": "a"})[0])
+                REPLICA_ROUTER_STATE.records.clear(); REPLICA_ROUTER_STATE.affinity.clear()
+                with (
+                    mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value={"p__replica_0", "p__replica_1"}),
+                    mock.patch("llamacpp_stack.cli._query_gpu_memory_snapshot_cached", return_value={0: {"free_mib": 10000, "total_mib": 10000}}),
+                ):
+                    select_replica_for_request(packed, {"messages": [{"role": "user", "content": "prime"}]}, {"thread-id": "prime"})
+                    REPLICA_ROUTER_STATE.records["p__replica_0"].status = "ready"
+                    REPLICA_ROUTER_STATE.records["p__replica_0"].in_flight = 1
+                    self.assertEqual(replica_model_id("p", 1), select_replica_for_request(packed, {"messages": [{"role": "user", "content": "b"}]}, {"thread-id": "b"})[0])
+
     def test_persist_server_config_writes_metadata_header_block(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             server_config = Path(tmp) / SERVER_CONFIG_BASENAME
@@ -3106,7 +4063,7 @@ class InstallHelpersTest(unittest.TestCase):
                 )
 
                 refreshed = load_catalog(catalog_path)
-                self.assertEqual(refreshed[0].server_overrides, {})
+                self.assertEqual(refreshed[0].server_overrides, {"batch_size": 2048})
 
     def test_ensure_llama_server_defaults_file_prefers_bundle_without_copy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3731,6 +4688,46 @@ models:
         self.assertEqual(selected, 10240)
         self.assertEqual(info["first_failure"], 12288)
 
+    def test_choose_auto_ctx_sets_parallel_one_when_retrying_batch_memory_failure(self) -> None:
+        model = ManagedModel(
+            model_id="repo-q4",
+            repo_id="org/repo",
+            quant="Q4_K_M",
+            filename="model.gguf",
+            local_path="/tmp/model.gguf",
+            server_overrides={"batch_size": 2048, "ubatch_size": 1024, "parallel": 8},
+        )
+        messages: list[str] = []
+
+        def fake_probe(probed_model: ManagedModel, _server: Path, ctx: int):
+            if ctx == 8192:
+                return True, "ok", {}
+            if probed_model.server_overrides.get("parallel") == 1:
+                return True, "ok", {}
+            return False, "slot context shift exceeds the available context size", {}
+
+        with (
+            mock.patch("llamacpp_stack.cli.get_model_context_size", return_value=262144),
+            mock.patch("llamacpp_stack.cli._query_gpu_free_memory_mib", return_value={0: 24576.0}),
+            mock.patch("llamacpp_stack.cli._parse_probe_trace_metrics", return_value=mock.Mock()),
+            mock.patch("llamacpp_stack.cli._estimate_ctx_ceiling", return_value=8192),
+            mock.patch("llamacpp_stack.cli.probe_model_ctx", side_effect=fake_probe) as probe_mock,
+        ):
+            selected, status, info = choose_auto_ctx(
+                model,
+                Path("/tmp/llama-server"),
+                progress_callback=messages.append,
+            )
+
+        self.assertEqual([call.args[2] for call in probe_mock.call_args_list], [8192, 262144, 262144])
+        self.assertEqual(selected, 262144)
+        self.assertEqual(status, "selected")
+        self.assertEqual(info["selected_ctx"], 262144)
+        self.assertEqual(model.server_overrides["batch_size"], 512)
+        self.assertEqual(model.server_overrides["ubatch_size"], 256)
+        self.assertEqual(model.server_overrides["parallel"], 1)
+        self.assertTrue(any("parallel=1" in message["message"] for message in messages))
+
     def test_build_openai_model_payload_exposes_ctx_probe_metrics_with_nc_defaults(self) -> None:
         model = ManagedModel(
             model_id="repo-q4",
@@ -3881,6 +4878,38 @@ models:
         self.assertIn("hf.co/Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M", aliases)
         self.assertIn("Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M", aliases)
 
+    def test_restart_service_to_free_vram_uses_user_systemctl_when_not_root(self) -> None:
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with (
+            mock.patch("llamacpp_stack.cli.os.geteuid", return_value=1000),
+            mock.patch("llamacpp_stack.cli.subprocess.run", side_effect=fake_run),
+            mock.patch("llamacpp_stack.cli.time.sleep"),
+        ):
+            self.assertTrue(restart_service_to_free_vram("llamacpp-superserver-swap.service"))
+
+        self.assertEqual(calls[0][:3], ["systemctl", "--user", "restart"])
+
+    def test_restart_service_to_free_vram_uses_system_systemctl_when_root(self) -> None:
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with (
+            mock.patch("llamacpp_stack.cli.os.geteuid", return_value=0),
+            mock.patch("llamacpp_stack.cli.subprocess.run", side_effect=fake_run),
+            mock.patch("llamacpp_stack.cli.time.sleep"),
+        ):
+            self.assertTrue(restart_service_to_free_vram("llamacpp-superserver-swap.service"))
+
+        self.assertEqual(calls[0][:2], ["systemctl", "restart"])
+
     def test_resolve_catalog_model_name_accepts_filename_and_repo_alias_variants(self) -> None:
         model = ManagedModel(
             model_id="qwen2-5-7b-instruct-q4-k-m",
@@ -3919,6 +4948,24 @@ models:
             resolve_catalog_model_name("hf.co/Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M", catalog),
             model.model_id,
         )
+
+    def test_resolve_catalog_model_name_accepts_precision_suffix_aliases(self) -> None:
+        model = ManagedModel(
+            model_id="qwen3.6-35b-a3b-ud-q4_k_m",
+            repo_id="unsloth/Qwen3.6-35B-A3B-GGUF",
+            quant="UD-Q4_K_M",
+            filename="Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+            local_path="/tmp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+        )
+        catalog = [model]
+
+        for requested in (
+            "qwen3.6-35b-a3b-ud-q4_k_m-bf16",
+            "qwen3.6-35b-a3b-ud-q4_k_m:BF16",
+            "qwen3.6-35b-a3b-ud-q4_k_m.fp16",
+            "llamacpp_rig_cpp/qwen3.6-35b-a3b-ud-q4_k_m-bf16",
+        ):
+            self.assertEqual(resolve_catalog_model_name(requested, catalog), model.model_id)
 
 
 

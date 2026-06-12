@@ -45,8 +45,9 @@ LEGACY_ENV_BASENAME = "llamacpp-stack.env"
 LLAMA_CPP_MODES = ("native", "prebuilt", "source")
 BACKEND_OPTIONS = ("llama.cpp", "vllm-beta")  # Beta: vLLM as alternative backend
 ELEVATED_INSTALL_ENV = "LLAMACPP_INSTALL_ELEVATED"
-DEFAULT_GRAMMAR_MAX_REPETITION_THRESHOLD = 2_000_000
-GRAMMAR_MAX_REPETITION_THRESHOLD_ENV = "LLAMACPP_GRAMMAR_MAX_REPETITION_THRESHOLD"
+DISABLE_AGGRESSIVE_CUDA_ENV = "LLAMACPP_DISABLE_AGGRESSIVE_CUDA"
+LLAMA_CPP_REF_ENV = "LLAMACPP_LLAMA_CPP_REF"
+LLAMA_CPP_REF_PROMPTED_ENV = "LLAMACPP_LLAMA_CPP_REF_PROMPTED"
 
 CONFIG_YAML_HEADER = textwrap.dedent(
     """\
@@ -76,40 +77,71 @@ ENV_FILE_HEADER = textwrap.dedent(
 )
 
 
+def _default_global_replicas_config() -> dict[str, object]:
+    return {
+        "enabled": False,
+        "max": "auto",
+        "placement": "exclusive_gpus",
+        "safety_vram_mib": 2048,
+    }
+
+
+def _normalize_llama_server_defaults_payload(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, object] = {}
+    for raw_key, raw_val in value.items():
+        key = str(raw_key).strip().lower().replace("-", "_")
+        if key == "gpu_layers":
+            key = "n_gpu_layers"
+        if not key:
+            continue
+        if key == "speculative_defaults" and isinstance(raw_val, dict):
+            normalized[key] = _normalize_llama_server_defaults_payload(raw_val)
+        else:
+            normalized[key] = raw_val
+    return normalized
+
+
+def _normalize_server_config_payload(payload: dict[str, object]) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        payload = {}
+    result = dict(payload)
+    # Legacy UI/per-model metadata belongs in catalog.json, not the global
+    # conf.json. The import/migration path below moves useful values before
+    # calling this normalizer, then strips the legacy block.
+    result.pop("models", None)
+    result["llama_server_defaults"] = _normalize_llama_server_defaults_payload(result.get("llama_server_defaults"))
+    replicas = _default_global_replicas_config()
+    raw_replicas = result.get("replicas")
+    if isinstance(raw_replicas, dict):
+        replicas.update(raw_replicas)
+    placement = str(replicas.get("placement") or "exclusive_gpus").strip().lower().replace("-", "_")
+    if placement not in {"exclusive_gpus", "pack_small_models"}:
+        placement = "exclusive_gpus"
+    replicas["placement"] = placement
+    result["replicas"] = replicas
+    result.setdefault("api_ctx_factor", 0.5)
+    _ensure_server_config_metadata(result)
+    return result
+
+
 def _ensure_server_config_metadata(payload: dict[str, object]) -> dict[str, object]:
     meta = payload.get("_meta")
     if not isinstance(meta, dict):
         meta = {}
-    meta.setdefault("purpose", "Global superserver settings consumed by CLI/services.")
-    meta.setdefault(
-        "note",
-        "Per-model context source of truth is catalog/config.yaml; this file stores global defaults and service-level settings.",
-    )
-    meta.setdefault(
-        "example",
-        {
-            "idle_ttl": 300,
-            "api_port": 11436,
-            "api_ctx_factor": 0.5,
-            "llama_server_defaults": {
-                "ctx_size": 65536,
-                "n_gpu_layers": 999,
-                "keep": 512,
-                "mirostat": 2,
-                "mirostat_ent": 4.5,
-                "mirostat_lr": 0.1,
-                "cache_type_k": "q8_0",
-                "cache_type_v": "q8_0",
-            },
-        },
-    )
-    meta.setdefault(
-        "service_restart_help",
-        {
-            "system_mode": f"sudo systemctl restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
-            "user_mode": f"systemctl --user restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
-        },
-    )
+    # _meta is documentation owned by superserver, not user configuration.
+    # Do not store example config values here: they look like duplicated active
+    # settings and can contradict the real top-level keys.
+    meta["purpose"] = "Global superserver settings consumed by CLI/services."
+    meta[
+        "note"
+    ] = "Active settings are top-level keys only. Model definitions live in catalog.json; config.yaml is generated for llama-swap."
+    meta.pop("example", None)
+    meta["service_restart_help"] = {
+        "system_mode": f"sudo systemctl restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
+        "user_mode": f"systemctl --user restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
+    }
     payload["_meta"] = meta
     return payload
 
@@ -284,7 +316,12 @@ def _build_cmake_args_from_config(
         # Add conditional CUDA-specific flags from configuration
         conditional_flags = config.get("conditional_flags", {})
         cuda_flags = ("GGML_CUDA_F16", "GGML_CUDA_FORCE_MMQ", "GGML_CUDA_GRAPHS", "GGML_CUDA_FA_ALL_QUANTS")
+        aggressive_cuda_disabled = os.environ.get(DISABLE_AGGRESSIVE_CUDA_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+        aggressive_cuda_flags = {"GGML_CUDA_FORCE_MMQ", "GGML_CUDA_GRAPHS", "GGML_CUDA_FA_ALL_QUANTS"}
         for flag in cuda_flags:
+            if aggressive_cuda_disabled and flag in aggressive_cuda_flags:
+                print(f"[*] Skipping aggressive CUDA build flag {flag} because {DISABLE_AGGRESSIVE_CUDA_ENV}=1")
+                continue
             if flag in conditional_flags:
                 flag_config = conditional_flags[flag]
                 # Handle both simple string values and complex config objects
@@ -445,7 +482,7 @@ def resolve_install_mode(requested_mode: str | None) -> str:
 def resolve_llama_cpp_mode(requested_mode: str | None) -> str:
     if requested_mode:
         return requested_mode
-    return prompt_choice(
+    selected = prompt_choice(
         "How should llama.cpp be installed?",
         [
             ("source", "build locally from source (best default, best GPU tuning)"),
@@ -454,6 +491,56 @@ def resolve_llama_cpp_mode(requested_mode: str | None) -> str:
         ],
         default="source",
     )
+    if (
+        selected == "source"
+        and sys.stdin.isatty()
+        and not os.environ.get(LLAMA_CPP_REF_ENV)
+        and not os.environ.get(LLAMA_CPP_REF_PROMPTED_ENV)
+    ):
+        source_choice = prompt_choice(
+            "Which llama.cpp source version should be built?",
+            [
+                ("latest", "use the latest llama.cpp release (default)"),
+                ("commit", "build a specific git commit/tag/ref"),
+            ],
+            default="latest",
+        )
+        os.environ[LLAMA_CPP_REF_PROMPTED_ENV] = "1"
+        if source_choice == "commit":
+            while True:
+                raw = input("llama.cpp commit/tag/ref: ").strip()
+                if raw:
+                    os.environ[LLAMA_CPP_REF_ENV] = raw
+                    break
+                print("Please enter a non-empty commit/tag/ref, or press Ctrl+C to cancel.")
+    return selected
+
+
+def resolve_llama_cpp_ref(requested_ref: str | None, llama_cpp_mode: str) -> str:
+    ref = str(requested_ref or os.environ.get(LLAMA_CPP_REF_ENV, "")).strip()
+    if ref:
+        return ref
+    if llama_cpp_mode != "source" or not sys.stdin.isatty():
+        return ""
+    if os.environ.get(LLAMA_CPP_REF_PROMPTED_ENV):
+        return ""
+    source_choice = prompt_choice(
+        "Which llama.cpp source version should be built?",
+        [
+            ("latest", "use the latest llama.cpp release (default)"),
+            ("commit", "build a specific git commit/tag/ref"),
+        ],
+        default="latest",
+    )
+    if source_choice != "commit":
+        os.environ[LLAMA_CPP_REF_PROMPTED_ENV] = "1"
+        return ""
+    os.environ[LLAMA_CPP_REF_PROMPTED_ENV] = "1"
+    while True:
+        raw = input("llama.cpp commit/tag/ref: ").strip()
+        if raw:
+            return raw
+        print("Please enter a non-empty commit/tag/ref, or press Ctrl+C to cancel.")
 
 
 def resolve_backend_choice(requested_backend: str | None) -> str:
@@ -739,6 +826,9 @@ def _args_to_cli(argv: argparse.Namespace, chosen_mode: str, chosen_llama_cpp_mo
         cmd.extend(["--public-host", str(argv.public_host)])
     if argv.public_port is not None:
         cmd.extend(["--public-port", str(argv.public_port)])
+    llama_cpp_ref = str(getattr(argv, "llama_cpp_ref", "") or "").strip()
+    if llama_cpp_ref:
+        cmd.extend(["--llama-cpp-ref", llama_cpp_ref])
     if argv.enable_tls:
         cmd.append("--enable-tls")
     cmd.append("--prefer-source-cuda" if argv.prefer_source_cuda else "--no-prefer-source-cuda")
@@ -1840,39 +1930,6 @@ def determine_build_jobs() -> int:
     return max(1, os.cpu_count() or 1)
 
 
-def _resolve_grammar_max_repetition_threshold() -> int:
-    raw = os.environ.get(GRAMMAR_MAX_REPETITION_THRESHOLD_ENV, "").strip()
-    if not raw:
-        return DEFAULT_GRAMMAR_MAX_REPETITION_THRESHOLD
-    try:
-        parsed = int(raw)
-    except Exception:
-        return DEFAULT_GRAMMAR_MAX_REPETITION_THRESHOLD
-    return parsed if parsed > 0 else DEFAULT_GRAMMAR_MAX_REPETITION_THRESHOLD
-
-
-def _patch_llama_cpp_grammar_repetition_threshold(source_root: Path, threshold: int) -> bool:
-    grammar_path = source_root / "src" / "llama-grammar.cpp"
-    if not grammar_path.exists():
-        return False
-    try:
-        current = grammar_path.read_text(encoding="utf-8")
-    except Exception:
-        return False
-    updated, replacements = re.subn(
-        r"(?m)^(\s*#define\s+MAX_REPETITION_THRESHOLD\s+)\d+\b",
-        rf"\g<1>{int(threshold)}",
-        current,
-        count=1,
-    )
-    if replacements <= 0:
-        return False
-    if updated == current:
-        return True
-    grammar_path.write_text(updated, encoding="utf-8")
-    return True
-
-
 def _run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True, env=env)
 
@@ -1996,7 +2053,11 @@ def build_llama_cpp_from_source(
     enable_cuda: bool,
 ) -> Path:
     tag = release["tag_name"]
-    source_url = f"https://github.com/{DEFAULT_LLAMA_CPP_REPO}/archive/refs/tags/{tag}.tar.gz"
+    source_kind = str(release.get("source_kind") or "tag")
+    if source_kind == "ref":
+        source_url = f"https://github.com/{DEFAULT_LLAMA_CPP_REPO}/archive/{tag}.tar.gz"
+    else:
+        source_url = f"https://github.com/{DEFAULT_LLAMA_CPP_REPO}/archive/refs/tags/{tag}.tar.gz"
     src_archive = install_root / f"{tag}.tar.gz"
     src_dir = install_root / f"llama.cpp-{tag}"
     build_dir = src_dir / "build"
@@ -2008,16 +2069,6 @@ def build_llama_cpp_from_source(
     if src_dir.exists():
         shutil.rmtree(src_dir)
     _extract_tarball(src_archive, install_root)
-    grammar_threshold = _resolve_grammar_max_repetition_threshold()
-    grammar_threshold_patched = _patch_llama_cpp_grammar_repetition_threshold(
-        src_dir,
-        grammar_threshold,
-    )
-    if grammar_threshold_patched:
-        print(f"[*] Ensured llama.cpp MAX_REPETITION_THRESHOLD is set to {grammar_threshold}.")
-    else:
-        print("[!] Warning: could not patch llama.cpp MAX_REPETITION_THRESHOLD (src/llama-grammar.cpp not found or unchanged pattern).")
-
     # Prepare auxiliary build parameters
     build_env = os.environ.copy()
     arch = detect_cuda_arch() if enable_cuda else None
@@ -2540,6 +2591,73 @@ def _effective_catalog_idle_ttl(layout: InstallLayout, server_config: dict[str, 
     return fallback
 
 
+def _merge_legacy_server_models_into_catalog(
+    catalog_raw: list[dict[str, object]],
+    legacy_models: object,
+    *,
+    effective_idle_ttl: int | None = None,
+) -> bool:
+    """Move useful legacy conf.json["models"] values into catalog entries.
+
+    conf.json is global-only now. Older installs stored per-model UI/config
+    snippets there; migrate conservative values before stripping that block.
+    """
+    if not isinstance(legacy_models, dict):
+        return False
+    changed = False
+    direct: dict[str, dict[str, object]] = {
+        str(item.get("model_id") or ""): item
+        for item in catalog_raw
+        if isinstance(item, dict) and str(item.get("model_id") or "")
+    }
+    for raw_model_id, raw_entry in legacy_models.items():
+        if not isinstance(raw_entry, dict):
+            continue
+        item = direct.get(str(raw_model_id))
+        if not isinstance(item, dict):
+            continue
+
+        for key in ("ctx_size", "n_gpu_layers", "tensor_split", "host", "description"):
+            val = raw_entry.get(key)
+            if val is None or val == "":
+                continue
+            if key not in item or item.get(key) in (None, "", 8192 if key == "ctx_size" else None):
+                item[key] = val
+                changed = True
+
+        aliases = _normalize_catalog_aliases(raw_entry.get("aliases"))
+        if aliases:
+            current = _normalize_catalog_aliases(item.get("aliases"))
+            merged = current + [alias for alias in aliases if alias not in current]
+            if merged != current:
+                item["aliases"] = merged
+                changed = True
+
+        ttl_raw = raw_entry.get("ttl") if "ttl" in raw_entry else raw_entry.get("idle_ttl")
+        if ttl_raw is not None:
+            try:
+                ttl = int(ttl_raw)
+                if effective_idle_ttl is None or ttl != int(effective_idle_ttl):
+                    if item.get("ttl") != ttl:
+                        item["ttl"] = ttl
+                        changed = True
+            except Exception:
+                pass
+
+        legacy_overrides = raw_entry.get("server_overrides")
+        if isinstance(legacy_overrides, dict):
+            current_overrides = item.get("server_overrides")
+            if not isinstance(current_overrides, dict):
+                current_overrides = {}
+            merged_overrides = dict(legacy_overrides)
+            merged_overrides.update(current_overrides)
+            if merged_overrides != item.get("server_overrides"):
+                item["server_overrides"] = merged_overrides
+                changed = True
+
+    return changed
+
+
 def _catalog_payload_for_import(catalog_path: Path) -> tuple[list[dict[str, object]] | None, str | None]:
     if not catalog_path.exists():
         return [], None
@@ -2842,8 +2960,8 @@ def _ensure_basic_server_config(layout: InstallLayout) -> None:
     except Exception:
         server_config = {}
 
-    if "models" not in server_config:
-        server_config["models"] = {}
+    legacy_server_models = server_config.get("models")
+    had_legacy_server_models = "models" in server_config
     had_meta = isinstance(server_config.get("_meta"), dict)
     api_ctx_factor_added = False
     if "llama_server_defaults" not in server_config:
@@ -2863,6 +2981,10 @@ def _ensure_basic_server_config(layout: InstallLayout) -> None:
     catalog_changed = False
 
     if _merge_missing_llama_server_defaults(server_config["llama_server_defaults"], layout.config_dir):
+        server_changed = True
+    normalized_server_config = _normalize_server_config_payload(server_config)
+    if normalized_server_config != server_config:
+        server_config = normalized_server_config
         server_changed = True
 
     # If server-level defaults are missing, try to infer common defaults from catalog
@@ -2924,6 +3046,15 @@ def _ensure_basic_server_config(layout: InstallLayout) -> None:
         pass
 
     effective_idle_ttl = _effective_catalog_idle_ttl(layout, server_config)
+    if _merge_legacy_server_models_into_catalog(
+        catalog_raw,
+        legacy_server_models,
+        effective_idle_ttl=effective_idle_ttl,
+    ):
+        catalog_changed = True
+    if had_legacy_server_models:
+        server_config.pop("models", None)
+        server_changed = True
 
     all_used_aliases: set[str] = set()
     for model in catalog_raw:
@@ -2976,39 +3107,10 @@ def _ensure_basic_server_config(layout: InstallLayout) -> None:
         except Exception:
             catalog_n_gpu_layers = default_n_gpu_layers
 
-        current_entry = server_config["models"].get(model_id)
-        if not isinstance(current_entry, dict):
-            server_config["models"][model_id] = {
-                "ctx_size": catalog_ctx,
-                "n_gpu_layers": catalog_n_gpu_layers,
-            }
-            server_changed = True
-            continue
-
-        entry = dict(current_entry)
-        entry_changed = False
-        try:
-            current_ctx = int(entry.get("ctx_size"))
-        except Exception:
-            current_ctx = None
-        try:
-            current_n_gpu_layers = int(entry.get("n_gpu_layers"))
-        except Exception:
-            current_n_gpu_layers = None
-
-        # Repair stale defaults left behind by previous installs/auto-ctx runs.
-        if current_ctx is None or (current_ctx == default_ctx and catalog_ctx != default_ctx):
-            entry["ctx_size"] = catalog_ctx
-            entry_changed = True
-        if current_n_gpu_layers is None or (
-            current_n_gpu_layers == default_n_gpu_layers and catalog_n_gpu_layers != default_n_gpu_layers
-        ):
-            entry["n_gpu_layers"] = catalog_n_gpu_layers
-            entry_changed = True
-
-        if entry_changed:
-            server_config["models"][model_id] = entry
-            server_changed = True
+        # Per-model runtime/config data lives in catalog.json. Older versions
+        # mirrored ctx/n_gpu_layers in conf.json["models"], but keeping that
+        # mirror made conf.json look authoritative and caused stale duplicate
+        # configuration. Do not regenerate it.
 
     if server_changed:
         server_config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3083,6 +3185,7 @@ def _ensure_basic_server_config(layout: InstallLayout) -> None:
 def maybe_rerun_auto_ctx(layout: InstallLayout, install_services: bool, dry_run: bool, args: argparse.Namespace) -> None:
     def _run_auto_ctx_update() -> None:
         try:
+            _run([str(layout.bin_dir / CLI_COMMAND), "config-migrate"])
             _run([str(layout.bin_dir / CLI_COMMAND), "update", "--auto"])
             _ensure_basic_server_config(layout)
         except subprocess.CalledProcessError as exc:
@@ -3094,6 +3197,7 @@ def maybe_rerun_auto_ctx(layout: InstallLayout, install_services: bool, dry_run:
 
     def _run_sync_config() -> None:
         try:
+            _run([str(layout.bin_dir / CLI_COMMAND), "config-migrate"])
             _run([str(layout.bin_dir / CLI_COMMAND), "update", "--preserve-ctx"])
             _ensure_basic_server_config(layout)
             print(f"Synced registered models to llama-swap UI configuration.")
@@ -3240,7 +3344,18 @@ def install_stack(args: argparse.Namespace) -> int:
     if backend == "vllm-beta":
         llama_cpp_mode = "source"
     elif update_binaries:
-        llama_cpp_mode = resolve_llama_cpp_mode(args.llama_cpp_mode)
+        if str(getattr(args, "llama_cpp_ref", "") or "").strip():
+            llama_cpp_mode = "source"
+            args.llama_cpp_mode = "source"
+            print(f"llama.cpp ref requested; forcing source build: {args.llama_cpp_ref}")
+        else:
+            llama_cpp_mode = resolve_llama_cpp_mode(args.llama_cpp_mode)
+        if llama_cpp_mode == "source":
+            args.llama_cpp_ref = resolve_llama_cpp_ref(getattr(args, "llama_cpp_ref", None), llama_cpp_mode)
+            if args.llama_cpp_ref:
+                os.environ[LLAMA_CPP_REF_ENV] = args.llama_cpp_ref
+        else:
+            args.llama_cpp_ref = ""
     else:
         llama_cpp_mode = detect_existing_llama_cpp_mode(layout)
         print(f"Keeping existing llama.cpp mode: {llama_cpp_mode}")
@@ -3253,6 +3368,18 @@ def install_stack(args: argparse.Namespace) -> int:
         # Ensure services are restarted to use the new package code
         if args.install_services:
             restart_systemd_units(layout, args.dry_run)
+            if not args.dry_run and wait_for_manager_socket(layout, args.dry_run):
+                print("\nApplying latest configuration migrations...")
+                try:
+                    _run([str(layout.bin_dir / CLI_COMMAND), "config-migrate"])
+                except subprocess.CalledProcessError as exc:
+                    print(f"Warning: config-migrate failed (exit code {exc.returncode}).")
+                
+                print("Regenerating llama-swap configuration to apply new features...")
+                try:
+                    _run([str(layout.bin_dir / CLI_COMMAND), "update", "--preserve-ctx"])
+                except subprocess.CalledProcessError as exc:
+                    print(f"Warning: update failed (exit code {exc.returncode}).")
         return 0
 
     existing_backend = detect_existing_backend(layout)
@@ -3275,14 +3402,20 @@ def install_stack(args: argparse.Namespace) -> int:
         ensure_models_dir_ready(layout, args.dry_run)
     ensure_service_writable_dirs(layout, args.dry_run)
 
+    llama_cpp_ref = str(getattr(args, "llama_cpp_ref", "") or "").strip()
     if args.dry_run:
-        llama_cpp_release = dry_run_release_placeholder(DEFAULT_LLAMA_CPP_REPO)
+        llama_cpp_release = {"tag_name": llama_cpp_ref, "source_kind": "ref", "assets": []} if llama_cpp_ref else dry_run_release_placeholder(DEFAULT_LLAMA_CPP_REPO)
         llamaswap_release = dry_run_release_placeholder(DEFAULT_LLAMASWAP_REPO)
     else:
-        llama_cpp_release = dry_run_release_placeholder(DEFAULT_LLAMA_CPP_REPO) if backend == "vllm-beta" else latest_release(DEFAULT_LLAMA_CPP_REPO)
+        if backend == "vllm-beta":
+            llama_cpp_release = dry_run_release_placeholder(DEFAULT_LLAMA_CPP_REPO)
+        elif llama_cpp_ref:
+            llama_cpp_release = {"tag_name": llama_cpp_ref, "source_kind": "ref", "assets": []}
+        else:
+            llama_cpp_release = latest_release(DEFAULT_LLAMA_CPP_REPO)
         llamaswap_release = latest_release(DEFAULT_LLAMASWAP_REPO)
     llamaswap_asset = choose_llamaswap_asset(llamaswap_release)
-    llama_cpp_asset = choose_llamacpp_linux_asset(llama_cpp_release) if backend != "vllm-beta" else None
+    llama_cpp_asset = choose_llamacpp_linux_asset(llama_cpp_release) if backend != "vllm-beta" and not llama_cpp_ref else None
 
     gpu_present = detect_nvidia_gpu()
     nvcc_path = locate_nvcc()
@@ -3500,13 +3633,19 @@ def install_stack(args: argparse.Namespace) -> int:
         server_config_data["idle_ttl"] = args.idle_ttl
         server_config_data["api_port"] = layout.public_port - 1
         server_config_data.setdefault("api_ctx_factor", 0.5)
+        server_config_data.setdefault("replicas", {
+            "enabled": False,
+            "max": "auto",
+            "placement": "exclusive_gpus",
+            "safety_vram_mib": 2048,
+        })
         llama_defaults = server_config_data.setdefault("llama_server_defaults", {})
         if not isinstance(llama_defaults, dict):
             llama_defaults = {}
             server_config_data["llama_server_defaults"] = llama_defaults
         _ensure_llama_server_defaults_file(layout.config_dir)
         _merge_missing_llama_server_defaults(llama_defaults, layout.config_dir)
-        _ensure_server_config_metadata(server_config_data)
+        server_config_data = _normalize_server_config_payload(server_config_data)
         server_config_payload = json.dumps(server_config_data, indent=2) + "\n"
         server_config_path.write_text(
             server_config_payload,
@@ -3586,6 +3725,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--llama-cpp-mode",
         choices=LLAMA_CPP_MODES,
         help="How to provide llama.cpp: native system package, prebuilt binary, or build from source.",
+    )
+    parser.add_argument(
+        "--llama-cpp-ref",
+        help="Build llama.cpp from a specific git ref/tag/commit. Forces --llama-cpp-mode source.",
     )
     parser.add_argument("--public-host")
     parser.add_argument(

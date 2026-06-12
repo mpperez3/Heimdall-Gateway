@@ -32,7 +32,7 @@ import tempfile
 import signal
 import termios
 from datetime import datetime, timezone
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -170,6 +170,7 @@ DEFAULT_REQUESTS_LOG_PATH = _env_path(
     if os.geteuid() == 0
     else str(Path.home() / ".local/state/llamacpp-superserver/api-requests.log"),
 )
+SYSTEM_REQUESTS_LOG_PATH = Path("/var/lib/llamacpp-superserver/api-requests.log")
 MODEL_ACTIVITY_LOCK = threading.Lock()
 MODEL_ACTIVITY: dict[str, dict[str, float | str]] = {}
 LAST_ACTIVITY_MODEL_ID = ""
@@ -242,40 +243,77 @@ def _is_debug_gate_active() -> bool:
     return True
 
 
+def _default_global_replicas_config() -> dict[str, object]:
+    return {
+        "enabled": False,
+        "max": "auto",
+        "placement": "exclusive_gpus",
+        "safety_vram_mib": 2048,
+    }
+
+
+def normalize_server_config_payload(payload: dict[str, object]) -> tuple[dict[str, object], bool]:
+    changed = False
+    if not isinstance(payload, dict):
+        payload = {}
+        changed = True
+    result = dict(payload)
+    if "models" in result:
+        # Legacy UI/per-model metadata used to live here. catalog.json is now
+        # the only editable source for model definitions; config.yaml is
+        # generated for llama-swap. Keep conf.json global-only.
+        result.pop("models", None)
+        changed = True
+    raw_defaults = result.get("llama_server_defaults")
+    if isinstance(raw_defaults, dict):
+        normalized_defaults = normalize_server_overrides(raw_defaults)
+        if normalized_defaults != raw_defaults:
+            result["llama_server_defaults"] = normalized_defaults
+            changed = True
+    else:
+        result["llama_server_defaults"] = {}
+        changed = True
+    raw_replicas = result.get("replicas")
+    if not isinstance(raw_replicas, dict):
+        result["replicas"] = _default_global_replicas_config()
+        changed = True
+    else:
+        replicas = _default_global_replicas_config()
+        replicas.update(raw_replicas)
+        placement = str(replicas.get("placement") or "exclusive_gpus").strip().lower().replace("-", "_")
+        if placement not in {"exclusive_gpus", "pack_small_models"}:
+            placement = "exclusive_gpus"
+        replicas["placement"] = placement
+        if replicas != raw_replicas:
+            result["replicas"] = replicas
+            changed = True
+    if "api_ctx_factor" not in result:
+        result["api_ctx_factor"] = 0.5
+        changed = True
+    before_meta = json.dumps(result.get("_meta", {}), sort_keys=True, default=str)
+    _ensure_server_config_metadata(result)
+    after_meta = json.dumps(result.get("_meta", {}), sort_keys=True, default=str)
+    if before_meta != after_meta:
+        changed = True
+    return result, changed
+
+
 def _ensure_server_config_metadata(payload: dict[str, object]) -> dict[str, object]:
     meta = payload.get("_meta")
     if not isinstance(meta, dict):
         meta = {}
-    meta.setdefault("purpose", "Global superserver settings consumed by CLI/services.")
-    meta.setdefault(
-        "note",
-        "Per-model context source of truth is catalog/config.yaml; this file stores global defaults and service-level settings.",
-    )
-    meta.setdefault(
-        "example",
-        {
-            "idle_ttl": 300,
-            "api_port": 11436,
-            "api_ctx_factor": 0.5,
-            "llama_server_defaults": {
-                "ctx_size": 65536,
-                "n_gpu_layers": 999,
-                "keep": 512,
-                "mirostat": 2,
-                "mirostat_ent": 4.5,
-                "mirostat_lr": 0.1,
-                "cache_type_k": "q8_0",
-                "cache_type_v": "q8_0",
-            },
-        },
-    )
-    meta.setdefault(
-        "service_restart_help",
-        {
-            "system_mode": f"sudo systemctl restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
-            "user_mode": f"systemctl --user restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
-        },
-    )
+    # _meta is documentation owned by superserver, not user configuration.
+    # Do not store example config values here: they look like duplicated active
+    # settings and can contradict the real top-level keys.
+    meta["purpose"] = "Global superserver settings consumed by CLI/services."
+    meta[
+        "note"
+    ] = "Active settings are top-level keys only. Model definitions live in catalog.json; config.yaml is generated for llama-swap."
+    meta.pop("example", None)
+    meta["service_restart_help"] = {
+        "system_mode": f"sudo systemctl restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
+        "user_mode": f"systemctl --user restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
+    }
     payload["_meta"] = meta
     return payload
 CATALOG_CACHE: dict[tuple[str, tuple[str, int, int]], tuple[int, int, list["ManagedModel"]]] = {}
@@ -426,6 +464,36 @@ class ManagedModel:
     server_overrides: dict[str, object] = field(default_factory=dict)
 
 
+
+
+@dataclass
+class ReplicaConfig:
+    enabled: bool = False
+    max: int = 1
+    gpus_per_replica: int = 1
+    placement: str = "exclusive_gpus"
+    safety_vram_mib: int = 2048
+    max_models_per_gpu: int = 2
+    max_pack_fraction: float = 0.35
+    sticky_ttl_s: int = 3600
+
+
+@dataclass
+class ReplicaRecord:
+    base_model_id: str
+    replica_model_id: str
+    gpu_set: list[int] = field(default_factory=list)
+    status: str = "cold"
+    estimated_mib: float | None = None
+    actual_mib: float | None = None
+    gpu_actual_mib: dict[int, float] = field(default_factory=dict)
+    pid: int | None = None
+    port: int | None = None
+    in_flight: int = 0
+    last_used: float = 0.0
+    blacklist_until: float = 0.0
+
+
 @dataclass
 class ProbeTraceMetrics:
     model_buffers_mib: dict[int, float] = field(default_factory=dict)
@@ -452,18 +520,14 @@ def parse_hf_input(raw: str):
 
 def normalize_tensor_split(value: str | None) -> str:
     normalized = (value or "").strip()
-    gpu_count = detect_cuda_device_count()
     if not normalized:
         return default_tensor_split()
-    if gpu_count <= 0:
-        return normalized
     parts = [part.strip() for part in normalized.split(",") if part.strip()]
     if not parts:
         return default_tensor_split()
-    if len(parts) == gpu_count:
-        return ",".join(parts)
-    if all(part == "1" for part in parts):
-        return ",".join(["1"] * gpu_count)
+    # Preserve the number of entries exactly. A catalog value of 1,1,1 means
+    # the user selected three visible GPUs; expanding it to all host GPUs is
+    # destructive and causes config.yaml to diverge from catalog.json.
     return ",".join(parts)
 
 
@@ -871,12 +935,27 @@ def load_catalog_with_diagnostics(path: Path, server_config_path: Path | None = 
         _clear_catalog_cache(path)
         return [], f"Catalog {path} has invalid format (expected a JSON array)."
     try:
-        items = [ManagedModel(**m) for m in payload]
+        model_field_names = {f.name for f in fields(ManagedModel)}
+        items = []
+        for raw_item in payload:
+            if not isinstance(raw_item, dict):
+                raise TypeError(f"expected object entries, got {type(raw_item).__name__}")
+            known = {k: v for k, v in raw_item.items() if k in model_field_names}
+            extra = {k: v for k, v in raw_item.items() if k not in model_field_names}
+            if extra:
+                overrides = dict(known.get("server_overrides") or {})
+                # Unknown top-level catalog keys are treated as llama.cpp
+                # server overrides. This keeps manual edits like
+                # `"parallel": 2` backward-compatible and avoids rejecting
+                # new llama.cpp flags before the dataclass schema knows them.
+                overrides.update(extra)
+                known["server_overrides"] = overrides
+            items.append(ManagedModel(**known))
     except Exception as exc:
         _clear_catalog_cache(path)
         return [], f"Catalog {path} has invalid entries: {exc}"
     changed = False
-    # Load global llama-server defaults (normalized) so we can prune redundant per-model overrides
+    # Load global llama-server defaults for normalization context.
     try:
         args = argparse.Namespace(server_config=server_config_path) if server_config_path is not None else None
         server_defaults = resolve_llama_server_defaults(args)
@@ -936,7 +1015,10 @@ def load_catalog_with_diagnostics(path: Path, server_config_path: Path | None = 
             item.ctx_probe_prompt_tokens = normalized_probe_prompt_tokens
             changed = True
 
-        normalized = preferred_tensor_split(item, item.tensor_split)
+        # Preserve catalog tensor_split exactly as the user wrote it.
+        # Expanding 1,1,1 to all currently visible GPUs destroys manual
+        # placement and makes update/reinstall appear to ignore catalog.json.
+        normalized = normalize_tensor_split(item.tensor_split)
         if normalized != item.tensor_split:
             item.tensor_split = normalized
             changed = True
@@ -944,22 +1026,26 @@ def load_catalog_with_diagnostics(path: Path, server_config_path: Path | None = 
         if isinstance(item.server_overrides, dict):
             raw_auto_performance = item.server_overrides.get("auto_performance")
         normalized_overrides = normalize_server_overrides(item.server_overrides)
+        override_tensor_split = normalized_overrides.pop("tensor_split", None)
+        if override_tensor_split is not None:
+            migrated_tensor_split = normalize_tensor_split(str(override_tensor_split))
+            if item.tensor_split != migrated_tensor_split:
+                item.tensor_split = migrated_tensor_split
+            changed = True
 
-        # Remove keys from per-model overrides when they are identical to global defaults
-        pruned_overrides: dict[str, object] = {}
-        for k, v in normalized_overrides.items():
-            if k in server_defaults and server_defaults.get(k) == v:
-                changed = True
-                continue
-            pruned_overrides[k] = v
+        # Keep explicit per-model overrides from the catalog. Loading a catalog
+        # must not silently remove a user edit such as {"parallel": 2} just
+        # because it currently matches a global default; otherwise `update` can
+        # appear to ignore catalog.json edits and can rewrite them away.
+        normalized_overrides_preserved = dict(normalized_overrides)
         if isinstance(raw_auto_performance, dict):
             # Persistent auto-performance metadata belongs in catalog config,
             # but normalize_server_overrides intentionally strips it so it can
             # never be emitted as a llama-server flag.
-            pruned_overrides["auto_performance"] = raw_auto_performance
+            normalized_overrides_preserved["auto_performance"] = raw_auto_performance
 
-        if pruned_overrides != item.server_overrides:
-            item.server_overrides = pruned_overrides
+        if normalized_overrides_preserved != item.server_overrides:
+            item.server_overrides = normalized_overrides_preserved
             changed = True
     if changed:
         save_catalog(path, items)
@@ -1041,10 +1127,18 @@ def choose_gguf_file(api, repo_id, quant, explicit_file, token):
     if quant:
         ql = quant.lower()
         
-        # Extract quantization code: last component after . or - before .gguf
+        # Extract the quantization token from the file basename.  Sharded GGUFs
+        # commonly look like `BF16/model-BF16-00001-of-00002.gguf`; stripping the
+        # shard suffix first is required, otherwise the extracted token becomes
+        # `00002` and an explicit `:BF16` request falls through to the default
+        # Q4_K_M selection.
         def extract_quant_code(filename):
-            stem = Path(filename).stem  # Remove .gguf
-            # Split by . or - and get last part
+            stem = Path(filename).stem  # Remove directory and .gguf
+            stem = re.sub(r"[-._]?\d{5}-of-\d{5}$", "", stem, flags=re.IGNORECASE)
+            if "/" in filename:
+                parent = Path(filename).parent.name
+                if parent and parent.lower() == ql:
+                    return ql
             parts = re.split(r'[-.]', stem)
             return parts[-1].lower() if parts else ""
         
@@ -1082,6 +1176,309 @@ def choose_mmproj_file(api, repo_id, token):
                 return candidate
     return files[0]
 
+
+def _as_bool(value: object, default: bool = False) -> bool:
+    parsed = _normalize_bool_flag(value)
+    return default if parsed is None else parsed
+
+
+def resolve_global_replica_config(args = None) -> dict[str, object]:
+    payload = _load_server_config_payload(args)
+    raw = payload.get("replicas")
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def get_model_replica_config(model: ManagedModel, global_raw: dict[str, object] | None = None) -> ReplicaConfig:
+    explicit_global_config = global_raw is not None
+    global_config: dict[str, object] = dict(global_raw if global_raw is not None else resolve_global_replica_config())
+    raw: dict[str, object] = dict(global_config)
+    model_raw: dict[str, object] = {}
+    try:
+        candidate = (model.server_overrides or {}).get("replicas")
+        if isinstance(candidate, dict):
+            model_raw = dict(candidate)
+    except Exception:
+        model_raw = {}
+    # Activation is global-first. Old per-model replicas.enabled values are
+    # only honored when there is no global enabled key, so stale per-model
+    # enabled=false cannot silently override conf.json enabled=true.
+    model_enabled = model_raw.pop("enabled", None)
+    raw.update(model_raw)
+    cfg = ReplicaConfig()
+    if explicit_global_config and "enabled" in global_config:
+        cfg.enabled = _as_bool(global_config.get("enabled"), False)
+    elif model_enabled is not None:
+        cfg.enabled = _as_bool(model_enabled, False)
+    else:
+        cfg.enabled = _as_bool(global_config.get("enabled"), False)
+    try:
+        cfg.gpus_per_replica = max(1, int(raw.get("gpus_per_replica", _infer_base_gpu_count(model))))
+    except Exception:
+        cfg.gpus_per_replica = _infer_base_gpu_count(model)
+    total_gpus = detect_cuda_device_count()
+    auto_max = max(1, total_gpus // max(1, cfg.gpus_per_replica)) if total_gpus > 0 else cfg.max
+    raw_max = raw.get("max", "auto" if cfg.enabled else cfg.max)
+    try:
+        if isinstance(raw_max, str) and raw_max.strip().lower() in {"auto", "", "none"}:
+            cfg.max = auto_max
+        else:
+            cfg.max = max(1, int(raw_max))
+    except Exception:
+        cfg.max = auto_max
+    placement = str(raw.get("placement", cfg.placement) or cfg.placement).strip().lower().replace("-", "_")
+    if placement in {"exclusive_gpus", "pack_small_models"}:
+        cfg.placement = placement
+    try:
+        cfg.safety_vram_mib = max(0, int(raw.get("safety_vram_mib", cfg.safety_vram_mib)))
+    except Exception:
+        pass
+    try:
+        cfg.max_models_per_gpu = max(1, int(raw.get("max_models_per_gpu", cfg.max_models_per_gpu)))
+    except Exception:
+        pass
+    try:
+        cfg.max_pack_fraction = max(0.01, min(1.0, float(raw.get("max_pack_fraction", cfg.max_pack_fraction))))
+    except Exception:
+        pass
+    try:
+        cfg.sticky_ttl_s = max(60, int(raw.get("sticky_ttl_s", cfg.sticky_ttl_s)))
+    except Exception:
+        pass
+    return cfg
+
+
+def replica_model_id(base_model_id: str, index: int) -> str:
+    return f"{base_model_id}__replica_{index}"
+
+
+def is_replica_model_id(model_id: str) -> bool:
+    return bool(re.search(r"__replica_\d+$", str(model_id or "")))
+
+
+def replica_base_model_id(model_id: str) -> str:
+    return re.sub(r"__replica_\d+$", "", str(model_id or ""))
+
+
+def _infer_base_gpu_count(model: ManagedModel) -> int:
+    try:
+        raw = (model.server_overrides or {}).get("gpu_count")
+        if raw is not None:
+            return max(1, int(raw))
+    except Exception:
+        pass
+    try:
+        ts = str((model.server_overrides or {}).get("tensor_split") or model.tensor_split or "1")
+        parts = [p for p in ts.split(",") if p.strip()]
+        return max(1, len(parts))
+    except Exception:
+        return 1
+
+
+def _replica_gpu_sets(model: ManagedModel, cfg: ReplicaConfig, total_gpus: int | None = None) -> list[list[int]]:
+    if not cfg.enabled or cfg.max <= 0:
+        return []
+    total = total_gpus if total_gpus is not None else detect_cuda_device_count()
+    if total <= 0:
+        total = max(cfg.gpus_per_replica, _infer_base_gpu_count(model))
+    gpr = max(1, cfg.gpus_per_replica or _infer_base_gpu_count(model))
+    sets: list[list[int]] = []
+    if cfg.placement == "exclusive_gpus":
+        for start in range(0, total, gpr):
+            gpu_set = list(range(start, min(start + gpr, total)))
+            if len(gpu_set) == gpr:
+                sets.append(gpu_set)
+            if len(sets) >= cfg.max:
+                break
+    else:
+        for idx in range(cfg.max):
+            if gpr == 1:
+                sets.append([idx % total])
+            else:
+                start = (idx * gpr) % total
+                gpu_set = [(start + off) % total for off in range(gpr)]
+                if len(set(gpu_set)) == gpr:
+                    sets.append(gpu_set)
+    return sets[: cfg.max]
+
+
+def _replica_overrides(base: ManagedModel, gpu_set: list[int]) -> dict[str, object]:
+    overrides = dict(base.server_overrides or {})
+    overrides.pop("replicas", None)
+    if gpu_set:
+        visible_count = len(gpu_set)
+        overrides.pop("tensor_split", None)
+        overrides["__replica_tensor_split"] = ",".join(["1"] * visible_count)
+        overrides["main_gpu"] = 0
+    return overrides
+
+
+def build_replica_model(base: ManagedModel, index: int, gpu_set: list[int]) -> ManagedModel:
+    return replace(
+        base,
+        model_id=replica_model_id(base.model_id, index),
+        aliases=[],
+        description=f"internal replica {index} of {base.model_id}",
+        server_overrides=_replica_overrides(base, gpu_set),
+    )
+
+
+def _command_with_cuda_visible_devices(cmd: list[str], gpu_set: list[int]) -> list[str]:
+    if not gpu_set:
+        return cmd
+    return ["/usr/bin/env", f"CUDA_VISIBLE_DEVICES={','.join(str(g) for g in gpu_set)}", *cmd]
+
+
+def iter_catalog_with_replicas(catalog: list[ManagedModel], global_replica_config: dict[str, object] | None = None) -> list[tuple[ManagedModel, str | None, list[int]]]:
+    """Return (model, public_base_model_id, gpu_set). public_base_model_id is set for internal replicas."""
+    result: list[tuple[ManagedModel, str | None, list[int]]] = []
+    for model in catalog:
+        result.append((model, None, []))
+        cfg = get_model_replica_config(model, global_replica_config)
+        if not cfg.enabled:
+            continue
+        for idx, gpu_set in enumerate(_replica_gpu_sets(model, cfg)):
+            result.append((build_replica_model(model, idx, gpu_set), model.model_id, gpu_set))
+    return result
+
+
+def summarize_configured_replicas(catalog: list[ManagedModel], global_replica_config: dict[str, object] | None = None) -> list[str]:
+    lines: list[str] = []
+    for model in catalog:
+        cfg = get_model_replica_config(model, global_replica_config)
+        if not cfg.enabled:
+            continue
+        gpu_sets = _replica_gpu_sets(model, cfg)
+        if gpu_sets:
+            lines.append(
+                f"{model.model_id}: {len(gpu_sets)} replica(s), gpus_per_replica={cfg.gpus_per_replica}, gpu_sets={gpu_sets}"
+            )
+        else:
+            lines.append(
+                f"{model.model_id}: replicas enabled but no GPU set generated (gpus_per_replica={cfg.gpus_per_replica}, max={cfg.max})"
+            )
+    return lines
+
+
+def _get_model_size_mib(m: ManagedModel) -> float:
+    """Estimate model size in MiB using the GGUF file size."""
+    try:
+        return float(Path(m.local_path).stat().st_size) / (1024 * 1024)
+    except Exception:
+        return 0.0
+
+
+def _is_embedding_model(m: ManagedModel) -> bool:
+    """Heuristic to identify if a model is an embedding model."""
+    low_id = m.model_id.lower()
+    # Check common embedding model names/prefixes
+    if any(k in low_id for k in ["embedding", "bge-", "gte-", "snowflake-", "nomic-"]):
+        return True
+    # Check overrides for --embedding flag
+    for v in m.server_overrides.values():
+        if isinstance(v, str) and "--embedding" in v:
+            return True
+    # Check load capabilities if populated
+    if "embedding" in (m.load_capabilities or []):
+        return True
+    return False
+
+
+def _is_small_model(m: ManagedModel) -> bool:
+    """Heuristic to identify if a model is 'small' and thus packable with others."""
+    # Heuristic: < 4GB is considered small and likely to fit alongside a main model.
+    return _get_model_size_mib(m) < 4096.0
+
+
+def _calculate_llama_swap_matrix(models_info: list[dict]) -> dict[str, object]:
+    """
+    Calculate the llama-swap matrix configuration to allow maximum concurrency.
+    
+    models_info is a list of dicts: {id, gpu_set, is_embedding, is_small, size_mib}
+    """
+    if not models_info:
+        return {}
+
+    # llama-swap's matrix parser expects `sets` to reference variable IDs, not
+    # arbitrary model names. Real model IDs commonly contain dots, colons or
+    # other characters that are not valid DSL atoms, so expose deterministic
+    # short vars and use those vars consistently in sets and evict_costs.
+    sorted_ids = sorted({str(m["id"]) for m in models_info if str(m.get("id") or "").strip()})
+    id_to_var = {model_id: f"m{idx}" for idx, model_id in enumerate(sorted_ids)}
+    vars_map = {var_id: model_id for model_id, var_id in id_to_var.items()}
+
+    embeddings = [m["id"] for m in models_info if m["is_embedding"]]
+    smalls = [m["id"] for m in models_info if m["is_small"] and not m["is_embedding"]]
+    larges = [m for m in models_info if not m["is_small"] and not m["is_embedding"]]
+
+    # Packables are models we assume can always run together or alongside a large model.
+    packables = sorted(embeddings + smalls)
+    
+    # We want to group large models into sets that don't conflict on GPUs.
+    # conflicting sets use a greedy approach to find maximal independent sets.
+    large_groups: list[list[str]] = []
+    
+    # If a model has an empty gpu_set but is large, assume it uses all GPUs to be safe.
+    # We approximate all GPUs by collecting all known GPU IDs from all models.
+    all_known_gpus = set()
+    for m in models_info:
+        all_known_gpus.update(m["gpu_set"])
+    
+    # Normalize gpu_set for collision checking
+    for m in larges:
+        if not m["gpu_set"]:
+            m["_effective_gpu_set"] = set(all_known_gpus)
+        else:
+            m["_effective_gpu_set"] = set(m["gpu_set"])
+            
+    sorted_larges = sorted(larges, key=lambda x: len(x["_effective_gpu_set"]), reverse=True)
+    
+    for l in sorted_larges:
+        added = False
+        l_gpu_set = l["_effective_gpu_set"]
+        
+        for group in large_groups:
+            conflict = False
+            for existing_id in group:
+                existing = next(m for m in models_info if m["id"] == existing_id)
+                # Check for GPU overlap
+                existing_gpus = existing.get("_effective_gpu_set", set(existing["gpu_set"]))
+                if not existing_gpus and not existing["is_small"] and not existing["is_embedding"]:
+                    existing_gpus = set(all_known_gpus)
+                if l_gpu_set & existing_gpus:
+                    conflict = True
+                    break
+            if not conflict:
+                group.append(l["id"])
+                added = True
+                break
+        if not added:
+            large_groups.append([l["id"]])
+
+            
+    # Final sets: each large group + all packables
+
+    matrix_sets = {}
+    for idx, group in enumerate(large_groups):
+        group_vars = [id_to_var[model_id] for model_id in sorted(group + packables) if model_id in id_to_var]
+        if group_vars:
+            matrix_sets[f"group_{idx}"] = " & ".join(group_vars)
+
+    # If there are no large models, just one set of packables
+    if not large_groups and packables:
+        packable_vars = [id_to_var[model_id] for model_id in packables if model_id in id_to_var]
+        if packable_vars:
+            matrix_sets["packables"] = " & ".join(packable_vars)
+
+    # Evict costs based on size (harder to evict larger models)
+    evict_costs = {id_to_var[m["id"]]: max(1, int(m["size_mib"])) for m in models_info if m["id"] in id_to_var}
+    
+    return {
+        "vars": vars_map,
+        "sets": matrix_sets,
+        "evict_costs": evict_costs
+    }
+
+
 def render_llamaswap_config(
     catalog,
     path,
@@ -1089,6 +1486,7 @@ def render_llamaswap_config(
     start_port,
     idle_ttl=DEFAULT_IDLE_TTL,
     server_defaults: dict[str, object] | None = None,
+    replica_defaults: dict[str, object] | None = None,
 ):
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {
@@ -1117,17 +1515,30 @@ def render_llamaswap_config(
         path_usage[key] = path_usage.get(key, 0) + 1
         resolved_paths[key] = Path(m.local_path) if m.local_path else Path("")
 
-    for m in sorted(catalog, key=lambda x: x.model_id):
+    replica_group_members: list[str] = []
+    models_info_for_matrix: list[dict] = []
+    resolved_replica_defaults = dict(replica_defaults) if replica_defaults is not None else None
+    for m, public_base_model_id, replica_gpu_set in sorted(iter_catalog_with_replicas(catalog, resolved_replica_defaults), key=lambda item: item[0].model_id):
         # Respect user's preference: do NOT create on-disk GGUF variants.
         # Use the original model file for rendering; duplicate catalog
-        # entries will reference the same local_path. Note: this may
-        # cause duplicate alias conflicts upstream if the backend refuses
-        # same-GGUF multiple publishes. The catalog will still contain
-        # separate entries (one with chat template override) but no new
-        # files are created on disk.
+        # entries will reference the same local_path. Note: internal replicas
+        # intentionally reference the same GGUF but publish distinct model ids.
         use_model = m
 
         cmd = build_llama_server_command(use_model, server_path, port="${PORT}", server_defaults=resolved_defaults)
+        if public_base_model_id is not None:
+            cmd = _command_with_cuda_visible_devices(cmd, replica_gpu_set)
+            replica_group_members.append(m.model_id)
+        
+        # Collect info for the concurrency matrix
+        models_info_for_matrix.append({
+            "id": m.model_id,
+            "gpu_set": replica_gpu_set if replica_gpu_set is not None else list(range(detect_cuda_device_count())),
+            "is_embedding": _is_embedding_model(m),
+            "is_small": _is_small_model(m),
+            "size_mib": _get_model_size_mib(m)
+        })
+
         # If this is a derived entry (template/speculative) that points to the
         # same GGUF, try to force a distinct published name/ID so backends that
         # key off internal GGUF aliases won't treat it as a duplicate. We
@@ -1152,11 +1563,20 @@ def render_llamaswap_config(
             "checkEndpoint": "/health",
             "ttl": int(idle_ttl),
         }
-        if m.aliases:
+        if public_base_model_id is not None:
+            data["models"][m.model_id]["metadata"] = {"internal_replica_of": public_base_model_id}
+        if public_base_model_id is None and m.aliases:
             data["models"][m.model_id]["aliases"] = m.aliases
         if m.description:
             data["models"][m.model_id]["description"] = m.description
+    
+    # Generate the concurrency matrix
+    matrix_config = _calculate_llama_swap_matrix(models_info_for_matrix)
+    if matrix_config:
+        data["matrix"] = matrix_config
+
     tmp = path.with_suffix(".tmp")
+
     with tmp.open("w", encoding="utf-8") as f:
         f.write(LLAMASWAP_CONFIG_HEADER)
         yaml.safe_dump(data, f, sort_keys=False)
@@ -1190,7 +1610,13 @@ def _load_server_config_payload(args = None) -> dict:
                 continue
             payload = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(payload, dict):
-                return payload
+                normalized, changed = normalize_server_config_payload(payload)
+                if changed:
+                    try:
+                        p.write_text(json.dumps(normalized, indent=2) + "\n", encoding="utf-8")
+                    except Exception:
+                        pass
+                return normalized
         except Exception:
             continue
     return {}
@@ -1378,7 +1804,22 @@ def _args_server_config_path(args) -> Path | None:
     return Path(value)
 
 
+def _llama_flag_name(key: str) -> str:
+    return key if str(key).startswith("-") else f"--{str(key).replace('_', '-')}"
+
+
+def _server_supports_or_unknown(server_path: Path | str | None, flag: str) -> bool:
+    try:
+        return server_path is None or server_supports_flag(server_path, flag)
+    except Exception:
+        # If help probing fails, prefer not to drop a configured flag silently.
+        return True
+
+
 def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_path: Path | str | None = None) -> None:
+    if value is None:
+        cmd.append(_llama_flag_name(key))
+        return
     if key == "split_mode":
         cmd.extend(["--split-mode", str(value)])
     elif key == "flash_attn":
@@ -1550,6 +1991,19 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
         except Exception:
             # Defensive fallback to default numeric value
             cmd.extend(["-fitc", str(4096)])
+    elif key == "draft_mtp":
+        # New llama.cpp option: enable draft MTP handling (flag `--draft-mtp`).
+        # Prefer emitting the flag only if the server supports it, but
+        # fall back to emitting it unconditionally if help parsing fails.
+        try:
+            flag = "--draft-mtp"
+            if server_supports_flag(server_path, flag) or server_path is None:
+                cmd.append(flag)
+        except Exception:
+            try:
+                cmd.append("--draft-mtp")
+            except Exception:
+                pass
     elif key == "mmap":
         bool_val = _normalize_bool_flag(value)
         if bool_val is False:
@@ -1561,38 +2015,30 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
         if value is not None:
             cmd.extend(["--gpu-memory-utilization", str(float(value))])
     elif key == "mul_mat_q":
-        if _normalize_bool_flag(value):
-            if server_supports_flag(server_path, "--mul-mat-q"):
-                cmd.append("--mul-mat-q")
-            else:
-                # skip unsupported flag
-                pass
+        if _normalize_bool_flag(value) and _server_supports_or_unknown(server_path, "--mul-mat-q"):
+            cmd.append("--mul-mat-q")
     elif key == "grp_attn_n":
         try:
-            flag = "--grp-attn-n"
-            if server_supports_flag(server_path, flag):
-                cmd.extend([flag, str(int(value))])
+            if _server_supports_or_unknown(server_path, "--grp-attn-n"):
+                cmd.extend(["--grp-attn-n", str(int(value))])
         except (TypeError, ValueError):
             pass
     elif key == "parallel":
         try:
-            flag = "--parallel"
-            if server_supports_flag(server_path, flag):
-                cmd.extend([flag, str(int(value))])
+            if _server_supports_or_unknown(server_path, "--parallel"):
+                cmd.extend(["--parallel", str(int(value))])
         except (TypeError, ValueError):
             pass
     elif key == "ctx_checkpoints":
         try:
-            flag = "--ctx-checkpoints"
-            if server_supports_flag(server_path, flag):
-                cmd.extend([flag, str(int(value))])
+            if _server_supports_or_unknown(server_path, "--ctx-checkpoints"):
+                cmd.extend(["--ctx-checkpoints", str(int(value))])
         except (TypeError, ValueError):
             pass
     elif key == "cache_ram":
         try:
-            flag = "--cache-ram"
-            if server_supports_flag(server_path, flag):
-                cmd.extend([flag, str(int(value))])
+            if _server_supports_or_unknown(server_path, "--cache-ram"):
+                cmd.extend(["--cache-ram", str(int(value))])
         except (TypeError, ValueError):
             pass
     elif key == "kv_offload":
@@ -1621,15 +2067,15 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
             cmd.append("--no-direct-io")
     elif key == "kv_unified":
         bool_val = _normalize_bool_flag(value)
-        if bool_val is True and server_supports_flag(server_path, "--kv-unified"):
+        if bool_val is True and _server_supports_or_unknown(server_path, "--kv-unified"):
             cmd.append("--kv-unified")
-        elif bool_val is False and server_supports_flag(server_path, "--no-kv-unified"):
+        elif bool_val is False and _server_supports_or_unknown(server_path, "--no-kv-unified"):
             cmd.append("--no-kv-unified")
     elif key == "cache_idle_slots":
         bool_val = _normalize_bool_flag(value)
-        if bool_val is True and server_supports_flag(server_path, "--cache-idle-slots"):
+        if bool_val is True and _server_supports_or_unknown(server_path, "--cache-idle-slots"):
             cmd.append("--cache-idle-slots")
-        elif bool_val is False and server_supports_flag(server_path, "--no-cache-idle-slots"):
+        elif bool_val is False and _server_supports_or_unknown(server_path, "--no-cache-idle-slots"):
             cmd.append("--no-cache-idle-slots")
     elif key == "cpu_moe":
         bool_val = _normalize_bool_flag(value)
@@ -1646,15 +2092,14 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
             cmd.extend(["--device", sval])
     elif key == "defrag_threshold":
         try:
-            flag = "--defrag-threshold"
-            if server_supports_flag(server_path, flag):
-                cmd.extend([flag, str(float(value))])
+            if _server_supports_or_unknown(server_path, "--defrag-threshold"):
+                cmd.extend(["--defrag-threshold", str(float(value))])
         except (TypeError, ValueError):
             pass
     else:
         # Generic fallback: map unknown keys to --kebab-case and append value.
         try:
-            flag = key if str(key).startswith("-") else f"--{str(key).replace('_', '-')}"
+            flag = _llama_flag_name(str(key))
             if isinstance(value, bool):
                 if value:
                     cmd.append(flag)
@@ -1670,6 +2115,18 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
         except Exception:
             pass
 
+
+
+
+def _device_list_for_tensor_split(tensor_split: str, total_devices: int | None = None) -> str | None:
+    parts = [part.strip() for part in str(tensor_split or "").split(",") if part.strip()]
+    if not parts:
+        return None
+    # Use llama.cpp device names, not bare indices. Do not depend on
+    # detect_cuda_device_count() here: in service environments it can disagree
+    # with the devices that llama-server later sees, which previously let a
+    # 3-way tensor_split launch while still touching 7 physical GPUs.
+    return ",".join(f"CUDA{idx}" for idx in range(len(parts)))
 
 def build_llama_server_command(
     model: ManagedModel,
@@ -1697,13 +2154,82 @@ def build_llama_server_command(
                         effective[raw_key] = spec_defaults[raw_key]
     except Exception:
         pass
-    effective.update(normalize_server_overrides(model.server_overrides))
+    model_overrides = normalize_server_overrides(model.server_overrides)
+    effective.update(model_overrides)
+    # Replica orchestration config is consumed by the superserver proxy/config
+    # renderer and must never be forwarded as a llama-server CLI flag.
+    effective.pop("replicas", None)
+    effective.pop("auto_performance", None)
+    # Internal escape hatch for generated replicas: tensor_split must be relative
+    # to CUDA_VISIBLE_DEVICES, not normalized against all host GPUs.
+    replica_tensor_split = effective.pop("__replica_tensor_split", None)
+
+    if _safe_runtime_enabled():
+        # Crash-diagnostics mode: avoid llama.cpp features that are more likely
+        # to hit backend-specific segfaults while preserving a usable baseline.
+        # This is intentionally conservative and opt-in via env var.
+        effective["flash_attn"] = False
+        effective["fit"] = False
+        effective["parallel"] = 1
+        effective["cont_batching"] = False
+        for risky_key in (
+            "draft_mtp",
+            "model_draft",
+            "hf_repo_draft",
+            "draft",
+            "draft_min",
+            "draft_p_min",
+            "ctx_size_draft",
+            "n_gpu_layers_draft",
+            "ctx_checkpoints",
+        ):
+            effective.pop(risky_key, None)
+
+    # Auto-enable draft-mtp for models whose id ends with '-mtp' unless
+    # explicitly overridden by server_overrides. Downstream code emits
+    # the corresponding `--draft-mtp` flag when present.
+    try:
+        mid = str(getattr(model, "model_id", "") or "").strip().lower()
+        if (not _safe_runtime_enabled()) and mid.endswith("-mtp"):
+            # normalized keys use underscores
+            if "draft_mtp" not in effective and "draft-mtp" not in effective:
+                effective["draft_mtp"] = True
+    except Exception:
+        pass
 
     # Resolve non-fit launch dimensions first so fit-mode can optionally move
     # context control from --ctx-size into -fitc.
     ctx_size = int(effective.pop("ctx_size", model.ctx_size))
     n_gpu_layers = int(effective.pop("n_gpu_layers", model.n_gpu_layers))
-    tensor_split = preferred_tensor_split(model, str(effective.pop("tensor_split", model.tensor_split)))
+    cuda_visible_devices: list[int] | None = None
+    if replica_tensor_split is not None:
+        tensor_split = str(replica_tensor_split)
+        effective.pop("tensor_split", None)
+        if "device" not in effective:
+            effective["device"] = ",".join(f"CUDA{idx}" for idx in range(len([p for p in tensor_split.split(",") if p.strip()])))
+    else:
+        # Server defaults and legacy server_overrides.tensor_split must not
+        # override the model placement. load_catalog migrates the legacy
+        # override into model.tensor_split, and this keeps command rendering
+        # robust for in-memory objects too.
+        effective.pop("tensor_split", None)
+        raw_tensor_split = str(model.tensor_split)
+        raw_parts = [part.strip() for part in raw_tensor_split.split(",") if part.strip()]
+        explicit_device = "device" in effective
+        if raw_parts:
+            # The number of tensor_split entries is the desired visible GPU set
+            # for this process. Enforce it with CUDA_VISIBLE_DEVICES as a hard
+            # boundary instead of relying on llama.cpp --device or on host GPU
+            # detection, both of which can still allow CUDA contexts on extra
+            # GPUs in some deployments.
+            tensor_split = raw_tensor_split
+            if not explicit_device:
+                cuda_visible_devices = list(range(len(raw_parts)))
+        else:
+            tensor_split = preferred_tensor_split(model, raw_tensor_split)
+        inferred_device = _device_list_for_tensor_split(tensor_split)
+        if inferred_device is not None and "device" not in effective:
+            effective["device"] = inferred_device
     resolved_host = str(effective.pop("host", host or model.host))
 
     # Fit policy:
@@ -1783,6 +2309,7 @@ def build_llama_server_command(
     cmd.extend(["--n-gpu-layers", str(n_gpu_layers)])
     cmd.extend(["--tensor-split", tensor_split])
     cmd.extend(["--host", resolved_host])
+    explicit_override_keys = set(model_overrides.keys())
     for key in (
         "split_mode",
         "flash_attn",
@@ -1801,6 +2328,7 @@ def build_llama_server_command(
         "draft_p_min",
         "ctx_size_draft",
         "n_gpu_layers_draft",
+        "draft_mtp",
         "fit",
         "fitt",
         "fitc",
@@ -1826,7 +2354,12 @@ def build_llama_server_command(
         "defrag_threshold",
     ):
         if key in effective:
-            _append_llama_server_flag(cmd, key, effective[key], server_path)
+            # Defaults generated by superserver should be conservative and must
+            # not inject unsupported flags into older/different llama.cpp builds.
+            # Explicit per-model catalog overrides are different: if the user
+            # configured a flag, emit it and let llama.cpp decide.
+            flag_probe_path = None if key in explicit_override_keys else server_path
+            _append_llama_server_flag(cmd, key, effective[key], flag_probe_path)
             # Mark as handled so it won't be appended again in the leftover pass
             try:
                 effective.pop(key, None)
@@ -1848,6 +2381,8 @@ def build_llama_server_command(
         cmd.extend(["--chat-template-file", str(tmpl)])
     if extra_flags:
         cmd.extend(list(extra_flags))
+    if cuda_visible_devices is not None:
+        cmd = _command_with_cuda_visible_devices(cmd, cuda_visible_devices)
     return cmd
 
 
@@ -1895,18 +2430,14 @@ def resolve_api_port(args = None) -> int:
 def persist_server_config(args) -> None:
     if getattr(args, "server_config", None) is None:
         return
-    if (
-        getattr(args, "idle_ttl", None) is None
-        and getattr(args, "api_port", None) is None
-        and getattr(args, "api_ctx_factor", None) is None
-    ):
-        return
     path = Path(args.server_config)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {}
+    payload: dict[str, object] = {}
     if path.exists():
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                payload = loaded
         except Exception:
             payload = {}
     if getattr(args, "idle_ttl", None) is not None:
@@ -1915,8 +2446,43 @@ def persist_server_config(args) -> None:
         payload["api_port"] = int(args.api_port)
     if getattr(args, "api_ctx_factor", None) is not None:
         payload["api_ctx_factor"] = float(args.api_ctx_factor)
-    _ensure_server_config_metadata(payload)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    normalized, changed = normalize_server_config_payload(payload)
+    if changed or not path.exists() or any(getattr(args, name, None) is not None for name in ("idle_ttl", "api_port", "api_ctx_factor")):
+        path.write_text(json.dumps(normalized, indent=2) + "\n", encoding="utf-8")
+
+
+def _server_config_summary_for_print(text: str) -> dict[str, object]:
+    try:
+        payload = json.loads(text) if text.strip() else {}
+    except Exception as exc:
+        return {"parse_error": str(exc)}
+    if not isinstance(payload, dict):
+        return {"type": type(payload).__name__}
+    defaults = payload.get("llama_server_defaults")
+    bad_default_keys: list[str] = []
+    if isinstance(defaults, dict):
+        bad_default_keys = sorted(str(k) for k in defaults if "-" in str(k))
+    return {
+        "has_models": "models" in payload,
+        "has_replicas": isinstance(payload.get("replicas"), dict),
+        "bad_default_keys": bad_default_keys,
+    }
+
+
+def migrate_server_config(args) -> int:
+    if getattr(args, "server_config", None) is None:
+        raise RuntimeError("No --server-config path configured")
+    path = Path(args.server_config)
+    before = path.read_text(encoding="utf-8") if path.exists() else ""
+    before_summary = _server_config_summary_for_print(before)
+    persist_server_config(args)
+    after = path.read_text(encoding="utf-8") if path.exists() else ""
+    after_summary = _server_config_summary_for_print(after)
+    changed = before != after
+    print(f"Server config migrated: {path} ({'changed' if changed else 'already current'})")
+    print("Before:", json.dumps(before_summary, sort_keys=True))
+    print("After: ", json.dumps(after_summary, sort_keys=True))
+    return 0
 
 
 def log_api_event(kind: str, payload: dict, log_path: Path = DEFAULT_REQUESTS_LOG_PATH) -> None:
@@ -1933,8 +2499,371 @@ def log_api_event(kind: str, payload: dict, log_path: Path = DEFAULT_REQUESTS_LO
         pass
 
 
+def _redact_large_log_value(value, *, max_string: int = 500):
+    if isinstance(value, str):
+        if value.startswith("data:") or len(value) > max_string:
+            return f"<str len={len(value)} preview={value[:120]!r}>"
+        return value
+    if isinstance(value, list):
+        return [_redact_large_log_value(item, max_string=max_string) for item in value[:20]]
+    if isinstance(value, dict):
+        return {str(key): _redact_large_log_value(item, max_string=max_string) for key, item in list(value.items())[:80]}
+    return value
+
+
+def _summarize_api_payload_for_log(payload: dict) -> dict:
+    """Keep request diagnostics useful without dumping huge prompts/images."""
+    if not isinstance(payload, dict):
+        return {"type": type(payload).__name__}
+    summary: dict[str, object] = {}
+    for key in (
+        "model",
+        "stream",
+        "max_tokens",
+        "max_output_tokens",
+        "temperature",
+        "tool_choice",
+        "parallel_tool_calls",
+    ):
+        if key in payload:
+            summary[key] = _redact_large_log_value(payload.get(key))
+    tools = payload.get("tools")
+    if isinstance(tools, list):
+        summary["tools_count"] = len(tools)
+        summary["tool_types"] = [
+            str(item.get("type") or "") if isinstance(item, dict) else type(item).__name__
+            for item in tools[:20]
+        ]
+    raw_input = payload.get("input")
+    if isinstance(raw_input, str):
+        summary["input_type"] = "str"
+        summary["input_len"] = len(raw_input)
+        summary["input_preview"] = raw_input[:200]
+    elif isinstance(raw_input, list):
+        summary["input_type"] = "list"
+        summary["input_items"] = len(raw_input)
+        summary["input_item_types"] = [
+            str(item.get("type") or "") if isinstance(item, dict) else type(item).__name__
+            for item in raw_input[:20]
+        ]
+    elif raw_input is not None:
+        summary["input_type"] = type(raw_input).__name__
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        summary["messages_count"] = len(messages)
+        summary["message_roles"] = [
+            str(item.get("role") or "") if isinstance(item, dict) else type(item).__name__
+            for item in messages[:20]
+        ]
+    return summary
+
+
 def _elapsed_ms(started_at: float) -> int:
     return int((time.monotonic() - started_at) * 1000)
+
+
+
+class ReplicaRouterState:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.records: dict[str, ReplicaRecord] = {}
+        self.affinity: dict[str, tuple[str, float]] = {}
+        self.response_to_replica: dict[str, tuple[str, float]] = {}
+        self.gpu_snapshot: tuple[float, dict[int, dict[str, float]]] = (0.0, {})
+
+    def prune(self, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            self.affinity = {k: v for k, v in self.affinity.items() if v[1] > now}
+            self.response_to_replica = {k: v for k, v in self.response_to_replica.items() if v[1] > now}
+
+    def bind_response(self, response_id: str, replica_id: str, ttl_s: int = 3600) -> None:
+        if not response_id or not replica_id:
+            return
+        with self.lock:
+            self.response_to_replica[response_id] = (replica_id, time.monotonic() + ttl_s)
+
+    def response_replica(self, response_id: str) -> str | None:
+        if not response_id:
+            return None
+        now = time.monotonic()
+        with self.lock:
+            value = self.response_to_replica.get(response_id)
+            if not value:
+                return None
+            if value[1] <= now:
+                self.response_to_replica.pop(response_id, None)
+                return None
+            return value[0]
+
+    def request_started(self, replica_id: str) -> None:
+        with self.lock:
+            rec = self.records.get(replica_id)
+            if rec:
+                rec.in_flight += 1
+                rec.last_used = time.monotonic()
+                if rec.status == "cold":
+                    rec.status = "loading"
+
+    def request_finished(self, replica_id: str, *, ok: bool = True) -> None:
+        with self.lock:
+            rec = self.records.get(replica_id)
+            if rec:
+                rec.in_flight = max(0, rec.in_flight - 1)
+                rec.last_used = time.monotonic()
+                rec.status = "ready" if ok else "error"
+                if not ok:
+                    rec.blacklist_until = time.monotonic() + 120.0
+
+
+REPLICA_ROUTER_STATE = ReplicaRouterState()
+
+
+def _headers_lower(headers) -> dict[str, str]:
+    try:
+        return {str(k).lower(): str(v) for k, v in headers.items()}
+    except Exception:
+        return {}
+
+
+def _first_header(headers: dict[str, str], names: list[str]) -> str:
+    for name in names:
+        value = headers.get(name.lower())
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def _payload_string(payload: dict, names: list[str]) -> str:
+    for name in names:
+        value = payload.get(name)
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _message_text_fingerprint(payload: dict) -> str:
+    pieces: list[str] = []
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for item in messages[:3]:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "")
+            content = item.get("content")
+            if isinstance(content, str):
+                text = content[:500]
+            elif isinstance(content, list):
+                text = " ".join(str(part.get("text") or "") for part in content if isinstance(part, dict))[:500]
+            else:
+                text = str(content or "")[:500]
+            pieces.append(f"{role}:{text}")
+    raw_input = payload.get("input")
+    if isinstance(raw_input, str):
+        pieces.append(raw_input[:800])
+    elif isinstance(raw_input, list):
+        pieces.append(json.dumps(_redact_large_log_value(raw_input[:3]), sort_keys=True, ensure_ascii=False)[:1000])
+    return hashlib.sha256("\n".join(pieces).encode("utf-8", errors="ignore")).hexdigest()[:24]
+
+
+def resolve_request_affinity_key(model_name: str, payload: dict, headers) -> str:
+    h = _headers_lower(headers)
+    session = _first_header(h, [
+        "thread-id", "session-id", "x-conversation-id", "x-session-id", "x-thread-id",
+        "helicone-session-id", "x-opencode-session",
+    ]) or _payload_string(payload, [
+        "thread_id", "session_id", "conversation_id", "conversation", "user", "promptCacheKey", "prompt_cache_key",
+    ])
+    agent = _first_header(h, ["x-agent-id", "x-subagent-id", "x-opencode-agent", "x-codex-subagent"]) or _payload_string(payload, ["agent_id", "subagent_id"])
+    if not agent:
+        # OpenCode subagents often share a session but differ in the prompt prefix.
+        agent = _message_text_fingerprint(payload)[:12]
+    previous_response_id = str(payload.get("previous_response_id") or "").strip()
+    if previous_response_id:
+        mapped = REPLICA_ROUTER_STATE.response_replica(previous_response_id)
+        if mapped:
+            return f"{model_name}:response:{previous_response_id}"
+    if session:
+        return f"{model_name}:session:{session}:agent:{agent}"
+    return f"{model_name}:fallback:{_message_text_fingerprint(payload)}"
+
+
+def is_fallback_affinity_key(affinity_key: str) -> bool:
+    return ":fallback:" in str(affinity_key or "")
+
+
+def _query_gpu_memory_snapshot_cached(ttl_s: float = 1.0) -> dict[int, dict[str, float]]:
+    now = time.monotonic()
+    with REPLICA_ROUTER_STATE.lock:
+        ts, snap = REPLICA_ROUTER_STATE.gpu_snapshot
+        if snap and now - ts <= ttl_s:
+            return {k: dict(v) for k, v in snap.items()}
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.used,memory.free,memory.total", "--format=csv,noheader,nounits"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        snap: dict[int, dict[str, float]] = {}
+        for line in result.stdout.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 4 and parts[0].isdigit():
+                snap[int(parts[0])] = {"used_mib": float(parts[1]), "free_mib": float(parts[2]), "total_mib": float(parts[3])}
+    except Exception:
+        snap = {}
+    with REPLICA_ROUTER_STATE.lock:
+        REPLICA_ROUTER_STATE.gpu_snapshot = (now, {k: dict(v) for k, v in snap.items()})
+    return snap
+
+
+def estimate_model_runtime_mib(model: ManagedModel) -> float | None:
+    try:
+        size_mib = Path(model.local_path).stat().st_size / (1024 * 1024)
+    except Exception:
+        return None
+    overrides = model.server_overrides or {}
+    ctx = int(overrides.get("ctx_size", model.ctx_size) or model.ctx_size or 8192)
+    parallel = int(overrides.get("parallel", 1) or 1)
+    batch = int(overrides.get("batch_size", 2048) or 2048)
+    ubatch = int(overrides.get("ubatch_size", 512) or 512)
+    kv_mib = (ctx * parallel * (size_mib / 2048.0) * 0.5) / 1024.0
+    compute_mib = (ubatch * 0.5) + (batch * 0.1)
+    return (size_mib * 1.08) + kv_mib + compute_mib + 700.0
+
+
+def _placement_fits(model: ManagedModel, cfg: ReplicaConfig, gpu_set: list[int], used_by_records: dict[int, int]) -> tuple[bool, float | None]:
+    required = estimate_model_runtime_mib(model)
+    if required is None:
+        return False, None
+    snap = _query_gpu_memory_snapshot_cached()
+    if not snap:
+        # Test/offline fallback: allow exclusive placement when GPU discovery is unavailable.
+        return cfg.placement == "exclusive_gpus", required
+    gpu_count = max(1, len(gpu_set))
+    # estimate_model_runtime_mib returns a whole-process estimate. For a
+    # tensor-split replica spread over N GPUs, comparing that total against
+    # each GPU is overly conservative and prevents scale-out. Use a per-GPU
+    # estimate plus a fixed overhead/safety cushion.
+    required_per_gpu = (required / gpu_count) + 1024.0
+    if cfg.placement == "pack_small_models":
+        for gpu in gpu_set:
+            total = snap.get(gpu, {}).get("total_mib", 0.0)
+            if total > 0 and required_per_gpu > total * cfg.max_pack_fraction:
+                log_api_event("replica_placement_reject", {"model": model.model_id, "gpu_set": gpu_set, "gpu": gpu, "reason": "pack_fraction", "required_total_mib": required, "required_per_gpu_mib": required_per_gpu, "total_mib": total, "max_pack_fraction": cfg.max_pack_fraction})
+                return False, required
+            if used_by_records.get(gpu, 0) >= cfg.max_models_per_gpu:
+                log_api_event("replica_placement_reject", {"model": model.model_id, "gpu_set": gpu_set, "gpu": gpu, "reason": "max_models_per_gpu", "used": used_by_records.get(gpu, 0), "max_models_per_gpu": cfg.max_models_per_gpu})
+                return False, required
+    for gpu in gpu_set:
+        free = snap.get(gpu, {}).get("free_mib", 0.0)
+        if required_per_gpu + cfg.safety_vram_mib > free:
+            log_api_event("replica_placement_reject", {"model": model.model_id, "gpu_set": gpu_set, "gpu": gpu, "reason": "vram", "required_total_mib": required, "required_per_gpu_mib": required_per_gpu, "safety_vram_mib": cfg.safety_vram_mib, "free_mib": free})
+            return False, required
+    return True, required
+
+
+def select_replica_for_request(
+    base_model: ManagedModel,
+    payload: dict,
+    headers,
+    replica_defaults: dict[str, object] | None = None,
+    published_model_ids: set[str] | None = None,
+) -> tuple[str, str, bool]:
+    """Return (upstream_model_id, affinity_key, is_replica)."""
+    cfg = get_model_replica_config(base_model, replica_defaults)
+    if not cfg.enabled:
+        return base_model.model_id, "", False
+    now = time.monotonic()
+    REPLICA_ROUTER_STATE.prune(now)
+    previous_response_id = str(payload.get("previous_response_id") or "").strip()
+    mapped_response_replica = REPLICA_ROUTER_STATE.response_replica(previous_response_id) if previous_response_id else None
+    affinity_key = resolve_request_affinity_key(base_model.model_id, payload, headers)
+    gpu_sets = _replica_gpu_sets(base_model, cfg)
+    if not gpu_sets:
+        log_api_event("replica_no_gpu_sets", {"model": base_model.model_id, "replicas_max": cfg.max, "gpus_per_replica": cfg.gpus_per_replica})
+        return base_model.model_id, affinity_key, False
+    replica_ids = [replica_model_id(base_model.model_id, idx) for idx in range(len(gpu_sets))]
+    published = set(published_model_ids) if published_model_ids is not None else get_published_model_ids()
+    published_replica_ids = [rid for rid in replica_ids if rid in published]
+    if not published_replica_ids:
+        log_api_event(
+            "replica_routes_missing",
+            {
+                "model": base_model.model_id,
+                "replicas_max": cfg.max,
+                "expected_replicas": replica_ids,
+                "published_sample": sorted(list(published))[:20],
+            },
+        )
+        return base_model.model_id, affinity_key, False
+    with REPLICA_ROUTER_STATE.lock:
+        for idx, rid in enumerate(replica_ids):
+            rec = REPLICA_ROUTER_STATE.records.setdefault(
+                rid,
+                ReplicaRecord(base_model_id=base_model.model_id, replica_model_id=rid, gpu_set=gpu_sets[idx]),
+            )
+            rec.gpu_set = list(gpu_sets[idx])
+        bound = REPLICA_ROUTER_STATE.affinity.get(affinity_key)
+        if mapped_response_replica and mapped_response_replica in published_replica_ids:
+            REPLICA_ROUTER_STATE.affinity[affinity_key] = (mapped_response_replica, now + cfg.sticky_ttl_s)
+            return mapped_response_replica, affinity_key, True
+        if bound and bound[1] > now and bound[0] in published_replica_ids:
+            return bound[0], affinity_key, True
+        candidates = [
+            REPLICA_ROUTER_STATE.records[rid]
+            for rid in published_replica_ids
+            if REPLICA_ROUTER_STATE.records[rid].blacklist_until <= now
+        ]
+        # For a new conversation/agent with no sticky binding, prefer scaling
+        # out to a cold replica if placement fits. Reusing an idle ready replica
+        # first keeps latency low but prevents the intended multi-server spread
+        # across available GPUs for independent conversations.
+        used_by_records: dict[int, int] = {}
+        for rec in REPLICA_ROUTER_STATE.records.values():
+            if rec.status in {"ready", "loading"}:
+                for gpu in rec.gpu_set:
+                    used_by_records[gpu] = used_by_records.get(gpu, 0) + 1
+        cold = [r for r in candidates if r.status in {"cold", "error"}]
+    # Potentially slow VRAM checks happen outside the lock.
+    for rec in sorted(cold, key=lambda r: r.replica_model_id):
+        fits, required = _placement_fits(base_model, cfg, rec.gpu_set, used_by_records)
+        if not fits:
+            continue
+        with REPLICA_ROUTER_STATE.lock:
+            # Re-verify state in case another concurrent request claimed this replica
+            # while we were performing the slow VRAM check outside the lock.
+            if rec.status not in {"cold", "error"}:
+                continue
+            rec.estimated_mib = required
+            rec.status = "loading"
+            REPLICA_ROUTER_STATE.affinity[affinity_key] = (rec.replica_model_id, time.monotonic() + cfg.sticky_ttl_s)
+        log_api_event("replica_selected_cold", {"model": base_model.model_id, "replica": rec.replica_model_id, "gpu_set": rec.gpu_set, "estimated_mib": required})
+        return rec.replica_model_id, affinity_key, True
+    with REPLICA_ROUTER_STATE.lock:
+        candidates = [
+            REPLICA_ROUTER_STATE.records[rid]
+            for rid in published_replica_ids
+            if REPLICA_ROUTER_STATE.records[rid].blacklist_until <= now
+        ]
+        ready_empty = [r for r in candidates if r.status == "ready" and r.in_flight == 0]
+        if ready_empty:
+            chosen = sorted(ready_empty, key=lambda r: r.last_used)[0]
+            REPLICA_ROUTER_STATE.affinity[affinity_key] = (chosen.replica_model_id, now + cfg.sticky_ttl_s)
+            log_api_event("replica_selected_ready_empty", {"model": base_model.model_id, "replica": chosen.replica_model_id})
+            return chosen.replica_model_id, affinity_key, True
+        if not candidates:
+            log_api_event("replica_no_unblacklisted_routes", {"model": base_model.model_id, "replicas": published_replica_ids})
+            return base_model.model_id, affinity_key, False
+        chosen = sorted(candidates, key=lambda r: (r.in_flight, 1 if r.status == "loading" else 0, r.last_used))[0]
+        REPLICA_ROUTER_STATE.affinity[affinity_key] = (chosen.replica_model_id, now + cfg.sticky_ttl_s)
+        log_api_event("replica_selected_loaded", {"model": base_model.model_id, "replica": chosen.replica_model_id, "in_flight": chosen.in_flight, "status": chosen.status})
+        return chosen.replica_model_id, affinity_key, True
+
+
+def public_model_id_for_response(model_id: str) -> str:
+    return replica_base_model_id(model_id) if is_replica_model_id(model_id) else model_id
 
 
 def mark_model_activity(model_id: str, source: str, phase: str, *, log: bool = True) -> None:
@@ -2017,6 +2946,7 @@ def apply_config_and_wait(
     settle_time = 3.0,
     timeout = 45.0,
     server_defaults: dict[str, object] | None = None,
+    replica_defaults: dict[str, object] | None = None,
 ):
     stop_running_ollama_models(progress_callback=progress_callback)
     render_llamaswap_config(
@@ -2026,6 +2956,7 @@ def apply_config_and_wait(
         start_port,
         resolve_idle_ttl(),
         server_defaults=server_defaults,
+        replica_defaults=replica_defaults,
     )
     _emit_message("Config updated. Waiting for llama-swap --watch-config...", progress_callback)
     time.sleep(settle_time)
@@ -2978,10 +3909,11 @@ def ensure_model_available(args, progress_callback = None):
             existing.n_gpu_layers = desired_n_gpu_layers
             config_changed = True
             _emit_message(f"Applied n_gpu_layers for {existing.model_id}: {desired_n_gpu_layers}", progress_callback)
-        if existing.tensor_split != args.tensor_split:
-            existing.tensor_split = args.tensor_split
+        requested_tensor_split = getattr(args, "tensor_split", None)
+        if requested_tensor_split is not None and existing.tensor_split != requested_tensor_split:
+            existing.tensor_split = requested_tensor_split
             config_changed = True
-            _emit_message(f"Applied tensor_split for {existing.model_id}: {args.tensor_split}", progress_callback)
+            _emit_message(f"Applied tensor_split for {existing.model_id}: {requested_tensor_split}", progress_callback)
         if existing.host != args.host:
             existing.host = args.host
             config_changed = True
@@ -3180,7 +4112,7 @@ def ensure_model_available(args, progress_callback = None):
                 mmproj_path=mmproj_path,
                 ctx_size=default_ctx,
                 n_gpu_layers=int(args.n_gpu_layers),
-                tensor_split=args.tensor_split,
+                tensor_split=args.tensor_split or default_tensor_split(),
                 host=args.host,
                 jinja=not args.no_jinja,
                 ttl=resolve_idle_ttl(args),
@@ -3366,7 +4298,7 @@ def ensure_model_available(args, progress_callback = None):
         mmproj_path=mmproj_path,
         ctx_size=desired_ctx,
         n_gpu_layers=int(args.n_gpu_layers),
-        tensor_split=args.tensor_split,
+        tensor_split=args.tensor_split or default_tensor_split(),
         host=args.host,
         jinja=not args.no_jinja,
         ttl=resolve_idle_ttl(args),
@@ -3517,6 +4449,7 @@ def apply_config_and_wait_absent(
     settle_time = 3.0,
     timeout = 45.0,
     server_defaults: dict[str, object] | None = None,
+    replica_defaults: dict[str, object] | None = None,
 ):
     render_llamaswap_config(
         catalog,
@@ -3525,6 +4458,7 @@ def apply_config_and_wait_absent(
         start_port,
         resolve_idle_ttl(),
         server_defaults=server_defaults,
+        replica_defaults=replica_defaults,
     )
     _emit_message("Config updated. Waiting for llama-swap --watch-config...", progress_callback)
     time.sleep(settle_time)
@@ -3723,6 +4657,7 @@ def remove_model(args, progress_callback = None):
         args.public_port,
         progress_callback=progress_callback,
         server_defaults=resolve_llama_server_defaults(args),
+        replica_defaults=resolve_global_replica_config(args),
     )
 
     if args.delete_files:
@@ -3989,6 +4924,7 @@ def get_llama_server_processes() -> list[dict]:
             check=False,
             capture_output=True,
             text=True,
+            timeout=2,
         )
     except Exception:
         return []
@@ -4007,7 +4943,14 @@ def get_llama_server_processes() -> list[dict]:
         match = re.search(r"--model\s+(\S+)", cmdline)
         if match:
             model_path = match.group(1).strip("'\"")
-        processes.append({"pid": pid, "cmdline": cmdline, "model_path": _safe_realpath(model_path)})
+        port = None
+        port_match = re.search(r"--port\s+(\d+)", cmdline)
+        if port_match:
+            try:
+                port = int(port_match.group(1))
+            except Exception:
+                port = None
+        processes.append({"pid": pid, "cmdline": cmdline, "model_path": _safe_realpath(model_path), "port": port})
     return processes
 
 
@@ -4021,25 +4964,121 @@ def get_loaded_catalog_model_ids(catalog: list[ManagedModel]) -> set[str]:
     }
 
 
-def get_gpu_process_map() -> dict[int, str]:
+def get_catalog_model_process(model_id: str, catalog: list[ManagedModel]) -> dict | None:
+    model = next((item for item in catalog if item.model_id == model_id), None)
+    if model is None:
+        return None
+    process_by_model = {proc["model_path"]: proc for proc in get_llama_server_processes()}
+    return process_by_model.get(_safe_realpath(model.local_path))
+
+
+def get_gpu_uuid_index_map() -> dict[str, int]:
     try:
         result = subprocess.run(
-            ["nvidia-smi", "--query-compute-apps=pid,used_gpu_memory", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader,nounits"],
             check=True,
             capture_output=True,
             text=True,
+            timeout=2,
         )
     except Exception:
         return {}
-
-    gpu_map: dict[int, str] = {}
+    mapping: dict[str, int] = {}
     for line in result.stdout.splitlines():
         chunks = [chunk.strip() for chunk in line.split(",")]
-        if len(chunks) < 2 or not chunks[0].isdigit():
+        if len(chunks) >= 2 and chunks[0].isdigit() and chunks[1]:
+            mapping[chunks[1]] = int(chunks[0])
+    return mapping
+
+
+def get_gpu_process_memory_by_pid() -> dict[int, dict[int, float]]:
+    uuid_to_index = get_gpu_uuid_index_map()
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,gpu_uuid,used_memory", "--format=csv,noheader,nounits"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return {}
+    by_pid: dict[int, dict[int, float]] = {}
+    for line in result.stdout.splitlines():
+        chunks = [chunk.strip() for chunk in line.split(",")]
+        if len(chunks) < 3 or not chunks[0].isdigit():
             continue
-        used = chunks[1]
-        gpu_map[int(chunks[0])] = used
-    return gpu_map
+        pid = int(chunks[0])
+        gpu_uuid = chunks[1]
+        gpu_index = uuid_to_index.get(gpu_uuid)
+        if gpu_index is None:
+            continue
+        try:
+            used_mib = float(str(chunks[2]).replace("MiB", "").strip())
+        except Exception:
+            continue
+        by_pid.setdefault(pid, {})[gpu_index] = used_mib
+    return by_pid
+
+
+def get_gpu_process_map() -> dict[int, str]:
+    # Backward-compatible summary: pid -> total MiB across GPUs.
+    by_pid = get_gpu_process_memory_by_pid()
+    return {pid: str(int(sum(gpus.values()))) for pid, gpus in by_pid.items()}
+
+
+def _model_runtime_snapshot(
+    model_id: str,
+    catalog: list[ManagedModel],
+    host=DEFAULT_PUBLIC_HOST,
+    port=DEFAULT_PUBLIC_PORT,
+    *,
+    include_upstream_health: bool = False,
+) -> dict:
+    """Collect non-fatal diagnostics for a model that may have just unloaded/crashed."""
+    snapshot: dict[str, object] = {"model": model_id}
+    try:
+        published = get_published_model_ids(host, port)
+        snapshot["published"] = model_id in published
+        snapshot["published_count"] = len(published)
+    except Exception as exc:
+        snapshot["published_error"] = str(exc)
+    try:
+        proc = get_catalog_model_process(model_id, catalog)
+        snapshot["process"] = proc or None
+        if proc and isinstance(proc.get("pid"), int):
+            gpu_mem = get_gpu_process_map().get(proc["pid"])
+            if gpu_mem is not None:
+                snapshot["gpu_memory_mib"] = gpu_mem
+    except Exception as exc:
+        snapshot["process_error"] = str(exc)
+    if include_upstream_health:
+        try:
+            health_url = f"http://{_normalize_client_host(host)}:{port}/upstream/{quote(model_id, safe='')}/health"
+            started_at = time.monotonic()
+            response = requests.get(health_url, timeout=(1.5, 3))
+            snapshot["upstream_health_status"] = response.status_code
+            snapshot["upstream_health_ms"] = _elapsed_ms(started_at)
+            if response.status_code >= 400:
+                snapshot["upstream_health_body"] = response.text[:1000]
+        except Exception as exc:
+            snapshot["upstream_health_error"] = str(exc)
+    return snapshot
+
+
+def log_model_runtime_snapshot(
+    kind: str,
+    model_id: str,
+    catalog: list[ManagedModel],
+    host=DEFAULT_PUBLIC_HOST,
+    port=DEFAULT_PUBLIC_PORT,
+    *,
+    include_upstream_health: bool = False,
+    **extra,
+) -> None:
+    payload = _model_runtime_snapshot(model_id, catalog, host, port, include_upstream_health=include_upstream_health)
+    payload.update(extra)
+    log_api_event(kind, payload)
 
 
 def _describe_pid(pid: int) -> str:
@@ -4276,6 +5315,19 @@ def build_model_ctx_payload(model: ManagedModel) -> dict:
     }
 
 
+
+
+def build_openai_model_list_payload(model: ManagedModel) -> dict:
+    # Keep /v1/models fast and side-effect free. Some clients call this during
+    # startup and expect a quick OpenAI-compatible list; detailed metadata is
+    # available through /api/show and /api/ctx.
+    return {
+        "id": model.model_id,
+        "object": "model",
+        "created": 0,
+        "owned_by": "llama-swap",
+    }
+
 def build_openai_model_payload(model: ManagedModel) -> dict:
     load_capabilities = refresh_model_load_capabilities(model)
     gguf_ctx = get_model_context_size(model)
@@ -4474,6 +5526,35 @@ def model_name_aliases(model: ManagedModel) -> list[str]:
     return aliases
 
 
+_PRECISION_MODEL_SUFFIX_RE = re.compile(
+    r"(?i)(?:[-_.:](?:bf16|bfloat16|f16|fp16|float16|f32|fp32|float32))$"
+)
+
+
+def _strip_precision_model_suffix(value: str) -> str:
+    return _PRECISION_MODEL_SUFFIX_RE.sub("", (value or "").strip())
+
+
+def _precision_suffix_alias_candidates(name: str) -> list[str]:
+    candidates: list[str] = []
+
+    def _append(value: str) -> None:
+        candidate = (value or "").strip()
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    stripped = _strip_precision_model_suffix(name)
+    if stripped != name:
+        _append(stripped)
+    if "/" in name:
+        provider_prefix, remainder = name.split("/", 1)
+        if provider_prefix and remainder:
+            stripped_remainder = _strip_precision_model_suffix(remainder)
+            if stripped_remainder != remainder:
+                _append(stripped_remainder)
+    return candidates
+
+
 def _ollama_message_to_openai(message: dict) -> dict:
     role = message.get("role") or "user"
     if role == "tool":
@@ -4644,32 +5725,207 @@ def _collect_openai_sse_response(response: requests.Response) -> dict:
     }
 
 
+def _responses_content_to_openai_content(content) -> str | list:
+    """Convert Responses API content blocks into chat/completions content."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content or "")
+    parts: list[dict] = []
+    for item in content:
+        if isinstance(item, str):
+            if item:
+                parts.append({"type": "text", "text": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").strip()
+        if item_type in {"input_text", "output_text", "text"}:
+            text = str(item.get("text") or "").strip()
+            if text:
+                parts.append({"type": "text", "text": text})
+            continue
+        image_part = _normalize_openai_image_part(item)
+        if image_part is not None:
+            parts.append(image_part)
+    if not parts:
+        return ""
+    if len(parts) == 1 and parts[0].get("type") == "text":
+        return str(parts[0].get("text") or "")
+    return parts
+
+
+def _responses_input_to_openai_messages(payload: dict) -> list[dict]:
+    """Best-effort shim from modern /v1/responses input into chat messages."""
+    messages: list[dict] = []
+    instructions = str(payload.get("instructions") or "").strip()
+    if instructions:
+        messages.append({"role": "system", "content": instructions})
+    raw_input = payload.get("input")
+    if isinstance(raw_input, str):
+        if raw_input.strip():
+            messages.append({"role": "user", "content": raw_input})
+        return messages
+    if isinstance(raw_input, dict):
+        raw_input = [raw_input]
+    if not isinstance(raw_input, list):
+        return messages
+    for item in raw_input:
+        if isinstance(item, str):
+            if item:
+                messages.append({"role": "user", "content": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").strip()
+        if item_type in {"message", ""} or "role" in item:
+            role = str(item.get("role") or "user").strip() or "user"
+            if role in {"tool", "function"}:
+                role = "user"
+            messages.append({"role": role, "content": _responses_content_to_openai_content(item.get("content"))})
+            continue
+        if item_type in {"input_text", "output_text", "text", "input_image"}:
+            messages.append({"role": "user", "content": _responses_content_to_openai_content([item])})
+            continue
+        if item_type in {"function_call_output", "computer_call_output", "tool_result"}:
+            text = item.get("output") or item.get("text") or item.get("content") or ""
+            if text:
+                messages.append({"role": "user", "content": str(text)})
+    return messages
+
+
+def _responses_payload_to_chat_payload(payload: dict, model_name: str) -> dict:
+    """Translate /v1/responses request fields supported by legacy chat backends."""
+    upstream_payload = {
+        "model": model_name,
+        "messages": _responses_input_to_openai_messages(payload),
+        "stream": False,
+    }
+    passthrough_fields = {
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "stop",
+        "seed",
+    }
+    for field_name in passthrough_fields:
+        if field_name in payload:
+            upstream_payload[field_name] = payload[field_name]
+    if "max_output_tokens" in payload:
+        upstream_payload["max_tokens"] = payload["max_output_tokens"]
+    elif "max_tokens" in payload:
+        upstream_payload["max_tokens"] = payload["max_tokens"]
+    # Do not pass Responses-native tools to a legacy /v1/chat/completions
+    # backend. This is not schema validation and does not reject the request:
+    # the proxy accepts the modern Responses payload, then adapts only the
+    # model text turn to the legacy backend endpoint that cannot execute or
+    # represent Responses-only tools like computer_use_preview.
+    return upstream_payload
+
+
+def _responses_raw_passthrough_enabled() -> bool:
+    value = os.environ.get("LLAMACPP_SUPERSERVER_RESPONSES_RAW_PASSTHROUGH", "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_runtime_enabled() -> bool:
+    value = os.environ.get("LLAMACPP_SAFE_RUNTIME", "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _chat_response_to_responses_payload(data: dict, model_name: str, request_payload: dict | None = None) -> dict:
+    request_payload = request_payload or {}
+    response_id = f"resp_{uuid.uuid4().hex}"
+    created_at = int(time.time())
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    output_text = message.get("content") or ""
+    output_item_id = f"msg_{uuid.uuid4().hex}"
+    payload = {
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "status": "completed",
+        "model": model_name,
+        "output": [
+            {
+                "id": output_item_id,
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": output_text, "annotations": []}],
+            }
+        ],
+        "parallel_tool_calls": bool(request_payload.get("parallel_tool_calls", True)),
+        "tool_choice": request_payload.get("tool_choice", "auto"),
+        "tools": request_payload.get("tools") if isinstance(request_payload.get("tools"), list) else [],
+        "output_text": output_text,
+    }
+    if data.get("usage") is not None:
+        payload["usage"] = data["usage"]
+    return payload
+
+
+def _write_responses_sse(handler: BaseHTTPRequestHandler, payload: dict) -> None:
+    text = payload.get("output_text") or ""
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/event-stream")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.end_headers()
+    events = [
+        ("response.created", {**payload, "status": "in_progress", "output": []}),
+        ("response.output_text.delta", {"type": "response.output_text.delta", "delta": text, "output_index": 0, "content_index": 0}),
+        ("response.output_text.done", {"type": "response.output_text.done", "text": text, "output_index": 0, "content_index": 0}),
+        ("response.completed", payload),
+    ]
+    for event_name, event_payload in events:
+        handler.wfile.write(f"event: {event_name}\n".encode("utf-8"))
+        handler.wfile.write(("data: " + json.dumps(event_payload, ensure_ascii=False) + "\n\n").encode("utf-8"))
+        handler.wfile.flush()
+    handler.wfile.write(b"data: [DONE]\n\n")
+    handler.wfile.flush()
+
+
 def resolve_catalog_model_name(raw_name: str, catalog: list[ManagedModel]) -> str:
     name = (raw_name or "").strip()
     if not name:
         return name
+
+    def _match_catalog(candidate: str) -> str | None:
+        exact = next((item.model_id for item in catalog if item.model_id == candidate), None)
+        if exact:
+            return exact
+        alias_match = next((item.model_id for item in catalog if candidate in item.aliases), None)
+        if alias_match:
+            return alias_match
+        for catalog_item in catalog:
+            if candidate in model_name_aliases(catalog_item):
+                return catalog_item.model_id
+        try:
+            repo_id, quant = parse_hf_input(candidate)
+        except Exception:
+            return None
+        for catalog_item in catalog:
+            if catalog_item.repo_id == repo_id and ((catalog_item.quant or "") == (quant or "")):
+                return catalog_item.model_id
+        return None
+
     if "/" in name:
         provider_prefix, remainder = name.split("/", 1)
         if provider_prefix and remainder:
-            exact_prefixed = next((item.model_id for item in catalog if item.model_id == remainder), None)
-            if exact_prefixed:
-                return exact_prefixed
-    exact = next((item.model_id for item in catalog if item.model_id == name), None)
-    if exact:
-        return exact
-    alias_match = next((item.model_id for item in catalog if name in item.aliases), None)
-    if alias_match:
-        return alias_match
-    for item in catalog:
-        if name in model_name_aliases(item):
-            return item.model_id
-    try:
-        repo_id, quant = parse_hf_input(name)
-    except Exception:
-        return name
-    for item in catalog:
-        if item.repo_id == repo_id and ((item.quant or "") == (quant or "")):
-            return item.model_id
+            prefixed_match = _match_catalog(remainder)
+            if prefixed_match:
+                return prefixed_match
+    direct_match = _match_catalog(name)
+    if direct_match:
+        return direct_match
+    for candidate in _precision_suffix_alias_candidates(name):
+        suffix_match = _match_catalog(candidate)
+        if suffix_match:
+            return suffix_match
     return name
 
 
@@ -4729,15 +5985,48 @@ def start_unexpected_unload_guard(args):
                         if not should_reload:
                             log_api_event(
                                 "model_unload_observed",
-                                {"model": model_id, "activity_age_seconds": age, "idle_ttl": idle_ttl},
+                                {
+                                    "model": model_id,
+                                    "activity_age_seconds": age,
+                                    "idle_ttl": idle_ttl,
+                                    "last_activity": activity.get(model_id),
+                                    "last_activity_model_id": last_activity_model_id,
+                                },
+                            )
+                            log_model_runtime_snapshot(
+                                "model_unload_observed_runtime",
+                                model_id,
+                                catalog,
+                                host,
+                                port,
                             )
                             continue
                         log_api_event(
                             "model_unexpected_unload",
-                            {"model": model_id, "activity_age_seconds": age, "idle_ttl": idle_ttl},
+                            {
+                                "model": model_id,
+                                "activity_age_seconds": age,
+                                "idle_ttl": idle_ttl,
+                                "last_activity": activity.get(model_id),
+                                "last_activity_model_id": last_activity_model_id,
+                            },
+                        )
+                        log_model_runtime_snapshot(
+                            "model_unexpected_unload_runtime_before_reload",
+                            model_id,
+                            catalog,
+                            host,
+                            port,
                         )
                         if _touch_model_via_llamaswap(model_id, host, port):
                             state["loaded"] = get_loaded_catalog_model_ids(catalog)
+                            log_model_runtime_snapshot(
+                                "model_unexpected_unload_runtime_after_reload",
+                                model_id,
+                                catalog,
+                                host,
+                                port,
+                            )
             except Exception as exc:
                 log_api_event("model_unload_guard_error", {"error": str(exc)})
             time.sleep(poll_interval)
@@ -4756,8 +6045,161 @@ def _tail_text_file(path: Path, lines: int = 50) -> str:
         return f"Could not read {path}: {exc}"
     return "\n".join(data[-lines:]) if data else f"No request log entries in {path}"
 
+
+def _candidate_request_log_paths(explicit_path: Path | None = None) -> list[Path]:
+    candidates: list[Path] = []
+    if explicit_path is not None:
+        candidates.append(explicit_path)
+    candidates.append(DEFAULT_REQUESTS_LOG_PATH)
+    if SYSTEM_REQUESTS_LOG_PATH not in candidates:
+        candidates.append(SYSTEM_REQUESTS_LOG_PATH)
+    env_path = os.environ.get("LLAMACPP_REQUESTS_LOG")
+    if env_path:
+        path = Path(env_path).expanduser()
+        if path not in candidates:
+            candidates.insert(0, path)
+    return candidates
+
+
+def get_config_model_port_map(config_path: Path | str | None) -> dict[str, int]:
+    if config_path is None:
+        return {}
+    try:
+        payload = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    try:
+        start_port = int(payload.get("startPort") or DEFAULT_START_PORT)
+    except Exception:
+        start_port = DEFAULT_START_PORT
+    models = payload.get("models") or {}
+    if not isinstance(models, dict):
+        return {}
+    return {str(model_id): start_port + idx for idx, model_id in enumerate(models.keys())}
+
+
+def sync_replica_runtime_state(
+    catalog: list[ManagedModel],
+    config_path: Path | str | None = None,
+    global_replica_config: dict[str, object] | None = None,
+) -> None:
+    port_by_model = get_config_model_port_map(config_path)
+    model_by_port = {port: model_id for model_id, port in port_by_model.items()}
+    processes = get_llama_server_processes()
+    proc_by_port = {proc.get("port"): proc for proc in processes if proc.get("port") is not None}
+    gpu_mem_by_pid = get_gpu_process_memory_by_pid()
+    now = time.monotonic()
+    with REPLICA_ROUTER_STATE.lock:
+        for model in catalog:
+            cfg = get_model_replica_config(model, global_replica_config)
+            if not cfg.enabled:
+                continue
+            for idx, gpu_set in enumerate(_replica_gpu_sets(model, cfg)):
+                rid = replica_model_id(model.model_id, idx)
+                rec = REPLICA_ROUTER_STATE.records.setdefault(
+                    rid,
+                    ReplicaRecord(base_model_id=model.model_id, replica_model_id=rid, gpu_set=list(gpu_set)),
+                )
+                rec.gpu_set = list(gpu_set)
+                port = port_by_model.get(rid)
+                rec.port = port
+                proc = proc_by_port.get(port) if port is not None else None
+                if proc is not None:
+                    pid = int(proc["pid"])
+                    rec.pid = pid
+                    rec.gpu_actual_mib = dict(gpu_mem_by_pid.get(pid, {}))
+                    rec.actual_mib = float(sum(rec.gpu_actual_mib.values())) if rec.gpu_actual_mib else None
+                    if rec.status in {"cold", "loading", "error"}:
+                        rec.status = "ready"
+                    rec.last_used = rec.last_used or now
+                else:
+                    rec.pid = None
+                    rec.gpu_actual_mib = {}
+                    rec.actual_mib = None
+                    if rec.status == "ready":
+                        rec.status = "cold"
+
+
+def replica_router_snapshot(catalog: list[ManagedModel], config_path: Path | str | None = None, args = None) -> dict[str, object]:
+    global_replica_config = resolve_global_replica_config(args)
+    sync_replica_runtime_state(catalog, config_path, global_replica_config)
+    if args is not None:
+        published = sorted(
+            get_published_model_ids(
+                host=getattr(args, "public_host", DEFAULT_PUBLIC_HOST),
+                port=int(getattr(args, "public_port", DEFAULT_PUBLIC_PORT)),
+            )
+        )
+    else:
+        published = sorted(get_published_model_ids())
+    configured = []
+    skipped = []
+    total_gpus = detect_cuda_device_count()
+    for model in catalog:
+        cfg = get_model_replica_config(model, global_replica_config)
+        if not cfg.enabled:
+            skipped.append({"model": model.model_id, "reason": "replicas_disabled", "tensor_split": model.tensor_split})
+            continue
+        gpu_sets = _replica_gpu_sets(model, cfg)
+        if not gpu_sets:
+            skipped.append({
+                "model": model.model_id,
+                "reason": "no_gpu_sets",
+                "tensor_split": model.tensor_split,
+                "max": cfg.max,
+                "gpus_per_replica": cfg.gpus_per_replica,
+                "total_gpus": total_gpus,
+            })
+            continue
+        configured.append({
+            "model": model.model_id,
+            "enabled": cfg.enabled,
+            "max": cfg.max,
+            "gpus_per_replica": cfg.gpus_per_replica,
+            "placement": cfg.placement,
+            "tensor_split": model.tensor_split,
+            "gpu_sets": gpu_sets,
+            "replica_ids": [replica_model_id(model.model_id, idx) for idx in range(len(gpu_sets))],
+        })
+    with REPLICA_ROUTER_STATE.lock:
+        records = [
+            {
+                "replica": rec.replica_model_id,
+                "base_model": rec.base_model_id,
+                "gpu_set": rec.gpu_set,
+                "status": rec.status,
+                "in_flight": rec.in_flight,
+                "estimated_mib": rec.estimated_mib,
+                "actual_mib": rec.actual_mib,
+                "gpu_actual_mib": rec.gpu_actual_mib,
+                "pid": rec.pid,
+                "port": rec.port,
+                "blacklist_until": rec.blacklist_until,
+                "published": rec.replica_model_id in published,
+            }
+            for rec in sorted(REPLICA_ROUTER_STATE.records.values(), key=lambda r: r.replica_model_id)
+        ]
+        affinities = [
+            {"key": key, "replica": value[0], "expires_in_s": max(0.0, value[1] - time.monotonic())}
+            for key, value in sorted(REPLICA_ROUTER_STATE.affinity.items())
+        ]
+    diagnostics = {
+        "server_config_path": str(_args_server_config_path(args)),
+        "config_path": str(config_path) if config_path is not None else "",
+        "catalog_path": str(getattr(args, "catalog", "")) if args is not None else "",
+        "catalog_count": len(catalog),
+        "total_gpus": total_gpus,
+        "replicas_config": global_replica_config,
+        "replicas_enabled_raw": global_replica_config.get("enabled") if isinstance(global_replica_config, dict) else None,
+        "configured_count": len(configured),
+        "skipped_sample": skipped[:20],
+    }
+    return {"diagnostics": diagnostics, "configured": configured, "records": records, "affinities": affinities, "published_model_ids": published}
+
+
 def start_ctx_metadata_server(args):
-    host = args.public_host
+    bind_host = args.public_host
+    client_host = _normalize_client_host(args.public_host)
     port = resolve_api_port(args)
     catalog_path = Path(args.catalog)
 
@@ -4786,11 +6228,11 @@ def start_ctx_metadata_server(args):
         def do_GET(self):
             parsed = urlparse(self.path)
             catalog = load_catalog(catalog_path)
-            if parsed.path == "/v1/models":
-                self._send_json({"object": "list", "data": [build_openai_model_payload(model) for model in catalog]})
+            if parsed.path in {"/v1/models", "/models"}:
+                self._send_json({"object": "list", "data": [build_openai_model_list_payload(model) for model in catalog]})
                 return
             if parsed.path == "/api/tags":
-                published_models = get_published_model_ids(host, int(args.public_port))
+                published_models = get_published_model_ids(client_host, int(args.public_port))
                 processes = get_llama_server_processes()
                 process_by_model = {proc["model_path"]: proc for proc in processes}
                 gpu_process_map = get_gpu_process_map()
@@ -4802,7 +6244,7 @@ def start_ctx_metadata_server(args):
                 self._send_json({"models": models})
                 return
             if parsed.path == "/api/ps":
-                published_models = get_published_model_ids(host, int(args.public_port))
+                published_models = get_published_model_ids(client_host, int(args.public_port))
                 processes = get_llama_server_processes()
                 process_by_model = {proc["model_path"]: proc for proc in processes}
                 gpu_process_map = get_gpu_process_map()
@@ -4833,6 +6275,9 @@ def start_ctx_metadata_server(args):
                     ]
                 })
                 return
+            if parsed.path == "/api/replicas":
+                self._send_json(replica_router_snapshot(catalog, args.config, args))
+                return
             if parsed.path == "/api/show":
                 name = parse_qs(parsed.query).get("name", [""])[0]
                 return self._handle_show(name, catalog)
@@ -4848,7 +6293,9 @@ def start_ctx_metadata_server(args):
                 return self._handle_ollama_generate()
             if parsed.path in {"/api/embed", "/api/embeddings"}:
                 return self._handle_ollama_embeddings()
-            if parsed.path == "/v1/chat/completions":
+            if parsed.path in {"/v1/responses", "/responses"}:
+                return self._handle_openai_responses()
+            if parsed.path in {"/v1/chat/completions", "/chat/completions"}:
                 return self._handle_openai_chat_completions()
             if parsed.path.startswith("/v1/"):
                 return self._proxy_request("POST")
@@ -4921,13 +6368,29 @@ def start_ctx_metadata_server(args):
             length = int(self.headers.get("Content-Length", "0") or 0)
             body = self.rfile.read(length) if length > 0 else None
             activity_model = ""
-            if body:
+            upstream_model_name = ""
+            is_replica_request = False
+            proxy_payload = {}
+            if body and method == "POST":
                 try:
                     proxy_payload = json.loads(body.decode("utf-8"))
-                    if isinstance(proxy_payload, dict):
-                        activity_model = resolve_catalog_model_name(str(proxy_payload.get("model") or ""), load_catalog(catalog_path))
+                    if isinstance(proxy_payload, dict) and proxy_payload.get("model"):
+                        catalog = load_catalog(catalog_path)
+                        activity_model = resolve_catalog_model_name(str(proxy_payload.get("model") or ""), catalog)
                         if activity_model:
                             mark_model_activity(activity_model, f"proxy:{parsed.path}", "request_start")
+                            model_entry = next((item for item in catalog if item.model_id == activity_model), None)
+                            if model_entry is not None:
+                                replica_defaults = resolve_global_replica_config(args)
+                                published_model_ids = get_published_model_ids(client_host, int(args.public_port))
+                                sync_replica_runtime_state(catalog, args.config, replica_defaults)
+                                upstream_model_name, _, is_replica_request = select_replica_for_request(
+                                    model_entry, proxy_payload, self.headers, replica_defaults, published_model_ids
+                                )
+                                if is_replica_request:
+                                    proxy_payload["model"] = upstream_model_name
+                                    body = json.dumps(proxy_payload).encode("utf-8")
+                                    REPLICA_ROUTER_STATE.request_started(upstream_model_name)
                 except Exception:
                     pass
             log_api_event("proxy_request", {"method": method, "path": parsed.path, "query": parsed.query, "body": body.decode("utf-8", errors="replace")[:4000] if body else ""})
@@ -4937,16 +6400,20 @@ def start_ctx_metadata_server(args):
                     parsed.path + (("?" + parsed.query) if parsed.query else ""),
                     body=body,
                     headers={key: value for key, value in self.headers.items()},
-                    host=host,
+                    host=client_host,
                     port=int(args.public_port),
                 )
             except requests.RequestException as exc:
                 log_api_event("proxy_error", {"method": method, "path": parsed.path, "error": str(exc)})
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": f"upstream unavailable: {exc}"}, status=502)
                 return
 
             content = response.content
             log_api_event("proxy_response", {"method": method, "path": parsed.path, "status": response.status_code, "body": content.decode('utf-8', errors='replace')[:4000]})
+            if is_replica_request:
+                REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=response.status_code < 400)
             if activity_model:
                 mark_model_activity(activity_model, f"proxy:{parsed.path}", "response_done")
             self.send_response(response.status_code)
@@ -4959,6 +6426,7 @@ def start_ctx_metadata_server(args):
             self.end_headers()
             self.wfile.write(content)
 
+
         def _read_json_body(self) -> dict:
             length = int(self.headers.get("Content-Length", "0") or 0)
             raw = self.rfile.read(length) if length > 0 else b"{}"
@@ -4968,8 +6436,20 @@ def start_ctx_metadata_server(args):
                 payload = {}
             return payload if isinstance(payload, dict) else {}
 
+        def _proxy_raw_response(self, response: requests.Response):
+            content = response.content
+            self.send_response(response.status_code)
+            for key, value in response.headers.items():
+                lowered = key.lower()
+                if lowered in {"content-length", "connection", "transfer-encoding", "content-encoding"}:
+                    continue
+                self.send_header(key, value)
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+
         def _reject_if_gpu_busy(self, model_name: str, catalog: list[ManagedModel], *, api_style: str) -> bool:
-            gpu_conflict = get_gpu_conflict_message(model_name, catalog, host, int(args.public_port))
+            gpu_conflict = get_gpu_conflict_message(model_name, catalog, client_host, int(args.public_port))
             if not gpu_conflict:
                 return False
             log_api_event("model_load_blocked_gpu_busy", {"model": model_name, "message": gpu_conflict, "api_style": api_style})
@@ -4988,10 +6468,22 @@ def start_ctx_metadata_server(args):
             if not model_name:
                 self._send_json({"error": "model is required"}, status=400)
                 return
-            if self._reject_if_gpu_busy(model_name, catalog, api_style="ollama"):
+            model_entry = next((item for item in catalog if item.model_id == model_name), None)
+            upstream_model_name = model_name
+            is_replica_request = False
+            affinity_key = ""
+            if model_entry is not None:
+                replica_defaults = resolve_global_replica_config(args)
+                published_model_ids = get_published_model_ids(client_host, int(args.public_port))
+                sync_replica_runtime_state(catalog, args.config, replica_defaults)
+                upstream_model_name, affinity_key, is_replica_request = select_replica_for_request(
+                    model_entry, payload, self.headers, replica_defaults, published_model_ids
+                )
+            if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama"):
                 return
             mark_model_activity(model_name, "ollama_chat", "request_start")
-            model_entry = next((item for item in catalog if item.model_id == model_name), None)
+            if is_replica_request:
+                REPLICA_ROUTER_STATE.request_started(upstream_model_name)
             raw_messages = payload.get("messages") or []
             messages = [_ollama_message_to_openai(item) for item in raw_messages if isinstance(item, dict)]
             if not messages:
@@ -5002,6 +6494,8 @@ def start_ctx_metadata_server(args):
                 if prompt:
                     messages.append({"role": "user", "content": prompt})
             if not messages:
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": "messages or prompt is required"}, status=400)
                 return
             if _messages_include_images(messages) and (model_entry is None or not _has_vision_runtime(model_entry)):
@@ -5014,10 +6508,12 @@ def start_ctx_metadata_server(args):
                     },
                     status=400,
                 )
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 return
             stream = bool(payload.get("stream"))
             upstream_payload = {
-                "model": model_name,
+                "model": upstream_model_name,
                 "messages": messages,
                 "stream": stream,
             }
@@ -5032,7 +6528,7 @@ def start_ctx_metadata_server(args):
             if stream:
                 try:
                     response = requests.post(
-                        f"http://{host}:{int(args.public_port)}/v1/chat/completions",
+                        f"http://{client_host}:{int(args.public_port)}/v1/chat/completions",
                         data=json.dumps(upstream_payload).encode("utf-8"),
                         headers={"Content-Type": "application/json"},
                         timeout=(10, 600),
@@ -5041,11 +6537,15 @@ def start_ctx_metadata_server(args):
                     log_api_event("ollama_chat_upstream_headers", {"model": model_name, "status": response.status_code, "wait_ms": _elapsed_ms(started_at), "stream": True})
                 except requests.RequestException as exc:
                     log_api_event("ollama_chat_upstream_network_error", {"error": str(exc)})
+                    if is_replica_request:
+                        REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                     self._send_json({"error": f"upstream unavailable: {exc}"}, status=502)
                     return
                 if response.status_code >= 400:
                     body_text = response.text[:4000]
                     log_api_event("ollama_chat_upstream_error", {"status": response.status_code, "body": body_text, "payload": upstream_payload})
+                    if is_replica_request:
+                        REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                     self._send_json({"error": f"upstream unavailable: HTTP {response.status_code}: {body_text[:1000]}"}, status=502)
                     return
                 self.send_response(200)
@@ -5064,6 +6564,8 @@ def start_ctx_metadata_server(args):
                         self.wfile.write((json.dumps(done_payload, ensure_ascii=False) + "\n").encode("utf-8"))
                         self.wfile.flush()
                         mark_model_activity(model_name, "ollama_chat", "stream_done")
+                        if is_replica_request:
+                            REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
                         log_api_event("ollama_chat_stream_done", done_payload)
                         log_api_event("ollama_chat_total", {"model": model_name, "total_ms": _elapsed_ms(started_at), "stream": True})
                         return
@@ -5089,13 +6591,15 @@ def start_ctx_metadata_server(args):
                 self.wfile.write((json.dumps(done_payload, ensure_ascii=False) + "\n").encode("utf-8"))
                 self.wfile.flush()
                 mark_model_activity(model_name, "ollama_chat", "stream_done")
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
                 log_api_event("ollama_chat_stream_done", done_payload)
-                log_api_event("ollama_chat_total", {"model": model_name, "total_ms": _elapsed_ms(started_at), "stream": True})
+                log_api_event("ollama_chat_total", {"model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": True})
                 return
 
             try:
                 response = requests.post(
-                    f"http://{host}:{int(args.public_port)}/v1/chat/completions",
+                    f"http://{client_host}:{int(args.public_port)}/v1/chat/completions",
                     data=json.dumps(upstream_payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     timeout=(10, 600),
@@ -5104,20 +6608,28 @@ def start_ctx_metadata_server(args):
                 log_api_event("ollama_chat_upstream_headers", {"model": model_name, "status": response.status_code, "wait_ms": _elapsed_ms(started_at), "stream": False})
             except requests.RequestException as exc:
                 log_api_event("ollama_chat_upstream_network_error", {"error": str(exc)})
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": f"upstream unavailable: {exc}"}, status=502)
                 return
             if response.status_code >= 400:
                 body_text = response.text[:4000]
                 log_api_event("ollama_chat_upstream_error", {"status": response.status_code, "body": body_text, "payload": upstream_payload})
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": f"upstream unavailable: HTTP {response.status_code}: {body_text[:1000]}"}, status=502)
                 return
             try:
                 data = response.json()
             except Exception as exc:
                 log_api_event("ollama_chat_upstream_invalid_json", {"status": response.status_code, "error": str(exc), "body": response.text[:4000]})
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": f"upstream invalid response: {exc}"}, status=502)
                 return
-            log_api_event("ollama_chat_total", {"model": model_name, "total_ms": _elapsed_ms(started_at), "stream": False})
+            if is_replica_request:
+                REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
+            log_api_event("ollama_chat_total", {"model": model_name, "upstream_model": upstream_model_name, "affinity_key": affinity_key, "total_ms": _elapsed_ms(started_at), "stream": False})
             message = data.get("choices", [{}])[0].get("message", {})
             content = message.get("content", "")
             usage = data.get("usage") or {}
@@ -5152,16 +6664,32 @@ def start_ctx_metadata_server(args):
             if not model_name:
                 self._send_json({"error": {"message": "model is required", "type": "invalid_request_error"}}, status=400)
                 return
-            if self._reject_if_gpu_busy(model_name, catalog, api_style="openai"):
+            model_entry = next((item for item in catalog if item.model_id == model_name), None)
+            upstream_model_name = model_name
+            is_replica_request = False
+            affinity_key = ""
+            if model_entry is not None:
+                replica_defaults = resolve_global_replica_config(args)
+                published_model_ids = get_published_model_ids(client_host, int(args.public_port))
+                sync_replica_runtime_state(catalog, args.config, replica_defaults)
+                upstream_model_name, affinity_key, is_replica_request = select_replica_for_request(
+                    model_entry, payload, self.headers, replica_defaults, published_model_ids
+                )
+            if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="openai"):
                 return
             mark_model_activity(model_name, "openai_chat", "request_start")
-            model_entry = next((item for item in catalog if item.model_id == model_name), None)
+            if is_replica_request:
+                REPLICA_ROUTER_STATE.request_started(upstream_model_name)
             raw_messages = payload.get("messages") or []
             if not isinstance(raw_messages, list) or not raw_messages:
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": {"message": "messages is required", "type": "invalid_request_error"}}, status=400)
                 return
             messages = [_normalize_openai_message(item) for item in raw_messages if isinstance(item, dict)]
             if not messages:
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": {"message": "messages is required", "type": "invalid_request_error"}}, status=400)
                 return
             if _messages_include_images(messages) and (model_entry is None or not _has_vision_runtime(model_entry)):
@@ -5177,27 +6705,33 @@ def start_ctx_metadata_server(args):
                     },
                     status=400,
                 )
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 return
             upstream_payload = dict(payload)
-            upstream_payload["model"] = model_name
+            upstream_payload["model"] = upstream_model_name
             upstream_payload["messages"] = messages
             stream = bool(payload.get("stream"))
             try:
                 response = requests.post(
-                    f"http://{host}:{int(args.public_port)}/v1/chat/completions",
+                    f"http://{client_host}:{int(args.public_port)}/v1/chat/completions",
                     data=json.dumps(upstream_payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     timeout=(10, 600),
                     stream=stream,
                 )
-                log_api_event("openai_chat_upstream_headers", {"model": model_name, "status": response.status_code, "wait_ms": _elapsed_ms(started_at), "stream": stream})
+                log_api_event("openai_chat_upstream_headers", {"model": model_name, "upstream_model": upstream_model_name, "affinity_key": affinity_key, "status": response.status_code, "wait_ms": _elapsed_ms(started_at), "stream": stream})
             except requests.RequestException as exc:
                 log_api_event("openai_chat_upstream_network_error", {"error": str(exc), "payload": upstream_payload})
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": {"message": f"upstream unavailable: {exc}", "type": "server_error"}}, status=502)
                 return
             if response.status_code >= 400:
                 body_text = response.text[:4000]
                 log_api_event("openai_chat_upstream_error", {"status": response.status_code, "body": body_text, "payload": upstream_payload})
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json(
                     {"error": {"message": f"upstream unavailable: HTTP {response.status_code}: {body_text[:1000]}", "type": "server_error"}},
                     status=502,
@@ -5223,15 +6757,21 @@ def start_ctx_metadata_server(args):
                 finally:
                     response.close()
                     mark_model_activity(model_name, "openai_chat", "stream_closed")
-                    log_api_event("openai_chat_total", {"model": model_name, "total_ms": _elapsed_ms(started_at), "stream": True})
+                    if is_replica_request:
+                        REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
+                    log_api_event("openai_chat_total", {"model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": True})
                 return
             try:
                 data = response.json()
             except Exception as exc:
                 log_api_event("openai_chat_upstream_invalid_json", {"error": str(exc), "payload": upstream_payload, "body": response.text[:4000]})
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": {"message": f"upstream invalid response: {exc}", "type": "server_error"}}, status=502)
                 return
-            log_api_event("openai_chat_total", {"model": model_name, "total_ms": _elapsed_ms(started_at), "stream": False})
+            if is_replica_request:
+                REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
+            log_api_event("openai_chat_total", {"model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": False})
             choice = (data.get("choices") or [{}])[0]
             final_payload = {
                 "id": data.get("id") or f"chatcmpl-{uuid.uuid4().hex}",
@@ -5254,18 +6794,265 @@ def start_ctx_metadata_server(args):
             mark_model_activity(model_name, "openai_chat", "response_done")
             self._send_json(final_payload)
 
+        def _handle_openai_responses(self):
+            payload = self._read_json_body()
+            request_id = f"resp_req_{uuid.uuid4().hex}"
+            log_api_event(
+                "openai_responses_request",
+                {"request_id": request_id, "payload": _summarize_api_payload_for_log(payload)},
+            )
+            started_at = time.monotonic()
+            catalog = load_catalog(catalog_path)
+            model_name = resolve_catalog_model_name(str(payload.get("model") or "").strip(), catalog)
+            if not model_name:
+                self._send_json({"error": {"message": "model is required", "type": "invalid_request_error"}}, status=400)
+                return
+            model_entry = next((item for item in catalog if item.model_id == model_name), None)
+            upstream_model_name = model_name
+            is_replica_request = False
+            affinity_key = ""
+            if model_entry is not None:
+                replica_defaults = resolve_global_replica_config(args)
+                published_model_ids = get_published_model_ids(client_host, int(args.public_port))
+                sync_replica_runtime_state(catalog, args.config, replica_defaults)
+                upstream_model_name, affinity_key, is_replica_request = select_replica_for_request(
+                    model_entry, payload, self.headers, replica_defaults, published_model_ids
+                )
+            if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="openai"):
+                return
+            mark_model_activity(model_name, f"openai_responses:{request_id}", "request_start")
+            if is_replica_request:
+                REPLICA_ROUTER_STATE.request_started(upstream_model_name)
+            log_model_runtime_snapshot(
+                "openai_responses_runtime_before_upstream",
+                model_name,
+                catalog,
+                host,
+                int(args.public_port),
+                request_id=request_id,
+            )
+
+            # Default path: this proxy is the Responses API compatibility
+            # adapter. Do not blindly forward Codex Desktop's modern Responses
+            # payload to llama.cpp: some builds expose/route /v1/responses only
+            # partially and may crash on proprietary tools such as
+            # computer_use_preview. Raw passthrough is opt-in for future
+            # backends that are known to implement modern Responses safely.
+            if _responses_raw_passthrough_enabled():
+                try:
+                    passthrough_response = requests.post(
+                        f"http://{client_host}:{int(args.public_port)}/v1/responses",
+                        data=json.dumps({**payload, "model": upstream_model_name}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        timeout=(10, 600),
+                        stream=False,
+                    )
+                    log_api_event(
+                        "openai_responses_passthrough_headers",
+                        {
+                            "model": model_name,
+                            "upstream_model": upstream_model_name,
+                            "affinity_key": affinity_key,
+                            "request_id": request_id,
+                            "status": passthrough_response.status_code,
+                            "wait_ms": _elapsed_ms(started_at),
+                        },
+                    )
+                    if passthrough_response.status_code not in {404, 405, 501}:
+                        mark_model_activity(model_name, f"openai_responses:{request_id}", "passthrough_done")
+                        if is_replica_request:
+                            REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
+                        self._proxy_raw_response(passthrough_response)
+                        return
+                    log_api_event(
+                        "openai_responses_passthrough_unsupported",
+                        {
+                            "model": model_name,
+                            "request_id": request_id,
+                            "status": passthrough_response.status_code,
+                            "body": passthrough_response.text[:1000],
+                        },
+                    )
+                except requests.RequestException as exc:
+                    log_api_event("openai_responses_passthrough_network_error", {"model": model_name, "request_id": request_id, "error": str(exc)})
+                    log_model_runtime_snapshot(
+                        "openai_responses_runtime_after_passthrough_network_error",
+                        model_name,
+                        catalog,
+                        host,
+                        int(args.public_port),
+                        request_id=request_id,
+                    )
+            else:
+                log_api_event("openai_responses_passthrough_skipped", {"model": model_name, "request_id": request_id, "reason": "disabled"})
+
+            # Compatibility path for llama.cpp versions that only expose
+            # /v1/chat/completions.  This path accepts modern Responses payloads
+            # but can only execute the model text turn; tools are preserved in
+            # the facade response metadata rather than rejected by old schemas.
+            upstream_payload = _responses_payload_to_chat_payload(payload, upstream_model_name)
+            log_api_event(
+                "openai_responses_chat_fallback_payload",
+                {"model": model_name, "request_id": request_id, "payload": _summarize_api_payload_for_log(upstream_payload)},
+            )
+            messages = upstream_payload.get("messages") or []
+            if not messages:
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                self._send_json({"error": {"message": "input is required", "type": "invalid_request_error"}}, status=400)
+                return
+            if _messages_include_images(messages) and (model_entry is None or not _has_vision_runtime(model_entry)):
+                self._send_json(
+                    {
+                        "error": {
+                            "message": (
+                                f"model '{model_name}' is installed without multimodal projector support (mmproj). "
+                                "Re-add or update the model so the matching mmproj GGUF is downloaded and configured."
+                            ),
+                            "type": "invalid_request_error",
+                        }
+                    },
+                    status=400,
+                )
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                return
+            try:
+                response = requests.post(
+                    f"http://{client_host}:{int(args.public_port)}/v1/chat/completions",
+                    data=json.dumps(upstream_payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    timeout=(10, 600),
+                    stream=False,
+                )
+                log_api_event(
+                    "openai_responses_upstream_headers",
+                    {
+                        "model": model_name,
+                        "request_id": request_id,
+                        "status": response.status_code,
+                        "wait_ms": _elapsed_ms(started_at),
+                    },
+                )
+            except requests.RequestException as exc:
+                log_api_event(
+                    "openai_responses_upstream_network_error",
+                    {
+                        "model": model_name,
+                        "request_id": request_id,
+                        "error": str(exc),
+                        "payload": _summarize_api_payload_for_log(upstream_payload),
+                    },
+                )
+                log_model_runtime_snapshot(
+                    "openai_responses_runtime_after_upstream_network_error",
+                    model_name,
+                    catalog,
+                    host,
+                    int(args.public_port),
+                    request_id=request_id,
+                )
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                self._send_json({"error": {"message": f"upstream unavailable: {exc}", "type": "server_error"}}, status=502)
+                return
+            if response.status_code >= 400:
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                body_text = response.text[:4000]
+                log_api_event(
+                    "openai_responses_upstream_error",
+                    {
+                        "model": model_name,
+                        "request_id": request_id,
+                        "status": response.status_code,
+                        "body": body_text,
+                        "payload": _summarize_api_payload_for_log(upstream_payload),
+                    },
+                )
+                log_model_runtime_snapshot(
+                    "openai_responses_runtime_after_upstream_http_error",
+                    model_name,
+                    catalog,
+                    host,
+                    int(args.public_port),
+                    request_id=request_id,
+                    upstream_status=response.status_code,
+                )
+                self._send_json(
+                    {"error": {"message": f"upstream unavailable: HTTP {response.status_code}: {body_text[:1000]}", "type": "server_error"}},
+                    status=502,
+                )
+                return
+            try:
+                data = response.json()
+            except Exception as exc:
+                log_api_event(
+                    "openai_responses_upstream_invalid_json",
+                    {
+                        "model": model_name,
+                        "request_id": request_id,
+                        "error": str(exc),
+                        "payload": _summarize_api_payload_for_log(upstream_payload),
+                        "body": response.text[:4000],
+                    },
+                )
+                log_model_runtime_snapshot(
+                    "openai_responses_runtime_after_upstream_invalid_json",
+                    model_name,
+                    catalog,
+                    host,
+                    int(args.public_port),
+                    request_id=request_id,
+                )
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                self._send_json({"error": {"message": f"upstream invalid response: {exc}", "type": "server_error"}}, status=502)
+                return
+            final_payload = _chat_response_to_responses_payload(data, model_name, payload)
+            if is_replica_request:
+                REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
+                REPLICA_ROUTER_STATE.bind_response(str(final_payload.get("id") or ""), upstream_model_name, get_model_replica_config(model_entry).sticky_ttl_s if model_entry else 3600)
+            log_api_event(
+                "openai_responses_response",
+                {
+                    "model": model_name,
+                    "request_id": request_id,
+                    "output_text_len": len(str(final_payload.get("output_text") or "")),
+                    "usage": final_payload.get("usage"),
+                },
+            )
+            mark_model_activity(model_name, f"openai_responses:{request_id}", "response_done")
+            if bool(payload.get("stream")):
+                _write_responses_sse(self, final_payload)
+            else:
+                self._send_json(final_payload)
+
         def _handle_ollama_generate(self):
             payload = self._read_json_body()
             log_api_event("ollama_generate_request", payload)
+            started_at = time.monotonic()
             catalog = load_catalog(catalog_path)
             model_name = resolve_catalog_model_name(str(payload.get("model") or "").strip(), catalog)
             if not model_name:
                 self._send_json({"error": "model is required"}, status=400)
                 return
-            if self._reject_if_gpu_busy(model_name, catalog, api_style="ollama"):
+            model_entry = next((item for item in catalog if item.model_id == model_name), None)
+            upstream_model_name = model_name
+            is_replica_request = False
+            affinity_key = ""
+            if model_entry is not None:
+                replica_defaults = resolve_global_replica_config(args)
+                published_model_ids = get_published_model_ids(client_host, int(args.public_port))
+                sync_replica_runtime_state(catalog, args.config, replica_defaults)
+                upstream_model_name, affinity_key, is_replica_request = select_replica_for_request(
+                    model_entry, payload, self.headers, replica_defaults, published_model_ids
+                )
+            if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama"):
                 return
             mark_model_activity(model_name, "ollama_generate", "request_start")
-            model_entry = next((item for item in catalog if item.model_id == model_name), None)
+            if is_replica_request:
+                REPLICA_ROUTER_STATE.request_started(upstream_model_name)
             prompt = str(payload.get("prompt") or "")
             images = payload.get("images") or []
             options = payload.get("options") or {}
@@ -5278,6 +7065,8 @@ def start_ctx_metadata_server(args):
                 _ollama_message_to_openai({"role": "user", "content": prompt, "images": images})
             )
             if images and (model_entry is None or not _has_vision_runtime(model_entry)):
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json(
                     {
                         "error": (
@@ -5289,7 +7078,7 @@ def start_ctx_metadata_server(args):
                 )
                 return
             upstream_payload = {
-                "model": model_name,
+                "model": upstream_model_name,
                 "messages": upstream_messages,
                 "stream": False,
             }
@@ -5300,7 +7089,7 @@ def start_ctx_metadata_server(args):
                 upstream_payload["max_tokens"] = int(options["num_ctx"])
             try:
                 response = requests.post(
-                    f"http://{host}:{int(args.public_port)}{endpoint}",
+                    f"http://{client_host}:{int(args.public_port)}{endpoint}",
                     data=json.dumps(upstream_payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     timeout=(10, 600),
@@ -5308,19 +7097,27 @@ def start_ctx_metadata_server(args):
                 )
             except requests.RequestException as exc:
                 log_api_event("ollama_generate_upstream_network_error", {"error": str(exc)})
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": f"upstream unavailable: {exc}"}, status=502)
                 return
             if response.status_code >= 400:
                 body_text = response.text[:4000]
                 log_api_event("ollama_generate_upstream_error", {"status": response.status_code, "body": body_text, "payload": upstream_payload})
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": f"upstream unavailable: HTTP {response.status_code}: {body_text[:1000]}"}, status=502)
                 return
             try:
                 data = _collect_openai_sse_response(response)
             except Exception as exc:
                 log_api_event("ollama_generate_upstream_invalid_json", {"status": response.status_code, "error": str(exc)})
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": f"upstream invalid response: {exc}"}, status=502)
                 return
+            if is_replica_request:
+                REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
             text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             base = {
                 "model": model_name,
@@ -5329,7 +7126,7 @@ def start_ctx_metadata_server(args):
                 "done": True,
                 "done_reason": "stop",
                 "context": [],
-                "total_duration": 0,
+                "total_duration": int(_elapsed_ms(started_at) * 1_000_000),
                 "load_duration": 0,
                 "prompt_eval_count": 0,
                 "prompt_eval_duration": 0,
@@ -5344,62 +7141,86 @@ def start_ctx_metadata_server(args):
             mark_model_activity(model_name, "ollama_generate", "response_done")
             self._send_json(base)
 
+
         def _handle_ollama_embeddings(self):
             payload = self._read_json_body()
             log_api_event("ollama_embeddings_request", payload)
-            model = str(payload.get("model") or "").strip()
+            started_at = time.monotonic()
+            model_name_raw = str(payload.get("model") or "").strip()
             catalog = load_catalog(catalog_path)
-            model = resolve_catalog_model_name(model, catalog)
+            model_name = resolve_catalog_model_name(model_name_raw, catalog)
             text_input = payload.get("input")
             if text_input is None:
                 text_input = payload.get("prompt")
-            if not model or text_input is None:
+            if not model_name or text_input is None:
                 self._send_json({"error": "model and input are required"}, status=400)
                 return
-            if self._reject_if_gpu_busy(model, catalog, api_style="ollama"):
+            model_entry = next((item for item in catalog if item.model_id == model_name), None)
+            upstream_model_name = model_name
+            is_replica_request = False
+            affinity_key = ""
+            if model_entry is not None:
+                replica_defaults = resolve_global_replica_config(args)
+                published_model_ids = get_published_model_ids(client_host, int(args.public_port))
+                sync_replica_runtime_state(catalog, args.config, replica_defaults)
+                upstream_model_name, affinity_key, is_replica_request = select_replica_for_request(
+                    model_entry, payload, self.headers, replica_defaults, published_model_ids
+                )
+            if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama"):
                 return
-            mark_model_activity(model, "ollama_embeddings", "request_start")
-            upstream_payload = {"model": model, "input": text_input}
+            mark_model_activity(model_name, "ollama_embeddings", "request_start")
+            if is_replica_request:
+                REPLICA_ROUTER_STATE.request_started(upstream_model_name)
+            upstream_payload = {"model": upstream_model_name, "input": text_input}
             try:
                 response = _proxy_request_to_public_api(
                     "POST",
                     "/v1/embeddings",
                     body=json.dumps(upstream_payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
-                    host=host,
+                    host=client_host,
                     port=int(args.public_port),
                 )
                 data = response.json()
             except requests.RequestException as exc:
                 log_api_event("ollama_embeddings_upstream_network_error", {"error": str(exc)})
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": f"upstream unavailable: {exc}"}, status=502)
                 return
             except ValueError as exc:
                 log_api_event("ollama_embeddings_upstream_invalid_json", {"status": response.status_code if 'response' in locals() else None, "error": str(exc)})
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": f"upstream invalid response: {exc}"}, status=502)
                 return
             if response.status_code >= 400:
                 log_api_event("ollama_embeddings_upstream_error", {"status": response.status_code, "body": response.text[:4000], "payload": upstream_payload})
+                if is_replica_request:
+                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": f"upstream unavailable: HTTP {response.status_code}: {response.text[:1000]}"}, status=502)
                 return
+            if is_replica_request:
+                REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
             embeddings = data.get("data", [])
             if len(embeddings) == 1:
-                mark_model_activity(model, "ollama_embeddings", "response_done")
+                mark_model_activity(model_name, "ollama_embeddings", "response_done")
                 self._send_json({"embedding": embeddings[0].get("embedding", [])})
                 return
-            mark_model_activity(model, "ollama_embeddings", "response_done")
+            mark_model_activity(model_name, "ollama_embeddings", "response_done")
             self._send_json({"embeddings": [item.get("embedding", []) for item in embeddings]})
 
+
     try:
-        server = ThreadingHTTPServer((host, port), Handler)
+        server = ThreadingHTTPServer((bind_host, port), Handler)
     except OSError as e:
-        print(f"[!] Could not start ctx metadata server on http://{host}:{port}: {e}")
+        print(f"[!] Could not start ctx metadata server on http://{bind_host}:{port}: {e}")
         print(f"    Check which process owns the port with: sudo ss -ltnp 'sport = :{port}'")
         return None
 
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    print(f"[*] Ctx metadata API listening on http://{host}:{port}")
+    print(f"[*] Ctx metadata API listening on http://{bind_host}:{port}")
     return server
 
 
@@ -5646,7 +7467,100 @@ def run_command(args):
 
 
 def show_request_log(args):
-    print(_tail_text_file(DEFAULT_REQUESTS_LOG_PATH, lines=int(args.lines)))
+    explicit_path = Path(args.path).expanduser() if getattr(args, "path", None) else None
+    missing: list[str] = []
+    for path in _candidate_request_log_paths(explicit_path):
+        if path.exists():
+            print(_tail_text_file(path, lines=int(args.lines)))
+            return 0
+        missing.append(str(path))
+    print("No request log found. Checked:")
+    for path in missing:
+        print(f"  {path}")
+    print("If the service runs under systemd/root, try:")
+    print(f"  sudo {CLI_COMMAND} requests --path {SYSTEM_REQUESTS_LOG_PATH} --lines {int(args.lines)}")
+    return 0
+
+
+def show_logs(args):
+    lines = int(getattr(args, "lines", 200))
+    print("== API request log ==")
+    explicit_path = Path(args.path).expanduser() if getattr(args, "path", None) else None
+    found_request_log = False
+    missing: list[str] = []
+    for path in _candidate_request_log_paths(explicit_path):
+        if path.exists():
+            print(f"-- {path}")
+            print(_tail_text_file(path, lines=lines))
+            found_request_log = True
+            break
+        missing.append(str(path))
+    if not found_request_log:
+        print("No API request log found. Checked:")
+        for path in missing:
+            print(f"  {path}")
+    print()
+    print("== systemd journals ==")
+    journal_cmd = [
+        "journalctl",
+        "-u",
+        SWAP_SERVICE_NAME,
+        "-u",
+        MANAGER_SERVICE_NAME,
+        "-n",
+        str(lines),
+        "--no-pager",
+    ]
+    if getattr(args, "since", None):
+        journal_cmd.extend(["--since", str(args.since)])
+    print("Command:")
+    prefix = "sudo " if os.geteuid() != 0 else ""
+    print(f"  {prefix}{' '.join(journal_cmd)}")
+    if not getattr(args, "journal", False):
+        print("Run with --journal to execute journalctl from this command.")
+        return 0
+    try:
+        result = subprocess.run(journal_cmd, check=False, capture_output=True, text=True, timeout=30)
+    except Exception as exc:
+        print(f"Could not run journalctl: {exc}")
+        if os.geteuid() != 0:
+            print("Try the sudo command shown above.")
+        return 1
+    if result.stdout:
+        print(result.stdout.rstrip())
+    if result.stderr:
+        print(result.stderr.rstrip(), file=sys.stderr)
+    return 0 if result.returncode == 0 else result.returncode
+
+
+def show_hacks(args):
+    print("llamacpp-stack llama.cpp modifications / risky knobs")
+    print()
+    print("Source patches applied during source builds:")
+    print("  - none")
+    print()
+    print("Potentially aggressive CUDA CMake flags when supported by source/config:")
+    print("  - GGML_CUDA_FORCE_MMQ")
+    print("  - GGML_CUDA_GRAPHS")
+    print("  - GGML_CUDA_FA_ALL_QUANTS")
+    print("    Disable for rebuild with: LLAMACPP_DISABLE_AGGRESSIVE_CUDA=1")
+    print()
+    print("Runtime knobs most relevant to native segfault isolation:")
+    print("  - flash_attn")
+    print("  - fit / fit_target / fitc")
+    print("  - parallel > 1")
+    print("  - cont_batching")
+    print("  - draft/speculative/MTP")
+    print("  - ctx_checkpoints")
+    print("    Disable conservatively with: LLAMACPP_SAFE_RUNTIME=1, then regenerate config/restart.")
+    print()
+    print("Active env in this CLI process:")
+    for key in (
+        "LLAMACPP_DISABLE_AGGRESSIVE_CUDA",
+        "LLAMACPP_SAFE_RUNTIME",
+        "LLAMACPP_REQUESTS_LOG",
+    ):
+        print(f"  {key}={os.environ.get(key, '')!r}")
     return 0
 
 
@@ -5770,6 +7684,7 @@ def unload_models(args):
         effective_args.start_port,
         resolve_idle_ttl(effective_args),
         server_defaults=resolve_llama_server_defaults(effective_args),
+        replica_defaults=resolve_global_replica_config(effective_args),
     )
     _emit_message("Unloaded all models." if unload_all else f"Unloaded model(s): {', '.join(target_ids)}.", None)
     if wait_for_models_absent(target_ids if not unload_all else [], effective_args.public_host, effective_args.public_port):
@@ -5807,6 +7722,7 @@ def temporarily_unload_published_models(args, progress_callback = None, timeout 
         args.start_port,
         resolve_idle_ttl(args),
         server_defaults=resolve_llama_server_defaults(args),
+        replica_defaults=resolve_global_replica_config(args),
     )
     _emit_message("Temporary empty config written. Waiting for llama-swap --watch-config...", progress_callback)
     time.sleep(3.0)
@@ -5827,9 +7743,12 @@ def temporarily_unload_published_models(args, progress_callback = None, timeout 
 
 def restart_service_to_free_vram(service_name: str, progress_callback = None, settle_time = 3.0):
     _emit_message(f"Restarting {service_name} to free VRAM...", progress_callback)
+    cmd = ["systemctl", "restart", service_name]
+    if os.geteuid() != 0:
+        cmd = ["systemctl", "--user", "restart", service_name]
     try:
         result = subprocess.run(
-            ["systemctl", "restart", service_name],
+            cmd,
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -5856,6 +7775,7 @@ def restore_catalog_config(args, catalog, progress_callback = None, settle_time 
         args.start_port,
         resolve_idle_ttl(args),
         server_defaults=resolve_llama_server_defaults(args),
+        replica_defaults=resolve_global_replica_config(args),
     )
     _emit_message("Previous llama-swap config restored after the failed operation.", progress_callback)
     if restart_service:
@@ -6746,7 +8666,7 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
             ok, reason, probe_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, candidate))
             # If context probing fails due to n_ctx_seq limit, reduce batch/ubatch to allow larger context
             if not ok and "exceeds the available context size" in str(reason):
-                _emit_message(f"{model.model_id}: ctx {candidate} failed due to batch memory; reducing batch_size to prioritize context...", progress_callback, timestamp=True)
+                _emit_message(f"{model.model_id}: ctx {candidate} failed due to batch/parallel memory; reducing batch_size and parallel=1 to prioritize context...", progress_callback, timestamp=True)
                 # Reduce batch parameters and retry once
                 if not hasattr(model, 'server_overrides'):
                     model.server_overrides = {}
@@ -6774,9 +8694,9 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
                         model.server_overrides["parallel"] = original_parallel
                     else:
                         model.server_overrides.pop("parallel", None)
-                    _emit_message(f"{model.model_id}: ctx {candidate} still failed after batch reduction ({reason}).", progress_callback, timestamp=True)
+                    _emit_message(f"{model.model_id}: ctx {candidate} still failed after batch/parallel reduction ({reason}).", progress_callback, timestamp=True)
                 else:
-                    _emit_message(f"{model.model_id}: ctx {candidate} success after reducing batch_size.", progress_callback, timestamp=True)
+                    _emit_message(f"{model.model_id}: ctx {candidate} success after reducing batch_size and parallel=1.", progress_callback, timestamp=True)
             if ok:
                 low = candidate
                 last_success = candidate
@@ -6846,7 +8766,7 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
             ok, reason, probe_metrics = _normalize_probe_result(probe_model_ctx(model, llama_server, midpoint))
             # If refinement fails due to n_ctx_seq limit, reduce batch/ubatch to allow larger context
             if not ok and "exceeds the available context size" in str(reason):
-                _emit_message(f"{model.model_id}: ctx {midpoint} failed due to batch memory; reducing batch_size to prioritize context...", progress_callback, timestamp=True)
+                _emit_message(f"{model.model_id}: ctx {midpoint} failed due to batch/parallel memory; reducing batch_size and parallel=1 to prioritize context...", progress_callback, timestamp=True)
                 # Reduce batch parameters and retry
                 if not hasattr(model, 'server_overrides'):
                     model.server_overrides = {}
@@ -6873,9 +8793,9 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
                         model.server_overrides["parallel"] = original_parallel
                     else:
                         model.server_overrides.pop("parallel", None)
-                    _emit_message(f"{model.model_id}: ctx {midpoint} still failed after batch reduction ({reason}).", progress_callback, timestamp=True)
+                    _emit_message(f"{model.model_id}: ctx {midpoint} still failed after batch/parallel reduction ({reason}).", progress_callback, timestamp=True)
                 else:
-                    _emit_message(f"{model.model_id}: ctx {midpoint} success after reducing batch_size.", progress_callback, timestamp=True)
+                    _emit_message(f"{model.model_id}: ctx {midpoint} success after reducing batch_size and parallel=1.", progress_callback, timestamp=True)
             if ok:
                 low = midpoint
                 last_success = midpoint
@@ -7342,7 +9262,7 @@ def _materialize_validation_model(args, progress_callback = None) -> tuple[Manag
         mmproj_path=mmproj_path,
         ctx_size=int(args.ctx_size),
         n_gpu_layers=int(args.n_gpu_layers),
-        tensor_split=normalize_tensor_split(args.tensor_split),
+        tensor_split=normalize_tensor_split(args.tensor_split or default_tensor_split()),
         host=args.host,
         jinja=not args.no_jinja,
         ttl=resolve_idle_ttl(args),
@@ -7401,6 +9321,9 @@ def delete_downloaded_files(target_dir: Path, filenames: list[str]):
     return removed
 
 def update_config(args, progress_callback = None):
+    # Always migrate/canonicalize the global server config on update, including
+    # when update is executed inside the manager daemon rather than via main().
+    persist_server_config(args)
     try:
         is_owner = (os.getuid() == 0 or os.getuid() == os.stat(args.catalog.parent).st_uid)
     except:
@@ -7419,7 +9342,9 @@ def update_config(args, progress_callback = None):
                 progress_callback,
             )
 
-    catalog = load_catalog(args.catalog, _args_server_config_path(args))
+    catalog, catalog_diag = load_catalog_with_diagnostics(args.catalog, _args_server_config_path(args))
+    if catalog_diag:
+        raise RuntimeError(f"Refusing to update from an invalid catalog: {catalog_diag}")
     target = getattr(args, "repo", None)
     repo_ref = getattr(args, "hf", None)
     model_id = getattr(args, "model_id", None)
@@ -7713,6 +9638,7 @@ def update_config(args, progress_callback = None):
             updated_ctx = 0
             missing_ctx = 0
     save_catalog(args.catalog, catalog)
+    replica_defaults = resolve_global_replica_config(args)
     render_llamaswap_config(
         catalog,
         args.config,
@@ -7720,7 +9646,11 @@ def update_config(args, progress_callback = None):
         args.start_port,
         resolve_idle_ttl(args),
         server_defaults=resolve_llama_server_defaults(args),
+        replica_defaults=replica_defaults,
     )
+    replica_summary = summarize_configured_replicas(catalog, replica_defaults)
+    if replica_summary:
+        _emit_message("Replicas configured:\n" + "\n".join(f"- {line}" for line in replica_summary), progress_callback)
     if auto_ctx:
         summary = f"Catalog ctx updated automatically: {updated_ctx} models changed, {missing_ctx} skipped."
         if deleted_models:
@@ -7831,7 +9761,7 @@ def _print_warmup_failure(model_id: str, host: str, port: int, exc: Exception) -
         print(f"{type(exc).__name__}: {exc}")
     print(f"Recent request log: {DEFAULT_REQUESTS_LOG_PATH}")
     print("Run for details:")
-    print("  llamacpp-superserver requests-log --lines 80")
+    print("  llamacpp-superserver requests --lines 80")
     print(f"  sudo journalctl -u {SWAP_SERVICE_NAME} -u {MANAGER_SERVICE_NAME} -n 120 --no-pager")
 
 
@@ -7934,12 +9864,21 @@ def start_chat(model_id, host, port):
 
 def daemon_mode(args):
     """Background manager listening on Unix socket."""
+    # Ensure llama-swap configuration is up-to-date with any manual edits to catalog.json or conf.json
+    try:
+        print("[*] Performing automatic configuration update on startup...")
+        update_config(args)
+    except Exception as exc:
+        print(f"[!] Warning: Automatic configuration update failed: {exc}")
+
     _prepare_manager_socket_path(SOCKET_PATH)
     try:
         os.makedirs(os.path.dirname(SOCKET_PATH), exist_ok=True)
     except Exception as exc:
         raise RuntimeError(f"Could not create manager socket directory for {SOCKET_PATH}: {exc}") from exc
     ctx_metadata_server = start_ctx_metadata_server(args)
+    if ctx_metadata_server is None:
+        raise RuntimeError(f"Could not start Superserver API on {args.public_host}:{resolve_api_port(args)}")
     unload_guard_thread = start_unexpected_unload_guard(args)
     
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -8184,7 +10123,6 @@ def build_info_text(args = None) -> str:
         f"  App config:          {server_config_path}\n"
         f"  Templates dir:       {templates_dir}\n"
         f"  llama-server binary: {llama_server_path}\n"
-        f"  Requests log:        {DEFAULT_REQUESTS_LOG_PATH}\n"
         f"  UI activity:         {ui_url}/ui/#/activity\n"
         f"  Idle TTL:            {resolve_idle_ttl(args)}s\n"
         "Service management:\n"
@@ -8192,6 +10130,10 @@ def build_info_text(args = None) -> str:
         f"  Start services:      {start_cmd}\n"
         f"  Status:              {status_cmd}\n"
         f"  Restart:             {restart_cmd}\n"
+        "Logs & Diagnostics:\n"
+        f"  API Requests Log:    {DEFAULT_REQUESTS_LOG_PATH}\n"
+        f"  Manager Service:     journalctl -u {MANAGER_SERVICE_NAME} -n 100 --no-pager\n"
+        f"  Swap Backend:        journalctl -u {SWAP_SERVICE_NAME} -n 100 --no-pager\n"
         "Config knobs:\n"
         f"  Global llama-server defaults: {server_config_path} -> llama_server_defaults\n"
         f"  Per-model overrides:          {catalog_path} -> server_overrides\n"
@@ -8247,6 +10189,12 @@ def build_help_epilog():
         "  requests [-n LINES]\n"
         "    Show recent API request log entries.\n"
         f"    Example: {CLI_COMMAND} requests -n 50 (or {CLI_COMMAND} requests -n 1)\n"
+        "  logs [-n LINES] [--journal]\n"
+        "    Show request log and journalctl command/output for crash diagnostics.\n"
+        f"    Example: {CLI_COMMAND} logs -n 200 --journal\n"
+        "  hacks\n"
+        "    List source patches, aggressive build flags and runtime safe-mode knobs.\n"
+        f"    Example: {CLI_COMMAND} hacks\n"
         "  info\n"
         "    Show endpoints, runtime paths, versions, service commands and status.\n"
         f"    Example: {CLI_COMMAND} info\n"
@@ -8311,7 +10259,7 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     )
     p_add.add_argument("--skip-ctx", action="store_true", help="Skip automatic ctx tuning and keep the default ctx size")
     p_add.add_argument("--n-gpu-layers", default=DEFAULT_N_GPU_LAYERS)
-    p_add.add_argument("--tensor-split", default=default_tensor_split())
+    p_add.add_argument("--tensor-split", default=None)
     p_add.add_argument("--host", default="127.0.0.1")
     p_add.add_argument("--no-jinja", action="store_true")
     p_add.add_argument("--force", action="store_true")
@@ -8399,6 +10347,14 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
         help="Probe and set a practical ctx size per model automatically",
     )
 
+    p_config_migrate = sub.add_parser(
+        "config-migrate",
+        help="Migrate/canonicalize the global conf.json",
+        description="Rewrite the selected --server-config file with current global keys (replicas, api_ctx_factor, metadata) and canonical llama.cpp defaults.",
+    )
+    subparsers["config-migrate"] = p_config_migrate
+    p_config_migrate.set_defaults(func=migrate_server_config)
+
     p_refresh = sub.add_parser(
         "refresh-templates",
         help="Scan templates folder and add template-backed model entries to catalog",
@@ -8449,7 +10405,7 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
         help="Force auto-fit before validating",
     )
     p_validate.add_argument("--n-gpu-layers", default=DEFAULT_N_GPU_LAYERS)
-    p_validate.add_argument("--tensor-split", default=default_tensor_split())
+    p_validate.add_argument("--tensor-split", default=None)
     p_validate.add_argument("--host", default="127.0.0.1")
     p_validate.add_argument("--no-jinja", action="store_true")
     p_validate.add_argument("--hf-token")
@@ -8491,7 +10447,7 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
         )
         p.add_argument("--skip-ctx", action="store_true", help="Skip automatic ctx tuning and keep the default ctx size")
         p.add_argument("--n-gpu-layers", default=DEFAULT_N_GPU_LAYERS)
-        p.add_argument("--tensor-split", default=default_tensor_split())
+        p.add_argument("--tensor-split", default=None)
         p.add_argument("--host", default="127.0.0.1")
         p.add_argument("--no-jinja", action="store_true")
         p.add_argument("--force", action="store_true")
@@ -8545,7 +10501,28 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     )
     subparsers["requests"] = p_requests
     p_requests.add_argument("-n", "--lines", type=int, default=50)
+    p_requests.add_argument("--path", type=Path, help="Read a specific API request log path")
     p_requests.set_defaults(func=show_request_log)
+
+    p_logs = sub.add_parser(
+        "logs",
+        help="Show request logs and service journal hints",
+        description="Show API request logs and optionally collect systemd journal entries for llama-swap/manager crash diagnostics.",
+    )
+    subparsers["logs"] = p_logs
+    p_logs.add_argument("-n", "--lines", type=int, default=200)
+    p_logs.add_argument("--path", type=Path, help="Read a specific API request log path")
+    p_logs.add_argument("--since", help="journalctl --since value, e.g. '10 minutes ago'")
+    p_logs.add_argument("--journal", action="store_true", help="Run journalctl and include service logs")
+    p_logs.set_defaults(func=show_logs)
+
+    p_hacks = sub.add_parser(
+        "hacks",
+        help="List llama.cpp source/build/runtime modifications",
+        description="List stack-managed llama.cpp source patches, aggressive CUDA build flags and runtime safe-mode knobs.",
+    )
+    subparsers["hacks"] = p_hacks
+    p_hacks.set_defaults(func=show_hacks)
 
     p_info = sub.add_parser(
         "info",
@@ -8580,7 +10557,8 @@ def parse_cli_args(
 def main(argv: list[str] | None = None):
     parser, subparsers = build_cli_parser()
     args = parse_cli_args(parser, subparsers, argv=argv)
-    persist_server_config(args)
+    if getattr(args, "func", None) is not migrate_server_config:
+        persist_server_config(args)
     return args.func(args)
 
 if __name__ == "__main__":
