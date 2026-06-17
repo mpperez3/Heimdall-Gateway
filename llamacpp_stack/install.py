@@ -6,6 +6,7 @@ import json
 import os
 import pwd
 import re
+import secrets
 import shutil
 import socket
 import stat
@@ -20,6 +21,32 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+
+
+def _json_loads_allow_comments(text: str, path_desc: str = "") -> object:
+    """Parse JSON supporting `#` full-line comments. Returns parsed value or raises."""
+    lines = text.split("\n")
+    comment_offset = 0
+    clean_lines: list[str] = []
+    for i, line in enumerate(lines):
+        if line.strip().startswith("#"):
+            comment_offset += 1
+            continue
+        clean_lines.append(line)
+    clean_text = "\n".join(clean_lines)
+    # Strip trailing commas before } or ] (common mistake)
+    clean_text = re.sub(r",\s*([}\]])", r"\1", clean_text)
+    try:
+        return json.loads(clean_text)
+    except json.JSONDecodeError as exc:
+        original_line = exc.lineno + comment_offset
+        print(f"\n[!] Syntax error in {path_desc or 'config'} at line {original_line},"
+              f" column {exc.colno}: {exc.msg}", file=sys.stderr)
+        if original_line <= len(lines):
+            context_line = lines[original_line - 1] if original_line > 0 else ""
+            print(f"    {original_line}: {context_line}", file=sys.stderr)
+        print(f"    Fix the error or delete the file to regenerate it from defaults.\n", file=sys.stderr)
+        raise
 
 
 DEFAULT_LLAMA_CPP_REPO = "ggml-org/llama.cpp"
@@ -86,6 +113,33 @@ def _default_global_replicas_config() -> dict[str, object]:
     }
 
 
+def _default_api_auth_config() -> dict[str, object]:
+    return {"enabled": False, "api_key": ""}
+
+
+def _default_api_https_config() -> dict[str, object]:
+    return {"enabled": False, "cert_file": "", "key_file": ""}
+
+
+def _normalize_api_auth_config(raw: object) -> dict[str, object]:
+    cfg = _default_api_auth_config()
+    if isinstance(raw, dict):
+        cfg.update({k: v for k, v in raw.items() if k in cfg})
+    cfg["enabled"] = bool(cfg.get("enabled"))
+    cfg["api_key"] = str(cfg.get("api_key") or "").strip()
+    return cfg
+
+
+def _normalize_api_https_config(raw: object) -> dict[str, object]:
+    cfg = _default_api_https_config()
+    if isinstance(raw, dict):
+        cfg.update({k: v for k, v in raw.items() if k in cfg})
+    cfg["enabled"] = bool(cfg.get("enabled"))
+    cfg["cert_file"] = str(cfg.get("cert_file") or "").strip()
+    cfg["key_file"] = str(cfg.get("key_file") or "").strip()
+    return cfg
+
+
 def _normalize_llama_server_defaults_payload(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         return {}
@@ -121,7 +175,10 @@ def _normalize_server_config_payload(payload: dict[str, object]) -> dict[str, ob
         placement = "exclusive_gpus"
     replicas["placement"] = placement
     result["replicas"] = replicas
+    result["api_auth"] = _normalize_api_auth_config(result.get("api_auth"))
+    result["api_https"] = _normalize_api_https_config(result.get("api_https"))
     result.setdefault("api_ctx_factor", 0.5)
+    result.setdefault("idle_ttl", DEFAULT_IDLE_TTL)
     _ensure_server_config_metadata(result)
     return result
 
@@ -138,6 +195,7 @@ def _ensure_server_config_metadata(payload: dict[str, object]) -> dict[str, obje
         "note"
     ] = "Active settings are top-level keys only. Model definitions live in catalog.json; config.yaml is generated for llama-swap."
     meta.pop("example", None)
+    meta["security"] = "api_auth enables Bearer/X-API-Key auth on the Superserver API. api_https enables TLS for the Superserver API when cert_file/key_file are configured."
     meta["service_restart_help"] = {
         "system_mode": f"sudo systemctl restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
         "user_mode": f"systemctl --user restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
@@ -192,19 +250,18 @@ def _load_llama_server_defaults_preset(config_dir: Path) -> dict[str, object]:
 def _merge_missing_llama_server_defaults(target: dict[str, object], config_dir: Path) -> bool:
     if not isinstance(target, dict):
         return False
-    # Record whether the caller already had any server defaults. If so,
-    # preserve explicit user-provided defaults and do not merge bundled
-    # preset keys into an already-managed config.
+    # Track whether the caller already had server defaults, so that
+    # speculative_defaults are only merged into fresh (not pre-existing) configs.
     had_existing_defaults = bool(target)
-
-    # If the config already has batch sizing defaults, treat it as fully
-    # managed by the project/user and avoid overriding or extending it.
-    if "batch-size" in target or "batch_size" in target:
-        return False
 
     preset_defaults = _load_llama_server_defaults_preset(config_dir)
     if not preset_defaults:
         return False
+
+    # Merge all missing keys from bundled presets into the target config.
+    # Existing keys are never overwritten so user-tuned values are preserved.
+    # This ensures all options with their defaults are visible and editable
+    # in the conf, even on reinstall.
     changed = False
     for key, value in preset_defaults.items():
         # Persist installer-managed defaults using the project's kebab-case
@@ -236,6 +293,27 @@ def _merge_missing_llama_server_defaults(target: dict[str, object], config_dir: 
                 if key not in spec_target:
                     spec_target[key] = value
                     changed = True
+
+    # Additionally merge any `mtp_defaults` mapping from the bundled YAML
+    # into `target['mtp_defaults']`. Unlike speculative_defaults, this runs
+    # for all configs (including pre-existing) so existing installs receive
+    # MTP defaults after an upgrade.
+    try:
+        defaults_path = _ensure_llama_server_defaults_file(config_dir)
+        payload = yaml.safe_load(defaults_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        payload = {}
+    mtp_defaults = payload.get("mtp_defaults")
+    if isinstance(mtp_defaults, dict):
+        mtp_target = target.get("mtp_defaults")
+        if not isinstance(mtp_target, dict):
+            target["mtp_defaults"] = {}
+            mtp_target = target["mtp_defaults"]
+            changed = True
+        for key, value in mtp_defaults.items():
+            if key not in mtp_target:
+                mtp_target[key] = value
+                changed = True
 
     return changed
 
@@ -1579,10 +1657,8 @@ def render_manager_service(layout: InstallLayout) -> str:
 def render_llamaswap_service(layout: InstallLayout) -> str:
     wanted_by = "multi-user.target" if layout.mode == "system" else "default.target"
     identity_lines: list[str] = []
-    runtime_lines: list[str] = []
     if layout.mode == "system":
         identity_lines = [f"User={layout.service_user}", f"Group={layout.service_group}"]
-        runtime_lines = [f"RuntimeDirectory={layout.run_dir.name}", "RuntimeDirectoryMode=0755"]
     service_lines = [
         "[Unit]",
         "Description=llamacpp superserver llama-swap backend",
@@ -1591,7 +1667,6 @@ def render_llamaswap_service(layout: InstallLayout) -> str:
         "[Service]",
         "Type=simple",
         *identity_lines,
-        *runtime_lines,
         f"ExecStart={layout.bin_dir / SWAP_WRAPPER_NAME}",
         "Restart=always",
         "RestartSec=2",
@@ -2385,9 +2460,10 @@ def maybe_offer_ufw_ports(layout: InstallLayout, dry_run: bool) -> None:
     _run(_sudo_prefix() + ["ufw", "allow", f"{layout.public_port}/tcp"])
 
 
-def print_install_summary(layout: InstallLayout, install_services: bool) -> None:
+def print_install_summary(layout: InstallLayout, install_services: bool, api_https_config: dict[str, object] | None = None) -> None:
     ui_base_url = f"http://{layout.public_host}:{layout.public_port}"
-    api_url = f"http://{layout.public_host}:{layout.public_port - 1}"
+    api_scheme = "https" if bool((api_https_config or {}).get("enabled")) else "http"
+    api_url = f"{api_scheme}://{layout.public_host}:{layout.public_port - 1}"
     ui_url = f"{ui_base_url}/ui/#/activity"
     help_cmd = layout.bin_dir / CLI_COMMAND
     manifest = read_install_manifest(layout)
@@ -2412,6 +2488,8 @@ def print_install_summary(layout: InstallLayout, install_services: bool) -> None
     print(f"Installed llama.cpp: {current_llama_cpp}")
     print(f"Installed llama-swap: {current_llamaswap}")
     print(f"Superserver API:     {api_url}")
+    if api_scheme == "https":
+        print("  HTTPS is enabled on the API port; use https://, not http://, for 11435.")
     print(f"UI activity:         {ui_url}")
     print(f"llama-swap UI/backend: {ui_base_url}")
     # Inform user where to drop per-model chat templates
@@ -2954,10 +3032,22 @@ def _ensure_basic_server_config(layout: InstallLayout) -> None:
     # Update server config (Manager config)
     try:
         if server_config_path.exists():
-            server_config = json.loads(server_config_path.read_text(encoding="utf-8"))
+            server_config = _json_loads_allow_comments(
+                server_config_path.read_text(encoding="utf-8"),
+                path_desc=str(server_config_path),
+            )
+            if not isinstance(server_config, dict):
+                server_config = {}
         else:
             server_config = {}
     except Exception:
+        backup = server_config_path.with_suffix(".json.bak")
+        try:
+            server_config_path.rename(backup)
+            print(f"[!] Backed up to {backup.name}. A fresh config will be written with defaults.")
+        except Exception:
+            print(f"[!] Could not back up {SERVER_CONFIG_BASENAME}. "
+                  "A fresh config will be written with defaults.")
         server_config = {}
 
     legacy_server_models = server_config.get("models")
@@ -3023,7 +3113,17 @@ def _ensure_basic_server_config(layout: InstallLayout) -> None:
                 best, cnt = max(counts.items(), key=lambda kv: kv[1])
                 return (best, cnt)
 
-            # Promote n_gpu_layers to global default when a clear majority exists
+            # Infer global defaults from catalog models when a clear majority
+            # shares the same value. This is intentionally unconditional — the
+            # merge path (_merge_missing_llama_server_defaults) runs earlier to
+            # fill in bundled defaults; this second pass promotes strongly
+            # consistent catalog-wide values (tensor_split, n_gpu_layers,
+            # idle_ttl) that the bundled defaults cannot know a priori for a
+            # multi-GPU system. User edits to conf.json are preserved because
+            # this function only runs during a *full* (not package-only)
+            # reinstall; the id_ttl/api_port overwrite bugs were in the
+            # package-only and update paths (write_api_security_config,
+            # persist_server_config, inline render).
             if not server_config.get("llama_server_defaults"):
                 server_config.setdefault("llama_server_defaults", {})
             majority = _majority(n_gpu_counts)
@@ -3292,6 +3392,269 @@ def maybe_migrate_existing_install(target_mode: str, public_host: str, public_po
     )
 
 
+def _generate_api_key() -> str:
+    return "lcsk_" + secrets.token_urlsafe(32)
+
+
+def _is_ipv4_literal(value: str) -> bool:
+    return bool(re.match(r"^\d+\.\d+\.\d+\.\d+$", str(value or "").strip()))
+
+
+def _is_ipv6_literal(value: str) -> bool:
+    text = str(value or "").strip()
+    return ":" in text and not text.startswith("[") and bool(re.match(r"^[0-9a-fA-F:]+$", text))
+
+
+def _san_entry_for_host(value: str) -> str | None:
+    clean = str(value or "").strip().strip("[]")
+    if not clean or clean in {"0.0.0.0", "::"}:
+        return None
+    if _is_ipv4_literal(clean) or _is_ipv6_literal(clean):
+        return f"IP:{clean}"
+    return f"DNS:{clean}"
+
+
+def _detect_lan_ip_addresses() -> list[str]:
+    ips: list[str] = []
+    try:
+        result = subprocess.run(
+            ["hostname", "-I"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+        for part in result.stdout.split():
+            clean = part.strip()
+            if clean and clean not in {"127.0.0.1", "::1"}:
+                ips.append(clean)
+    except Exception:
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            ip = str(sock.getsockname()[0])
+            if ip and ip not in ips and ip != "127.0.0.1":
+                ips.append(ip)
+    except Exception:
+        pass
+    return ips
+
+
+def _detect_public_ip_addresses(timeout_s: float = 2.5) -> list[str]:
+    ips: list[str] = []
+    endpoints = [
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://icanhazip.com",
+    ]
+    for url in endpoints:
+        try:
+            with urllib.request.urlopen(url, timeout=timeout_s) as response:
+                text = response.read(128).decode("utf-8", "ignore").strip()
+            if text and (_is_ipv4_literal(text) or _is_ipv6_literal(text)) and text not in ips:
+                ips.append(text)
+                break
+        except Exception:
+            continue
+    return ips
+
+
+def _parse_extra_api_cert_sans(raw: object) -> list[str]:
+    values: list[str] = []
+    text = str(raw or "").strip()
+    if not text:
+        return values
+    for part in re.split(r"[,\s]+", text):
+        clean = part.strip()
+        if clean:
+            values.append(clean)
+    return values
+
+
+def _api_cert_san_entries(host: str, extra_sans: list[str] | None = None, include_public_ip: bool = True) -> list[str]:
+    candidates: list[str] = ["localhost", "127.0.0.1", "::1", host]
+    candidates.extend(_detect_lan_ip_addresses())
+    if include_public_ip:
+        candidates.extend(_detect_public_ip_addresses())
+    candidates.extend(extra_sans or [])
+    entries: list[str] = []
+    for candidate in candidates:
+        entry = _san_entry_for_host(candidate)
+        if entry and entry not in entries:
+            entries.append(entry)
+    return entries
+
+
+def _cert_subject_alt_names(cert_file: Path) -> list[str]:
+    if not cert_file.exists():
+        return []
+    try:
+        result = subprocess.run(
+            ["openssl", "x509", "-in", str(cert_file), "-noout", "-ext", "subjectAltName"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    found: list[str] = []
+    for raw in result.stdout.replace("\n", ",").split(","):
+        item = raw.strip()
+        if item.startswith("DNS:") or item.startswith("IP Address:"):
+            found.append(item.replace("IP Address:", "IP:"))
+    return found
+
+
+def _generate_self_signed_api_cert(layout: InstallLayout, host: str, dry_run: bool, extra_sans: list[str] | None = None, force: bool = False) -> tuple[str, str]:
+    cert_dir = layout.config_dir / "certs"
+    cert_file = cert_dir / "superserver-api.crt"
+    key_file = cert_dir / "superserver-api.key"
+    san_parts = _api_cert_san_entries(host, extra_sans=extra_sans)
+    if dry_run:
+        print(f"[dry-run] API certificate SANs: {', '.join(san_parts)}")
+        return str(cert_file), str(key_file)
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    existing_sans = _cert_subject_alt_names(cert_file)
+    if cert_file.exists() and key_file.exists() and not force and all(san in existing_sans for san in san_parts):
+        return str(cert_file), str(key_file)
+    if cert_file.exists() or key_file.exists():
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        if cert_file.exists():
+            shutil.copy2(cert_file, cert_file.with_suffix(f".crt.bak-{stamp}"))
+        if key_file.exists():
+            shutil.copy2(key_file, key_file.with_suffix(f".key.bak-{stamp}"))
+    subj = "/CN=llamacpp-superserver"
+    cmd = [
+        "openssl", "req", "-x509", "-newkey", "rsa:4096", "-sha256",
+        "-days", "825", "-nodes", "-keyout", str(key_file), "-out", str(cert_file),
+        "-subj", subj, "-addext", "subjectAltName=" + ",".join(san_parts),
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        key_file.chmod(0o600)
+        print("Generated self-signed Superserver API certificate with SANs:")
+        for san in san_parts:
+            print(f"  - {san}")
+    except Exception as exc:
+        raise RuntimeError(f"Could not generate self-signed HTTPS certificate with openssl: {exc}")
+    return str(cert_file), str(key_file)
+
+
+def _preserve_existing_api_key(server_config_data: dict[str, object], api_auth_config: dict[str, object]) -> None:
+    existing_auth = server_config_data.get("api_auth")
+    if isinstance(existing_auth, dict):
+        existing_key = str(existing_auth.get("api_key") or "").strip()
+        new_key = str(api_auth_config.get("api_key") or "").strip()
+        if existing_key and not new_key:
+            api_auth_config["api_key"] = existing_key
+
+
+def write_api_security_config(layout: InstallLayout, api_auth_config: dict[str, object], api_https_config: dict[str, object], dry_run: bool) -> None:
+    server_config_path = layout.config_dir / SERVER_CONFIG_BASENAME
+    if dry_run:
+        print(f"[dry-run] would write API security config to {server_config_path}")
+        return
+    layout.config_dir.mkdir(parents=True, exist_ok=True)
+    server_config_data: dict[str, object] = {}
+    if server_config_path.exists():
+        try:
+            payload = _json_loads_allow_comments(
+                server_config_path.read_text(encoding="utf-8"),
+                path_desc=str(server_config_path),
+            )
+            if isinstance(payload, dict):
+                server_config_data = payload
+        except Exception:
+            backup = server_config_path.with_suffix(".json.bak")
+            try:
+                server_config_path.rename(backup)
+                print(f"[!] Backed up to {backup.name}. A fresh config will be written with defaults.")
+            except Exception:
+                print(f"[!] Could not back up {SERVER_CONFIG_BASENAME}. "
+                      "A fresh config will be written with defaults.")
+            server_config_data = {}
+    server_config_data.setdefault("api_port", layout.public_port - 1)
+    _preserve_existing_api_key(server_config_data, api_auth_config)
+    server_config_data["api_auth"] = api_auth_config
+    server_config_data["api_https"] = api_https_config
+    llama_defaults = server_config_data.setdefault("llama_server_defaults", {})
+    if not isinstance(llama_defaults, dict):
+        llama_defaults = {}
+        server_config_data["llama_server_defaults"] = llama_defaults
+    _ensure_llama_server_defaults_file(layout.config_dir)
+    _merge_missing_llama_server_defaults(llama_defaults, layout.config_dir)
+    server_config_data = _normalize_server_config_payload(server_config_data)
+    server_config_path.write_text(json.dumps(server_config_data, indent=2) + "\n", encoding="utf-8")
+    legacy_server_config_path = layout.config_dir / LEGACY_SERVER_CONFIG_BASENAME
+    if not legacy_server_config_path.exists():
+        legacy_server_config_path.write_text(json.dumps(server_config_data, indent=2) + "\n", encoding="utf-8")
+
+
+
+def _existing_api_security_config(layout: InstallLayout) -> tuple[dict[str, object], dict[str, object]]:
+    server_config_path = layout.config_dir / SERVER_CONFIG_BASENAME
+    try:
+        payload = _json_loads_allow_comments(
+            server_config_path.read_text(encoding="utf-8"),
+            path_desc=str(server_config_path),
+        )
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+    return (
+        _normalize_api_auth_config(payload.get("api_auth")),
+        _normalize_api_https_config(payload.get("api_https")),
+    )
+
+def resolve_api_security_options(args: argparse.Namespace, layout: InstallLayout) -> tuple[dict[str, object], dict[str, object]]:
+    existing_auth, existing_https = _existing_api_security_config(layout)
+    auth_enabled = getattr(args, "api_auth", None)
+    https_enabled = getattr(args, "api_https", None)
+    if auth_enabled is None:
+        if existing_auth.get("enabled"):
+            auth_enabled = True
+        else:
+            # Secure by default when the API is exposed beyond loopback. Do not add
+            # another interactive prompt here: the installer already asks whether
+            # to bind 0.0.0.0, and package-only reinstalls must keep their prompt
+            # order stable. Local loopback clients are still trusted at request time.
+            auth_enabled = layout.public_host not in {"127.0.0.1", "localhost", "::1"}
+    auth_enabled = bool(auth_enabled)
+    api_key = str(getattr(args, "api_key", "") or "").strip()
+    if auth_enabled and not api_key:
+        api_key = str(existing_auth.get("api_key") or "").strip()
+    if auth_enabled and not api_key:
+        api_key = _generate_api_key()
+    if https_enabled is None:
+        if existing_https.get("enabled"):
+            https_enabled = True
+        elif sys.stdin.isatty():
+            https_enabled = prompt_bool("Enable HTTPS on the Superserver API (11435)?", default=False)
+    https_enabled = bool(https_enabled)
+    cert_file = str(getattr(args, "api_cert_file", "") or "").strip() or str(existing_https.get("cert_file") or "").strip()
+    key_file = str(getattr(args, "api_key_file", "") or "").strip() or str(existing_https.get("key_file") or "").strip()
+    if https_enabled and (not cert_file or not key_file):
+        if sys.stdin.isatty():
+            if prompt_bool("Generate a self-signed HTTPS certificate now? Remote clients must trust it manually.", default=True):
+                cert_file, key_file = _generate_self_signed_api_cert(layout, layout.public_host, getattr(args, "dry_run", False), extra_sans=_parse_extra_api_cert_sans(getattr(args, "api_cert_sans", "") or os.environ.get("LLAMACPP_API_CERT_SANS", "")), force=bool(getattr(args, "regenerate_api_cert", False)))
+            else:
+                print("HTTPS requested but no certificate/key configured; leaving HTTPS disabled.")
+                https_enabled = False
+        else:
+            cert_file, key_file = _generate_self_signed_api_cert(layout, layout.public_host, getattr(args, "dry_run", False), extra_sans=_parse_extra_api_cert_sans(getattr(args, "api_cert_sans", "") or os.environ.get("LLAMACPP_API_CERT_SANS", "")), force=bool(getattr(args, "regenerate_api_cert", False)))
+    return (
+        {"enabled": auth_enabled, "api_key": api_key if auth_enabled else ""},
+        {"enabled": https_enabled, "cert_file": cert_file if https_enabled else "", "key_file": key_file if https_enabled else ""},
+    )
+
+
 def install_stack(args: argparse.Namespace) -> int:
     pre_mode = resolve_install_mode(args.mode)
     chosen_public_host = resolve_public_host(args.public_host)
@@ -3359,15 +3722,26 @@ def install_stack(args: argparse.Namespace) -> int:
     else:
         llama_cpp_mode = detect_existing_llama_cpp_mode(layout)
         print(f"Keeping existing llama.cpp mode: {llama_cpp_mode}")
+    api_auth_config, api_https_config = resolve_api_security_options(args, layout)
+    api_scheme = "https" if api_https_config.get("enabled") else "http"
+    print(f"Superserver API:     {api_scheme}://{layout.public_host}:{layout.public_port - 1}")
+    print(f"Superserver API key: {'enabled' if api_auth_config.get('enabled') else 'disabled'}")
+
     reexec_status = maybe_reexec_system_install(args, pre_mode, llama_cpp_mode, chosen_models_dir)
     if reexec_status is not None:
         return reexec_status
 
     if package_only_update:
         maybe_refresh_runtime_package_only(layout, args.dry_run, args)
-        # Ensure services are restarted to use the new package code
+        write_api_security_config(layout, api_auth_config, api_https_config, args.dry_run)
+        if api_auth_config.get("enabled"):
+            print(f"Superserver API key saved in {layout.config_dir / SERVER_CONFIG_BASENAME} -> api_auth.api_key")
+        # Ensure services are installed/enabled as well as restarted. A package-only
+        # reinstall may run on a machine where the unit files exist under our
+        # config dir but systemd currently says "Unit not loaded". enable --now
+        # covers both first-load and restart cases.
         if args.install_services:
-            restart_systemd_units(layout, args.dry_run)
+            install_systemd_units(layout, args.dry_run)
             if not args.dry_run and wait_for_manager_socket(layout, args.dry_run):
                 print("\nApplying latest configuration migrations...")
                 try:
@@ -3446,7 +3820,6 @@ def install_stack(args: argparse.Namespace) -> int:
     print(f"backend: {backend}")
     print(f"models directory: {layout.models_dir}")
     print(f"llama-swap UI/backend: http://{layout.public_host}:{layout.public_port}")
-    print(f"Superserver API:     http://{layout.public_host}:{layout.public_port - 1}")
     print(f"llama.cpp mode: {llama_cpp_mode}")
     if backend != "vllm-beta" and llama_cpp_mode == "source" and update_binaries and gpu_present and not cuda_toolkit_present:
         print("NVIDIA GPU detected but no nvcc/CUDA toolkit was found; falling back to prebuilt llama.cpp binary.")
@@ -3625,14 +3998,28 @@ def install_stack(args: argparse.Namespace) -> int:
         server_config_data: dict[str, object] = {}
         if server_config_path.exists():
             try:
-                payload = json.loads(server_config_path.read_text(encoding="utf-8"))
+                payload = _json_loads_allow_comments(
+                    server_config_path.read_text(encoding="utf-8"),
+                    path_desc=str(server_config_path),
+                )
                 if isinstance(payload, dict):
                     server_config_data = payload
             except Exception:
+                backup = server_config_path.with_suffix(".json.bak")
+                try:
+                    server_config_path.rename(backup)
+                    print(f"[!] Backed up to {backup.name}. A fresh config will be written with defaults.")
+                except Exception:
+                    print(f"[!] Could not back up {SERVER_CONFIG_BASENAME}. "
+                          "A fresh config will be written with defaults.")
                 server_config_data = {}
-        server_config_data["idle_ttl"] = args.idle_ttl
-        server_config_data["api_port"] = layout.public_port - 1
+        server_config_data.setdefault("idle_ttl", args.idle_ttl)
+        server_config_data.setdefault("api_port", layout.public_port - 1)
+        _preserve_existing_api_key(server_config_data, api_auth_config)
+        server_config_data["api_auth"] = api_auth_config
+        server_config_data["api_https"] = api_https_config
         server_config_data.setdefault("api_ctx_factor", 0.5)
+        server_config_data.setdefault("flatten_namespace_tools", True)
         server_config_data.setdefault("replicas", {
             "enabled": False,
             "max": "auto",
@@ -3651,6 +4038,8 @@ def install_stack(args: argparse.Namespace) -> int:
             server_config_payload,
             encoding="utf-8",
         )
+        if api_auth_config.get("enabled"):
+            print(f"Superserver API key saved in {server_config_path} -> api_auth.api_key")
         legacy_server_config_path = layout.config_dir / LEGACY_SERVER_CONFIG_BASENAME
         if not legacy_server_config_path.exists():
             legacy_server_config_path.write_text(server_config_payload, encoding="utf-8")
@@ -3713,7 +4102,7 @@ def install_stack(args: argparse.Namespace) -> int:
         restart_systemd_units(layout, args.dry_run)
 
     if not args.dry_run:
-        print_install_summary(layout, args.install_services)
+        print_install_summary(layout, args.install_services, api_https_config)
     return 0
 
 
@@ -3736,6 +4125,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="llama-swap backend port. By default new installs use ollama_port+2 and reserve ollama_port+1 for the superserver API.",
     )
+    parser.add_argument("--api-auth", action=argparse.BooleanOptionalAction, default=None, help="Require an API key on the Superserver API port.")
+    parser.add_argument("--api-key", help="API key to write to conf.json when --api-auth is enabled. Generated if omitted.")
+    parser.add_argument("--api-https", action=argparse.BooleanOptionalAction, default=None, help="Serve the Superserver API over HTTPS.")
+    parser.add_argument("--api-cert-file", help="Certificate file for --api-https.")
+    parser.add_argument("--api-key-file", help="Private key file for --api-https.")
+    parser.add_argument("--api-cert-sans", help="Comma/space separated extra DNS names or IPs to include in generated API HTTPS certificate SANs.")
+    parser.add_argument("--regenerate-api-cert", action="store_true", help="Regenerate the self-signed API HTTPS certificate even if one already exists.")
     parser.add_argument("--models-dir", help="Models directory. If omitted, the installer asks interactively.")
     parser.add_argument("--idle-ttl", type=int, default=DEFAULT_IDLE_TTL, help="Global idle timeout in seconds before llama-swap unloads a model.")
     parser.add_argument("--enable-tls", action="store_true", help="Try to enable extra HTTP/TLS related llama.cpp flags when supported.")

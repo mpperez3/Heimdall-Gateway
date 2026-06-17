@@ -8,73 +8,43 @@
 # not found, the `default` block is used.
 
 default:
-  keep: 1024
+  keep: 20000
+  cache_type_k: q8_0
+  cache_type_v: q8_0
+  batch_size: 4096
+  ubatch_size: 2048
+  threads: 16
+  threads_batch: 8
+  numa: distribute
+  flash_attn: true
+  n_gpu_layers: -1
+  mul_mat_q: true
+  grp_attn_n: 16
+  parallel: 1
+  use_fitc: false
+  swa_full: true
   mirostat: 2
   mirostat_ent: 4.5
   mirostat_lr: 0.1
-  cache_type_k: q8_0
-  cache_type_v: q8_0
-  flash_attn: on
-  mul_mat_q: true
+  fit_target: 1536
 
 
 presets:
   "1":
-    # Single GPU: smaller batches, conservative memory
+    # Single GPU placement
     tensor_split: "1"
-    batch_size: 512
-    ubatch_size: 256
-    threads: 1
-    threads_batch: 4
-    keep: 512
-    cache_type_k: q8_0
-    cache_type_v: q8_0
-    grp_attn_n: 4
 
   "2":
-    # Dual GPU: balanced performance
-    tensor_split: "0.94,1"
-    batch_size: 1024
-    ubatch_size: 512
-    threads: 1
-    threads_batch: 8
-    keep: 1024
-    cache_type_k: q8_0
-    cache_type_v: q8_0
-    grp_attn_n: 8
-    parallel: 2
+    # Dual GPU placement
+    tensor_split: "1,1"
 
   "4":
-    # Quad GPU: higher throughput
-    tensor_split: "0.94,0.97,0.97,1"
-    batch_size: 2048
-    ubatch_size: 1024
-    threads: 1
-    threads_batch: 8
-    keep: 2048
-    cache_type_k: q8_0
-    cache_type_v: q8_0
-    grp_attn_n: 12
-    parallel: 4
-    defrag_threshold: 0.1
+    # Quad GPU placement
+    tensor_split: "1,1,1,1"
 
   "7":
-    # 7+ GPUs: maximum throughput configuration (169 GB VRAM available)
-    # Note: batch_size and ubatch_size reduced to allow large KV caches
-    # (fit will calibrate the actual ctx_seq available on the system)
-    tensor_split: "0.94,1,1,1,1,1,0.94"
-    batch_size: 2048
-    ubatch_size: 1024
-    threads: 1
-    threads_batch: 8
-    numa: distribute
-    fit_target: 16384
-    keep: 8192
-    cache_type_k: q8_0
-    cache_type_v: q8_0
-    grp_attn_n: 16
-    parallel: 4
-    defrag_threshold: 0.05
+    # 7+ GPU placement
+    tensor_split: "1,1,1,1,1,1,1"
 
 speculative_defaults:
   # Global defaults for speculative/draft model variants.
@@ -89,3 +59,11 @@ speculative_defaults:
   fitt: 1024
   # Allow multiple speculative variants per base model when true.
   allow_multiple_variants: true
+
+# Defaults for MTP (multi-token prediction) drafter-equipped models.
+# Applied to the main model when an MTP drafter file is detected.
+# Can be overridden per-model via server_overrides in the catalog.
+mtp_defaults:
+  spec_draft_n_max: 2
+  spec_draft_n_min: 0
+  spec_draft_p_min: 0.75
