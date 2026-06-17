@@ -1,0 +1,12 @@
+# Phi-3.5 Chat Template
+# Auto-generated for model: phi-3.5-mini
+jinja: true
+chat_template: |
+  {% for message in messages %}
+    {%- if message['role'] == 'user' %}
+      <|user|>{{ message['content'] }}<|end|>
+    {%- elif message['role'] == 'assistant' %}
+      <|assistant|>{{ message['content'] }}<|end|>
+    {%- endif %}
+  {%- endfor %}
+  <|assistant|>
