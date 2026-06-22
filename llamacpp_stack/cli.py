@@ -27,6 +27,7 @@ import subprocess
 import sys
 import time
 import threading
+import traceback
 import itertools
 import socket
 import uuid
@@ -146,6 +147,27 @@ except ValueError:
     DEFAULT_API_CTX_FACTOR = 0.5
 DEFAULT_N_GPU_LAYERS = 999
 DEFAULT_IDLE_TTL = int(os.environ.get("LLAMACPP_IDLE_TTL", os.environ.get("LLAMACPP_DEFAULT_TTL", "300")))
+DEFAULT_MODEL_SWITCH_GRACE_S = int(os.environ.get("LLAMACPP_MODEL_SWITCH_GRACE_S", "30"))
+LLAMASWAP_UPSTREAM_STATIC_BLOCKED_BASENAMES = {
+    "sw.js",
+    "service-worker.js",
+    "favicon.ico",
+    "manifest.json",
+}
+LLAMASWAP_UPSTREAM_STATIC_BLOCKED_EXTENSIONS = {
+    ".css",
+    ".js",
+    ".map",
+    ".ico",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".svg",
+    ".webp",
+    ".woff",
+    ".woff2",
+    ".ttf",
+}
 
 
 def _default_ctx_update_command(model_id: str) -> str:
@@ -285,6 +307,36 @@ def _is_debug_gate_active() -> bool:
         _disable_debug_gate()
         return False
     return True
+
+
+def _summarize_responses_input_tool_items(payload: dict) -> dict[str, object]:
+    raw_input = payload.get("input") if isinstance(payload, dict) else None
+    if isinstance(raw_input, dict):
+        raw_input = [raw_input]
+    if not isinstance(raw_input, list):
+        return {"function_calls": [], "function_call_outputs": []}
+    calls = []
+    outputs = []
+    for item in raw_input:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "")
+        if item_type == "function_call":
+            calls.append({
+                "id": str(item.get("id") or "")[:120],
+                "call_id": str(item.get("call_id") or "")[:120],
+                "name": str(item.get("name") or "")[:160],
+                "arguments_len": len(str(item.get("arguments") or "")),
+            })
+        elif item_type in {"function_call_output", "tool_result", "computer_call_output"}:
+            text = item.get("output") or item.get("text") or item.get("content") or ""
+            outputs.append({
+                "call_id": str(item.get("call_id") or "")[:120],
+                "status": str(item.get("status") or "")[:80],
+                "output_len": len(str(text)),
+                "output_preview": str(text)[:300],
+            })
+    return {"function_calls": calls[:20], "function_call_outputs": outputs[:20]}
 
 
 def _default_global_replicas_config() -> dict[str, object]:
@@ -1707,7 +1759,7 @@ def render_llamaswap_config(
         "logLevel": "info",
         "logToStdout": "proxy",
         "startPort": start_port,
-        "sendLoadingState": True,
+        "sendLoadingState": False,
         "includeAliasesInList": True,
         "models": {},
     }
@@ -1852,7 +1904,7 @@ def ensure_replica_route_in_llamaswap_config(
     data.setdefault("healthCheckTimeout", 600)
     data.setdefault("logLevel", "info")
     data.setdefault("logToStdout", "proxy")
-    data.setdefault("sendLoadingState", True)
+    data.setdefault("sendLoadingState", False)
     data.setdefault("includeAliasesInList", True)
     models = data.setdefault("models", {})
     if not isinstance(models, dict):
@@ -2825,8 +2877,10 @@ def persist_server_config(args) -> None:
         payload["api_port"] = int(args.api_port)
     if getattr(args, "api_ctx_factor", None) is not None:
         payload["api_ctx_factor"] = float(args.api_ctx_factor)
+    if getattr(args, "flatten", None) is not None:
+        payload["flatten_namespace_tools"] = bool(args.flatten)
     normalized, changed = normalize_server_config_payload(payload)
-    if changed or not path.exists() or any(getattr(args, name, None) is not None for name in ("idle_ttl", "api_port", "api_ctx_factor")):
+    if changed or not path.exists() or any(getattr(args, name, None) is not None for name in ("idle_ttl", "api_port", "api_ctx_factor", "flatten")):
         path.write_text(json.dumps(normalized, indent=2) + "\n", encoding="utf-8")
 
 
@@ -2925,6 +2979,27 @@ def _summarize_api_payload_for_log(payload: dict) -> dict:
             str(item.get("type") or "") if isinstance(item, dict) else type(item).__name__
             for item in tools[:20]
         ]
+        tool_summaries: list[dict[str, object]] = []
+        for item in tools[:20]:
+            if not isinstance(item, dict):
+                tool_summaries.append({"type": type(item).__name__})
+                continue
+            tool_type = str(item.get("type") or "")
+            entry: dict[str, object] = {"type": tool_type}
+            if item.get("name") is not None:
+                entry["name"] = str(item.get("name") or "")[:120]
+            function = item.get("function")
+            if isinstance(function, dict):
+                entry["function_name"] = str(function.get("name") or "")[:120]
+            sub_tools = item.get("tools")
+            if isinstance(sub_tools, list):
+                entry["tools_count"] = len(sub_tools)
+                entry["tool_names"] = [
+                    str(st.get("name") or "")[:80] if isinstance(st, dict) else type(st).__name__
+                    for st in sub_tools[:12]
+                ]
+            tool_summaries.append(entry)
+        summary["tools_sample"] = tool_summaries
     raw_input = payload.get("input")
     if isinstance(raw_input, str):
         summary["input_type"] = "str"
@@ -3381,6 +3456,53 @@ def mark_model_activity(model_id: str, source: str, phase: str, *, log: bool = T
 def get_model_activity_snapshot() -> tuple[dict[str, dict[str, float | str]], str]:
     with MODEL_ACTIVITY_LOCK:
         return ({model: dict(record) for model, record in MODEL_ACTIVITY.items()}, LAST_ACTIVITY_MODEL_ID)
+
+
+def recent_activity_blocking_model_switch(
+    target_model_id: str,
+    activity: dict[str, dict[str, float | str]],
+    *,
+    now: float,
+    grace_s: int = DEFAULT_MODEL_SWITCH_GRACE_S,
+) -> tuple[str, float, str] | None:
+    """Return the most recent different model active inside the switch grace window."""
+    target = str(target_model_id or "")
+    best: tuple[str, float, str] | None = None
+    for model_id, record in activity.items():
+        if not model_id or model_id == target:
+            continue
+        try:
+            ts = float(record.get("last_activity_monotonic", 0.0))
+        except Exception:
+            continue
+        age = now - ts
+        if age < 0 or age > grace_s:
+            continue
+        phase = str(record.get("last_phase") or "")
+        if best is None or age < best[1]:
+            best = (model_id, age, phase)
+    return best
+
+
+def request_looks_like_model_probe(payload: dict) -> bool:
+    """Heuristic for client model probes that should not autoload/evict a model."""
+    if not isinstance(payload, dict):
+        return False
+    tools = payload.get("tools")
+    if isinstance(tools, list) and tools:
+        return False
+    if payload.get("tool_choice") not in (None, "", "none", "auto"):
+        return False
+    raw_input = payload.get("input")
+    if isinstance(raw_input, list):
+        return len(raw_input) <= 1
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        return len(messages) <= 1 and not bool(payload.get("functions"))
+    prompt = payload.get("prompt")
+    if isinstance(prompt, str):
+        return len(prompt.strip()) <= 128
+    return False
 
 
 def should_reload_after_unexpected_unload(
@@ -5819,18 +5941,87 @@ def _is_ollama_process(pid: int) -> bool:
     return "ollama" in description
 
 
+def _parse_llama_device_indices(value: object) -> list[int]:
+    indices: list[int] = []
+    for match in re.finditer(r"(?:CUDA)?\s*([0-9]+)", str(value or ""), flags=re.IGNORECASE):
+        try:
+            gpu = int(match.group(1))
+        except Exception:
+            continue
+        if gpu not in indices:
+            indices.append(gpu)
+    return indices
+
+
+def model_launch_gpu_set(model: ManagedModel, total_gpus: int | None = None) -> list[int]:
+    """Return the physical GPU indices this catalog model is expected to touch."""
+    try:
+        if int(model.n_gpu_layers) == 0:
+            return []
+    except Exception:
+        pass
+    overrides = model.server_overrides or {}
+    explicit_devices = _parse_llama_device_indices(overrides.get("device"))
+    if explicit_devices:
+        return explicit_devices
+    tensor_split = str(overrides.get("__replica_tensor_split") or model.tensor_split or "")
+    parts = [part for part in tensor_split.split(",") if part.strip()]
+    count = len(parts) or 1
+    total = total_gpus if total_gpus is not None else detect_cuda_device_count()
+    if total > 0:
+        count = min(count, total)
+    return list(range(max(0, count)))
+
+
+def model_has_enough_free_vram_to_load(model: ManagedModel, *, safety_vram_mib: int = 2048) -> tuple[bool, dict[str, object]]:
+    """Conservative preflight: allow coexistence only when the target estimate fits current free VRAM."""
+    gpu_set = model_launch_gpu_set(model)
+    if not gpu_set:
+        return True, {"reason": "cpu_model", "gpu_set": []}
+    required = estimate_model_runtime_mib(model)
+    if required is None:
+        return False, {"reason": "missing_estimate", "gpu_set": gpu_set}
+    snap = _query_gpu_memory_snapshot_cached()
+    if not snap:
+        return False, {"reason": "missing_gpu_snapshot", "gpu_set": gpu_set, "required_total_mib": required}
+    required_per_gpu = (required / max(1, len(gpu_set))) + 1024.0
+    checks: list[dict[str, float | int | str]] = []
+    for gpu in gpu_set:
+        free = float(snap.get(gpu, {}).get("free_mib", 0.0))
+        need = required_per_gpu + safety_vram_mib
+        checks.append({"gpu": gpu, "free_mib": free, "required_mib": need})
+        if need > free:
+            return False, {
+                "reason": "insufficient_vram",
+                "gpu_set": gpu_set,
+                "required_total_mib": required,
+                "required_per_gpu_mib": required_per_gpu,
+                "safety_vram_mib": safety_vram_mib,
+                "checks": checks,
+            }
+    return True, {
+        "reason": "fits",
+        "gpu_set": gpu_set,
+        "required_total_mib": required,
+        "required_per_gpu_mib": required_per_gpu,
+        "safety_vram_mib": safety_vram_mib,
+        "checks": checks,
+    }
+
+
 def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DEFAULT_PUBLIC_HOST, port=DEFAULT_PUBLIC_PORT) -> str | None:
     """Generate a user-friendly error message for GPU conflicts.
     
     Uses only the local llamacpp-superserver installation for model management.
     If a GPU conflict is detected, suggests using 'llamacpp-superserver unload' to free resources.
     """
-    published_models = get_published_model_ids(host, port)
-    if model_id in published_models:
-        return None
     processes = get_llama_server_processes()
     process_by_pid = {proc["pid"]: proc for proc in processes}
     model_by_path = {_safe_realpath(model.local_path): model.model_id for model in catalog}
+    target_process = get_catalog_model_process(model_id, catalog)
+    if target_process is not None:
+        return None
+    target_model = next((model for model in catalog if model.model_id == model_id), None)
     gpu_process_map = get_gpu_process_map()
     if not gpu_process_map:
         return None
@@ -5848,6 +6039,18 @@ def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DE
             conflicts.append(f"{running_model} (pid {pid}, {used_mem} MiB)")
     if not conflicts:
         return None
+    if target_model is not None:
+        fits, fit_info = model_has_enough_free_vram_to_load(target_model)
+        if fits:
+            log_api_event(
+                "model_load_allowed_vram_available",
+                {"model": model_id, "conflicts": conflicts[:4], **fit_info},
+            )
+            return None
+        log_api_event(
+            "model_load_vram_preflight_reject",
+            {"model": model_id, "conflicts": conflicts[:4], **fit_info},
+        )
     joined = "; ".join(conflicts[:4])
     if len(conflicts) > 4:
         joined += f"; +{len(conflicts) - 4} more"
@@ -6445,6 +6648,8 @@ def _flatten_responses_tools(tools: object, flatten_enabled: bool = True) -> lis
     """
     if not flatten_enabled or not isinstance(tools, list):
         return tools if isinstance(tools, list) else []
+    
+    initial_count = len(tools)
     result: list[dict] = []
     for tool in tools:
         if not isinstance(tool, dict):
@@ -6495,6 +6700,118 @@ def _flatten_responses_tools(tools: object, flatten_enabled: bool = True) -> lis
                 "parameters": tool.get("parameters", {}),
             },
         })
+
+    log_api_event("tool_flattening_done", {
+        "initial_count": initial_count,
+        "final_count": len(result),
+        "flattened_names": [t.get("function", {}).get("name") for t in result if t.get("type") == "function"]
+    })
+    return result
+
+
+def _responses_namespace_tool_map(tools: object) -> dict[str, dict[str, str]]:
+    """Map flattened legacy function names back to Responses namespace calls."""
+    mapping: dict[str, dict[str, str]] = {}
+    if not isinstance(tools, list):
+        return mapping
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if str(tool.get("type") or "").strip() != "namespace":
+            continue
+        namespace = str(tool.get("name") or "").strip()
+        sub_tools = tool.get("tools")
+        if not namespace or not isinstance(sub_tools, list):
+            continue
+        for sub_tool in sub_tools:
+            if not isinstance(sub_tool, dict):
+                continue
+            name = str(sub_tool.get("name") or "").strip()
+            if not name:
+                continue
+            mapping[f"{namespace}__{name}"] = {"namespace": namespace, "name": name}
+    return mapping
+
+
+def _responses_contains_failed_tool_output(text: object) -> bool:
+    value = str(text or "")
+    return "unsupported call:" in value or "unknown MCP server" in value
+
+
+def _responses_tools_to_chat_tools(tools: object, flatten_namespace_tools: bool = True) -> list[dict]:
+    """Convert Responses tools to legacy Chat Completions function tools.
+
+    Top-level function tools are passed through. Namespace tools may be flattened
+    internally for llama.cpp, but every flattened name must be translated back to
+    Responses `name` + `namespace` before being returned to Codex.
+    Built-ins/custom/freeform tools are intentionally not converted here because
+    the local legacy backend cannot execute them.
+    """
+    if not isinstance(tools, list):
+        return []
+    result: list[dict] = []
+    skipped: dict[str, int] = {}
+    for tool in tools:
+        if not isinstance(tool, dict):
+            skipped[type(tool).__name__] = skipped.get(type(tool).__name__, 0) + 1
+            continue
+        tool_type = str(tool.get("type") or "").strip()
+        if tool_type == "namespace" and flatten_namespace_tools:
+            ns_name = str(tool.get("name") or "").strip()
+            sub_tools = tool.get("tools")
+            if ns_name and isinstance(sub_tools, list):
+                added = 0
+                for sub_tool in sub_tools:
+                    if not isinstance(sub_tool, dict):
+                        continue
+                    sub_name = str(sub_tool.get("name") or "").strip()
+                    if not sub_name:
+                        continue
+                    result.append({
+                        "type": "function",
+                        "function": {
+                            "name": f"{ns_name}__{sub_name}",
+                            "description": sub_tool.get("description", ""),
+                            "parameters": sub_tool.get("parameters", {}),
+                        },
+                    })
+                    added += 1
+                if added:
+                    continue
+            skipped["namespace_empty"] = skipped.get("namespace_empty", 0) + 1
+            continue
+        if tool_type != "function":
+            skipped[tool_type or "unknown"] = skipped.get(tool_type or "unknown", 0) + 1
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict):
+            name = str(function.get("name") or "").strip()
+            if not name:
+                skipped["function_without_name"] = skipped.get("function_without_name", 0) + 1
+                continue
+            result.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": function.get("description", ""),
+                    "parameters": function.get("parameters", {}),
+                },
+            })
+            continue
+        name = str(tool.get("name") or "").strip()
+        if not name:
+            skipped["function_without_name"] = skipped.get("function_without_name", 0) + 1
+            continue
+        result.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": tool.get("description", ""),
+                "parameters": tool.get("parameters", {}),
+            },
+        })
+    if skipped:
+        log_api_event("responses_legacy_chat_tools_skipped", {"skipped": skipped, "forwarded_count": len(result)})
     return result
 
 
@@ -6528,9 +6845,18 @@ def _responses_content_to_openai_content(content) -> str | list:
     return parts
 
 
-def _responses_input_to_openai_messages(payload: dict) -> list[dict]:
-    """Best-effort shim from modern /v1/responses input into chat messages."""
+def _responses_input_to_openai_messages(payload: dict, allowed_tool_names: set[str] | None = None) -> list[dict]:
+    """Best-effort shim from modern /v1/responses input into chat messages.
+
+    When translating Responses history to legacy Chat Completions, only keep
+    tool-call history for tools that are actually being forwarded to the legacy
+    backend.  Otherwise old failed MCP/namespace calls such as
+    ``mcp__engram__mem_context`` can be injected back into the local model as
+    normal chat context and trigger repeated "unsupported call" loops.
+    """
     messages: list[dict] = []
+    allowed_tool_call_ids: set[str] = set()
+    blocked_tool_call_ids: set[str] = set()
     instructions = str(payload.get("instructions") or "").strip()
     if instructions:
         messages.append({"role": "system", "content": instructions})
@@ -6543,6 +6869,16 @@ def _responses_input_to_openai_messages(payload: dict) -> list[dict]:
         raw_input = [raw_input]
     if not isinstance(raw_input, list):
         return messages
+    failed_tool_call_ids: set[str] = set()
+    for item in raw_input:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").strip()
+        if item_type in {"function_call_output", "computer_call_output", "tool_result"}:
+            call_id = str(item.get("call_id") or "").strip()
+            text = item.get("output") or item.get("text") or item.get("content") or ""
+            if call_id and _responses_contains_failed_tool_output(text):
+                failed_tool_call_ids.add(call_id)
     for item in raw_input:
         if isinstance(item, str):
             if item:
@@ -6554,25 +6890,99 @@ def _responses_input_to_openai_messages(payload: dict) -> list[dict]:
         if item_type in {"message", ""} or "role" in item:
             role = str(item.get("role") or "user").strip() or "user"
             if role in {"tool", "function"}:
-                role = "user"
+                log_api_event("responses_legacy_chat_history_tool_message_skipped", {"role": role, "reason": "tool_history_not_forwarded_as_user"})
+                continue
             messages.append({"role": role, "content": _responses_content_to_openai_content(item.get("content"))})
             continue
         if item_type in {"input_text", "output_text", "text", "input_image"}:
             messages.append({"role": "user", "content": _responses_content_to_openai_content([item])})
             continue
+        if item_type == "function_call":
+            raw_name = str(item.get("name") or "").strip()
+            namespace = str(item.get("namespace") or "").strip().rstrip("_")
+            name = f"{namespace}__{raw_name}" if namespace and raw_name else raw_name
+            arguments = str(item.get("arguments") or "{}")
+            call_id = str(item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex}")
+            if name:
+                if call_id in failed_tool_call_ids:
+                    blocked_tool_call_ids.add(call_id)
+                    log_api_event(
+                        "responses_legacy_chat_history_tool_call_skipped",
+                        {"name": name, "call_id": call_id, "reason": "previous_tool_output_failed"},
+                    )
+                    continue
+                if allowed_tool_names is not None and name not in allowed_tool_names:
+                    blocked_tool_call_ids.add(call_id)
+                    log_api_event(
+                        "responses_legacy_chat_history_tool_call_skipped",
+                        {"name": name, "call_id": call_id, "reason": "not_in_forwarded_legacy_toolset"},
+                    )
+                    continue
+                allowed_tool_call_ids.add(call_id)
+                messages.append({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments},
+                        }
+                    ],
+                })
+            continue
         if item_type in {"function_call_output", "computer_call_output", "tool_result"}:
             text = item.get("output") or item.get("text") or item.get("content") or ""
+            call_id = str(item.get("call_id") or "").strip()
             if text:
-                messages.append({"role": "user", "content": str(text)})
+                if call_id:
+                    if call_id in failed_tool_call_ids:
+                        log_api_event(
+                            "responses_legacy_chat_history_tool_output_skipped",
+                            {
+                                "call_id": call_id,
+                                "reason": "previous_tool_output_failed",
+                                "was_blocked_tool_call": call_id in blocked_tool_call_ids,
+                                "output_preview": str(text)[:160],
+                            },
+                        )
+                        continue
+                    if allowed_tool_names is not None and call_id not in allowed_tool_call_ids:
+                        log_api_event(
+                            "responses_legacy_chat_history_tool_output_skipped",
+                            {
+                                "call_id": call_id,
+                                "reason": "matching_tool_call_not_forwarded",
+                                "was_blocked_tool_call": call_id in blocked_tool_call_ids,
+                                "output_preview": str(text)[:160],
+                            },
+                        )
+                        continue
+                    messages.append({"role": "tool", "tool_call_id": call_id, "content": str(text)})
+                else:
+                    output_text = str(text)
+                    if "unsupported call:" in output_text or "unknown MCP server" in output_text:
+                        log_api_event(
+                            "responses_legacy_chat_history_tool_output_skipped",
+                            {"call_id": "", "reason": "orphan_unsupported_tool_output", "output_preview": output_text[:160]},
+                        )
+                        continue
+                    messages.append({"role": "user", "content": output_text})
     return messages
 
 
-def _responses_payload_to_chat_payload(payload: dict, model_name: str) -> dict:
+def _responses_payload_to_chat_payload(payload: dict, model_name: str, *, flatten_namespace_tools: bool = True) -> dict:
     """Translate /v1/responses request fields supported by legacy chat backends."""
+    chat_tools = _responses_tools_to_chat_tools(payload.get("tools"), flatten_namespace_tools=flatten_namespace_tools)
+    allowed_tool_names = {
+        str(tool.get("function", {}).get("name") or "")
+        for tool in chat_tools
+        if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
+    }
     upstream_payload = {
         "model": model_name,
-        "messages": _responses_input_to_openai_messages(payload),
-        "stream": False,
+        "messages": _responses_input_to_openai_messages(payload, allowed_tool_names=allowed_tool_names),
+        "stream": bool(payload.get("stream")),
     }
     passthrough_fields = {
         "temperature",
@@ -6591,13 +7001,27 @@ def _responses_payload_to_chat_payload(payload: dict, model_name: str) -> dict:
         upstream_payload["max_tokens"] = payload["max_output_tokens"]
     elif "max_tokens" in payload:
         upstream_payload["max_tokens"] = payload["max_tokens"]
-    # Do not pass Responses-native tools to a legacy /v1/chat/completions
-    # backend. This is not schema validation and does not reject the request:
-    # the proxy accepts the modern Responses payload, then adapts only the
-    # model text turn to the legacy backend endpoint that cannot execute or
-    # represent Responses-only tools like computer_use_preview.
+    chat_tools = _responses_tools_to_chat_tools(payload.get("tools"), flatten_namespace_tools=flatten_namespace_tools)
+    if chat_tools:
+        upstream_payload["tools"] = chat_tools
+        if "tool_choice" in payload:
+            upstream_payload["tool_choice"] = _responses_tool_choice_to_chat_tool_choice(payload["tool_choice"])
+
     return upstream_payload
 
+
+
+def _responses_tool_choice_to_chat_tool_choice(tool_choice: object) -> object:
+    if not isinstance(tool_choice, dict):
+        return tool_choice
+    choice_type = str(tool_choice.get("type") or "").strip()
+    if choice_type == "function" and isinstance(tool_choice.get("function"), dict):
+        return tool_choice
+    if choice_type == "function":
+        name = str(tool_choice.get("name") or "").strip()
+        if name:
+            return {"type": "function", "function": {"name": name}}
+    return tool_choice
 
 def _responses_raw_passthrough_enabled() -> bool:
     value = os.environ.get("LLAMACPP_SUPERSERVER_RESPONSES_RAW_PASSTHROUGH", "")
@@ -6616,22 +7040,50 @@ def _chat_response_to_responses_payload(data: dict, model_name: str, request_pay
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
     output_text = message.get("content") or ""
-    output_item_id = f"msg_{uuid.uuid4().hex}"
+    reasoning_text = message.get("reasoning_content") or message.get("reasoning") or ""
+    
+    output_items = []
+    if reasoning_text:
+        output_items.append({
+            "id": f"rs_{uuid.uuid4().hex}",
+            "type": "reasoning",
+            "status": "completed",
+            "summary": [],
+            "content": [{"type": "reasoning_text", "text": reasoning_text}],
+        })
+    if output_text:
+        output_items.append({
+            "id": f"msg_{uuid.uuid4().hex}",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": output_text, "annotations": []}],
+        })
+        
+    for tc in message.get("tool_calls", []):
+        func = tc.get("function", {})
+        call_id = tc.get("call_id") or tc.get("id") or f"call_{uuid.uuid4().hex}"
+        item_id = tc.get("responses_item_id") or tc.get("item_id") or (tc.get("id") if str(tc.get("id") or "").startswith("fc_") else f"fc_{uuid.uuid4().hex}")
+        output_item = {
+            "id": item_id,
+            "type": "function_call",
+            "status": "completed",
+            "call_id": call_id,
+            "name": func.get("name", ""),
+            "arguments": func.get("arguments", "{}"),
+        }
+        namespace = tc.get("namespace") or func.get("namespace")
+        if namespace:
+            output_item["namespace"] = namespace
+        output_items.append(output_item)
+        
     payload = {
         "id": response_id,
         "object": "response",
         "created_at": created_at,
         "status": "completed",
         "model": model_name,
-        "output": [
-            {
-                "id": output_item_id,
-                "type": "message",
-                "status": "completed",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": output_text, "annotations": []}],
-            }
-        ],
+        "output": output_items,
         "parallel_tool_calls": bool(request_payload.get("parallel_tool_calls", True)),
         "tool_choice": request_payload.get("tool_choice", "auto"),
         "tools": request_payload.get("tools") if isinstance(request_payload.get("tools"), list) else [],
@@ -6642,22 +7094,131 @@ def _chat_response_to_responses_payload(data: dict, model_name: str, request_pay
     return payload
 
 
+def _responses_event(event_type: str, sequence_number: int, **fields) -> dict:
+    payload = {"type": event_type, "sequence_number": sequence_number}
+    payload.update(fields)
+    return payload
+
+
+def _write_sse_event(handler: BaseHTTPRequestHandler, event_name: str, event_payload: dict) -> None:
+    handler.wfile.write(f"event: {event_name}\n".encode("utf-8"))
+    handler.wfile.write(("data: " + json.dumps(event_payload, ensure_ascii=False) + "\n\n").encode("utf-8"))
+    handler.wfile.flush()
+
+
+def _response_in_progress(payload: dict) -> dict:
+    return {**payload, "status": "in_progress", "output": []}
+
+
+def _response_message_item(item_id: str, text: str, status: str = "completed") -> dict:
+    return {
+        "id": item_id,
+        "type": "message",
+        "status": status,
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text, "annotations": []}],
+    }
+
+
+def _response_function_call_item(item_id: str, call_id: str, name: str, arguments: str, status: str = "completed", namespace: str | None = None) -> dict:
+    item = {
+        "id": item_id,
+        "type": "function_call",
+        "status": status,
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+    }
+    if namespace:
+        item["namespace"] = namespace
+    return item
+
+
+def _response_reasoning_item(item_id: str, text: str, status: str = "completed") -> dict:
+    return {
+        "id": item_id,
+        "type": "reasoning",
+        "status": status,
+        "summary": [],
+        "content": [{"type": "reasoning_text", "text": text}],
+    }
+
+
+def _responses_payload_sse_events(payload: dict) -> list[tuple[str, dict]]:
+    events: list[tuple[str, dict]] = []
+    seq = 0
+
+    seq += 1
+    events.append(("response.created", _responses_event("response.created", seq, response=_response_in_progress(payload))))
+
+    for output_index, item in enumerate(payload.get("output") or []):
+        item_type = item.get("type")
+        if item_type == "reasoning":
+            text = ""
+            content = item.get("content") or []
+            for part in content:
+                if part.get("type") == "reasoning_text":
+                    text += str(part.get("text") or "")
+            item_id = str(item.get("id") or f"rs_{uuid.uuid4().hex}")
+            seq += 1
+            events.append(("response.output_item.added", _responses_event("response.output_item.added", seq, output_index=output_index, item=_response_reasoning_item(item_id, "", "in_progress"))))
+            if text:
+                seq += 1
+                events.append(("response.reasoning_text.delta", _responses_event("response.reasoning_text.delta", seq, item_id=item_id, output_index=output_index, content_index=0, delta=text)))
+            seq += 1
+            events.append(("response.reasoning_text.done", _responses_event("response.reasoning_text.done", seq, item_id=item_id, output_index=output_index, content_index=0, text=text)))
+            seq += 1
+            events.append(("response.output_item.done", _responses_event("response.output_item.done", seq, output_index=output_index, item=_response_reasoning_item(item_id, text, "completed"))))
+        elif item_type == "message":
+            text = ""
+            content = item.get("content") or []
+            for part in content:
+                if part.get("type") == "output_text":
+                    text += str(part.get("text") or "")
+            in_progress_item = _response_message_item(str(item.get("id") or f"msg_{uuid.uuid4().hex}"), "", "in_progress")
+            seq += 1
+            events.append(("response.output_item.added", _responses_event("response.output_item.added", seq, output_index=output_index, item=in_progress_item)))
+            part = {"type": "output_text", "text": "", "annotations": []}
+            seq += 1
+            events.append(("response.content_part.added", _responses_event("response.content_part.added", seq, item_id=in_progress_item["id"], output_index=output_index, content_index=0, part=part)))
+            if text:
+                seq += 1
+                events.append(("response.output_text.delta", _responses_event("response.output_text.delta", seq, item_id=in_progress_item["id"], output_index=output_index, content_index=0, delta=text, logprobs=[])))
+            done_part = {"type": "output_text", "text": text, "annotations": []}
+            seq += 1
+            events.append(("response.output_text.done", _responses_event("response.output_text.done", seq, item_id=in_progress_item["id"], output_index=output_index, content_index=0, text=text, logprobs=[])))
+            seq += 1
+            events.append(("response.content_part.done", _responses_event("response.content_part.done", seq, item_id=in_progress_item["id"], output_index=output_index, content_index=0, part=done_part)))
+            seq += 1
+            events.append(("response.output_item.done", _responses_event("response.output_item.done", seq, output_index=output_index, item=_response_message_item(in_progress_item["id"], text, "completed"))))
+        elif item_type == "function_call":
+            item_id = str(item.get("id") or f"fc_{uuid.uuid4().hex}")
+            call_id = str(item.get("call_id") or item_id)
+            name = str(item.get("name") or "")
+            arguments = str(item.get("arguments") or "")
+            started_item = _response_function_call_item(item_id, call_id, name, "", "in_progress")
+            seq += 1
+            events.append(("response.output_item.added", _responses_event("response.output_item.added", seq, output_index=output_index, item=started_item)))
+            if arguments:
+                seq += 1
+                events.append(("response.function_call_arguments.delta", _responses_event("response.function_call_arguments.delta", seq, item_id=item_id, output_index=output_index, delta=arguments)))
+            seq += 1
+            events.append(("response.function_call_arguments.done", _responses_event("response.function_call_arguments.done", seq, item_id=item_id, output_index=output_index, name=name, arguments=arguments)))
+            seq += 1
+            events.append(("response.output_item.done", _responses_event("response.output_item.done", seq, output_index=output_index, item=_response_function_call_item(item_id, call_id, name, arguments, "completed"))))
+
+    seq += 1
+    events.append(("response.completed", _responses_event("response.completed", seq, response=payload)))
+    return events
+
+
 def _write_responses_sse(handler: BaseHTTPRequestHandler, payload: dict) -> None:
-    text = payload.get("output_text") or ""
     handler.send_response(200)
     handler.send_header("Content-Type", "text/event-stream")
     handler.send_header("Cache-Control", "no-cache")
     handler.end_headers()
-    events = [
-        ("response.created", {**payload, "status": "in_progress", "output": []}),
-        ("response.output_text.delta", {"type": "response.output_text.delta", "delta": text, "output_index": 0, "content_index": 0}),
-        ("response.output_text.done", {"type": "response.output_text.done", "text": text, "output_index": 0, "content_index": 0}),
-        ("response.completed", payload),
-    ]
-    for event_name, event_payload in events:
-        handler.wfile.write(f"event: {event_name}\n".encode("utf-8"))
-        handler.wfile.write(("data: " + json.dumps(event_payload, ensure_ascii=False) + "\n\n").encode("utf-8"))
-        handler.wfile.flush()
+    for event_name, event_payload in _responses_payload_sse_events(payload):
+        _write_sse_event(handler, event_name, event_payload)
     handler.wfile.write(b"data: [DONE]\n\n")
     handler.wfile.flush()
 
@@ -6711,7 +7272,192 @@ def _proxy_request_to_public_api(method: str, path: str, *, body: bytes | None =
             if lowered in {"host", "content-length", "connection"}:
                 continue
             proxy_headers[key] = value
-    return requests.request(method, url, data=body, headers=proxy_headers, timeout=(10, 600), stream=False)
+    return requests.request(method, url, data=body, headers=proxy_headers, timeout=(60, 600), stream=False)
+
+
+def _proxy_headers_safe(headers: dict) -> dict:
+    return {
+        k: v for k, v in headers.items()
+        if k.lower() not in {"host", "connection", "content-length", "accept-encoding"}
+    }
+
+
+def is_llamaswap_upstream_static_autoload_path(method: str, path: str) -> bool:
+    """Return True for browser static-asset GETs that would otherwise autoload /upstream models."""
+    if str(method or "").upper() not in {"GET", "HEAD"}:
+        return False
+    parsed = urlparse(str(path or ""))
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 3 or parts[0] != "upstream":
+        return False
+    # /upstream/<model>/health is an intentional load/touch path used by the
+    # manager; only block static browser/UI assets below the upstream prefix.
+    remainder = "/" + "/".join(parts[2:])
+    basename = parts[-1].lower()
+    suffix = Path(basename).suffix.lower()
+    return (
+        basename in LLAMASWAP_UPSTREAM_STATIC_BLOCKED_BASENAMES
+        or suffix in LLAMASWAP_UPSTREAM_STATIC_BLOCKED_EXTENSIONS
+        or remainder.startswith("/assets/")
+        or remainder.startswith("/static/")
+    )
+
+
+def _next_llamaswap_guard_backend_port(public_port: int) -> int:
+    raw = os.environ.get("LLAMASWAP_GUARD_BACKEND_PORT")
+    if raw:
+        try:
+            return int(raw)
+        except Exception:
+            pass
+    candidate = int(public_port) + 10000
+    if candidate <= 65535:
+        return candidate
+    return int(public_port) + 1000
+
+
+def run_llamaswap_guard(args) -> int:
+    """Run llama-swap behind a small guard proxy that blocks upstream static autoloads."""
+    listen_host = str(getattr(args, "listen_host", None) or getattr(args, "public_host", None) or DEFAULT_PUBLIC_HOST)
+    listen_port = int(getattr(args, "listen_port", None) or getattr(args, "public_port", None) or DEFAULT_PUBLIC_PORT)
+    backend_host = "127.0.0.1"
+    backend_port = int(getattr(args, "backend_port", None) or _next_llamaswap_guard_backend_port(listen_port))
+    llamaswap_bin = Path(getattr(args, "llamaswap_bin", None) or os.environ.get("LLAMASWAP_BIN", "llama-swap"))
+    config_path = Path(getattr(args, "config", None) or os.environ.get("LLAMACPP_CONFIG", DEFAULT_CONFIG_PATH))
+    child_cmd = [
+        str(llamaswap_bin),
+        "--config",
+        str(config_path),
+        "--listen",
+        f"{backend_host}:{backend_port}",
+        "--watch-config",
+    ]
+    child = subprocess.Popen(child_cmd)
+
+    class GuardHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt, *values):
+            return
+
+        def _blocked(self) -> bool:
+            if not is_llamaswap_upstream_static_autoload_path(self.command, self.path):
+                return False
+            log_api_event(
+                "llamaswap_upstream_static_autoload_blocked",
+                {"method": self.command, "path": self.path},
+            )
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return True
+
+        def _proxy(self):
+            if self._blocked():
+                return
+            length = int(self.headers.get("Content-Length") or "0")
+            body = self.rfile.read(length) if length > 0 else None
+            target_url = f"http://{backend_host}:{backend_port}{self.path}"
+            try:
+                upstream = requests.request(
+                    self.command,
+                    target_url,
+                    headers=_proxy_headers_safe(dict(self.headers)),
+                    data=body,
+                    stream=True,
+                    timeout=(5, None),
+                )
+            except Exception as exc:
+                message = f"llama-swap guard backend error: {exc}"
+                log_api_event("llamaswap_guard_backend_error", {"method": self.command, "path": self.path, "error": str(exc)})
+                data = message.encode("utf-8", errors="replace")
+                self.send_response(502)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            self.send_response(upstream.status_code)
+            for key, value in upstream.headers.items():
+                lowered = key.lower()
+                if lowered in {"connection", "transfer-encoding", "content-encoding", "content-length"}:
+                    continue
+                self.send_header(key, value)
+            
+            # Crucial fix: If upstream is chunked, we MUST either send chunked encoding ourselves 
+            # or close the connection so the client knows when the response ends. 
+            # The safest and easiest is to disable keep-alive for proxied streaming responses.
+            if upstream.headers.get("Transfer-Encoding", "").lower() == "chunked":
+                self.send_header("Connection", "close")
+                
+            if upstream.headers.get("Content-Length") is not None:
+                content = upstream.content
+                self.send_header("Content-Length", str(len(content)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(content)
+                return
+            self.end_headers()
+            if self.command == "HEAD":
+                return
+            for chunk in upstream.iter_content(chunk_size=None):
+                if chunk:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+
+        def do_GET(self): self._proxy()
+        def do_HEAD(self): self._proxy()
+        def do_POST(self): self._proxy()
+        def do_PUT(self): self._proxy()
+        def do_PATCH(self): self._proxy()
+        def do_DELETE(self): self._proxy()
+        def do_OPTIONS(self): self._proxy()
+
+    server = ThreadingHTTPServer((listen_host, listen_port), GuardHandler)
+    server.daemon_threads = True
+    stop_event = threading.Event()
+
+    def _request_server_shutdown():
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+
+    def _shutdown(_signum=None, _frame=None):
+        stop_event.set()
+        # BaseServer.shutdown() must not run in the same thread that is inside
+        # serve_forever(); signal handlers run on the main thread, so dispatch
+        # the actual shutdown call to a helper thread to avoid systemd stop
+        # hanging in "deactivating".
+        threading.Thread(target=_request_server_shutdown, daemon=True).start()
+        if child.poll() is None:
+            child.terminate()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    def _watch_child():
+        rc = child.wait()
+        if not stop_event.is_set():
+            log_api_event("llamaswap_guard_child_exited", {"returncode": rc})
+            _request_server_shutdown()
+
+    threading.Thread(target=_watch_child, daemon=True).start()
+    print(
+        f"llama-swap guard listening on {listen_host}:{listen_port}; "
+        f"backend {backend_host}:{backend_port}",
+        flush=True,
+    )
+    try:
+        server.serve_forever()
+    finally:
+        _shutdown()
+        try:
+            child.wait(timeout=10)
+        except Exception:
+            child.kill()
+    return child.returncode or 0
 
 
 def _touch_model_via_llamaswap(model_id: str, host: str, port: int, *, timeout: float = 30.0) -> bool:
@@ -7064,6 +7810,19 @@ def _make_tls_context(https_cfg: dict[str, object]) -> ssl.SSLContext:
     return ctx
 
 
+def _should_redirect_plain_http_to_https(*, https_enabled: bool, client_host: str, connection: object) -> bool:
+    if not https_enabled:
+        return False
+    if isinstance(connection, ssl.SSLSocket):
+        return False
+    # Local API clients such as Codex Desktop often use http://127.0.0.1
+    # intentionally.  Keep loopback plaintext usable even when the network API
+    # is HTTPS-enabled; remote plaintext clients are still redirected.
+    if _is_loopback_client(client_host):
+        return False
+    return True
+
+
 class HTTPSRedirectingThreadingHTTPServer(ThreadingHTTPServer):
     """Serve HTTPS and redirect plain HTTP clients on the same API port.
 
@@ -7113,16 +7872,17 @@ def start_ctx_metadata_server(args):
 
     class Handler(BaseHTTPRequestHandler):
         def _redirect_plain_http_to_https(self) -> bool:
-            if not bool(api_https.get("enabled")):
-                return False
             try:
-                # When the server is HTTPS-enabled but this handler got a raw
-                # socket, the client spoke plaintext HTTP. Redirect it to HTTPS.
-                if isinstance(self.connection, ssl.SSLSocket):
+                client_addr = self.client_address[0] if self.client_address else ""
+                if not _should_redirect_plain_http_to_https(
+                    https_enabled=bool(api_https.get("enabled")),
+                    client_host=client_addr,
+                    connection=self.connection,
+                ):
                     return False
                 host = self.headers.get("Host") or f"{client_host}:{port}"
                 location = f"https://{host}{self.path or '/'}"
-                log_api_event("api_http_redirect", {"path": self.path, "location": location, "client": self.client_address[0] if self.client_address else ""})
+                log_api_event("api_http_redirect", {"path": self.path, "location": location, "client": client_addr})
                 encoded = (
                     "HTTP/1.1 308 Permanent Redirect\r\n"
                     f"Location: {location}\r\n"
@@ -7429,10 +8189,21 @@ def start_ctx_metadata_server(args):
             if body and method == "POST":
                 try:
                     proxy_payload = json.loads(body.decode("utf-8"))
-                    if isinstance(proxy_payload, dict) and isinstance(proxy_payload.get("tools"), list) and parsed.path.rstrip("/") in {"/v1/chat/completions", "/chat/completions"}:
+                    
+                    # Use explicit CLI flag if provided, otherwise fall back to server config
+                    flatten_enabled = True
+                    if getattr(args, "flatten", None) is not None:
+                        flatten_enabled = bool(args.flatten)
+                    else:
                         try:
                             _scfg = _load_server_config_payload(args)
-                            if bool(_scfg.get("flatten_namespace_tools", True)):
+                            flatten_enabled = bool(_scfg.get("flatten_namespace_tools", True))
+                        except Exception:
+                            pass
+
+                    if isinstance(proxy_payload, dict) and isinstance(proxy_payload.get("tools"), list) and parsed.path.rstrip("/") in {"/v1/chat/completions", "/chat/completions"}:
+                        try:
+                            if flatten_enabled:
                                 proxy_payload["tools"] = _flatten_responses_tools(proxy_payload["tools"])
                                 body = json.dumps(proxy_payload).encode("utf-8")
                         except Exception:
@@ -7510,10 +8281,21 @@ def start_ctx_metadata_server(args):
             except Exception:
                 payload = {}
             payload = payload if isinstance(payload, dict) else {}
-            if isinstance(payload.get("tools"), list) and urlparse(self.path).path in {"/v1/chat/completions", "/chat/completions"}:
+            
+            # Use explicit CLI flag if provided, otherwise fall back to server config
+            flatten_enabled = True
+            if getattr(args, "flatten", None) is not None:
+                flatten_enabled = bool(args.flatten)
+            else:
                 try:
                     _scfg = _load_server_config_payload(args)
-                    if bool(_scfg.get("flatten_namespace_tools", True)):
+                    flatten_enabled = bool(_scfg.get("flatten_namespace_tools", True))
+                except Exception:
+                    pass
+
+            if isinstance(payload.get("tools"), list) and urlparse(self.path).path in {"/v1/chat/completions", "/chat/completions"}:
+                try:
+                    if flatten_enabled:
                         payload["tools"] = _flatten_responses_tools(payload["tools"])
                 except Exception:
                     pass
@@ -7531,7 +8313,38 @@ def start_ctx_metadata_server(args):
             self.end_headers()
             self.wfile.write(content)
 
-        def _reject_if_gpu_busy(self, model_name: str, catalog: list[ManagedModel], *, api_style: str) -> bool:
+        def _reject_if_gpu_busy(self, model_name: str, catalog: list[ManagedModel], *, api_style: str, payload: dict | None = None) -> bool:
+            target_loaded = get_catalog_model_process(model_name, catalog) is not None
+            if (not target_loaded) and request_looks_like_model_probe(payload or {}):
+                activity, _last_activity_model_id = get_model_activity_snapshot()
+                blocker = recent_activity_blocking_model_switch(
+                    model_name,
+                    activity,
+                    now=time.monotonic(),
+                    grace_s=DEFAULT_MODEL_SWITCH_GRACE_S,
+                )
+                if blocker is not None:
+                    active_model, age_s, phase = blocker
+                    message = (
+                        f"Refusing to autoload probe for model '{model_name}' while model "
+                        f"'{active_model}' was active {age_s:.1f}s ago ({phase})."
+                    )
+                    log_api_event(
+                        "model_probe_autoload_blocked",
+                        {
+                            "model": model_name,
+                            "active_model": active_model,
+                            "activity_age_seconds": age_s,
+                            "phase": phase,
+                            "grace_s": DEFAULT_MODEL_SWITCH_GRACE_S,
+                            "api_style": api_style,
+                        },
+                    )
+                    if api_style == "openai":
+                        self._send_json({"error": {"message": message, "type": "server_error"}}, status=503)
+                    else:
+                        self._send_json({"error": message}, status=503)
+                    return True
             gpu_conflict = get_gpu_conflict_message(model_name, catalog, client_host, int(args.public_port))
             if not gpu_conflict:
                 return False
@@ -7573,7 +8386,7 @@ def start_ctx_metadata_server(args):
                     public_host=client_host,
                     public_port=int(args.public_port),
                 )
-            if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama"):
+            if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
                 return
             mark_model_activity(model_name, "ollama_chat", "request_start")
             if upstream_model_name:
@@ -7625,7 +8438,7 @@ def start_ctx_metadata_server(args):
                         f"http://{client_host}:{int(args.public_port)}/v1/chat/completions",
                         data=json.dumps(upstream_payload).encode("utf-8"),
                         headers={"Content-Type": "application/json"},
-                        timeout=(10, 600),
+                        timeout=(60, 600),
                         stream=True,
                     )
                     log_api_event("ollama_chat_upstream_headers", {"model": model_name, "status": response.status_code, "wait_ms": _elapsed_ms(started_at), "stream": True})
@@ -7696,7 +8509,7 @@ def start_ctx_metadata_server(args):
                     f"http://{client_host}:{int(args.public_port)}/v1/chat/completions",
                     data=json.dumps(upstream_payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
-                    timeout=(10, 600),
+                    timeout=(60, 600),
                     stream=False,
                 )
                 log_api_event("ollama_chat_upstream_headers", {"model": model_name, "status": response.status_code, "wait_ms": _elapsed_ms(started_at), "stream": False})
@@ -7781,7 +8594,7 @@ def start_ctx_metadata_server(args):
                     public_host=client_host,
                     public_port=int(args.public_port),
                 )
-            if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="openai"):
+            if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="openai", payload=payload):
                 return
             log_api_event(
                 "openai_chat_route_decision",
@@ -7840,19 +8653,30 @@ def start_ctx_metadata_server(args):
             upstream_payload = dict(payload)
             upstream_payload["model"] = upstream_model_name
             upstream_payload["messages"] = messages
-            # Flatten Responses-native tools to standard function type when enabled
-            _server_cfg = _load_server_config_payload(args)
-            if bool(_server_cfg.get("flatten_namespace_tools", True)):
+            
+            # Use explicit CLI flag if provided, otherwise fall back to server config
+            flatten_enabled = True
+            if getattr(args, "flatten", None) is not None:
+                flatten_enabled = bool(args.flatten)
+            else:
+                try:
+                    _server_cfg = _load_server_config_payload(args)
+                    flatten_enabled = bool(_server_cfg.get("flatten_namespace_tools", True))
+                except Exception:
+                    pass
+
+            if flatten_enabled:
                 tools_list = upstream_payload.get("tools")
                 if isinstance(tools_list, list):
                     upstream_payload["tools"] = _flatten_responses_tools(tools_list)
+            
             stream = bool(payload.get("stream"))
             try:
                 response = requests.post(
                     f"http://{client_host}:{int(args.public_port)}/v1/chat/completions",
                     data=json.dumps(upstream_payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
-                    timeout=(10, 600),
+                    timeout=(60, 600),
                     stream=stream,
                 )
                 log_api_event("openai_chat_upstream_headers", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "affinity_key": affinity_key, "status": response.status_code, "wait_ms": _elapsed_ms(started_at), "stream": stream})
@@ -7876,20 +8700,66 @@ def start_ctx_metadata_server(args):
                 self.send_response(200)
                 self.send_header("Content-Type", response.headers.get("Content-Type", "text/event-stream"))
                 self.end_headers()
+                
+                write_lock = threading.Lock()
+                stop_heartbeat = threading.Event()
+
+                def send_pulse():
+                    while not stop_heartbeat.is_set():
+                        if stop_heartbeat.wait(15):
+                            break
+                        try:
+                            with write_lock:
+                                log_api_event("openai_chat_stream_pulse", {"request_id": request_id})
+                                pulse_payload = {
+                                    "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": None}]
+                                }
+                                # Send SSE comment and empty delta as heartbeat
+                                self.wfile.write(b": keep-alive\n\n")
+                                self.wfile.write(("data: " + json.dumps(pulse_payload, ensure_ascii=False) + "\n\n").encode("utf-8"))
+                                self.wfile.flush()
+                        except Exception:
+                            break
+
+                heartbeat_thread = threading.Thread(target=send_pulse)
+                heartbeat_thread.daemon = True
+                heartbeat_thread.start()
+
                 first_chunk_logged = False
                 try:
-                    for chunk in response.iter_content(chunk_size=4096):
-                        if not chunk:
-                            continue
-                        if not first_chunk_logged:
-                            first_chunk_logged = True
-                            log_api_event("openai_chat_first_chunk", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "first_chunk_ms": _elapsed_ms(started_at)})
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-                        mark_model_activity(model_name, "openai_chat", "stream_chunk", log=False)
+                    for line in response.iter_lines():
+                        with write_lock:
+                            if not first_chunk_logged and line and line.startswith(b"data: "):
+                                first_chunk_logged = True
+                                log_api_event("openai_chat_first_chunk", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "first_chunk_ms": _elapsed_ms(started_at)})
+                            
+                            if line:
+                                if line.startswith(b"data: ") and line != b"data: [DONE]":
+                                    try:
+                                        chunk_data = json.loads(line[6:].decode("utf-8", errors="ignore"))
+                                        delta = chunk_data.get("choices", [{}])[0].get("delta", {})
+                                        content = delta.get("content", "")
+                                        reasoning = delta.get("reasoning_content", "")
+                                        if content or reasoning:
+                                            log_api_event("openai_chat_stream_chunk_received", {
+                                                "request_id": request_id,
+                                                "content_len": len(content),
+                                                "reasoning_len": len(reasoning),
+                                                "preview": (content or reasoning)[:50]
+                                            })
+                                    except Exception:
+                                        pass
+                                self.wfile.write(line + b"\n")
+                            else:
+                                self.wfile.write(b"\n")
+                            self.wfile.flush()
+                        if line and line.startswith(b"data: "):
+                            mark_model_activity(model_name, "openai_chat", "stream_chunk", log=False)
                 except (BrokenPipeError, ConnectionResetError, requests.RequestException) as exc:
                     log_api_event("openai_chat_stream_interrupted", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "error": str(exc), "router_state": replica_trace_state_for_base(model_name)})
                 finally:
+                    stop_heartbeat.set()
+                    heartbeat_thread.join(timeout=1.0)
                     response.close()
                     mark_model_activity(model_name, "openai_chat", "stream_closed")
                     if upstream_model_name:
@@ -7932,9 +8802,13 @@ def start_ctx_metadata_server(args):
         def _handle_openai_responses(self):
             payload = self._read_json_body()
             request_id = f"resp_req_{uuid.uuid4().hex}"
+            _payload_summary = _summarize_api_payload_for_log(payload)
+            _tool_item_summary = _summarize_responses_input_tool_items(payload)
+            if _tool_item_summary.get("function_calls") or _tool_item_summary.get("function_call_outputs"):
+                _payload_summary.update(_tool_item_summary)
             log_api_event(
                 "openai_responses_request",
-                {"request_id": request_id, "payload": _summarize_api_payload_for_log(payload)},
+                {"request_id": request_id, "payload": _payload_summary},
             )
             started_at = time.monotonic()
             catalog = load_catalog(catalog_path)
@@ -7964,7 +8838,7 @@ def start_ctx_metadata_server(args):
                     public_host=client_host,
                     public_port=int(args.public_port),
                 )
-            if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="openai"):
+            if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="openai", payload=payload):
                 return
             mark_model_activity(model_name, f"openai_responses:{request_id}", "request_start")
             if upstream_model_name:
@@ -7973,10 +8847,11 @@ def start_ctx_metadata_server(args):
                 "openai_responses_runtime_before_upstream",
                 model_name,
                 catalog,
-                host,
+                client_host,
                 int(args.public_port),
                 request_id=request_id,
             )
+            _server_cfg_resp = _load_server_config_payload(args)
 
             # Default path: this proxy is the Responses API compatibility
             # adapter. Do not blindly forward Codex Desktop's modern Responses
@@ -7987,11 +8862,24 @@ def start_ctx_metadata_server(args):
             if _responses_raw_passthrough_enabled():
                 _passthrough_payload = {**payload, "model": upstream_model_name}
                 try:
-                    _server_cfg_resp = _load_server_config_payload(args)
-                    if bool(_server_cfg_resp.get("flatten_namespace_tools", True)):
+                    # Use explicit CLI flag if provided, otherwise fall back to server config
+                    flatten_enabled = True
+                    if getattr(args, "flatten", None) is not None:
+                        flatten_enabled = bool(args.flatten)
+                    else:
+                        flatten_enabled = bool(_server_cfg_resp.get("flatten_namespace_tools", True))
+                    
+                    if flatten_enabled:
                         pt_tools = _passthrough_payload.get("tools")
                         if isinstance(pt_tools, list):
                             _passthrough_payload["tools"] = _flatten_responses_tools(pt_tools)
+                    
+                    log_api_event("openai_responses_passthrough_payload", {
+                        "model": model_name,
+                        "request_id": request_id,
+                        "tool_count": len(_passthrough_payload.get("tools", [])),
+                        "payload": _summarize_api_payload_for_log(_passthrough_payload)
+                    })
                 except Exception:
                     log_api_event("flatten_tools_error", {"error": "failed to flatten tools in responses passthrough", "model": model_name})
                     pass
@@ -8000,7 +8888,7 @@ def start_ctx_metadata_server(args):
                         f"http://{client_host}:{int(args.public_port)}/v1/responses",
                         data=json.dumps(_passthrough_payload).encode("utf-8"),
                         headers={"Content-Type": "application/json"},
-                        timeout=(10, 600),
+                        timeout=(60, 600),
                         stream=False,
                     )
                     log_api_event(
@@ -8035,7 +8923,7 @@ def start_ctx_metadata_server(args):
                         "openai_responses_runtime_after_passthrough_network_error",
                         model_name,
                         catalog,
-                        host,
+                        client_host,
                         int(args.public_port),
                         request_id=request_id,
                     )
@@ -8044,12 +8932,25 @@ def start_ctx_metadata_server(args):
 
             # Compatibility path for llama.cpp versions that only expose
             # /v1/chat/completions.  This path accepts modern Responses payloads
-            # but can only execute the model text turn; tools are preserved in
-            # the facade response metadata rather than rejected by old schemas.
-            upstream_payload = _responses_payload_to_chat_payload(payload, upstream_model_name)
+            # and translates tools to the legacy Chat Completions schema while
+            # preserving the Responses facade on the way back to Codex.
+            flatten_namespace_tools = bool(_server_cfg_resp.get("flatten_namespace_tools", True))
+            namespace_tool_map = _responses_namespace_tool_map(payload.get("tools")) if flatten_namespace_tools else {}
+            upstream_payload = _responses_payload_to_chat_payload(payload, upstream_model_name, flatten_namespace_tools=flatten_namespace_tools)
+            allowed_legacy_tool_names = {
+                str(tool.get("function", {}).get("name") or "")
+                for tool in upstream_payload.get("tools", [])
+                if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
+            }
             log_api_event(
                 "openai_responses_chat_fallback_payload",
-                {"model": model_name, "request_id": request_id, "payload": _summarize_api_payload_for_log(upstream_payload)},
+                {
+                    "model": model_name, 
+                    "request_id": request_id, 
+                    "tool_count": len(upstream_payload.get("tools", [])),
+                    "allowed_tool_names": sorted(name for name in allowed_legacy_tool_names if name)[:80],
+                    "payload": _summarize_api_payload_for_log(upstream_payload)
+                },
             )
             messages = upstream_payload.get("messages") or []
             if not messages:
@@ -8073,13 +8974,14 @@ def start_ctx_metadata_server(args):
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 return
+            stream = bool(payload.get("stream"))
             try:
                 response = requests.post(
                     f"http://{client_host}:{int(args.public_port)}/v1/chat/completions",
                     data=json.dumps(upstream_payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
-                    timeout=(10, 600),
-                    stream=False,
+                    timeout=(60, 600),
+                    stream=stream,
                 )
                 log_api_event(
                     "openai_responses_upstream_headers",
@@ -8088,6 +8990,7 @@ def start_ctx_metadata_server(args):
                         "request_id": request_id,
                         "status": response.status_code,
                         "wait_ms": _elapsed_ms(started_at),
+                        "stream": stream,
                     },
                 )
             except requests.RequestException as exc:
@@ -8104,7 +9007,7 @@ def start_ctx_metadata_server(args):
                     "openai_responses_runtime_after_upstream_network_error",
                     model_name,
                     catalog,
-                    host,
+                    client_host,
                     int(args.public_port),
                     request_id=request_id,
                 )
@@ -8112,17 +9015,18 @@ def start_ctx_metadata_server(args):
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": {"message": f"upstream unavailable: {exc}", "type": "server_error"}}, status=502)
                 return
+
             if response.status_code >= 400:
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
-                body_text = response.text[:4000]
+                body_text = response.text
                 log_api_event(
                     "openai_responses_upstream_error",
                     {
                         "model": model_name,
                         "request_id": request_id,
                         "status": response.status_code,
-                        "body": body_text,
+                        "body_len": len(body_text),
                         "payload": _summarize_api_payload_for_log(upstream_payload),
                     },
                 )
@@ -8130,16 +9034,454 @@ def start_ctx_metadata_server(args):
                     "openai_responses_runtime_after_upstream_http_error",
                     model_name,
                     catalog,
-                    host,
+                    client_host,
                     int(args.public_port),
                     request_id=request_id,
                     upstream_status=response.status_code,
                 )
                 self._send_json(
-                    {"error": {"message": f"upstream unavailable: HTTP {response.status_code}: {body_text[:1000]}", "type": "server_error"}},
+                    {"error": {"message": f"upstream unavailable: HTTP {response.status_code}", "type": "server_error"}},
                     status=502,
                 )
                 return
+
+            if stream:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                
+                write_lock = threading.Lock()
+                first_chunk_sent = threading.Event()
+                stop_heartbeat = threading.Event()
+                
+                generated_resp_id = f"resp_{uuid.uuid4().hex}"
+                msg_item_id = f"msg_{uuid.uuid4().hex}"
+                reasoning_item_id = f"rs_{uuid.uuid4().hex}"
+                sequence_counter = [0]
+                message_item_started = [False]
+                reasoning_item_started = [False]
+                
+                def next_sequence() -> int:
+                    sequence_counter[0] += 1
+                    return sequence_counter[0]
+
+                def stream_event(event_name: str, event_payload: dict) -> None:
+                    _write_sse_event(self, event_name, event_payload)
+                
+                # We must track output_index carefully.
+                # Do not reserve an index for text until text is actually emitted;
+                # tool-only responses must have their function_call at output_index=0.
+                output_index_counter = [0]
+                msg_output_index: list[int | None] = [None]
+                reasoning_output_index: list[int | None] = [None]
+
+                def allocate_output_index() -> int:
+                    output_index = output_index_counter[0]
+                    output_index_counter[0] += 1
+                    return output_index
+
+                def send_pulse():
+                    while not stop_heartbeat.is_set():
+                        if stop_heartbeat.wait(15):
+                            break
+                        try:
+                            with write_lock:
+                                log_api_event("openai_responses_stream_pulse", {"request_id": request_id, "first_chunk_sent": first_chunk_sent.is_set()})
+                                if not first_chunk_sent.is_set() or not message_item_started[0]:
+                                    continue
+                                
+                                delta_payload = _responses_event(
+                                    "response.output_text.delta",
+                                    next_sequence(),
+                                    item_id=msg_item_id,
+                                    output_index=msg_output_index[0],
+                                    content_index=0,
+                                    delta="",
+                                    logprobs=[],
+                                )
+                                stream_event("response.output_text.delta", delta_payload)
+                        except Exception:
+                            break
+
+                heartbeat_thread = threading.Thread(target=send_pulse)
+                heartbeat_thread.daemon = True
+                heartbeat_thread.start()
+
+                # Send response.created immediately
+                with write_lock:
+                    log_api_event("openai_responses_stream_start_immediate", {"request_id": request_id, "model": model_name})
+                    base_payload = _chat_response_to_responses_payload({"choices": [{"message": {"role": "assistant", "content": ""}}]}, model_name, payload)
+                    base_payload["id"] = generated_resp_id
+                    initial_payload = _responses_event("response.created", next_sequence(), response=_response_in_progress(base_payload))
+                    
+                    stream_event("response.created", initial_payload)
+                    first_chunk_sent.set()
+
+                full_content = ""
+                full_reasoning = ""
+                active_tool_calls = {} # tool_call_index -> {item_id, call_id, name, args_buf, output_index}
+                in_loading_block = False
+
+                try:
+                    # Use decode_unicode=False to avoid 'requests' guessing wrong encoding
+                    for line_bytes in response.iter_lines(decode_unicode=False):
+                        if not line_bytes:
+                            continue
+                        
+                        with write_lock:
+                            if not line_bytes.startswith(b"data: "):
+                                log_api_event("openai_responses_stream_raw_line", {"request_id": request_id, "line": str(line_bytes[:200])})
+                                continue
+                            
+                            data_bytes = line_bytes[6:].strip()
+                            if data_bytes == b"[DONE]":
+                                log_api_event("openai_responses_stream_done_signal", {"request_id": request_id})
+                                break
+                            
+                            try:
+                                data_str = data_bytes.decode("utf-8", errors="replace")
+                                chunk = json.loads(data_str)
+                                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                                
+                                content = str(delta.get("content") or "")
+                                reasoning = ""
+                                for field in ("reasoning_content", "reasoning"):
+                                    val = delta.get(field)
+                                    if val is not None:
+                                        reasoning += str(val)
+                                tool_calls = delta.get("tool_calls")
+                                
+                                if content or reasoning or tool_calls:
+                                    log_api_event("openai_responses_stream_chunk_received", {
+                                        "request_id": request_id,
+                                        "has_content": bool(content),
+                                        "content_len": len(content),
+                                        "content_preview": content[:100],
+                                        "has_reasoning": bool(reasoning),
+                                        "reasoning_len": len(reasoning),
+                                        "reasoning_preview": reasoning[:100],
+                                        "has_tool_calls": bool(tool_calls)
+                                    })
+
+                                if reasoning:
+                                    if not reasoning_item_started[0]:
+                                        reasoning_output_index[0] = allocate_output_index()
+                                        reasoning_item_started[0] = True
+                                        stream_event(
+                                            "response.output_item.added",
+                                            _responses_event(
+                                                "response.output_item.added",
+                                                next_sequence(),
+                                                output_index=reasoning_output_index[0],
+                                                item=_response_reasoning_item(reasoning_item_id, "", "in_progress"),
+                                            ),
+                                        )
+                                    full_reasoning += reasoning
+                                    stream_event(
+                                        "response.reasoning_text.delta",
+                                        _responses_event(
+                                            "response.reasoning_text.delta",
+                                            next_sequence(),
+                                            item_id=reasoning_item_id,
+                                            output_index=reasoning_output_index[0],
+                                            content_index=0,
+                                            delta=reasoning,
+                                        ),
+                                    )
+
+                                if content:
+                                    # Filter out llama-swap loading animations
+                                    if "━━━━━\nllama-swap loading model" in content or in_loading_block:
+                                        in_loading_block = True
+                                        if "━━━━━\n" in content and "llama-swap" not in content.split("━━━━━\n")[-1]:
+                                            # Found the end of the block
+                                            content = content.split("━━━━━\n")[-1]
+                                            in_loading_block = False
+                                        else:
+                                            content = ""
+
+                                if content:
+                                    if not message_item_started[0]:
+                                        msg_output_index[0] = allocate_output_index()
+                                        message_item_started[0] = True
+                                        stream_event(
+                                            "response.output_item.added",
+                                            _responses_event(
+                                                "response.output_item.added",
+                                                next_sequence(),
+                                                output_index=msg_output_index[0],
+                                                item=_response_message_item(msg_item_id, "", "in_progress"),
+                                            ),
+                                        )
+                                        stream_event(
+                                            "response.content_part.added",
+                                            _responses_event(
+                                                "response.content_part.added",
+                                                next_sequence(),
+                                                item_id=msg_item_id,
+                                                output_index=msg_output_index[0],
+                                                content_index=0,
+                                                part={"type": "output_text", "text": "", "annotations": []},
+                                            ),
+                                        )
+                                    full_content += content
+                                    delta_payload = _responses_event(
+                                        "response.output_text.delta",
+                                        next_sequence(),
+                                        item_id=msg_item_id,
+                                        output_index=msg_output_index[0],
+                                        content_index=0,
+                                        delta=content,
+                                        logprobs=[],
+                                    )
+                                    stream_event("response.output_text.delta", delta_payload)
+
+                                if isinstance(tool_calls, list):
+                                    for tc in tool_calls:
+                                        idx = tc.get("index", 0)
+                                        function_delta = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+                                        args_delta = str(function_delta.get("arguments") or "")
+                                        name_delta = str(function_delta.get("name") or "")
+                                        if idx not in active_tool_calls:
+                                            active_tool_calls[idx] = {
+                                                "item_id": f"fc_{uuid.uuid4().hex}",
+                                                "call_id": tc.get("id") or f"call_{uuid.uuid4().hex}",
+                                                "name": "",
+                                                "responses_name": "",
+                                                "namespace": "",
+                                                "args_buf": "",
+                                                "output_index": None,
+                                                "started": False,
+                                                "blocked": False,
+                                            }
+                                        tc_state = active_tool_calls[idx]
+                                        if name_delta and not tc_state["name"]:
+                                            tc_state["name"] = name_delta
+                                            mapped_tool = namespace_tool_map.get(name_delta, {}) if isinstance(namespace_tool_map, dict) else {}
+                                            tc_state["responses_name"] = str(mapped_tool.get("name") or name_delta)
+                                            tc_state["namespace"] = str(mapped_tool.get("namespace") or "")
+                                            if allowed_legacy_tool_names and name_delta not in allowed_legacy_tool_names:
+                                                tc_state["blocked"] = True
+                                                log_api_event(
+                                                    "openai_responses_tool_call_blocked_not_forwarded",
+                                                    {
+                                                        "request_id": request_id,
+                                                        "name": name_delta,
+                                                        "call_id": tc_state["call_id"],
+                                                        "allowed_tool_names": sorted(name for name in allowed_legacy_tool_names if name)[:80],
+                                                    },
+                                                )
+                                        if args_delta:
+                                            tc_state["args_buf"] += args_delta
+
+                                        if (
+                                            tc_state["name"]
+                                            and not tc_state["blocked"]
+                                            and not tc_state["started"]
+                                        ):
+                                            tc_state["output_index"] = allocate_output_index()
+                                            tc_state["started"] = True
+                                            stream_event(
+                                                "response.output_item.added",
+                                                _responses_event(
+                                                    "response.output_item.added",
+                                                    next_sequence(),
+                                                    output_index=tc_state["output_index"],
+                                                    item=_response_function_call_item(
+                                                        tc_state["item_id"],
+                                                        tc_state["call_id"],
+                                                        str(tc_state.get("responses_name") or tc_state["name"] or ""),
+                                                        "",
+                                                        "in_progress",
+                                                        str(tc_state.get("namespace") or "") or None,
+                                                    ),
+                                                ),
+                                            )
+
+                                        if args_delta and tc_state["started"] and not tc_state["blocked"]:
+                                            stream_event(
+                                                "response.function_call_arguments.delta",
+                                                _responses_event(
+                                                    "response.function_call_arguments.delta",
+                                                    next_sequence(),
+                                                    item_id=tc_state["item_id"],
+                                                    output_index=tc_state["output_index"],
+                                                    delta=args_delta,
+                                                ),
+                                            )
+
+                                mark_model_activity(model_name, f"openai_responses:{request_id}", "stream_chunk", log=False)
+                            except Exception as exc:
+                                log_api_event("openai_responses_stream_parse_error", {"request_id": request_id, "error": str(exc), "data_len": len(data_bytes)})
+                                continue
+                    
+                    # End of stream
+                    with write_lock:
+                        if full_reasoning and reasoning_item_started[0]:
+                            stream_event(
+                                "response.reasoning_text.done",
+                                _responses_event(
+                                    "response.reasoning_text.done",
+                                    next_sequence(),
+                                    item_id=reasoning_item_id,
+                                    output_index=reasoning_output_index[0],
+                                    content_index=0,
+                                    text=full_reasoning,
+                                ),
+                            )
+                            stream_event(
+                                "response.output_item.done",
+                                _responses_event(
+                                    "response.output_item.done",
+                                    next_sequence(),
+                                    output_index=reasoning_output_index[0],
+                                    item=_response_reasoning_item(reasoning_item_id, full_reasoning, "completed"),
+                                ),
+                            )
+
+                        if full_content and message_item_started[0]:
+                            stream_event(
+                                "response.output_text.done",
+                                _responses_event(
+                                    "response.output_text.done",
+                                    next_sequence(),
+                                    item_id=msg_item_id,
+                                    output_index=msg_output_index[0],
+                                    content_index=0,
+                                    text=full_content,
+                                    logprobs=[],
+                                ),
+                            )
+                            stream_event(
+                                "response.content_part.done",
+                                _responses_event(
+                                    "response.content_part.done",
+                                    next_sequence(),
+                                    item_id=msg_item_id,
+                                    output_index=msg_output_index[0],
+                                    content_index=0,
+                                    part={"type": "output_text", "text": full_content, "annotations": []},
+                                ),
+                            )
+                            stream_event(
+                                "response.output_item.done",
+                                _responses_event(
+                                    "response.output_item.done",
+                                    next_sequence(),
+                                    output_index=msg_output_index[0],
+                                    item=_response_message_item(msg_item_id, full_content, "completed"),
+                                ),
+                            )
+                        
+                        # Pack everything into response.completed
+                        tc_list = []
+                        for tc_info in active_tool_calls.values():
+                            if tc_info.get("blocked") or not tc_info.get("started"):
+                                log_api_event(
+                                    "openai_responses_tool_call_omitted_from_completed",
+                                    {
+                                        "request_id": request_id,
+                                        "name": str(tc_info.get("name") or ""),
+                                        "call_id": str(tc_info.get("call_id") or ""),
+                                        "blocked": bool(tc_info.get("blocked")),
+                                        "started": bool(tc_info.get("started")),
+                                        "arguments_len": len(str(tc_info.get("args_buf") or "")),
+                                    },
+                                )
+                                continue
+                            stream_event(
+                                "response.function_call_arguments.done",
+                                _responses_event(
+                                    "response.function_call_arguments.done",
+                                    next_sequence(),
+                                    item_id=tc_info["item_id"],
+                                    output_index=tc_info["output_index"],
+                                    name=str(tc_info.get("responses_name") or tc_info["name"] or ""),
+                                    arguments=tc_info["args_buf"],
+                                ),
+                            )
+                            stream_event(
+                                "response.output_item.done",
+                                _responses_event(
+                                    "response.output_item.done",
+                                    next_sequence(),
+                                    output_index=tc_info["output_index"],
+                                    item=_response_function_call_item(
+                                        tc_info["item_id"],
+                                        tc_info["call_id"],
+                                        str(tc_info.get("responses_name") or tc_info["name"] or ""),
+                                        tc_info["args_buf"],
+                                        "completed",
+                                        str(tc_info.get("namespace") or "") or None,
+                                    ),
+                                ),
+                            )
+                            log_api_event(
+                                "openai_responses_stream_tool_call_completed",
+                                {
+                                    "request_id": request_id,
+                                    "item_id": tc_info["item_id"],
+                                    "call_id": tc_info["call_id"],
+                                    "name": str(tc_info.get("responses_name") or tc_info["name"] or ""),
+                                    "namespace": str(tc_info.get("namespace") or ""),
+                                    "legacy_name": str(tc_info["name"] or ""),
+                                    "arguments_len": len(tc_info["args_buf"]),
+                                    "arguments_preview": tc_info["args_buf"][:500],
+                                    "output_index": tc_info["output_index"],
+                                },
+                            )
+                            tc_entry = {
+                                "id": tc_info["call_id"],
+                                "responses_item_id": tc_info["item_id"],
+                                "type": "function",
+                                "function": {
+                                    "name": tc_info.get("responses_name") or tc_info["name"],
+                                    "arguments": tc_info["args_buf"],
+                                },
+                            }
+                            if tc_info.get("namespace"):
+                                tc_entry["namespace"] = str(tc_info.get("namespace") or "")
+                                tc_entry["function"]["namespace"] = str(tc_info.get("namespace") or "")
+                            tc_list.append(tc_entry)
+                            
+                        final_message = {"role": "assistant", "content": full_content}
+                        if full_reasoning:
+                            final_message["reasoning_content"] = full_reasoning
+                        if tc_list:
+                            final_message["tool_calls"] = tc_list
+                            
+                        final_payload = _chat_response_to_responses_payload({"choices": [{"message": final_message}]}, model_name, payload)
+                        final_payload["id"] = generated_resp_id
+                        completed_payload = _responses_event("response.completed", next_sequence(), response=final_payload)
+                        
+                        stream_event("response.completed", completed_payload)
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                        log_api_event("openai_responses_stream_completed_sent", {"request_id": request_id, "output_text_len": len(full_content), "tool_calls": len(tc_list)})
+
+                    
+                    if upstream_model_name:
+                        REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
+                    mark_model_activity(model_name, f"openai_responses:{request_id}", "response_done")
+                except Exception as exc:
+                    log_api_event(
+                        "openai_responses_stream_error",
+                        {
+                            "request_id": request_id,
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                            "traceback": traceback.format_exc(limit=8),
+                        },
+                    )
+                    if upstream_model_name:
+                        REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                finally:
+                    stop_heartbeat.set()
+                    heartbeat_thread.join(timeout=1.0)
+                    response.close()
+                return
+
             try:
                 data = response.json()
             except Exception as exc:
@@ -8150,14 +9492,14 @@ def start_ctx_metadata_server(args):
                         "request_id": request_id,
                         "error": str(exc),
                         "payload": _summarize_api_payload_for_log(upstream_payload),
-                        "body": response.text[:4000],
+                        "body_len": len(response.text),
                     },
                 )
                 log_model_runtime_snapshot(
                     "openai_responses_runtime_after_upstream_invalid_json",
                     model_name,
                     catalog,
-                    host,
+                    client_host,
                     int(args.public_port),
                     request_id=request_id,
                 )
@@ -8215,7 +9557,7 @@ def start_ctx_metadata_server(args):
                     public_host=client_host,
                     public_port=int(args.public_port),
                 )
-            if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama"):
+            if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
                 return
             mark_model_activity(model_name, "ollama_generate", "request_start")
             if upstream_model_name:
@@ -8259,7 +9601,7 @@ def start_ctx_metadata_server(args):
                     f"http://{client_host}:{int(args.public_port)}{endpoint}",
                     data=json.dumps(upstream_payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
-                    timeout=(10, 600),
+                    timeout=(60, 600),
                     stream=True,
                 )
             except requests.RequestException as exc:
@@ -8344,7 +9686,7 @@ def start_ctx_metadata_server(args):
                     public_host=client_host,
                     public_port=int(args.public_port),
                 )
-            if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama"):
+            if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
                 return
             mark_model_activity(model_name, "ollama_embeddings", "request_start")
             if upstream_model_name:
@@ -11487,7 +12829,13 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     parser.add_argument("--api-port", type=int, default=None)
     parser.add_argument("--idle-ttl", type=int, default=None)
     parser.add_argument("--api-ctx-factor", type=float, default=None)
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument("--flatten", action=argparse.BooleanOptionalAction, default=None, help="Flatten Responses-native tools (namespaces) to standard function tools.")
+    public_command_metavar = (
+        "{add,run,remove,rm,unload,update,config-migrate,refresh-templates,"
+        "remove-templates,validate,daemon,debug,auto-performance,list,ps,"
+        "requests,logs,hacks,info}"
+    )
+    sub = parser.add_subparsers(dest="command", required=True, metavar=public_command_metavar)
     subparsers: dict[str, argparse.ArgumentParser] = {}
     
     p_add = sub.add_parser(
@@ -11673,6 +13021,22 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     )
     subparsers["daemon"] = p_daemon
     p_daemon.set_defaults(func=daemon_mode)
+
+    p_swap_guard = sub.add_parser(
+        "llama-swap-guard",
+        help=argparse.SUPPRESS,
+        description="Internal guard proxy for llama-swap.",
+    )
+    subparsers["llama-swap-guard"] = p_swap_guard
+    p_swap_guard.set_defaults(func=run_llamaswap_guard)
+    p_swap_guard.add_argument("--llamaswap-bin", type=Path, default=None)
+    p_swap_guard.add_argument("--listen-host", default=None)
+    p_swap_guard.add_argument("--listen-port", type=int, default=None)
+    p_swap_guard.add_argument("--backend-port", type=int, default=None)
+    try:
+        sub._choices_actions = [action for action in sub._choices_actions if action.dest != "llama-swap-guard"]
+    except Exception:
+        pass
     
     p_debug = sub.add_parser(
         "debug",

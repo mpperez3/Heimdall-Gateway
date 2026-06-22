@@ -72,9 +72,12 @@ from llamacpp_stack.cli import (
     summarize_configured_replicas,
     start_catalog_auto_update_watch,
     start_ctx_metadata_server,
+    is_llamaswap_upstream_static_autoload_path,
     _api_auth_matches,
     _detect_mtp_drafter_file,
     summarize_download_state,
+    request_looks_like_model_probe,
+    recent_activity_blocking_model_switch,
     should_reload_after_unexpected_unload,
     stop_running_ollama_models,
     unload_models,
@@ -239,7 +242,7 @@ class InstallHelpersTest(unittest.TestCase):
                 server.server_close()
 
 
-    def test_superserver_https_redirects_plain_http_on_same_port(self) -> None:
+    def test_superserver_https_keeps_loopback_plain_http_on_same_port(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             catalog = root / "catalog.json"
@@ -266,15 +269,32 @@ class InstallHelpersTest(unittest.TestCase):
             server = start_ctx_metadata_server(args)
             self.assertIsNotNone(server)
             try:
-                opener = urllib.request.build_opener(urllib.request.HTTPHandler)
-                req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/models", method="GET")
-                with self.assertRaises(urllib.error.HTTPError) as ctx:
-                    opener.open(req, timeout=3)
-                self.assertEqual(ctx.exception.code, 308)
-                self.assertEqual(ctx.exception.headers.get("Location"), f"https://127.0.0.1:{port}/v1/models")
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=3) as response:
+                    self.assertEqual(response.status, 200)
+                    payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(payload, {"object": "list", "data": []})
             finally:
                 server.shutdown()
                 server.server_close()
+
+    def test_superserver_https_redirect_decision_only_applies_to_remote_plain_http(self) -> None:
+        from llamacpp_stack.cli import _should_redirect_plain_http_to_https
+
+        self.assertFalse(_should_redirect_plain_http_to_https(
+            https_enabled=True,
+            client_host="127.0.0.1",
+            connection=object(),
+        ))
+        self.assertFalse(_should_redirect_plain_http_to_https(
+            https_enabled=False,
+            client_host="192.168.1.50",
+            connection=object(),
+        ))
+        self.assertTrue(_should_redirect_plain_http_to_https(
+            https_enabled=True,
+            client_host="192.168.1.50",
+            connection=object(),
+        ))
 
     def test_superserver_api_can_serve_https_with_configured_cert(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1267,6 +1287,8 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertNotRegex(help_text, r"(?m)^\s*llamacpp-superserver v\d")
         self.assertRegex(help_text, r"usage: llamacpp-superserver")
         self.assertIn("info", help_text)
+        self.assertNotIn("llama-swap-guard", help_text)
+        self.assertNotIn("==SUPPRESS==", help_text)
 
     def test_build_info_text_contains_runtime_sections(self) -> None:
         args = Namespace(
@@ -4035,6 +4057,7 @@ class InstallHelpersTest(unittest.TestCase):
             )
             rendered_text = config_path.read_text(encoding="utf-8")
             self.assertIn("ttl: 10", rendered_text)
+            self.assertIn("sendLoadingState: false", rendered_text)
             self.assertTrue(rendered_text.startswith("# llamacpp-superserver config.yaml"))
 
 
@@ -5191,7 +5214,7 @@ models:
         self.assertIn("--cache-type-v q8_0", rendered)
 
 
-    def test_get_gpu_conflict_message_ignores_target_when_already_published(self) -> None:
+    def test_get_gpu_conflict_message_ignores_target_when_already_loaded(self) -> None:
         model = ManagedModel(
             model_id="repo-q4",
             repo_id="org/repo",
@@ -5201,9 +5224,119 @@ models:
         )
         with (
             mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value={"repo-q4"}),
+            mock.patch("llamacpp_stack.cli.get_llama_server_processes", return_value=[{"pid": 123, "model_path": "/tmp/model-q4.gguf"}]),
             mock.patch("llamacpp_stack.cli.get_gpu_process_map", return_value={123: "4000"}),
         ):
             self.assertIsNone(get_gpu_conflict_message("repo-q4", [model]))
+
+    def test_get_gpu_conflict_message_reports_other_model_even_when_target_is_published_but_unloaded(self) -> None:
+        model_a = ManagedModel(
+            model_id="model-a",
+            repo_id="org/a",
+            quant="Q4",
+            filename="a.gguf",
+            local_path="/tmp/a.gguf",
+        )
+        model_b = ManagedModel(
+            model_id="model-b",
+            repo_id="org/b",
+            quant="Q4",
+            filename="b.gguf",
+            local_path="/tmp/b.gguf",
+        )
+        with (
+            mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value={"model-b"}),
+            mock.patch("llamacpp_stack.cli.get_llama_server_processes", return_value=[{"pid": 123, "model_path": "/tmp/a.gguf"}]),
+            mock.patch("llamacpp_stack.cli.get_gpu_process_map", return_value={123: "4096"}),
+        ):
+            message = get_gpu_conflict_message("model-b", [model_a, model_b])
+        self.assertIn("Cannot load model 'model-b'", message)
+        self.assertIn("model-a (pid 123, 4096 MiB)", message)
+
+    def test_get_gpu_conflict_message_allows_second_model_when_vram_fits(self) -> None:
+        model_a = ManagedModel(
+            model_id="model-a",
+            repo_id="org/a",
+            quant="Q4",
+            filename="a.gguf",
+            local_path="/tmp/a.gguf",
+            tensor_split="1",
+        )
+        model_b = ManagedModel(
+            model_id="model-b",
+            repo_id="org/b",
+            quant="Q4",
+            filename="b.gguf",
+            local_path="/tmp/b.gguf",
+            tensor_split="1",
+        )
+        with (
+            mock.patch("llamacpp_stack.cli.get_llama_server_processes", return_value=[{"pid": 123, "model_path": "/tmp/a.gguf"}]),
+            mock.patch("llamacpp_stack.cli.get_gpu_process_map", return_value={123: "4096"}),
+            mock.patch("llamacpp_stack.cli.estimate_model_runtime_mib", return_value=6000.0),
+            mock.patch("llamacpp_stack.cli._query_gpu_memory_snapshot_cached", return_value={0: {"free_mib": 12000.0, "used_mib": 4096.0, "total_mib": 24576.0}}),
+        ):
+            self.assertIsNone(get_gpu_conflict_message("model-b", [model_a, model_b]))
+
+    def test_get_gpu_conflict_message_blocks_second_model_when_vram_does_not_fit(self) -> None:
+        model_a = ManagedModel(
+            model_id="model-a",
+            repo_id="org/a",
+            quant="Q4",
+            filename="a.gguf",
+            local_path="/tmp/a.gguf",
+            tensor_split="1",
+        )
+        model_b = ManagedModel(
+            model_id="model-b",
+            repo_id="org/b",
+            quant="Q4",
+            filename="b.gguf",
+            local_path="/tmp/b.gguf",
+            tensor_split="1",
+        )
+        with (
+            mock.patch("llamacpp_stack.cli.get_llama_server_processes", return_value=[{"pid": 123, "model_path": "/tmp/a.gguf"}]),
+            mock.patch("llamacpp_stack.cli.get_gpu_process_map", return_value={123: "4096"}),
+            mock.patch("llamacpp_stack.cli.estimate_model_runtime_mib", return_value=9000.0),
+            mock.patch("llamacpp_stack.cli._query_gpu_memory_snapshot_cached", return_value={0: {"free_mib": 10000.0, "used_mib": 4096.0, "total_mib": 24576.0}}),
+        ):
+            message = get_gpu_conflict_message("model-b", [model_a, model_b])
+        self.assertIn("Cannot load model 'model-b'", message)
+        self.assertIn("model-a (pid 123, 4096 MiB)", message)
+
+    def test_responses_single_message_without_tools_looks_like_model_probe(self) -> None:
+        self.assertTrue(request_looks_like_model_probe({
+            "model": "gpt-5.4-mini",
+            "stream": True,
+            "tools": [],
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ping"}]}],
+        }))
+        self.assertFalse(request_looks_like_model_probe({
+            "model": "gpt-5.5",
+            "stream": True,
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [{"type": "message"}, {"type": "message"}],
+        }))
+
+    def test_llamaswap_guard_blocks_upstream_static_assets_only(self) -> None:
+        self.assertTrue(is_llamaswap_upstream_static_autoload_path("GET", "/upstream/gemma/sw.js"))
+        self.assertTrue(is_llamaswap_upstream_static_autoload_path("HEAD", "/upstream/gemma/assets/app.js"))
+        self.assertFalse(is_llamaswap_upstream_static_autoload_path("GET", "/upstream/gemma/health"))
+        self.assertFalse(is_llamaswap_upstream_static_autoload_path("POST", "/v1/chat/completions"))
+        self.assertFalse(is_llamaswap_upstream_static_autoload_path("POST", "/upstream/gemma/completion"))
+
+    def test_recent_activity_blocks_model_switch_inside_grace_window(self) -> None:
+        activity = {
+            "qwen": {
+                "last_activity_monotonic": 100.0,
+                "last_phase": "request_start",
+            }
+        }
+        blocker = recent_activity_blocking_model_switch("gemma", activity, now=125.0, grace_s=30)
+        self.assertEqual(blocker, ("qwen", 25.0, "request_start"))
+        self.assertIsNone(recent_activity_blocking_model_switch("gemma", activity, now=131.0, grace_s=30))
+        self.assertIsNone(recent_activity_blocking_model_switch("qwen", activity, now=125.0, grace_s=30))
 
     def test_get_gpu_conflict_message_reports_other_llamacpp_model(self) -> None:
         model_a = ManagedModel(

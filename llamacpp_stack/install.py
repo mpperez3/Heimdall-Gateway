@@ -1748,10 +1748,14 @@ def render_llamaswap_wrapper(layout: InstallLayout) -> str:
         if [[ -n "${{LLAMACPP_NCCL_ROOT:-}}" ]]; then
           export LD_LIBRARY_PATH="$LLAMACPP_NCCL_ROOT/lib64:$LLAMACPP_NCCL_ROOT/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
         fi
-        exec "$LLAMASWAP_BIN" \\
+        exec "$PYTHON_BIN" -m llamacpp_stack.cli \\
           --config "$LLAMACPP_CONFIG" \\
-          --listen "$LLAMACPP_PUBLIC_HOST:$LLAMACPP_PUBLIC_PORT" \\
-          --watch-config
+          --public-host "$LLAMACPP_PUBLIC_HOST" \\
+          --public-port "$LLAMACPP_PUBLIC_PORT" \\
+          llama-swap-guard \\
+          --llamaswap-bin "$LLAMASWAP_BIN" \\
+          --listen-host "$LLAMACPP_PUBLIC_HOST" \\
+          --listen-port "$LLAMACPP_PUBLIC_PORT"
         """
     )
 
@@ -1854,7 +1858,7 @@ def render_initial_config(config_path: Path, start_port: int = 18080) -> None:
         logLevel: info
         logToStdout: proxy
         startPort: {start_port}
-        sendLoadingState: true
+        sendLoadingState: false
         includeAliasesInList: true
         models: {{}}
         """
@@ -2489,7 +2493,7 @@ def print_install_summary(layout: InstallLayout, install_services: bool, api_htt
     print(f"Installed llama-swap: {current_llamaswap}")
     print(f"Superserver API:     {api_url}")
     if api_scheme == "https":
-        print("  HTTPS is enabled on the API port; use https://, not http://, for 11435.")
+        print("  HTTPS is enabled for remote clients; loopback http://127.0.0.1:11435 remains available for local API clients.")
     print(f"UI activity:         {ui_url}")
     print(f"llama-swap UI/backend: {ui_base_url}")
     # Inform user where to drop per-model chat templates
