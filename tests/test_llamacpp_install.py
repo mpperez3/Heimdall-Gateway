@@ -24,6 +24,7 @@ from llamacpp_stack.cli import (
     ManagedModel,
     add_models,
     build_openai_model_payload,
+    build_openai_model_list_payload,
     build_ollama_model_payload,
     build_info_text,
     choose_auto_ctx,
@@ -3822,6 +3823,41 @@ class InstallHelpersTest(unittest.TestCase):
         )
         self.assertEqual(desired_models_dir_owner(layout), (DEFAULT_SERVICE_USER, DEFAULT_SERVICE_USER))
 
+
+    def test_catalog_auto_update_defers_while_model_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            catalog_path = root / "catalog.json"
+            server_config_path = root / "conf.json"
+            catalog_path.write_text("[]\n", encoding="utf-8")
+            server_config_path.write_text("{}\n", encoding="utf-8")
+            args = Namespace(catalog=catalog_path, server_config=server_config_path)
+            stop_event = threading.Event()
+            active = {"value": True}
+            calls = []
+
+            def fake_active_summary(*_args, **_kwargs):
+                return "qwen(request_start)" if active["value"] else ""
+
+            def fake_update_config(update_args):
+                calls.append(update_args)
+
+            with (
+                mock.patch("llamacpp_stack.cli._active_download_blocker_summary", side_effect=fake_active_summary),
+                mock.patch("llamacpp_stack.cli.update_config", side_effect=fake_update_config),
+            ):
+                thread = start_catalog_auto_update_watch(args, poll_s=0.05, debounce_s=0.05, stop_event=stop_event)
+                time.sleep(0.1)
+                catalog_path.write_text("[]\n ", encoding="utf-8")
+                time.sleep(0.25)
+                self.assertEqual(calls, [])
+                active["value"] = False
+                time.sleep(0.25)
+                stop_event.set()
+                thread.join(timeout=1)
+
+            self.assertEqual(len(calls), 1)
+
     def test_existing_model_updates_runtime_settings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3841,6 +3877,7 @@ class InstallHelpersTest(unittest.TestCase):
                         quant="Q4",
                         filename="model-q4.gguf",
                         local_path=str(model_path),
+                        ctx_size=65536,
                         ttl=300,
                         n_gpu_layers=0,
                         tensor_split="1",
@@ -3884,6 +3921,7 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertEqual(result, "repo-q4")
             model = load_catalog(catalog_path)[0]
             self.assertEqual(model.ttl, 300)
+            self.assertEqual(model.ctx_size, 65536)
             self.assertEqual(model.n_gpu_layers, 99)
             self.assertEqual(model.tensor_split, "3,1")
             self.assertEqual(model.host, "0.0.0.0")
@@ -5422,6 +5460,16 @@ models:
                 "model-a",
                 activity,
                 "model-a",
+                now=386.0,
+                idle_ttl=300,
+            ),
+            (False, 286.0),
+        )
+        self.assertEqual(
+            should_reload_after_unexpected_unload(
+                "model-a",
+                activity,
+                "model-a",
                 now=401.0,
                 idle_ttl=300,
             ),
@@ -5697,6 +5745,26 @@ models:
         self.assertEqual(model.server_overrides["parallel"], 1)
         self.assertTrue(any("parallel=1" in message["message"] for message in messages))
 
+    def test_build_openai_model_list_payload_exposes_lightweight_vision_metadata(self) -> None:
+        model = ManagedModel(
+            model_id="repo-vl",
+            repo_id="org/repo-vl",
+            quant="Q4",
+            filename="model-vl.gguf",
+            local_path="/tmp/model-vl.gguf",
+            ctx_size=32768,
+            load_capabilities=["image", "image-text-to-text"],
+        )
+
+        with mock.patch(
+            "llamacpp_stack.cli.refresh_model_load_capabilities",
+            side_effect=AssertionError("/v1/models must not read GGUF metadata"),
+        ):
+            payload = build_openai_model_list_payload(model)
+
+        self.assertEqual(payload["metadata"]["load_capabilities"], ["image", "image-text-to-text"])
+        self.assertTrue(payload["metadata"]["vision"])
+
     def test_build_openai_model_payload_exposes_ctx_probe_metrics_with_nc_defaults(self) -> None:
         model = ManagedModel(
             model_id="repo-q4",
@@ -5970,7 +6038,10 @@ models:
                 calls.append(received_args.catalog)
 
             stop_event = threading.Event()
-            with mock.patch("llamacpp_stack.cli.update_config", side_effect=fake_update):
+            with (
+                mock.patch("llamacpp_stack.cli.update_config", side_effect=fake_update),
+                mock.patch("llamacpp_stack.cli._active_download_blocker_summary", return_value=""),
+            ):
                 thread = start_catalog_auto_update_watch(args, poll_s=0.05, debounce_s=0.05, stop_event=stop_event)
                 try:
                     time.sleep(0.12)
@@ -6001,7 +6072,10 @@ models:
                 catalog_path.write_text("[{\"model_id\": \"canonical\"}]", encoding="utf-8")
 
             stop_event = threading.Event()
-            with mock.patch("llamacpp_stack.cli.update_config", side_effect=fake_update):
+            with (
+                mock.patch("llamacpp_stack.cli.update_config", side_effect=fake_update),
+                mock.patch("llamacpp_stack.cli._active_download_blocker_summary", return_value=""),
+            ):
                 thread = start_catalog_auto_update_watch(args, poll_s=0.05, debounce_s=0.05, stop_event=stop_event)
                 try:
                     time.sleep(0.12)

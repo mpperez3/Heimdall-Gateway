@@ -2956,6 +2956,25 @@ def _redact_large_log_value(value, *, max_string: int = 500):
     return value
 
 
+def _payload_contains_images(payload: object) -> bool:
+    def scan(value: object) -> bool:
+        if isinstance(value, dict):
+            item_type = str(value.get("type") or "").strip()
+            if item_type in {"input_image", "image_url"}:
+                return True
+            image_url = value.get("image_url")
+            if isinstance(image_url, (str, dict)) and image_url:
+                return True
+            if value.get("data") and str(value.get("mime_type") or value.get("media_type") or "").startswith("image/"):
+                return True
+            return any(scan(item) for item in value.values())
+        if isinstance(value, list):
+            return any(scan(item) for item in value)
+        return False
+
+    return scan(payload)
+
+
 def _summarize_api_payload_for_log(payload: dict) -> dict:
     """Keep request diagnostics useful without dumping huge prompts/images."""
     if not isinstance(payload, dict):
@@ -3000,6 +3019,8 @@ def _summarize_api_payload_for_log(payload: dict) -> dict:
                 ]
             tool_summaries.append(entry)
         summary["tools_sample"] = tool_summaries
+    if _payload_contains_images(payload):
+        summary["has_images"] = True
     raw_input = payload.get("input")
     if isinstance(raw_input, str):
         summary["input_type"] = "str"
@@ -3021,6 +3042,11 @@ def _summarize_api_payload_for_log(payload: dict) -> dict:
             str(item.get("role") or "") if isinstance(item, dict) else type(item).__name__
             for item in messages[:20]
         ]
+        if len(messages) > 20:
+            summary["message_roles_tail"] = [
+                str(item.get("role") or "") if isinstance(item, dict) else type(item).__name__
+                for item in messages[-20:]
+            ]
     return summary
 
 
@@ -3521,6 +3547,12 @@ def should_reload_after_unexpected_unload(
         return False, None
     age = now - float(last_activity)
     if age < 0 or age >= idle_ttl:
+        return False, age
+    # Do not fight llama-swap's normal TTL unload near the end of the idle
+    # window. The guard is for abrupt unloads shortly after activity, not for
+    # keeping an idle model alive forever or reloading it seconds before TTL.
+    ttl_tail_grace = min(30.0, max(5.0, idle_ttl * 0.1))
+    if age >= max(0.0, idle_ttl - ttl_tail_grace):
         return False, age
     if last_activity_model_id and last_activity_model_id != model_id:
         return False, age
@@ -4641,24 +4673,19 @@ def ensure_model_available(args, progress_callback = None):
         ctx_probe_kv_gb = None
         ctx_probe_prompt_tokens = None
         _emit_message(f"Applied ctx override for {existing.model_id}: {ctx_override}", progress_callback)
-    elif existing and skip_ctx and (existing.ctx_size != default_ctx or existing.auto_ctx_failed or existing.auto_ctx_error):
-        existing.ctx_size = default_ctx
+    elif existing and skip_ctx and (existing.auto_ctx_failed or existing.auto_ctx_error):
+        # --skip-ctx means do not run auto-probing now; it must not silently
+        # downgrade an already tuned model to the installer default.  Preserve
+        # the existing ctx_size and only clear the failure state so the model can
+        # be republished with other metadata/config changes such as mmproj.
         existing.auto_ctx_failed = False
         existing.auto_ctx_error = ""
-        clear_ctx_probe_metrics(existing)
         refresh_model_load_capabilities(existing)
         save_catalog(args.catalog, catalog)
         ctx_changed = True
         auto_ctx_failed = False
         auto_ctx_error = ""
-        ctx_probe_read_s = None
-        ctx_probe_tokens_s = None
-        ctx_probe_totals_s = None
-        ctx_probe_latency_ms = None
-        ctx_probe_speed_tps = None
-        ctx_probe_kv_gb = None
-        ctx_probe_prompt_tokens = None
-        _emit_message(f"Applied default ctx for {existing.model_id}: {default_ctx}", progress_callback)
+        _emit_message(f"Preserving existing ctx for {existing.model_id}: {existing.ctx_size or default_ctx}", progress_callback)
 
     if existing:
         desired_n_gpu_layers = int(args.n_gpu_layers)
@@ -4819,6 +4846,29 @@ def ensure_model_available(args, progress_callback = None):
             local_dir=target_dir,
             local_dir_use_symlinks=False
         )
+    if not mmproj_filename and selected_file != "hf-native" and local_path:
+        capability_probe = ManagedModel(
+            model_id=mid,
+            repo_id=repo_id,
+            quant=quant,
+            filename=selected_file,
+            local_path=str(local_path),
+            description=args.description or f"{repo_id} / {selected_file}",
+        )
+        detected_capabilities = refresh_model_load_capabilities(capability_probe)
+        if _model_capabilities_imply_vision(capability_probe):
+            try:
+                detected_mmproj_filename = choose_mmproj_file(api, repo_id, token)
+            except Exception:
+                detected_mmproj_filename = None
+            if detected_mmproj_filename:
+                mmproj_filename = detected_mmproj_filename
+                mmproj_path = str(target_dir / mmproj_filename)
+                mmproj_ready = bool(Path(mmproj_path).exists())
+                _emit_message(
+                    f"Detected image-capable GGUF metadata ({', '.join(detected_capabilities)}); pairing mmproj {Path(mmproj_filename).name}.",
+                    progress_callback,
+                )
     if mmproj_filename:
         if _download_file_state(target_dir, mmproj_filename, expected_sizes.get(mmproj_filename)) == "completed":
             mmproj_path = str(target_dir / mmproj_filename)
@@ -4853,7 +4903,7 @@ def ensure_model_available(args, progress_callback = None):
             mtp_path = mtp_loc
 
     probe_config_replaced = False
-    desired_ctx = ctx_override if ctx_override is not None else (existing.ctx_size if existing and existing.auto_ctx_failed else default_ctx)
+    desired_ctx = ctx_override if ctx_override is not None else (existing.ctx_size if existing and skip_ctx and existing.ctx_size else (existing.ctx_size if existing and existing.auto_ctx_failed else default_ctx))
     if ctx_override is not None:
         auto_ctx_failed = False
         auto_ctx_error = ""
@@ -4875,7 +4925,10 @@ def ensure_model_available(args, progress_callback = None):
         ctx_probe_speed_tps = None
         ctx_probe_kv_gb = None
         ctx_probe_prompt_tokens = None
-        _emit_message(f"Skipping automatic ctx tuning. Using default ctx {desired_ctx} for {mid}.", progress_callback)
+        if existing and existing.ctx_size:
+            _emit_message(f"Skipping automatic ctx tuning. Preserving existing ctx {desired_ctx} for {mid}.", progress_callback)
+        else:
+            _emit_message(f"Skipping automatic ctx tuning. Using default ctx {desired_ctx} for {mid}.", progress_callback)
     elif existing and existing.auto_ctx_failed and not force_auto_ctx:
         desired_ctx = existing.ctx_size or default_ctx
         auto_ctx_failed = True
@@ -5287,6 +5340,82 @@ def apply_config_and_wait_absent(
         f"Model {model_id} is still published after updating {config_path}. "
         "Ensure llama-swap is running with --watch-config and is watching that config file."
     )
+
+
+def reload_model_runtime_from_catalog_config(
+    model: ManagedModel,
+    catalog: list[ManagedModel],
+    args,
+    host: str,
+    port: int,
+    *,
+    progress_callback=None,
+    unload_timeout: float = 45.0,
+    reload_timeout: float = 45.0,
+) -> bool:
+    """Force llama-swap to drop a stale live process and publish it again.
+
+    llama-swap publishes models from config.yaml, but an already-loaded
+    llama-server process can survive a command change such as adding --mmproj.
+    Temporarily removing just this model from the watched config makes
+    llama-swap stop the old process; restoring the full catalog makes the next
+    request load the model with the current command.
+    """
+    if model is None or not getattr(model, "model_id", None):
+        return False
+    model_id = model.model_id
+    config_path = getattr(args, "config", None)
+    llama_server = getattr(args, "llama_server", None)
+    start_port = getattr(args, "start_port", None)
+    if not config_path or not llama_server or start_port is None:
+        return False
+    server_defaults = resolve_llama_server_defaults(args)
+    replica_defaults = resolve_global_replica_config(args)
+    idle_ttl = resolve_idle_ttl(args)
+    reduced_catalog = [item for item in catalog if item.model_id != model_id]
+    try:
+        log_api_event("model_runtime_reload_begin", {"model": model_id, "reason": "stale_runtime_flags"})
+        render_llamaswap_config(
+            reduced_catalog,
+            config_path,
+            llama_server,
+            start_port,
+            idle_ttl,
+            server_defaults=server_defaults,
+            replica_defaults=replica_defaults,
+        )
+        if not wait_for_model_absent([model_id], host, port, timeout=unload_timeout):
+            log_api_event("model_runtime_reload_unload_timeout", {"model": model_id})
+            return False
+        render_llamaswap_config(
+            catalog,
+            config_path,
+            llama_server,
+            start_port,
+            idle_ttl,
+            server_defaults=server_defaults,
+            replica_defaults=replica_defaults,
+        )
+        if not wait_for_model(model_id, host, port, timeout=reload_timeout):
+            log_api_event("model_runtime_reload_restore_timeout", {"model": model_id})
+            return False
+        log_api_event("model_runtime_reload_done", {"model": model_id})
+        return True
+    except Exception as exc:
+        log_api_event("model_runtime_reload_error", {"model": model_id, "error": str(exc), "traceback": traceback.format_exc(limit=6)})
+        try:
+            render_llamaswap_config(
+                catalog,
+                config_path,
+                llama_server,
+                start_port,
+                idle_ttl,
+                server_defaults=server_defaults,
+                replica_defaults=replica_defaults,
+            )
+        except Exception:
+            pass
+        return False
 
 
 def _model_candidate_files(model: ManagedModel) -> list[Path]:
@@ -6233,12 +6362,19 @@ def build_model_ctx_payload(model: ManagedModel) -> dict:
 def build_openai_model_list_payload(model: ManagedModel) -> dict:
     # Keep /v1/models fast and side-effect free. Some clients call this during
     # startup and expect a quick OpenAI-compatible list; detailed metadata is
-    # available through /api/show and /api/ctx.
+    # available through /api/show and /api/ctx.  Include lightweight capability
+    # hints so OpenAI-compatible clients can avoid sending images to text-only
+    # GGUF models.
+    load_capabilities = _normalize_load_capabilities(getattr(model, "load_capabilities", []))
     return {
         "id": model.model_id,
         "object": "model",
         "created": 0,
         "owned_by": "llama-swap",
+        "metadata": {
+            "vision": _has_vision_runtime(model),
+            "load_capabilities": load_capabilities,
+        },
     }
 
 def build_openai_model_payload(model: ManagedModel) -> dict:
@@ -6268,8 +6404,15 @@ def build_openai_model_payload(model: ManagedModel) -> dict:
     }
 
 
+def _model_capabilities_imply_vision(model: ManagedModel) -> bool:
+    capabilities = _normalize_load_capabilities(getattr(model, "load_capabilities", []))
+    return any(token in capabilities for token in ("image", "image-text-to-text", "image-to-text", "vision"))
+
+
 def _looks_like_vision_model(model: ManagedModel) -> bool:
     if model.mmproj_path:
+        return True
+    if _model_capabilities_imply_vision(model):
         return True
     haystack = " ".join([
         model.model_id or "",
@@ -6285,6 +6428,49 @@ def _has_vision_runtime(model: ManagedModel) -> bool:
         return True
     capabilities = _normalize_load_capabilities(getattr(model, "load_capabilities", []))
     return any(token in capabilities for token in ("image", "image-text-to-text", "image-to-text", "vision"))
+
+
+def _has_configured_mmproj_runtime(model: ManagedModel) -> bool:
+    # llama.cpp accepts actual image blocks only when the launched server has a
+    # valid multimodal projector. Hub-level capabilities such as image-to-text
+    # are metadata, not proof that this local GGUF runtime can consume images.
+    return bool(model.mmproj_path and Path(model.mmproj_path).exists())
+
+
+def _cmdline_mmproj_path(cmdline: str) -> str | None:
+    try:
+        argv = shlex.split(str(cmdline or ""))
+    except Exception:
+        argv = str(cmdline or "").split()
+    for idx, arg in enumerate(argv):
+        if arg == "--mmproj" and idx + 1 < len(argv):
+            return argv[idx + 1]
+        if str(arg).startswith("--mmproj="):
+            return str(arg).split("=", 1)[1]
+    return None
+
+
+def _loaded_process_missing_configured_mmproj(model: ManagedModel, catalog: list[ManagedModel]) -> bool:
+    """Return True when a currently loaded llama-server is stale for image input.
+
+    The catalog/YAML can be updated to include ``--mmproj`` while llama-swap
+    keeps an older already-loaded process alive.  In that state the model is
+    advertised as vision-capable, but image requests still fail upstream with
+    llama.cpp's opaque ``image input is not supported`` 500.
+    """
+    if not _has_configured_mmproj_runtime(model):
+        return False
+    try:
+        proc = get_catalog_model_process(model.model_id, catalog)
+    except Exception:
+        return False
+    if not proc:
+        return False
+    configured_mmproj = _safe_realpath(str(model.mmproj_path or ""))
+    live_mmproj = _cmdline_mmproj_path(str(proc.get("cmdline") or ""))
+    if not live_mmproj:
+        return True
+    return _safe_realpath(live_mmproj) != configured_mmproj
 
 
 def _infer_model_family(model: ManagedModel) -> str:
@@ -6638,6 +6824,46 @@ def _collect_openai_sse_response(response: requests.Response) -> dict:
     }
 
 
+
+def _responses_tools_with_deferred_search(tools: object) -> list[dict]:
+    """Prepare Responses tools for tool_search-capable backends.
+
+    OpenAI Tool Search expects `{"type":"tool_search"}` in the tools list and
+    `defer_loading: true` on functions or MCP server definitions that should be
+    loaded lazily.  For namespaces, the namespace remains visible while each
+    child function is marked deferred.
+    """
+    if not isinstance(tools, list):
+        return []
+
+    result: list[dict] = []
+    has_tool_search = False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            result.append(tool)
+            continue
+        tool_type = str(tool.get("type") or "").strip()
+        if tool_type == "tool_search":
+            has_tool_search = True
+            result.append(dict(tool))
+            continue
+        updated = dict(tool)
+        if tool_type == "namespace":
+            sub_tools = tool.get("tools")
+            if isinstance(sub_tools, list):
+                updated["tools"] = [
+                    {**sub_tool, "defer_loading": True} if isinstance(sub_tool, dict) else sub_tool
+                    for sub_tool in sub_tools
+                ]
+        elif tool_type in {"function", "mcp"}:
+            updated["defer_loading"] = True
+        result.append(updated)
+
+    if result and not has_tool_search:
+        result.append({"type": "tool_search"})
+    return result
+
+
 def _flatten_responses_tools(tools: object, flatten_enabled: bool = True) -> list[dict]:
     """Convert Responses-native tool types to standard function-type tools.
 
@@ -6738,14 +6964,875 @@ def _responses_contains_failed_tool_output(text: object) -> bool:
     return "unsupported call:" in value or "unknown MCP server" in value
 
 
+_IMAGE_DATA_URL_RE = re.compile(
+    r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=\r\n]+",
+    flags=re.IGNORECASE,
+)
+
+
+def _extract_legacy_tool_output_parts(value: object) -> tuple[str, list[dict], int]:
+    """Split Responses tool output into text plus structured image parts.
+
+    Legacy Chat Completions can carry images as structured `image_url` content
+    on a user message, but not as raw Python/JSON stringified tool output.  When
+    a Responses tool returns screenshots or other multimodal data, extract those
+    images so the caller can attach them as real image blocks for vision-capable
+    backends.  The returned text never contains data URL/base64 payloads.
+    """
+
+    images: list[dict] = []
+    image_count = 0
+
+    def add_image_url(url: object) -> None:
+        nonlocal image_count
+        url_text = str(url or "").strip()
+        if not url_text:
+            return
+        images.append({"type": "image_url", "image_url": {"url": url_text}})
+        image_count += 1
+
+    def sanitize(item: object) -> str:
+        nonlocal image_count
+        if item is None:
+            return ""
+        if isinstance(item, str):
+            def repl(match: re.Match[str]) -> str:
+                add_image_url(match.group(0))
+                return f"[image attached from tool output #{image_count}]"
+
+            return _IMAGE_DATA_URL_RE.sub(repl, item)
+        if isinstance(item, bytes):
+            return sanitize(item.decode("utf-8", errors="replace"))
+        if isinstance(item, list):
+            parts = [sanitize(part).strip() for part in item]
+            return "\n".join(part for part in parts if part)
+        if isinstance(item, dict):
+            item_type = str(item.get("type") or "").strip()
+            if item_type in {"input_image", "image_url"} or item.get("image_url"):
+                url = item.get("image_url")
+                if isinstance(url, dict):
+                    url = url.get("url")
+                add_image_url(url)
+                return f"[image attached from tool output #{image_count}]"
+            if item.get("data") and str(item.get("mime_type") or item.get("media_type") or "").startswith("image/"):
+                mime_type = str(item.get("mime_type") or item.get("media_type") or "image/png").strip()
+                add_image_url(f"data:{mime_type};base64,{str(item.get('data') or '').strip()}")
+                return f"[image attached from tool output #{image_count}]"
+            if item_type in {"input_text", "output_text", "text"}:
+                return sanitize(item.get("text") or "")
+            # For other structured tool outputs, preserve JSON-ish content but
+            # still extract any nested image data URLs.
+            try:
+                return sanitize(json.dumps(item, ensure_ascii=False))
+            except Exception:
+                return sanitize(str(item))
+        return sanitize(str(item))
+
+    return sanitize(value), images, image_count
+
+
+def _responses_chat_tool_entry(name: str, description: object = "", parameters: object = None) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description or "",
+            "parameters": parameters if parameters is not None else {},
+        },
+    }
+
+
+RESPONSES_INTERNAL_TOOL_SEARCH_NAME = "tool_search"
+RESPONSES_INTERNAL_CALL_DEFERRED_TOOL_NAME = "call_deferred_tool"
+
+
+@dataclass
+class ResponsesDeferredTool:
+    legacy_name: str
+    responses_name: str
+    namespace: str
+    description: str
+    parameters: object
+    source_type: str = "function"
+
+    def search_blob(self) -> str:
+        return " ".join(
+            str(part or "").lower()
+            for part in (
+                self.legacy_name,
+                self.responses_name,
+                self.namespace,
+                self.description,
+            )
+        )
+
+    def schema_payload(self) -> dict:
+        payload = {
+            "name": self.responses_name,
+            "legacy_name": self.legacy_name,
+            "description": self.description,
+            "parameters": self.parameters if self.parameters is not None else {},
+        }
+        if self.namespace:
+            payload["namespace"] = self.namespace
+        return payload
+
+
+
+
+@dataclass
+class ToolCallRepairResult:
+    translated: dict | None = None
+    repaired: bool = False
+    feedback: dict | None = None
+    fatal: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.translated is not None
+
+    def feedback_message(self, call_id: str) -> dict | None:
+        if not self.feedback:
+            return None
+        diagnostic_json = json.dumps(self.feedback, ensure_ascii=False, separators=(",", ":"))
+        content = (
+            "The previous call_deferred_tool call was not executed.\n"
+            "Retry by calling call_deferred_tool again with the corrected namespace, name, and arguments. "
+            "Do not answer the user yet unless you can complete the task without this tool.\n"
+            "Use exactly this wrapper shape: "
+            '{"namespace":"<namespace>","name":"<tool_name>","arguments":{...}}\n'
+            "Diagnostic JSON:\n"
+            f"{diagnostic_json}"
+        )
+        return {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": content,
+        }
+
+
+class ResponsesToolRegistry:
+    """KV-stable registry for Responses deferred tools.
+
+    The legacy chat fallback must not mutate the upstream `tools` field between
+    internal rounds, otherwise llama.cpp loses most of the benefit of prompt/KV
+    reuse.  This registry keeps full deferred schemas in proxy memory, exposes a
+    compact directory in messages, and uses two stable internal functions:
+    `tool_search` and `call_deferred_tool`.
+    """
+
+    def __init__(self, eager_chat_tools: list[dict] | None = None, deferred_tools: list[ResponsesDeferredTool] | None = None):
+        self.eager_chat_tools = list(eager_chat_tools or [])
+        self.deferred_tools = list(deferred_tools or [])
+        self.deferred_by_legacy_name = {tool.legacy_name: tool for tool in self.deferred_tools}
+        self.deferred_by_response_key = {
+            self._response_key(tool.namespace, tool.responses_name): tool
+            for tool in self.deferred_tools
+        }
+
+    @staticmethod
+    def _response_key(namespace: object, name: object) -> str:
+        return f"{str(namespace or '').strip()}::{str(name or '').strip()}"
+
+    @staticmethod
+    def _function_fields(tool: dict) -> tuple[str, str, object]:
+        function = tool.get("function")
+        if isinstance(function, dict):
+            return (
+                str(function.get("name") or "").strip(),
+                str(function.get("description") or tool.get("description") or "").strip(),
+                function.get("parameters", tool.get("parameters", {})),
+            )
+        return (
+            str(tool.get("name") or "").strip(),
+            str(tool.get("description") or "").strip(),
+            tool.get("parameters", {}),
+        )
+
+    @classmethod
+    def from_responses_tools(
+        cls,
+        tools: object,
+        *,
+        flatten_namespace_tools: bool = True,
+        default_defer_namespaces: bool = True,
+    ) -> "ResponsesToolRegistry":
+        if not isinstance(tools, list):
+            return cls()
+        eager: list[dict] = []
+        deferred: list[ResponsesDeferredTool] = []
+
+        def add_tool(*, namespace: str, name: str, description: object, parameters: object, defer: bool, source_type: str = "function") -> None:
+            if not name:
+                return
+            legacy_name = f"{namespace}__{name}" if namespace and flatten_namespace_tools else name
+            if defer:
+                deferred.append(
+                    ResponsesDeferredTool(
+                        legacy_name=legacy_name,
+                        responses_name=name,
+                        namespace=namespace,
+                        description=str(description or ""),
+                        parameters=parameters if parameters is not None else {},
+                        source_type=source_type,
+                    )
+                )
+                return
+            eager.append(_responses_chat_tool_entry(legacy_name, description, parameters if parameters is not None else {}))
+
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            tool_type = str(tool.get("type") or "").strip()
+            if tool_type == "namespace" and flatten_namespace_tools:
+                namespace = str(tool.get("name") or "").strip()
+                if "defer_loading" in tool:
+                    namespace_defer = bool(tool.get("defer_loading"))
+                else:
+                    namespace_defer = bool(default_defer_namespaces)
+                sub_tools = tool.get("tools")
+                if not namespace or not isinstance(sub_tools, list):
+                    continue
+                for sub_tool in sub_tools:
+                    if not isinstance(sub_tool, dict):
+                        continue
+                    name, desc, params = cls._function_fields(sub_tool)
+                    defer = bool(sub_tool.get("defer_loading")) if "defer_loading" in sub_tool else namespace_defer
+                    add_tool(namespace=namespace, name=name, description=desc, parameters=params, defer=defer, source_type="namespace")
+                continue
+            if tool_type != "function":
+                if tool_type == "mcp" and bool(tool.get("defer_loading")):
+                    server_label = str(tool.get("server_label") or tool.get("name") or "").strip()
+                    if server_label:
+                        deferred.append(
+                            ResponsesDeferredTool(
+                                legacy_name=server_label,
+                                responses_name=server_label,
+                                namespace="",
+                                description=str(tool.get("description") or f"MCP server {server_label}"),
+                                parameters=tool.get("parameters", {}),
+                                source_type="mcp",
+                            )
+                        )
+                continue
+            name, desc, params = cls._function_fields(tool)
+            add_tool(namespace="", name=name, description=desc, parameters=params, defer=bool(tool.get("defer_loading")), source_type="function")
+        return cls(eager, deferred)
+
+    @property
+    def has_deferred_tools(self) -> bool:
+        return bool(self.deferred_tools)
+
+    def directory_text(self, *, max_tools_per_namespace: int = 40) -> str:
+        if not self.deferred_tools:
+            return ""
+        grouped: dict[str, list[ResponsesDeferredTool]] = {}
+        for tool in self.deferred_tools:
+            grouped.setdefault(tool.namespace or "global", []).append(tool)
+        lines = [
+            "Deferred tool directory:",
+            "Use the internal tool_search function to load full schemas before using deferred tools.",
+            "After a schema is loaded, invoke it with call_deferred_tool(namespace, name, arguments).",
+        ]
+        for namespace in sorted(grouped):
+            tools = sorted(grouped[namespace], key=lambda item: item.responses_name)
+            visible = tools[:max_tools_per_namespace]
+            suffix = f" (+{len(tools) - len(visible)} more)" if len(tools) > len(visible) else ""
+            names = ", ".join(tool.responses_name for tool in visible)
+            lines.append(f"- {namespace}: {names}{suffix}")
+        return "\n".join(lines)
+
+    def _internal_tool_search_entry(self) -> dict:
+        return _responses_chat_tool_entry(
+            RESPONSES_INTERNAL_TOOL_SEARCH_NAME,
+            "Search deferred tools by namespace, exact tool name, or task query. Returns full schemas as tool output.",
+            {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Task or capability to search for."},
+                    "namespaces": {"type": "array", "items": {"type": "string"}},
+                    "tools": {"type": "array", "items": {"type": "string"}, "description": "Exact tool names or namespace.tool names."},
+                },
+                "required": [],
+            },
+        )
+
+    def _internal_call_deferred_tool_entry(self) -> dict:
+        return _responses_chat_tool_entry(
+            RESPONSES_INTERNAL_CALL_DEFERRED_TOOL_NAME,
+            "Invoke a deferred tool after loading its schema with tool_search. The proxy translates this to the real Responses tool call.",
+            {
+                "type": "object",
+                "properties": {
+                    "namespace": {"type": "string", "description": "Namespace shown by tool_search, empty for global tools."},
+                    "name": {"type": "string", "description": "Deferred tool name."},
+                    "arguments": {"type": "object", "description": "Arguments for the deferred tool."},
+                },
+                "required": ["name", "arguments"],
+            },
+        )
+
+    def chat_tools_with_internal_search(self) -> list[dict]:
+        tools = [dict(tool) for tool in self.eager_chat_tools]
+        if self.deferred_tools:
+            tools.append(self._internal_tool_search_entry())
+            tools.append(self._internal_call_deferred_tool_entry())
+        return tools
+
+    def search(self, request: object, *, max_results: int = 24) -> dict:
+        if isinstance(request, str):
+            request = {"query": request}
+        request = request if isinstance(request, dict) else {}
+        namespaces = {
+            str(item or "").strip()
+            for item in (request.get("namespaces") if isinstance(request.get("namespaces"), list) else [])
+            if str(item or "").strip()
+        }
+        exact_tools = {
+            str(item or "").strip()
+            for item in (request.get("tools") if isinstance(request.get("tools"), list) else [])
+            if str(item or "").strip()
+        }
+        query = str(request.get("query") or "").strip().lower()
+        query_terms = [term for term in re.split(r"\W+", query) if term]
+
+        matches: list[ResponsesDeferredTool] = []
+        for tool in self.deferred_tools:
+            if namespaces and tool.namespace not in namespaces:
+                continue
+            exact_names = {tool.responses_name, tool.legacy_name}
+            if tool.namespace:
+                exact_names.add(f"{tool.namespace}.{tool.responses_name}")
+                exact_names.add(f"{tool.namespace}__{tool.responses_name}")
+            is_match = False
+            if exact_tools and exact_names.intersection(exact_tools):
+                is_match = True
+            if query_terms:
+                blob = tool.search_blob()
+                if all(term in blob for term in query_terms) or any(term in blob for term in query_terms):
+                    is_match = True
+            if namespaces and not exact_tools and not query_terms:
+                is_match = True
+            if is_match:
+                matches.append(tool)
+
+        deduped: list[ResponsesDeferredTool] = []
+        seen: set[str] = set()
+        for tool in matches:
+            if tool.legacy_name in seen:
+                continue
+            seen.add(tool.legacy_name)
+            deduped.append(tool)
+
+        if not deduped:
+            return {
+                "status": "not_found",
+                "message": "No deferred tools matched. Use a narrower namespace or exact tool name from the directory.",
+                "tools": [],
+            }
+        if len(deduped) > max_results:
+            return {
+                "status": "too_many_matches",
+                "message": f"Too many deferred tools matched ({len(deduped)}). Please narrow by namespace or exact tool names.",
+                "matches": [tool.schema_payload() for tool in deduped[:max_results]],
+            }
+        return {"status": "ok", "tools": [tool.schema_payload() for tool in deduped]}
+
+    def tool_search_output_message(self, call_id: str, arguments: object) -> dict:
+        result = self.search(arguments)
+        return {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": json.dumps(result, ensure_ascii=False, separators=(",", ":")),
+        }
+
+    @staticmethod
+    def _normalize_chrome_evaluate_script_arguments(raw_args: object) -> object:
+        if not isinstance(raw_args, dict):
+            return raw_args
+        function_text = raw_args.get("function")
+        if not isinstance(function_text, str):
+            return raw_args
+        stripped = function_text.strip()
+        if not stripped:
+            return raw_args
+        starts_like_function = (
+            stripped.startswith("(")
+            or stripped.startswith("async ")
+            or stripped.startswith("function")
+            or stripped.startswith("()=>")
+            or stripped.startswith("() =>")
+        )
+        if starts_like_function:
+            return raw_args
+        if stripped.startswith("return ") or stripped.startswith("await "):
+            normalized = dict(raw_args)
+            normalized["function"] = f"() => {{ {stripped} }}"
+            return normalized
+        return raw_args
+
+    def _deferred_tools_named(self, name: str) -> list[ResponsesDeferredTool]:
+        matches: list[ResponsesDeferredTool] = []
+        for tool in self.deferred_tools:
+            exact_names = {tool.responses_name, tool.legacy_name}
+            if tool.namespace:
+                exact_names.add(f"{tool.namespace}.{tool.responses_name}")
+                exact_names.add(f"{tool.namespace}__{tool.responses_name}")
+            if name in exact_names and tool not in matches:
+                matches.append(tool)
+        return matches
+
+    @staticmethod
+    def _required_parameters(tool: ResponsesDeferredTool) -> list[str]:
+        parameters = tool.parameters if isinstance(tool.parameters, dict) else {}
+        required = parameters.get("required")
+        if not isinstance(required, list):
+            return []
+        return [str(item) for item in required if str(item or "").strip()]
+
+    @staticmethod
+    def _argument_example_for_schema(parameters: object, required: list[str]) -> dict:
+        params = parameters if isinstance(parameters, dict) else {}
+        properties = params.get("properties") if isinstance(params.get("properties"), dict) else {}
+        example: dict = {}
+        for name in required:
+            schema = properties.get(name) if isinstance(properties.get(name), dict) else {}
+            schema_type = str(schema.get("type") or "").strip()
+            if schema_type == "array":
+                example[name] = ["..."]
+            elif schema_type in {"integer", "number"}:
+                example[name] = 0
+            elif schema_type == "boolean":
+                example[name] = True
+            elif schema_type == "object":
+                example[name] = {}
+            else:
+                example[name] = "..."
+        return example
+
+    @staticmethod
+    def _candidate_payloads(tools: list[ResponsesDeferredTool]) -> list[dict]:
+        return [
+            {"namespace": tool.namespace, "name": tool.responses_name, "legacy_name": tool.legacy_name}
+            for tool in tools[:12]
+        ]
+
+    def _feedback_payload(
+        self,
+        *,
+        error: str,
+        message: str,
+        received: dict,
+        tool: ResponsesDeferredTool | None = None,
+        candidates: list[ResponsesDeferredTool] | None = None,
+        missing: list[str] | None = None,
+    ) -> dict:
+        payload: dict = {
+            "error": error,
+            "message": message,
+            "received": received,
+        }
+        if tool is not None:
+            required = self._required_parameters(tool)
+            example_args = self._argument_example_for_schema(tool.parameters, required)
+            payload["expected"] = {
+                "namespace": tool.namespace,
+                "name": tool.responses_name,
+                "arguments": example_args,
+            }
+            payload["example"] = {
+                "namespace": tool.namespace,
+                "name": tool.responses_name,
+                "arguments": example_args,
+            }
+        if candidates:
+            payload["candidates"] = self._candidate_payloads(candidates)
+        if missing is not None:
+            payload["missing"] = missing
+        return payload
+
+    def repair_deferred_tool_call(self, arguments: object, *, loaded_tools: list[dict] | None = None) -> ToolCallRepairResult:
+        original_arguments = arguments
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except Exception:
+                return ToolCallRepairResult(feedback={
+                    "error": "invalid_call_deferred_tool_arguments",
+                    "message": "call_deferred_tool arguments must be valid JSON. Retry with {namespace, name, arguments}.",
+                    "received": {"arguments": str(original_arguments or "")[:500]},
+                    "example": {"namespace": "mcp__chrome_devtools", "name": "wait_for", "arguments": {"text": ["..."], "timeout": 5000}},
+                })
+        if not isinstance(arguments, dict):
+            return ToolCallRepairResult(feedback={
+                "error": "invalid_call_deferred_tool_arguments",
+                "message": "call_deferred_tool arguments must be an object with name and arguments.",
+                "received": {"arguments": str(original_arguments or "")[:500]},
+                "example": {"namespace": "mcp__chrome_devtools", "name": "wait_for", "arguments": {"text": ["..."]}},
+            })
+        namespace = str(arguments.get("namespace") or "").strip()
+        name = str(arguments.get("name") or "").strip()
+        received = {"namespace": namespace, "name": name, "arguments": arguments.get("arguments", {})}
+        if not name:
+            return ToolCallRepairResult(feedback={
+                "error": "missing_deferred_tool_name",
+                "message": "call_deferred_tool requires a deferred tool name. Use tool_search first if you need to find the name.",
+                "received": received,
+                "example": {"namespace": "mcp__chrome_devtools", "name": "wait_for", "arguments": {"text": ["..."]}},
+            })
+        raw_args = arguments.get("arguments", {})
+        if isinstance(raw_args, str):
+            decoded_raw_args = _decode_tool_call_arguments(raw_args)
+            repaired = decoded_raw_args != raw_args
+        else:
+            decoded_raw_args = raw_args if isinstance(raw_args, dict) else {}
+            repaired = False
+        if not namespace and isinstance(decoded_raw_args, dict):
+            server_namespace = str(decoded_raw_args.get("server") or "").strip()
+            if server_namespace:
+                namespace = server_namespace
+                repaired = True
+        tool = (
+            self.deferred_by_response_key.get(self._response_key(namespace, name))
+            or self.deferred_by_legacy_name.get(name)
+            or self.deferred_by_legacy_name.get(f"{namespace}__{name}" if namespace else name)
+        )
+        if tool is None and not namespace and loaded_tools:
+            scoped_matches: list[ResponsesDeferredTool] = []
+            for loaded in loaded_tools:
+                if not isinstance(loaded, dict):
+                    continue
+                loaded_name = str(loaded.get("name") or loaded.get("responses_name") or "").strip()
+                loaded_namespace = str(loaded.get("namespace") or "").strip()
+                if loaded_name != name or not loaded_namespace:
+                    continue
+                scoped_tool = self.deferred_by_response_key.get(self._response_key(loaded_namespace, loaded_name))
+                if scoped_tool is not None and scoped_tool not in scoped_matches:
+                    scoped_matches.append(scoped_tool)
+            if len(scoped_matches) == 1:
+                tool = scoped_matches[0]
+        if tool is None:
+            candidates = self._deferred_tools_named(name)
+            if not namespace and len(candidates) > 1:
+                return ToolCallRepairResult(feedback=self._feedback_payload(
+                    error="ambiguous_deferred_tool",
+                    message="Multiple deferred tools match this name. Retry with an explicit namespace from candidates, or use tool_search with a namespace.",
+                    received=received,
+                    candidates=candidates,
+                ))
+            if candidates:
+                return ToolCallRepairResult(feedback=self._feedback_payload(
+                    error="deferred_tool_schema_not_loaded",
+                    message="This deferred tool was not resolved in the current scope. Retry with namespace/name from candidates, or call tool_search for the schema first.",
+                    received=received,
+                    candidates=candidates,
+                ))
+            return ToolCallRepairResult(feedback=self._feedback_payload(
+                error="deferred_tool_not_found",
+                message="No deferred tool matched this name. Use tool_search to find the correct namespace and tool name, then retry call_deferred_tool.",
+                received=received,
+            ))
+        if isinstance(decoded_raw_args, dict):
+            normalized_args = dict(decoded_raw_args)
+            if "server" in normalized_args:
+                normalized_args.pop("server", None)
+                repaired = True
+        else:
+            normalized_args = raw_args
+        if tool.responses_name == "evaluate_script" and str(tool.namespace or "").startswith("mcp__chrome_devtools"):
+            before = normalized_args
+            normalized_args = self._normalize_chrome_evaluate_script_arguments(normalized_args)
+            if normalized_args != before:
+                repaired = True
+        required = self._required_parameters(tool)
+        if required and isinstance(normalized_args, dict):
+            missing = [item for item in required if item not in normalized_args or normalized_args.get(item) in (None, "")]
+            if missing:
+                return ToolCallRepairResult(feedback=self._feedback_payload(
+                    error="invalid_deferred_tool_arguments",
+                    message=f"{tool.responses_name} requires {', '.join(missing)}. Retry with namespace and all required fields.",
+                    received={"namespace": namespace, "name": name, "arguments": normalized_args},
+                    tool=tool,
+                    missing=missing,
+                ))
+        if isinstance(normalized_args, str):
+            arg_text = normalized_args
+        else:
+            arg_text = json.dumps(normalized_args if normalized_args is not None else {}, ensure_ascii=False, separators=(",", ":"))
+        return ToolCallRepairResult(
+            translated={
+                "legacy_name": tool.legacy_name,
+                "responses_name": tool.responses_name,
+                "namespace": tool.namespace,
+                "arguments": arg_text,
+            },
+            repaired=repaired,
+        )
+
+    def translate_deferred_tool_call(self, arguments: object, *, loaded_tools: list[dict] | None = None) -> dict | None:
+        return self.repair_deferred_tool_call(arguments, loaded_tools=loaded_tools).translated
+
+    def deferred_tool_for_history(self, *, namespace: object = "", name: object = "") -> ResponsesDeferredTool | None:
+        namespace_text = str(namespace or "").strip().rstrip("_")
+        name_text = str(name or "").strip()
+        if not name_text:
+            return None
+        return (
+            self.deferred_by_response_key.get(self._response_key(namespace_text, name_text))
+            or self.deferred_by_legacy_name.get(f"{namespace_text}__{name_text}" if namespace_text else name_text)
+            or self.deferred_by_legacy_name.get(name_text)
+        )
+
+
+def _responses_tool_search_emulation_enabled(server_cfg: dict | None = None) -> bool:
+    server_cfg = server_cfg or {}
+    cfg = server_cfg.get("responses_tool_search_emulation")
+    if isinstance(cfg, dict) and "enabled" in cfg:
+        return bool(cfg.get("enabled"))
+    raw = os.environ.get("LLAMACPP_RESPONSES_TOOL_SEARCH_EMULATION")
+    if raw:
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return True
+
+
+
+def _loaded_deferred_tools_from_tool_search_messages(messages: object) -> list[dict]:
+    loaded: list[dict] = []
+    if not isinstance(messages, list):
+        return loaded
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            payload = json.loads(content)
+        except Exception:
+            continue
+        tools = payload.get("tools") if isinstance(payload, dict) else None
+        if not isinstance(tools, list):
+            continue
+        for tool in tools:
+            if isinstance(tool, dict):
+                loaded.append(tool)
+    return loaded
+
+def _decode_tool_call_arguments(value: object) -> object:
+    if isinstance(value, str):
+        try:
+            return json.loads(value or "{}")
+        except Exception:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _translate_internal_deferred_tool_calls_in_chat_response(
+    data: dict,
+    registry: ResponsesToolRegistry,
+    *,
+    loaded_schema_messages: list[dict] | None = None,
+) -> tuple[dict, bool]:
+    """Translate internal call_deferred_tool chat calls into real tool calls."""
+    loaded_tools = _loaded_deferred_tools_from_tool_search_messages(loaded_schema_messages or [])
+    changed = False
+    new_data = dict(data)
+    new_choices = []
+    for choice in data.get("choices") or []:
+        if not isinstance(choice, dict):
+            new_choices.append(choice)
+            continue
+        new_choice = dict(choice)
+        message = dict(choice.get("message") or {})
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            translated_calls = []
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    translated_calls.append(tc)
+                    continue
+                function = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                name = str(function.get("name") or "").strip()
+                if name != RESPONSES_INTERNAL_CALL_DEFERRED_TOOL_NAME:
+                    translated_calls.append(tc)
+                    continue
+                repair = registry.repair_deferred_tool_call(_decode_tool_call_arguments(function.get("arguments")), loaded_tools=loaded_tools)
+                translated = repair.translated
+                if translated is None:
+                    continue
+                if repair.repaired:
+                    log_api_event(
+                        "openai_responses_tool_repair_applied",
+                        {
+                            "internal_name": RESPONSES_INTERNAL_CALL_DEFERRED_TOOL_NAME,
+                            "call_id": str(tc.get("id") or tc.get("call_id") or ""),
+                            "namespace": translated.get("namespace"),
+                            "name": translated.get("responses_name"),
+                        },
+                    )
+                new_tc = dict(tc)
+                new_function = dict(function)
+                new_function["name"] = translated["responses_name"]
+                new_function["arguments"] = translated["arguments"]
+                if translated.get("namespace"):
+                    new_function["namespace"] = translated["namespace"]
+                    new_tc["namespace"] = translated["namespace"]
+                new_tc["function"] = new_function
+                translated_calls.append(new_tc)
+                changed = True
+            message["tool_calls"] = translated_calls
+        new_choice["message"] = message
+        new_choices.append(new_choice)
+    new_data["choices"] = new_choices
+    return new_data, changed
+
+
+def _chat_response_internal_tool_repair_followup_messages(
+    data: dict,
+    registry: ResponsesToolRegistry,
+    *,
+    loaded_schema_messages: list[dict] | None = None,
+) -> list[dict]:
+    """Return internal assistant/tool feedback messages for unrepairable wrapper calls.
+
+    This keeps the legacy Responses fallback from ending with an empty response
+    when the local model emits call_deferred_tool in a shape the proxy cannot
+    translate.  The feedback is appended to the internal chat history so the
+    model can retry with corrected arguments without changing the stable tools
+    array.
+    """
+    loaded_tools = _loaded_deferred_tools_from_tool_search_messages(loaded_schema_messages or [])
+    tool_calls_for_history: list[dict] = []
+    output_messages: list[dict] = []
+    for choice in data.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message") or {}
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            function = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            name = str(function.get("name") or "").strip()
+            if name != RESPONSES_INTERNAL_CALL_DEFERRED_TOOL_NAME:
+                continue
+            decoded = _decode_tool_call_arguments(function.get("arguments"))
+            if isinstance(decoded, dict) and str(decoded.get("name") or "").strip() == RESPONSES_INTERNAL_TOOL_SEARCH_NAME:
+                continue
+            repair = registry.repair_deferred_tool_call(decoded, loaded_tools=loaded_tools)
+            if repair.ok:
+                continue
+            call_id = str(tc.get("id") or tc.get("call_id") or f"call_{uuid.uuid4().hex}")
+            normalized_tc = dict(tc)
+            normalized_tc["id"] = call_id
+            normalized_tc["type"] = "function"
+            normalized_tc["function"] = {
+                "name": RESPONSES_INTERNAL_CALL_DEFERRED_TOOL_NAME,
+                "arguments": json.dumps(decoded if isinstance(decoded, dict) else {}, ensure_ascii=False, separators=(",", ":")),
+            }
+            feedback_message = repair.feedback_message(call_id)
+            if feedback_message is None:
+                continue
+            tool_calls_for_history.append(normalized_tc)
+            output_messages.append(feedback_message)
+    if not tool_calls_for_history:
+        return []
+    return [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": tool_calls_for_history,
+        },
+        *output_messages,
+    ]
+
+
+def _chat_response_internal_tool_search_followup_messages(data: dict, registry: ResponsesToolRegistry) -> list[dict]:
+    tool_calls_for_history: list[dict] = []
+    output_messages: list[dict] = []
+    for choice in data.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message") or {}
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            function = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            name = str(function.get("name") or "").strip()
+            raw_arguments = function.get("arguments")
+            search_arguments = raw_arguments
+            if name == RESPONSES_INTERNAL_CALL_DEFERRED_TOOL_NAME:
+                # Local models sometimes wrap the internal schema discovery call as
+                # call_deferred_tool({name:"tool_search", arguments:{...}}). Treat
+                # that as the same private discovery round instead of translating it
+                # to a real client tool or dropping it as an unresolved deferred call.
+                decoded = _decode_tool_call_arguments(raw_arguments)
+                nested_name = str(decoded.get("name") or "").strip() if isinstance(decoded, dict) else ""
+                if nested_name != RESPONSES_INTERNAL_TOOL_SEARCH_NAME:
+                    continue
+                search_arguments = decoded.get("arguments", {})
+                name = RESPONSES_INTERNAL_TOOL_SEARCH_NAME
+            if name != RESPONSES_INTERNAL_TOOL_SEARCH_NAME:
+                continue
+            call_id = str(tc.get("id") or tc.get("call_id") or f"call_{uuid.uuid4().hex}")
+            decoded_search_arguments = _decode_tool_call_arguments(search_arguments)
+            normalized_tc = dict(tc)
+            normalized_tc["id"] = call_id
+            normalized_tc["type"] = "function"
+            normalized_tc["function"] = {
+                "name": RESPONSES_INTERNAL_TOOL_SEARCH_NAME,
+                "arguments": json.dumps(decoded_search_arguments, ensure_ascii=False, separators=(",", ":")),
+            }
+            tool_calls_for_history.append(normalized_tc)
+            output_messages.append(registry.tool_search_output_message(call_id, decoded_search_arguments))
+    if not tool_calls_for_history:
+        return []
+    return [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": tool_calls_for_history,
+        },
+        *output_messages,
+    ]
+
+
+def _chat_response_internal_tool_search_messages(data: dict, registry: ResponsesToolRegistry) -> list[dict]:
+    return [
+        message
+        for message in _chat_response_internal_tool_search_followup_messages(data, registry)
+        if message.get("role") == "tool"
+    ]
+
+
+def _combine_responses_usage(first: dict | None, second: dict | None) -> dict | None:
+    first = _normalize_responses_usage(first) if first is not None else None
+    second = _normalize_responses_usage(second) if second is not None else None
+    if not first:
+        return second
+    if not second:
+        return first
+    return {
+        "input_tokens": int(first.get("input_tokens") or 0) + int(second.get("input_tokens") or 0),
+        "input_tokens_details": {"cached_tokens": int((first.get("input_tokens_details") or {}).get("cached_tokens") or 0) + int((second.get("input_tokens_details") or {}).get("cached_tokens") or 0)},
+        "output_tokens": int(first.get("output_tokens") or 0) + int(second.get("output_tokens") or 0),
+        "output_tokens_details": {"reasoning_tokens": int((first.get("output_tokens_details") or {}).get("reasoning_tokens") or 0) + int((second.get("output_tokens_details") or {}).get("reasoning_tokens") or 0)},
+        "total_tokens": int(first.get("total_tokens") or 0) + int(second.get("total_tokens") or 0),
+    }
+
+
 def _responses_tools_to_chat_tools(tools: object, flatten_namespace_tools: bool = True) -> list[dict]:
     """Convert Responses tools to legacy Chat Completions function tools.
 
-    Top-level function tools are passed through. Namespace tools may be flattened
-    internally for llama.cpp, but every flattened name must be translated back to
-    Responses `name` + `namespace` before being returned to Codex.
-    Built-ins/custom/freeform tools are intentionally not converted here because
-    the local legacy backend cannot execute them.
+    Top-level function tools are passed through. Namespace tools are flattened
+    into legacy function names and translated back to Responses namespace calls
+    on output. Built-ins/custom/freeform tools are intentionally not converted
+    here because the local legacy backend cannot execute them.
     """
     if not isinstance(tools, list):
         return []
@@ -6767,14 +7854,11 @@ def _responses_tools_to_chat_tools(tools: object, flatten_namespace_tools: bool 
                     sub_name = str(sub_tool.get("name") or "").strip()
                     if not sub_name:
                         continue
-                    result.append({
-                        "type": "function",
-                        "function": {
-                            "name": f"{ns_name}__{sub_name}",
-                            "description": sub_tool.get("description", ""),
-                            "parameters": sub_tool.get("parameters", {}),
-                        },
-                    })
+                    result.append(_responses_chat_tool_entry(
+                        f"{ns_name}__{sub_name}",
+                        sub_tool.get("description", ""),
+                        sub_tool.get("parameters", {}),
+                    ))
                     added += 1
                 if added:
                     continue
@@ -6789,27 +7873,13 @@ def _responses_tools_to_chat_tools(tools: object, flatten_namespace_tools: bool 
             if not name:
                 skipped["function_without_name"] = skipped.get("function_without_name", 0) + 1
                 continue
-            result.append({
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": function.get("description", ""),
-                    "parameters": function.get("parameters", {}),
-                },
-            })
+            result.append(_responses_chat_tool_entry(name, function.get("description", ""), function.get("parameters", {})))
             continue
         name = str(tool.get("name") or "").strip()
         if not name:
             skipped["function_without_name"] = skipped.get("function_without_name", 0) + 1
             continue
-        result.append({
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": tool.get("description", ""),
-                "parameters": tool.get("parameters", {}),
-            },
-        })
+        result.append(_responses_chat_tool_entry(name, tool.get("description", ""), tool.get("parameters", {})))
     if skipped:
         log_api_event("responses_legacy_chat_tools_skipped", {"skipped": skipped, "forwarded_count": len(result)})
     return result
@@ -6845,7 +7915,69 @@ def _responses_content_to_openai_content(content) -> str | list:
     return parts
 
 
-def _responses_input_to_openai_messages(payload: dict, allowed_tool_names: set[str] | None = None) -> list[dict]:
+def _openai_chat_content_is_empty(content: object) -> bool:
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return not content.strip()
+    if isinstance(content, list):
+        return not content
+    return False
+
+
+def _merge_openai_chat_content(left: object, right: object) -> object:
+    if _openai_chat_content_is_empty(left):
+        return right
+    if _openai_chat_content_is_empty(right):
+        return left
+    if isinstance(left, str) and isinstance(right, str):
+        return f"{left}\n\n{right}"
+    if isinstance(left, list) and isinstance(right, list):
+        return [*left, *right]
+    if isinstance(left, list) and isinstance(right, str):
+        return [*left, {"type": "text", "text": right}]
+    if isinstance(left, str) and isinstance(right, list):
+        return [{"type": "text", "text": left}, *right]
+    return f"{left}\n\n{right}"
+
+
+def _append_responses_history_message(messages: list[dict], role: str, content: object) -> None:
+    """Append a Responses history message in a llama.cpp-chat-safe shape.
+
+    llama.cpp rejects histories that end with multiple assistant messages.  The
+    Responses API can represent a single assistant turn as several output items
+    (message, reasoning/function_call, final empty message), so the legacy
+    fallback must compact adjacent assistant content and drop empty assistant
+    placeholders before forwarding to /v1/chat/completions.
+    """
+    if role == "assistant" and _openai_chat_content_is_empty(content):
+        log_api_event(
+            "responses_legacy_chat_history_assistant_message_skipped",
+            {"reason": "empty_assistant_placeholder"},
+        )
+        return
+    if (
+        role == "assistant"
+        and messages
+        and messages[-1].get("role") == "assistant"
+        and not messages[-1].get("tool_calls")
+        and "tool_call_id" not in messages[-1]
+    ):
+        messages[-1]["content"] = _merge_openai_chat_content(messages[-1].get("content"), content)
+        log_api_event(
+            "responses_legacy_chat_history_assistant_message_merged",
+            {"reason": "adjacent_assistant_messages"},
+        )
+        return
+    messages.append({"role": role, "content": content})
+
+
+def _responses_input_to_openai_messages(
+    payload: dict,
+    allowed_tool_names: set[str] | None = None,
+    tool_registry: ResponsesToolRegistry | None = None,
+    allow_tool_output_images: bool = True,
+) -> list[dict]:
     """Best-effort shim from modern /v1/responses input into chat messages.
 
     When translating Responses history to legacy Chat Completions, only keep
@@ -6892,7 +8024,7 @@ def _responses_input_to_openai_messages(payload: dict, allowed_tool_names: set[s
             if role in {"tool", "function"}:
                 log_api_event("responses_legacy_chat_history_tool_message_skipped", {"role": role, "reason": "tool_history_not_forwarded_as_user"})
                 continue
-            messages.append({"role": role, "content": _responses_content_to_openai_content(item.get("content"))})
+            _append_responses_history_message(messages, role, _responses_content_to_openai_content(item.get("content")))
             continue
         if item_type in {"input_text", "output_text", "text", "input_image"}:
             messages.append({"role": "user", "content": _responses_content_to_openai_content([item])})
@@ -6904,6 +8036,7 @@ def _responses_input_to_openai_messages(payload: dict, allowed_tool_names: set[s
             arguments = str(item.get("arguments") or "{}")
             call_id = str(item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex}")
             if name:
+                history_deferred_tool = None
                 if call_id in failed_tool_call_ids:
                     blocked_tool_call_ids.add(call_id)
                     log_api_event(
@@ -6912,29 +8045,66 @@ def _responses_input_to_openai_messages(payload: dict, allowed_tool_names: set[s
                     )
                     continue
                 if allowed_tool_names is not None and name not in allowed_tool_names:
-                    blocked_tool_call_ids.add(call_id)
-                    log_api_event(
-                        "responses_legacy_chat_history_tool_call_skipped",
-                        {"name": name, "call_id": call_id, "reason": "not_in_forwarded_legacy_toolset"},
-                    )
-                    continue
+                    history_deferred_tool = tool_registry.deferred_tool_for_history(namespace=namespace, name=raw_name) if tool_registry is not None else None
+                    if history_deferred_tool is None:
+                        blocked_tool_call_ids.add(call_id)
+                        log_api_event(
+                            "responses_legacy_chat_history_tool_call_skipped",
+                            {"name": name, "call_id": call_id, "reason": "not_in_forwarded_legacy_toolset"},
+                        )
+                        continue
                 allowed_tool_call_ids.add(call_id)
-                messages.append({
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [
+                function_name = name
+                function_arguments = arguments
+                if history_deferred_tool is not None:
+                    function_name = RESPONSES_INTERNAL_CALL_DEFERRED_TOOL_NAME
+                    function_arguments = json.dumps(
                         {
-                            "id": call_id,
-                            "type": "function",
-                            "function": {"name": name, "arguments": arguments},
-                        }
-                    ],
-                })
+                            "namespace": history_deferred_tool.namespace,
+                            "name": history_deferred_tool.responses_name,
+                            "arguments": _decode_tool_call_arguments(arguments),
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    log_api_event(
+                        "responses_legacy_chat_history_deferred_tool_call_mapped",
+                        {
+                            "name": name,
+                            "call_id": call_id,
+                            "internal_name": function_name,
+                            "namespace": history_deferred_tool.namespace,
+                            "responses_name": history_deferred_tool.responses_name,
+                        },
+                    )
+                tool_call_entry = {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": function_name, "arguments": function_arguments},
+                }
+                if messages and messages[-1].get("role") == "assistant" and "tool_call_id" not in messages[-1]:
+                    previous_tool_calls = messages[-1].setdefault("tool_calls", [])
+                    if isinstance(previous_tool_calls, list):
+                        previous_tool_calls.append(tool_call_entry)
+                    else:
+                        messages[-1]["tool_calls"] = [tool_call_entry]
+                else:
+                    messages.append({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [tool_call_entry],
+                    })
             continue
         if item_type in {"function_call_output", "computer_call_output", "tool_result"}:
             text = item.get("output") or item.get("text") or item.get("content") or ""
             call_id = str(item.get("call_id") or "").strip()
             if text:
+                output_text, output_images, image_count = _extract_legacy_tool_output_parts(text)
+                if image_count:
+                    log_api_event(
+                        "responses_legacy_chat_tool_output_images_extracted",
+                        {"call_id": call_id, "images": image_count, "output_preview": output_text[:160]},
+                    )
                 if call_id:
                     if call_id in failed_tool_call_ids:
                         log_api_event(
@@ -6943,7 +8113,7 @@ def _responses_input_to_openai_messages(payload: dict, allowed_tool_names: set[s
                                 "call_id": call_id,
                                 "reason": "previous_tool_output_failed",
                                 "was_blocked_tool_call": call_id in blocked_tool_call_ids,
-                                "output_preview": str(text)[:160],
+                                "output_preview": output_text[:160],
                             },
                         )
                         continue
@@ -6954,36 +8124,88 @@ def _responses_input_to_openai_messages(payload: dict, allowed_tool_names: set[s
                                 "call_id": call_id,
                                 "reason": "matching_tool_call_not_forwarded",
                                 "was_blocked_tool_call": call_id in blocked_tool_call_ids,
-                                "output_preview": str(text)[:160],
+                                "output_preview": output_text[:160],
                             },
                         )
                         continue
-                    messages.append({"role": "tool", "tool_call_id": call_id, "content": str(text)})
+                    messages.append({"role": "tool", "tool_call_id": call_id, "content": output_text})
+                    if output_images and allow_tool_output_images:
+                        image_content = [{"type": "text", "text": f"Images returned by tool call {call_id}."}, *output_images]
+                        messages.append({"role": "user", "content": image_content})
+                    elif output_images:
+                        log_api_event(
+                            "responses_legacy_chat_tool_output_images_not_forwarded_nonvision",
+                            {"call_id": call_id, "images": image_count, "output_preview": output_text[:160]},
+                        )
                 else:
-                    output_text = str(text)
                     if "unsupported call:" in output_text or "unknown MCP server" in output_text:
                         log_api_event(
                             "responses_legacy_chat_history_tool_output_skipped",
                             {"call_id": "", "reason": "orphan_unsupported_tool_output", "output_preview": output_text[:160]},
                         )
                         continue
-                    messages.append({"role": "user", "content": output_text})
+                    if output_images and allow_tool_output_images:
+                        image_content = [{"type": "text", "text": output_text or "Images returned by tool output."}, *output_images]
+                        messages.append({"role": "user", "content": image_content})
+                    elif output_images:
+                        log_api_event(
+                            "responses_legacy_chat_tool_output_images_not_forwarded_nonvision",
+                            {"call_id": "", "images": image_count, "output_preview": output_text[:160]},
+                        )
+                        if output_text:
+                            messages.append({"role": "user", "content": output_text})
+                    elif output_text:
+                        messages.append({"role": "user", "content": output_text})
     return messages
 
 
-def _responses_payload_to_chat_payload(payload: dict, model_name: str, *, flatten_namespace_tools: bool = True) -> dict:
+def _responses_payload_to_chat_payload(
+    payload: dict,
+    model_name: str,
+    *,
+    flatten_namespace_tools: bool = True,
+    tool_registry: ResponsesToolRegistry | None = None,
+    extra_messages: list[dict] | None = None,
+    allow_tool_output_images: bool = True,
+) -> dict:
     """Translate /v1/responses request fields supported by legacy chat backends."""
-    chat_tools = _responses_tools_to_chat_tools(payload.get("tools"), flatten_namespace_tools=flatten_namespace_tools)
+    chat_tools = (
+        tool_registry.chat_tools_with_internal_search()
+        if tool_registry is not None
+        else _responses_tools_to_chat_tools(payload.get("tools"), flatten_namespace_tools=flatten_namespace_tools)
+    )
     allowed_tool_names = {
         str(tool.get("function", {}).get("name") or "")
         for tool in chat_tools
         if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
     }
+    stream_enabled = bool(payload.get("stream"))
     upstream_payload = {
         "model": model_name,
-        "messages": _responses_input_to_openai_messages(payload, allowed_tool_names=allowed_tool_names),
-        "stream": bool(payload.get("stream")),
+        "messages": _responses_input_to_openai_messages(
+            payload,
+            allowed_tool_names=allowed_tool_names,
+            tool_registry=tool_registry,
+            allow_tool_output_images=allow_tool_output_images,
+        ),
+        "stream": stream_enabled,
     }
+    if tool_registry is not None and tool_registry.has_deferred_tools:
+        directory = tool_registry.directory_text()
+        if directory:
+            if upstream_payload["messages"] and upstream_payload["messages"][0].get("role") == "system":
+                upstream_payload["messages"][0]["content"] = f"{upstream_payload['messages'][0].get('content')}\n\n{directory}"
+            else:
+                upstream_payload["messages"].insert(0, {"role": "system", "content": directory})
+    if extra_messages:
+        upstream_payload["messages"].extend(extra_messages)
+    if stream_enabled:
+        # Codex relies on Responses `response.completed.usage` for context/token
+        # accounting.  The legacy Chat Completions stream only includes usage if
+        # requested explicitly, so always ask llama.cpp for it when we are acting
+        # as the Responses compatibility adapter.
+        stream_options = payload.get("stream_options") if isinstance(payload.get("stream_options"), dict) else {}
+        upstream_payload["stream_options"] = {**stream_options, "include_usage": True}
     passthrough_fields = {
         "temperature",
         "top_p",
@@ -7001,7 +8223,6 @@ def _responses_payload_to_chat_payload(payload: dict, model_name: str, *, flatte
         upstream_payload["max_tokens"] = payload["max_output_tokens"]
     elif "max_tokens" in payload:
         upstream_payload["max_tokens"] = payload["max_tokens"]
-    chat_tools = _responses_tools_to_chat_tools(payload.get("tools"), flatten_namespace_tools=flatten_namespace_tools)
     if chat_tools:
         upstream_payload["tools"] = chat_tools
         if "tool_choice" in payload:
@@ -7031,6 +8252,44 @@ def _responses_raw_passthrough_enabled() -> bool:
 def _safe_runtime_enabled() -> bool:
     value = os.environ.get("LLAMACPP_SAFE_RUNTIME", "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_responses_usage(usage: object) -> dict | None:
+    """Normalize Chat Completions usage into Responses API usage shape."""
+    if not isinstance(usage, dict):
+        return None
+    if any(key in usage for key in ("input_tokens", "output_tokens")):
+        input_tokens = _to_int_or_none(usage.get("input_tokens")) or 0
+        output_tokens = _to_int_or_none(usage.get("output_tokens")) or 0
+        total_tokens = _to_int_or_none(usage.get("total_tokens"))
+        if total_tokens is None:
+            total_tokens = input_tokens + output_tokens
+        normalized = dict(usage)
+        normalized["input_tokens"] = input_tokens
+        normalized["output_tokens"] = output_tokens
+        normalized["total_tokens"] = total_tokens
+        normalized.setdefault("input_tokens_details", {"cached_tokens": 0})
+        normalized.setdefault("output_tokens_details", {"reasoning_tokens": 0})
+        return normalized
+
+    prompt_tokens = _to_int_or_none(usage.get("prompt_tokens")) or 0
+    completion_tokens = _to_int_or_none(usage.get("completion_tokens")) or 0
+    total_tokens = _to_int_or_none(usage.get("total_tokens"))
+    if total_tokens is None:
+        total_tokens = prompt_tokens + completion_tokens
+    prompt_details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
+    completion_details = usage.get("completion_tokens_details") if isinstance(usage.get("completion_tokens_details"), dict) else {}
+    return {
+        "input_tokens": prompt_tokens,
+        "input_tokens_details": {
+            "cached_tokens": _to_int_or_none(prompt_details.get("cached_tokens")) or 0,
+        },
+        "output_tokens": completion_tokens,
+        "output_tokens_details": {
+            "reasoning_tokens": _to_int_or_none(completion_details.get("reasoning_tokens")) or 0,
+        },
+        "total_tokens": total_tokens,
+    }
 
 
 def _chat_response_to_responses_payload(data: dict, model_name: str, request_payload: dict | None = None) -> dict:
@@ -7089,9 +8348,37 @@ def _chat_response_to_responses_payload(data: dict, model_name: str, request_pay
         "tools": request_payload.get("tools") if isinstance(request_payload.get("tools"), list) else [],
         "output_text": output_text,
     }
-    if data.get("usage") is not None:
-        payload["usage"] = data["usage"]
+    normalized_usage = _normalize_responses_usage(data.get("usage"))
+    if normalized_usage is not None:
+        payload["usage"] = normalized_usage
     return payload
+
+
+def _responses_payload_has_output_items(payload: dict) -> bool:
+    """Return True when a Responses payload has something meaningful to send.
+
+    An empty message after internal repair feedback is not a valid completion:
+    it means the local model stopped instead of retrying/correcting the tool
+    call.  Function calls are valid even when output_text is empty.
+    """
+    output = payload.get("output")
+    if not isinstance(output, list):
+        return False
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "function_call" and str(item.get("name") or "").strip():
+            return True
+        if item_type == "message":
+            for part in item.get("content") or []:
+                if isinstance(part, dict) and str(part.get("text") or "").strip():
+                    return True
+        if item_type == "reasoning":
+            for part in item.get("content") or []:
+                if isinstance(part, dict) and str(part.get("text") or "").strip():
+                    return True
+    return False
 
 
 def _responses_event(event_type: str, sequence_number: int, **fields) -> dict:
@@ -7103,6 +8390,19 @@ def _responses_event(event_type: str, sequence_number: int, **fields) -> dict:
 def _write_sse_event(handler: BaseHTTPRequestHandler, event_name: str, event_payload: dict) -> None:
     handler.wfile.write(f"event: {event_name}\n".encode("utf-8"))
     handler.wfile.write(("data: " + json.dumps(event_payload, ensure_ascii=False) + "\n\n").encode("utf-8"))
+    handler.wfile.flush()
+
+
+def _start_responses_sse_stream(handler: BaseHTTPRequestHandler) -> None:
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/event-stream")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.end_headers()
+
+
+def _write_sse_comment(handler: BaseHTTPRequestHandler, comment: str) -> None:
+    safe_comment = str(comment or "keepalive").replace("\n", " ")
+    handler.wfile.write(f": {safe_comment}\n\n".encode("utf-8"))
     handler.wfile.flush()
 
 
@@ -7196,16 +8496,20 @@ def _responses_payload_sse_events(payload: dict) -> list[tuple[str, dict]]:
             call_id = str(item.get("call_id") or item_id)
             name = str(item.get("name") or "")
             arguments = str(item.get("arguments") or "")
-            started_item = _response_function_call_item(item_id, call_id, name, "", "in_progress")
+            namespace = str(item.get("namespace") or "").strip() or None
+            started_item = _response_function_call_item(item_id, call_id, name, "", "in_progress", namespace)
             seq += 1
             events.append(("response.output_item.added", _responses_event("response.output_item.added", seq, output_index=output_index, item=started_item)))
             if arguments:
                 seq += 1
                 events.append(("response.function_call_arguments.delta", _responses_event("response.function_call_arguments.delta", seq, item_id=item_id, output_index=output_index, delta=arguments)))
             seq += 1
-            events.append(("response.function_call_arguments.done", _responses_event("response.function_call_arguments.done", seq, item_id=item_id, output_index=output_index, name=name, arguments=arguments)))
+            done_payload = _responses_event("response.function_call_arguments.done", seq, item_id=item_id, output_index=output_index, name=name, arguments=arguments)
+            if namespace:
+                done_payload["namespace"] = namespace
+            events.append(("response.function_call_arguments.done", done_payload))
             seq += 1
-            events.append(("response.output_item.done", _responses_event("response.output_item.done", seq, output_index=output_index, item=_response_function_call_item(item_id, call_id, name, arguments, "completed"))))
+            events.append(("response.output_item.done", _responses_event("response.output_item.done", seq, output_index=output_index, item=_response_function_call_item(item_id, call_id, name, arguments, "completed", namespace))))
 
     seq += 1
     events.append(("response.completed", _responses_event("response.completed", seq, response=payload)))
@@ -7213,12 +8517,28 @@ def _responses_payload_sse_events(payload: dict) -> list[tuple[str, dict]]:
 
 
 def _write_responses_sse(handler: BaseHTTPRequestHandler, payload: dict) -> None:
-    handler.send_response(200)
-    handler.send_header("Content-Type", "text/event-stream")
-    handler.send_header("Cache-Control", "no-cache")
-    handler.end_headers()
+    _start_responses_sse_stream(handler)
+    _write_responses_sse_events(handler, payload)
+
+
+def _write_responses_sse_events(handler: BaseHTTPRequestHandler, payload: dict) -> None:
     for event_name, event_payload in _responses_payload_sse_events(payload):
         _write_sse_event(handler, event_name, event_payload)
+    handler.wfile.write(b"data: [DONE]\n\n")
+    handler.wfile.flush()
+
+
+def _write_responses_sse_error(handler: BaseHTTPRequestHandler, message: str, error_type: str = "server_error") -> None:
+    seq = 1
+    payload = {
+        "id": f"resp_{uuid.uuid4().hex}",
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "failed",
+        "error": {"message": message, "type": error_type},
+        "output": [],
+    }
+    _write_sse_event(handler, "response.failed", _responses_event("response.failed", seq, response=payload))
     handler.wfile.write(b"data: [DONE]\n\n")
     handler.wfile.flush()
 
@@ -8405,7 +9725,7 @@ def start_ctx_metadata_server(args):
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": "messages or prompt is required"}, status=400)
                 return
-            if _messages_include_images(messages) and (model_entry is None or not _has_vision_runtime(model_entry)):
+            if _messages_include_images(messages) and (model_entry is None or not _has_configured_mmproj_runtime(model_entry)):
                 self._send_json(
                     {
                         "error": (
@@ -8634,14 +9954,25 @@ def start_ctx_metadata_server(args):
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": {"message": "messages is required", "type": "invalid_request_error"}}, status=400)
                 return
-            if _messages_include_images(messages) and (model_entry is None or not _has_vision_runtime(model_entry)):
+            if _messages_include_images(messages) and (model_entry is None or not _has_configured_mmproj_runtime(model_entry)):
+                error_message = (
+                    f"model '{model_name}' is installed without multimodal projector support (mmproj). "
+                    "Use a vision model or re-add/update this model so the matching mmproj GGUF is downloaded and configured."
+                )
+                log_api_event(
+                    "openai_chat_image_rejected_nonvision",
+                    {
+                        "model": model_name,
+                        "request_id": request_id,
+                        "has_model_entry": model_entry is not None,
+                        "vision": bool(model_entry and _has_configured_mmproj_runtime(model_entry)),
+                        "payload": _summarize_api_payload_for_log(payload),
+                    },
+                )
                 self._send_json(
                     {
                         "error": {
-                            "message": (
-                                f"model '{model_name}' is installed without multimodal projector support (mmproj). "
-                                "Re-add or update the model so the matching mmproj GGUF is downloaded and configured."
-                            ),
+                            "message": error_message,
                             "type": "invalid_request_error",
                         }
                     },
@@ -8869,10 +10200,13 @@ def start_ctx_metadata_server(args):
                     else:
                         flatten_enabled = bool(_server_cfg_resp.get("flatten_namespace_tools", True))
                     
-                    if flatten_enabled:
-                        pt_tools = _passthrough_payload.get("tools")
-                        if isinstance(pt_tools, list):
-                            _passthrough_payload["tools"] = _flatten_responses_tools(pt_tools)
+                    pt_tools = _passthrough_payload.get("tools")
+                    if isinstance(pt_tools, list):
+                        # Raw Responses passthrough is for backends that understand
+                        # Responses-native tools.  Do not explode namespaces into
+                        # hundreds of legacy functions here; prepare them for
+                        # tool_search/deferred loading instead.
+                        _passthrough_payload["tools"] = _responses_tools_with_deferred_search(pt_tools)
                     
                     log_api_event("openai_responses_passthrough_payload", {
                         "model": model_name,
@@ -8935,8 +10269,20 @@ def start_ctx_metadata_server(args):
             # and translates tools to the legacy Chat Completions schema while
             # preserving the Responses facade on the way back to Codex.
             flatten_namespace_tools = bool(_server_cfg_resp.get("flatten_namespace_tools", True))
+            tool_registry = (
+                ResponsesToolRegistry.from_responses_tools(payload.get("tools"), flatten_namespace_tools=flatten_namespace_tools)
+                if _responses_tool_search_emulation_enabled(_server_cfg_resp)
+                else None
+            )
             namespace_tool_map = _responses_namespace_tool_map(payload.get("tools")) if flatten_namespace_tools else {}
-            upstream_payload = _responses_payload_to_chat_payload(payload, upstream_model_name, flatten_namespace_tools=flatten_namespace_tools)
+            allow_tool_output_images = bool(model_entry and _has_configured_mmproj_runtime(model_entry))
+            upstream_payload = _responses_payload_to_chat_payload(
+                payload,
+                upstream_model_name,
+                flatten_namespace_tools=flatten_namespace_tools,
+                tool_registry=tool_registry,
+                allow_tool_output_images=allow_tool_output_images,
+            )
             allowed_legacy_tool_names = {
                 str(tool.get("function", {}).get("name") or "")
                 for tool in upstream_payload.get("tools", [])
@@ -8958,14 +10304,26 @@ def start_ctx_metadata_server(args):
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": {"message": "input is required", "type": "invalid_request_error"}}, status=400)
                 return
-            if _messages_include_images(messages) and (model_entry is None or not _has_vision_runtime(model_entry)):
+            messages_have_images = _messages_include_images(messages)
+            if messages_have_images and (model_entry is None or not _has_configured_mmproj_runtime(model_entry)):
+                error_message = (
+                    f"model '{model_name}' is installed without multimodal projector support (mmproj). "
+                    "Use a vision model or re-add/update this model so the matching mmproj GGUF is downloaded and configured."
+                )
+                log_api_event(
+                    "openai_responses_image_rejected_nonvision",
+                    {
+                        "model": model_name,
+                        "request_id": request_id,
+                        "has_model_entry": model_entry is not None,
+                        "vision": bool(model_entry and _has_configured_mmproj_runtime(model_entry)),
+                        "payload": _summarize_api_payload_for_log(upstream_payload),
+                    },
+                )
                 self._send_json(
                     {
                         "error": {
-                            "message": (
-                                f"model '{model_name}' is installed without multimodal projector support (mmproj). "
-                                "Re-add or update the model so the matching mmproj GGUF is downloaded and configured."
-                            ),
+                            "message": error_message,
                             "type": "invalid_request_error",
                         }
                     },
@@ -8974,7 +10332,270 @@ def start_ctx_metadata_server(args):
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 return
+            if messages_have_images and model_entry is not None and _loaded_process_missing_configured_mmproj(model_entry, catalog):
+                proc = get_catalog_model_process(model_entry.model_id, catalog)
+                log_api_event(
+                    "openai_responses_image_stale_mmproj_runtime_reload",
+                    {
+                        "model": model_name,
+                        "request_id": request_id,
+                        "configured_mmproj": str(model_entry.mmproj_path or ""),
+                        "process": proc,
+                        "payload": _summarize_api_payload_for_log(upstream_payload),
+                    },
+                )
+                reloaded = reload_model_runtime_from_catalog_config(
+                    model_entry,
+                    catalog,
+                    args,
+                    client_host,
+                    int(args.public_port),
+                    unload_timeout=45.0,
+                    reload_timeout=45.0,
+                )
+                if not reloaded or _loaded_process_missing_configured_mmproj(model_entry, catalog):
+                    error_message = (
+                        f"model '{model_name}' is configured with mmproj but the currently loaded llama-server process was started without it. "
+                        "Automatic reload failed; unload/restart the model so llama-swap reloads it with the configured --mmproj before sending image inputs."
+                    )
+                    log_api_event(
+                        "openai_responses_image_rejected_stale_mmproj_runtime",
+                        {
+                            "model": model_name,
+                            "request_id": request_id,
+                            "configured_mmproj": str(model_entry.mmproj_path or ""),
+                            "process": get_catalog_model_process(model_entry.model_id, catalog),
+                            "payload": _summarize_api_payload_for_log(upstream_payload),
+                        },
+                    )
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": error_message,
+                                "type": "stale_runtime_error",
+                            }
+                        },
+                        status=503,
+                    )
+                    if upstream_model_name:
+                        REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                    return
+                log_api_event(
+                    "openai_responses_image_stale_mmproj_runtime_reloaded",
+                    {"model": model_name, "request_id": request_id, "configured_mmproj": str(model_entry.mmproj_path or "")},
+                )
             stream = bool(payload.get("stream"))
+            if tool_registry is not None and tool_registry.has_deferred_tools:
+                extra_messages: list[dict] = []
+                accumulated_usage: dict | None = None
+                rounds = 0
+                tool_repair_rounds = 0
+                seen_tool_repair_signatures: set[str] = set()
+                max_internal_tool_search_rounds = 2
+                max_internal_tool_repair_rounds = 2
+                sse_started = False
+
+                def fail_internal_response(message: str, *, status: int = 502, error_type: str = "server_error", extra: dict | None = None) -> None:
+                    if upstream_model_name:
+                        REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                    if stream and sse_started:
+                        _write_responses_sse_error(self, message, error_type)
+                        return
+                    payload_error = {"message": message, "type": error_type}
+                    if extra:
+                        payload_error.update(extra)
+                    self._send_json({"error": payload_error}, status=status)
+
+                if stream:
+                    _start_responses_sse_stream(self)
+                    sse_started = True
+                    _write_sse_comment(self, "llamacpp-superserver internal Responses fallback started")
+                while True:
+                    internal_payload = _responses_payload_to_chat_payload(
+                        payload,
+                        upstream_model_name,
+                        flatten_namespace_tools=flatten_namespace_tools,
+                        tool_registry=tool_registry,
+                        extra_messages=extra_messages,
+                        allow_tool_output_images=allow_tool_output_images,
+                    )
+                    # Keep tool discovery KV-stable and private.  For streaming
+                    # clients we collect the final response and emit Responses SSE
+                    # only after internal tool_search rounds have completed.
+                    internal_payload["stream"] = False
+                    if stream and sse_started:
+                        _write_sse_comment(self, f"internal round {rounds}; repair_rounds={tool_repair_rounds}; extra_messages={len(extra_messages)}")
+                    log_api_event(
+                        "openai_responses_tool_search_round_payload",
+                        {
+                            "model": model_name,
+                            "request_id": request_id,
+                            "round": rounds,
+                            "tool_count": len(internal_payload.get("tools", [])),
+                            "extra_messages": len(extra_messages),
+                            "payload": _summarize_api_payload_for_log(internal_payload),
+                        },
+                    )
+                    try:
+                        response = requests.post(
+                            f"http://{client_host}:{int(args.public_port)}/v1/chat/completions",
+                            data=json.dumps(internal_payload).encode("utf-8"),
+                            headers={"Content-Type": "application/json"},
+                            timeout=(60, 600),
+                            stream=False,
+                        )
+                        log_api_event(
+                            "openai_responses_tool_search_round_headers",
+                            {
+                                "model": model_name,
+                                "request_id": request_id,
+                                "round": rounds,
+                                "status": response.status_code,
+                                "wait_ms": _elapsed_ms(started_at),
+                            },
+                        )
+                    except requests.RequestException as exc:
+                        log_api_event(
+                            "openai_responses_tool_search_round_network_error",
+                            {"model": model_name, "request_id": request_id, "round": rounds, "error": str(exc)},
+                        )
+                        fail_internal_response(f"upstream unavailable: {exc}", status=502, error_type="server_error")
+                        return
+                    if response.status_code >= 400:
+                        body_text = response.text
+                        log_api_event(
+                            "openai_responses_tool_search_round_upstream_error",
+                            {
+                                "model": model_name,
+                                "request_id": request_id,
+                                "round": rounds,
+                                "status": response.status_code,
+                                "body_preview": body_text[:2000],
+                                "payload": _summarize_api_payload_for_log(internal_payload),
+                            },
+                        )
+                        message = f"upstream HTTP {response.status_code}: {body_text[:1000]}" if body_text else f"upstream HTTP {response.status_code}"
+                        fail_internal_response(message, status=response.status_code, error_type="upstream_error", extra={"upstream_status": response.status_code})
+                        return
+                    try:
+                        data = response.json()
+                    except Exception as exc:
+                        log_api_event(
+                            "openai_responses_tool_search_round_invalid_json",
+                            {"model": model_name, "request_id": request_id, "round": rounds, "error": str(exc), "body_len": len(response.text)},
+                        )
+                        fail_internal_response(f"upstream invalid response: {exc}", status=502, error_type="server_error")
+                        return
+
+                    accumulated_usage = _combine_responses_usage(accumulated_usage, data.get("usage"))
+                    followup_messages = _chat_response_internal_tool_search_followup_messages(data, tool_registry)
+                    if followup_messages:
+                        if rounds >= max_internal_tool_search_rounds:
+                            log_api_event(
+                                "openai_responses_tool_search_round_limit",
+                                {"model": model_name, "request_id": request_id, "rounds": rounds, "followup_messages": len(followup_messages)},
+                            )
+                            fail_internal_response("internal tool_search round limit exceeded; narrow the deferred tool search", status=500, error_type="server_error")
+                            return
+                        extra_messages.extend(followup_messages)
+                        if stream and sse_started:
+                            _write_sse_comment(self, "internal tool_search result appended")
+                        rounds += 1
+                        continue
+
+                    repair_followup_messages = _chat_response_internal_tool_repair_followup_messages(
+                        data,
+                        tool_registry,
+                        loaded_schema_messages=extra_messages,
+                    )
+                    if repair_followup_messages:
+                        repair_feedbacks = [
+                            message for message in repair_followup_messages
+                            if isinstance(message, dict) and message.get("role") == "tool"
+                        ]
+                        repair_signature = ""
+                        if repair_feedbacks:
+                            repair_signature = str(repair_feedbacks[0].get("content") or "")[:1000]
+                        if tool_repair_rounds >= max_internal_tool_repair_rounds or repair_signature in seen_tool_repair_signatures:
+                            log_api_event(
+                                "openai_responses_tool_repair_limit",
+                                {
+                                    "model": model_name,
+                                    "request_id": request_id,
+                                    "repair_rounds": tool_repair_rounds,
+                                    "repeated": repair_signature in seen_tool_repair_signatures,
+                                    "feedback_preview": repair_signature[:500],
+                                },
+                            )
+                            fail_internal_response(
+                                "internal tool repair limit exceeded; model repeated an invalid tool call",
+                                status=502,
+                                error_type="upstream_tool_call_error",
+                                extra={"feedback": repair_signature[:1000]},
+                            )
+                            return
+                        if repair_signature:
+                            seen_tool_repair_signatures.add(repair_signature)
+                        log_api_event(
+                            "openai_responses_tool_repair_feedback",
+                            {
+                                "model": model_name,
+                                "request_id": request_id,
+                                "repair_round": tool_repair_rounds,
+                                "feedback_count": len(repair_feedbacks),
+                                "feedback_preview": repair_signature[:500],
+                            },
+                        )
+                        extra_messages.extend(repair_followup_messages)
+                        if stream and sse_started:
+                            _write_sse_comment(self, "internal tool repair feedback appended")
+                        tool_repair_rounds += 1
+                        continue
+
+                    data, translated_internal_call = _translate_internal_deferred_tool_calls_in_chat_response(data, tool_registry, loaded_schema_messages=extra_messages)
+                    if accumulated_usage is not None:
+                        data["usage"] = accumulated_usage
+                    final_payload = _chat_response_to_responses_payload(data, model_name, payload)
+                    if tool_repair_rounds > 0 and not _responses_payload_has_output_items(final_payload):
+                        log_api_event(
+                            "openai_responses_tool_repair_empty_final",
+                            {
+                                "model": model_name,
+                                "request_id": request_id,
+                                "rounds": rounds,
+                                "repair_rounds": tool_repair_rounds,
+                                "usage": final_payload.get("usage"),
+                            },
+                        )
+                        fail_internal_response(
+                            "model stopped after internal tool repair feedback without producing text or a valid tool call",
+                            status=502,
+                            error_type="upstream_tool_call_error",
+                        )
+                        return
+                    if upstream_model_name:
+                        REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
+                        REPLICA_ROUTER_STATE.bind_response(str(final_payload.get("id") or ""), upstream_model_name, get_model_replica_config(model_entry).sticky_ttl_s if model_entry else 3600)
+                    log_api_event(
+                        "openai_responses_tool_search_final",
+                        {
+                            "model": model_name,
+                            "request_id": request_id,
+                            "rounds": rounds,
+                            "translated_internal_call": translated_internal_call,
+                            "output_text_len": len(str(final_payload.get("output_text") or "")),
+                            "usage": final_payload.get("usage"),
+                        },
+                    )
+                    mark_model_activity(model_name, f"openai_responses:{request_id}", "response_done")
+                    if stream:
+                        if sse_started:
+                            _write_responses_sse_events(self, final_payload)
+                        else:
+                            _write_responses_sse(self, final_payload)
+                    else:
+                        self._send_json(final_payload)
+                    return
             try:
                 response = requests.post(
                     f"http://{client_host}:{int(args.public_port)}/v1/chat/completions",
@@ -9027,6 +10648,7 @@ def start_ctx_metadata_server(args):
                         "request_id": request_id,
                         "status": response.status_code,
                         "body_len": len(body_text),
+                        "body_preview": body_text[:2000],
                         "payload": _summarize_api_payload_for_log(upstream_payload),
                     },
                 )
@@ -9039,9 +10661,10 @@ def start_ctx_metadata_server(args):
                     request_id=request_id,
                     upstream_status=response.status_code,
                 )
+                message = f"upstream HTTP {response.status_code}: {body_text[:1000]}" if body_text else f"upstream HTTP {response.status_code}"
                 self._send_json(
-                    {"error": {"message": f"upstream unavailable: HTTP {response.status_code}", "type": "server_error"}},
-                    status=502,
+                    {"error": {"message": message, "type": "upstream_error", "upstream_status": response.status_code}},
+                    status=response.status_code,
                 )
                 return
 
@@ -9120,6 +10743,7 @@ def start_ctx_metadata_server(args):
 
                 full_content = ""
                 full_reasoning = ""
+                latest_usage = None
                 active_tool_calls = {} # tool_call_index -> {item_id, call_id, name, args_buf, output_index}
                 in_loading_block = False
 
@@ -9142,7 +10766,14 @@ def start_ctx_metadata_server(args):
                             try:
                                 data_str = data_bytes.decode("utf-8", errors="replace")
                                 chunk = json.loads(data_str)
-                                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                                usage = _normalize_responses_usage(chunk.get("usage"))
+                                if isinstance(usage, dict):
+                                    latest_usage = usage
+                                    log_api_event("openai_responses_stream_usage_received", {"request_id": request_id, "usage": usage})
+                                choices = chunk.get("choices")
+                                if not isinstance(choices, list) or not choices:
+                                    choices = [{}]
+                                delta = choices[0].get("delta", {}) if isinstance(choices[0], dict) else {}
                                 
                                 content = str(delta.get("content") or "")
                                 reasoning = ""
@@ -9451,14 +11082,17 @@ def start_ctx_metadata_server(args):
                         if tc_list:
                             final_message["tool_calls"] = tc_list
                             
-                        final_payload = _chat_response_to_responses_payload({"choices": [{"message": final_message}]}, model_name, payload)
+                        final_chat_payload = {"choices": [{"message": final_message}]}
+                        if isinstance(latest_usage, dict):
+                            final_chat_payload["usage"] = latest_usage
+                        final_payload = _chat_response_to_responses_payload(final_chat_payload, model_name, payload)
                         final_payload["id"] = generated_resp_id
                         completed_payload = _responses_event("response.completed", next_sequence(), response=final_payload)
                         
                         stream_event("response.completed", completed_payload)
                         self.wfile.write(b"data: [DONE]\n\n")
                         self.wfile.flush()
-                        log_api_event("openai_responses_stream_completed_sent", {"request_id": request_id, "output_text_len": len(full_content), "tool_calls": len(tc_list)})
+                        log_api_event("openai_responses_stream_completed_sent", {"request_id": request_id, "output_text_len": len(full_content), "tool_calls": len(tc_list), "usage": final_payload.get("usage")})
 
                     
                     if upstream_model_name:
@@ -9573,7 +11207,7 @@ def start_ctx_metadata_server(args):
             upstream_messages.append(
                 _ollama_message_to_openai({"role": "user", "content": prompt, "images": images})
             )
-            if images and (model_entry is None or not _has_vision_runtime(model_entry)):
+            if images and (model_entry is None or not _has_configured_mmproj_runtime(model_entry)):
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json(
@@ -12410,6 +14044,7 @@ def start_catalog_auto_update_watch(args, *, poll_s: float = 2.0, debounce_s: fl
     server_config_path = Path(getattr(args, "server_config", DEFAULT_SERVER_CONFIG_PATH))
     watched = [catalog_path, server_config_path]
     state = {str(path): _file_signature(path) for path in watched}
+    pending_changed: set[str] = set()
 
     def loop():
         while stop_event is None or not stop_event.is_set():
@@ -12422,28 +14057,40 @@ def start_catalog_auto_update_watch(args, *, poll_s: float = 2.0, debounce_s: fl
                         changed.append(key)
                     state[key] = sig
                 if changed:
+                    pending_changed.update(changed)
                     log_api_event("auto_update_change_detected", {"paths": changed})
-                    if stop_event is not None and stop_event.wait(max(0.1, debounce_s)):
-                        break
-                    if stop_event is None:
-                        time.sleep(max(0.1, debounce_s))
-                    # Refresh signatures after debounce so a partial write is less likely.
-                    for path in watched:
-                        state[str(path)] = _file_signature(path)
-                    started = time.monotonic()
-                    try:
-                        update_config(args)
-                        # update_config may canonicalize catalog.json/conf.json itself.
-                        # Refresh signatures after the write so the watcher does not
-                        # trigger an infinite self-update loop.
+                if pending_changed:
+                    active_summary = _active_download_blocker_summary()
+                    if active_summary:
+                        log_api_event(
+                            "auto_update_deferred_model_active",
+                            {"paths": sorted(pending_changed), "active": active_summary},
+                        )
+                    else:
+                        if stop_event is not None and stop_event.wait(max(0.1, debounce_s)):
+                            break
+                        if stop_event is None:
+                            time.sleep(max(0.1, debounce_s))
+                        # Refresh signatures after debounce so a partial write is less likely.
                         for path in watched:
                             state[str(path)] = _file_signature(path)
-                        log_api_event("auto_update_completed", {"paths": changed, "elapsed_ms": _elapsed_ms(started)})
-                    except Exception as exc:
-                        for path in watched:
-                            state[str(path)] = _file_signature(path)
-                        log_api_event("auto_update_failed", {"paths": changed, "elapsed_ms": _elapsed_ms(started), "error": str(exc)})
-                        print(f"[!] Automatic config update after file change failed: {exc}")
+                        update_paths = sorted(pending_changed)
+                        pending_changed.clear()
+                        started = time.monotonic()
+                        try:
+                            update_config(args)
+                            # update_config may canonicalize catalog.json/conf.json itself.
+                            # Refresh signatures after the write so the watcher does not
+                            # trigger an infinite self-update loop.
+                            for path in watched:
+                                state[str(path)] = _file_signature(path)
+                            log_api_event("auto_update_completed", {"paths": update_paths, "elapsed_ms": _elapsed_ms(started)})
+                        except Exception as exc:
+                            pending_changed.update(update_paths)
+                            for path in watched:
+                                state[str(path)] = _file_signature(path)
+                            log_api_event("auto_update_failed", {"paths": update_paths, "elapsed_ms": _elapsed_ms(started), "error": str(exc)})
+                            print(f"[!] Automatic config update after file change failed: {exc}")
             except Exception as exc:
                 log_api_event("auto_update_watch_error", {"error": str(exc)})
             if stop_event is not None:
