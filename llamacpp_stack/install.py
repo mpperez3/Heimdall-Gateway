@@ -113,6 +113,33 @@ def _default_global_replicas_config() -> dict[str, object]:
     }
 
 
+def _default_experimental_config() -> dict[str, object]:
+    return {
+        "chat_tool_continue_repair": {
+            "enabled": False,
+            "max_rounds": 1,
+        }
+    }
+
+
+def _normalize_experimental_config(raw: object) -> dict[str, object]:
+    cfg = _default_experimental_config()
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if key == "chat_tool_continue_repair" and isinstance(value, dict):
+                repair = dict(cfg["chat_tool_continue_repair"])
+                repair.update(value)
+                repair["enabled"] = bool(repair.get("enabled"))
+                try:
+                    repair["max_rounds"] = max(0, int(repair.get("max_rounds", 1)))
+                except Exception:
+                    repair["max_rounds"] = 1
+                cfg["chat_tool_continue_repair"] = repair
+            elif key not in cfg:
+                cfg[key] = value
+    return cfg
+
+
 def _default_api_auth_config() -> dict[str, object]:
     return {"enabled": False, "api_key": ""}
 
@@ -175,6 +202,7 @@ def _normalize_server_config_payload(payload: dict[str, object]) -> dict[str, ob
         placement = "exclusive_gpus"
     replicas["placement"] = placement
     result["replicas"] = replicas
+    result["experimental"] = _normalize_experimental_config(result.get("experimental"))
     result["api_auth"] = _normalize_api_auth_config(result.get("api_auth"))
     result["api_https"] = _normalize_api_https_config(result.get("api_https"))
     result.setdefault("api_ctx_factor", 0.5)
@@ -258,11 +286,30 @@ def _merge_missing_llama_server_defaults(target: dict[str, object], config_dir: 
     if not preset_defaults:
         return False
 
+    changed = False
+
+    legacy_defaults = {
+        "mirostat": 2,
+        "mirostat-ent": 4.5,
+        "mirostat_ent": 4.5,
+        "mirostat-lr": 0.1,
+        "mirostat_lr": 0.1,
+    }
+    for key, legacy_value in legacy_defaults.items():
+        if key not in target:
+            continue
+        try:
+            same = float(target.get(key)) == float(legacy_value)
+        except Exception:
+            same = str(target.get(key)).strip() == str(legacy_value)
+        if same:
+            target.pop(key, None)
+            changed = True
+
     # Merge all missing keys from bundled presets into the target config.
     # Existing keys are never overwritten so user-tuned values are preserved.
     # This ensures all options with their defaults are visible and editable
     # in the conf, even on reinstall.
-    changed = False
     for key, value in preset_defaults.items():
         # Persist installer-managed defaults using the project's kebab-case
         # config keys so the generated server config matches runtime flags.
@@ -311,7 +358,10 @@ def _merge_missing_llama_server_defaults(target: dict[str, object], config_dir: 
             mtp_target = target["mtp_defaults"]
             changed = True
         for key, value in mtp_defaults.items():
-            if key not in mtp_target:
+            if key == "spec_draft_n_max" and str(mtp_target.get(key, "")).strip() == "2" and str(value).strip() == "3":
+                mtp_target[key] = value
+                changed = True
+            elif key not in mtp_target:
                 mtp_target[key] = value
                 changed = True
 
@@ -1518,6 +1568,28 @@ def _is_executable_working(path: Path, timeout: float = 3.0) -> bool:
 
 
 def _resolve_existing_stable_target(install_root: Path, stable_link: Path, name: str) -> Path | None:
+    realpath_file = stable_link.with_name(stable_link.name + ".realpath")
+    if realpath_file.exists():
+        try:
+            target = Path(realpath_file.read_text(encoding="utf-8").strip()).expanduser()
+            if target.exists() and target.is_file() and os.path.abspath(str(target)) != os.path.abspath(str(stable_link)):
+                target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                return target
+        except Exception:
+            pass
+
+    if stable_link.is_symlink():
+        try:
+            target = Path(os.readlink(stable_link))
+            if not target.is_absolute():
+                target = stable_link.parent / target
+            target = target.resolve(strict=False)
+            if target.exists() and target.is_file() and os.path.abspath(str(target)) != os.path.abspath(str(stable_link)):
+                target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                return target
+        except Exception:
+            pass
+
     candidates: list[Path] = []
     for extracted_root in install_root.glob("*.d"):
         if not extracted_root.is_dir():
@@ -1573,9 +1645,37 @@ def _link_stable_binary(target: Path, link_path: Path, dry_run: bool) -> Path:
                     "Re-run installer with binary update enabled to recreate llama-server."
                 )
         return link_path
+    realpath_file = link_path.with_name(link_path.name + ".realpath")
     if link_path.exists() or link_path.is_symlink():
         link_path.unlink()
-    link_path.symlink_to(target)
+    realpath_file.write_text(f"{target_abs}\n", encoding="utf-8")
+    wrapper = f"""#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
+REAL="{target_abs}"
+if [[ -f "$ROOT/{realpath_file.name}" ]]; then
+  REAL="$(cat "$ROOT/{realpath_file.name}")"
+fi
+prepend_ld() {{
+  local dir="$1"
+  if [[ -d "$dir" ]]; then
+    case ":${{LD_LIBRARY_PATH:-}}:" in
+      *":$dir:"*) ;;
+      *) export LD_LIBRARY_PATH="$dir${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}" ;;
+    esac
+  fi
+}}
+prepend_ld "$ROOT/cuda/lib64"
+prepend_ld "$ROOT/cuda/lib"
+prepend_ld "$ROOT/nccl/lib64"
+prepend_ld "$ROOT/nccl/lib"
+prepend_ld "$ROOT/lib64"
+prepend_ld "$ROOT/lib"
+prepend_ld "$(dirname "$REAL")"
+exec "$REAL" "$@"
+"""
+    link_path.write_text(wrapper, encoding="utf-8")
+    link_path.chmod(0o755)
     return link_path
 
 
@@ -1622,6 +1722,7 @@ def _render_env(
         LLAMACPP_INSTALL_MODE={layout.mode}
         LLAMACPP_BACKEND={layout.backend}
         LLAMACPP_SERVICE_NAME={SWAP_SERVICE_NAME}
+        LLAMACPP_RESPONSES_INTERNAL_MAX_TOKENS=4096
         PYTHON_BIN={python_exec}
         LLAMACPP_PYTHONPATH={python_path}
         {backend_extra}{extra}"""
@@ -4024,6 +4125,7 @@ def install_stack(args: argparse.Namespace) -> int:
         server_config_data["api_https"] = api_https_config
         server_config_data.setdefault("api_ctx_factor", 0.5)
         server_config_data.setdefault("flatten_namespace_tools", True)
+        server_config_data.setdefault("experimental", _default_experimental_config())
         server_config_data.setdefault("replicas", {
             "enabled": False,
             "max": "auto",

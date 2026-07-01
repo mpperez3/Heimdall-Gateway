@@ -25,6 +25,26 @@ class SpeculativeSupportTest(unittest.TestCase):
         self.assertIn("fitt", spec)
         self.assertEqual(int(spec.get("fitt")), 1024)
 
+    def test_merge_updates_long_context_defaults_and_retires_legacy_mirostat(self) -> None:
+        target = {
+            "mirostat": 2,
+            "mirostat_ent": 4.5,
+            "mirostat_lr": 0.1,
+            "mtp_defaults": {"spec_draft_n_max": 2},
+        }
+
+        changed = _merge_missing_llama_server_defaults(target, Path("/nonexistent"))
+
+        self.assertTrue(changed)
+        self.assertNotIn("mirostat", target)
+        self.assertNotIn("mirostat_ent", target)
+        self.assertNotIn("mirostat_lr", target)
+        self.assertEqual(target["cache-ram"], 32768)
+        self.assertEqual(target["ctx-checkpoints"], 32)
+        self.assertEqual(target["checkpoint-min-step"], 1024)
+        self.assertEqual(target["chat-template-kwargs"], '{"preserve_thinking":true}')
+        self.assertEqual(target["mtp_defaults"]["spec_draft_n_max"], 3)
+
     def test_cli_parser_accepts_speculative_flag(self) -> None:
         parser, _ = build_cli_parser()
         args = parser.parse_args(["add", "org/repo", "--speculative"])
@@ -56,7 +76,21 @@ class SpeculativeSupportTest(unittest.TestCase):
         self.assertIn("-fitc 8192", joined)
         self.assertNotIn("--ctx-size", joined)
 
-    def test_build_llama_server_command_fit_off_uses_ctx_size_and_omits_fitc(self) -> None:
+    def test_mtp_overrides_migrate_legacy_draft_n_max_to_three(self) -> None:
+        updated, changed = cli._apply_mtp_server_overrides(
+            {
+                "model_draft": "/models/mtp.gguf",
+                "spec_type": "draft-mtp",
+                "spec_draft_n_max": 4,
+            },
+            "/models/mtp.gguf",
+            {"mtp_defaults": {"spec_draft_n_max": 3, "spec_draft_n_min": 0, "spec_draft_p_min": 0.75}},
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(updated["spec_draft_n_max"], 3)
+
+    def test_build_llama_server_command_fit_off_uses_ctx_size_and_omits_fit_flags(self) -> None:
         model = ManagedModel(
             model_id="foo",
             repo_id="org/foo",
@@ -77,8 +111,8 @@ class SpeculativeSupportTest(unittest.TestCase):
 
         cmd = build_llama_server_command(model, Path("/bin/llama-server"), port="12345", server_defaults=server_defaults)
         joined = " ".join(cmd)
-        self.assertIn("-fit off", joined)
         self.assertIn("--ctx-size 262144", joined)
+        self.assertNotIn("-fit", joined)
         self.assertNotIn("-fitc", joined)
         self.assertNotIn("-fitt", joined)
 
@@ -126,7 +160,7 @@ class SpeculativeSupportTest(unittest.TestCase):
         cmd = build_llama_server_command(model, Path("/bin/llama-server"), port="12345")
         joined = " ".join(cmd)
         self.assertIn("--model-draft /models/foo-draft.gguf", joined)
-        self.assertIn("--draft-max 12", joined)
+        self.assertRegex(joined, r"--(?:spec-draft-n-max|draft-max) 12")
         # draft_min and draft_p_min were removed in newer llama.cpp API
         self.assertNotIn("--draft-min", joined)
         self.assertNotIn("--draft-p-min", joined)

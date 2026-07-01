@@ -3,6 +3,7 @@ from llamacpp_stack.cli import (
     _summarize_api_payload_for_log,
     _responses_raw_passthrough_enabled,
     _responses_payload_to_chat_payload,
+    _responses_internal_round_max_tokens,
     _responses_namespace_tool_map,
     _responses_tools_to_chat_tools,
     _responses_tools_with_deferred_search,
@@ -15,6 +16,9 @@ from llamacpp_stack.cli import (
     _translate_internal_deferred_tool_calls_in_chat_response,
     _chat_response_internal_tool_search_followup_messages,
     _chat_response_internal_tool_repair_followup_messages,
+    _chat_tool_continue_repair_messages,
+    _chat_tool_continue_trigger_reason,
+    _sanitize_responses_tool_arguments,
 )
 import inspect
 import io
@@ -26,6 +30,50 @@ def _feedback_json_from_tool_content(content: str) -> dict:
     marker = "Diagnostic JSON:"
     assert marker in content
     return json.loads(content.split(marker, 1)[1].strip())
+
+
+def _sample_chat_tools() -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "exec_command",
+                "description": "Runs a command",
+                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+            },
+        }
+    ]
+
+
+def test_chat_tool_continue_triggers_only_on_empty_visible_content_or_trailing_colon():
+    tools = _sample_chat_tools()
+
+    assert _chat_tool_continue_trigger_reason("", [], tools) == "empty_visible_content"
+    assert _chat_tool_continue_trigger_reason("   ", [], tools) == "empty_visible_content"
+    assert _chat_tool_continue_trigger_reason("Déjame editar:", [], tools) == "visible_content_trailing_colon"
+    assert _chat_tool_continue_trigger_reason("Déjame editar el archivo", [], tools) == ""
+    assert _chat_tool_continue_trigger_reason("Let me edit the file", [], tools) == ""
+
+
+def test_chat_tool_continue_does_not_trigger_without_tools_or_with_tool_calls():
+    tools = _sample_chat_tools()
+
+    assert _chat_tool_continue_trigger_reason("", [], []) == ""
+    assert _chat_tool_continue_trigger_reason(":", [{"id": "call_1"}], tools) == ""
+
+
+def test_chat_tool_continue_repair_message_lists_available_tools():
+    repaired = _chat_tool_continue_repair_messages(
+        [{"role": "user", "content": "hazlo"}],
+        {"role": "assistant", "content": "Déjame editar:"},
+        _sample_chat_tools(),
+    )
+
+    assert repaired[-2] == {"role": "assistant", "content": "Déjame editar:"}
+    assert repaired[-1]["role"] == "user"
+    assert "Your previous assistant message ended without any tool_calls" in repaired[-1]["content"]
+    assert "you must call one of the available tools" in repaired[-1]["content"]
+    assert "exec_command" in repaired[-1]["content"]
 
 
 def test_responses_payload_does_not_convert_builtin_tools_for_legacy_chat_fallback():
@@ -57,6 +105,17 @@ def test_responses_payload_does_not_convert_builtin_tools_for_legacy_chat_fallba
     assert chat_payload["temperature"] == 0.2
     assert "tools" not in chat_payload
     assert "parallel_tool_calls" not in chat_payload
+
+
+def test_responses_internal_round_max_tokens_has_safe_default(monkeypatch):
+    monkeypatch.delenv("LLAMACPP_RESPONSES_INTERNAL_MAX_TOKENS", raising=False)
+    assert _responses_internal_round_max_tokens() == 4096
+
+    monkeypatch.setenv("LLAMACPP_RESPONSES_INTERNAL_MAX_TOKENS", "64")
+    assert _responses_internal_round_max_tokens() == 256
+
+    monkeypatch.setenv("LLAMACPP_RESPONSES_INTERNAL_MAX_TOKENS", "8192")
+    assert _responses_internal_round_max_tokens() == 8192
 
 
 def test_responses_top_level_function_tools_are_wrapped_for_chat_completions():
@@ -366,6 +425,38 @@ def test_chat_response_to_responses_payload_preserves_tool_namespace():
     ]
 
 
+def test_chat_response_to_responses_payload_strips_tool_routing_arguments():
+    payload = _chat_response_to_responses_payload(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "responses_item_id": "fc_1",
+                                "type": "function",
+                                "namespace": "mcp__chrome_devtools",
+                                "function": {
+                                    "name": "take_snapshot",
+                                    "arguments": '{"namespace":"mcp__chrome_devtools","server":"mcp__chrome_devtools","verbose":false}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+        "m",
+        {"tools": []},
+    )
+
+    assert payload["output"][0]["namespace"] == "mcp__chrome_devtools"
+    assert json.loads(payload["output"][0]["arguments"]) == {"verbose": False}
+
+
 def test_responses_function_call_history_filters_unforwarded_mcp_tools():
     chat_payload = _responses_payload_to_chat_payload(
         {
@@ -460,7 +551,42 @@ def test_responses_payload_summary_flags_images_without_logging_data():
 
     assert summary["has_images"] is True
     assert summary["input_type"] == "list"
+    assert summary["input_image_count"] == 1
+    assert summary["total_image_count"] == 1
     assert image_data not in json.dumps(summary)
+
+
+def test_sanitize_responses_tool_arguments_strips_namespace_and_server():
+    arguments, repaired = _sanitize_responses_tool_arguments(
+        "take_snapshot",
+        "mcp__chrome_devtools",
+        '{"namespace":"mcp__chrome_devtools","server":"mcp__chrome_devtools","verbose":false}',
+    )
+
+    assert repaired is True
+    assert json.loads(arguments) == {"verbose": False}
+
+
+def test_sanitize_responses_tool_arguments_normalizes_chrome_evaluate_script_body():
+    arguments, repaired = _sanitize_responses_tool_arguments(
+        "evaluate_script",
+        "mcp__chrome_devtools",
+        '{"function":"var x = 1; return x;"}',
+    )
+
+    assert repaired is True
+    assert json.loads(arguments)["function"] == "() => { var x = 1; return x; }"
+
+
+def test_sanitize_responses_tool_arguments_normalizes_chrome_evaluate_script_iife():
+    arguments, repaired = _sanitize_responses_tool_arguments(
+        "evaluate_script",
+        "mcp__chrome_devtools",
+        '{"function":"(() => document.title)()"}',
+    )
+
+    assert repaired is True
+    assert json.loads(arguments)["function"] == "() => ((() => document.title)())"
 
 
 def test_responses_payload_to_chat_payload_preserves_image_url_part():
@@ -1441,8 +1567,12 @@ def test_responses_handler_contains_kv_stable_tool_search_loop():
     assert "_chat_response_internal_tool_repair_followup_messages" in responses_source
     assert "openai_responses_tool_repair_feedback" in responses_source
     assert "openai_responses_tool_repair_empty_final" in responses_source
+    assert "openai_responses_internal_round_max_tokens_applied" in responses_source
+    assert "_responses_internal_round_max_tokens()" in responses_source
     assert "_start_responses_sse_stream" in responses_source
     assert "_write_sse_comment" in responses_source
+    assert "internal chat tool continuation repair" in responses_source
+    assert responses_source.index("internal chat tool continuation repair") < responses_source.index("self.wfile.write(b\"data: [DONE]\\n\\n\")")
 
 
 def test_responses_payload_sse_events_preserve_function_call_namespace():

@@ -36,6 +36,7 @@ from llamacpp_stack.cli import (
     build_cli_parser,
     choose_gguf_file,
     ensure_model_available,
+    ensure_catalog_mtp_drafters,
     ensure_replica_route_in_llamaswap_config,
     get_gpu_conflict_message,
     get_model_replica_config,
@@ -650,11 +651,29 @@ class InstallHelpersTest(unittest.TestCase):
             stable.symlink_to(stable)
             real = root / "llama-b8770-bin.d" / "bin" / "llama-server"
             real.parent.mkdir(parents=True)
-            real.write_text("bin", encoding="utf-8")
+            real.write_text("#!/usr/bin/env bash\necho real \"$@\"\n", encoding="utf-8")
+            real.chmod(0o755)
             result = _link_stable_binary(real, stable, dry_run=False)
             self.assertEqual(result, stable)
-            self.assertTrue(stable.is_symlink())
-            self.assertEqual(stable.resolve(), real.resolve())
+            self.assertFalse(stable.is_symlink())
+            self.assertTrue(stable.exists())
+            self.assertEqual((root / "llama-server.realpath").read_text(encoding="utf-8").strip(), str(real.resolve()))
+            output = subprocess.check_output([str(stable), "--help"], text=True).strip()
+            self.assertEqual(output, "real --help")
+
+    def test_resolve_existing_stable_target_uses_realpath_file_for_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stable = root / "llama-server"
+            real = root / "llama-b8770-bin.d" / "bin" / "llama-server"
+            real.parent.mkdir(parents=True)
+            real.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            real.chmod(0o755)
+            _link_stable_binary(real, stable, dry_run=False)
+
+            resolved = _resolve_existing_stable_target(root, stable, "llama-server")
+
+            self.assertEqual(resolved, real)
 
     def test_resolve_existing_stable_target_prefers_latest_extracted_binary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3344,6 +3363,11 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertTrue(changed)
         self.assertIn("replicas", normalized)
         self.assertEqual(normalized["replicas"]["enabled"], False)
+        self.assertIn("experimental", normalized)
+        self.assertEqual(
+            normalized["experimental"]["chat_tool_continue_repair"],
+            {"enabled": False, "max_rounds": 1},
+        )
         self.assertNotIn("example", normalized["_meta"])
         defaults = normalized["llama_server_defaults"]
         self.assertEqual(defaults["batch_size"], 4096)
@@ -4070,8 +4094,87 @@ class InstallHelpersTest(unittest.TestCase):
             model = load_catalog(catalog_path)[0]
             self.assertEqual(model.server_overrides["model_draft"], str(repo_dir / "mtp-gemma-4-31B-it.gguf"))
             self.assertEqual(model.server_overrides["spec_type"], "draft-mtp")
-            self.assertEqual(model.server_overrides["spec_draft_n_max"], 2)
+            self.assertEqual(model.server_overrides["spec_draft_n_max"], 3)
             self.assertEqual(model.server_overrides["parallel"], 1)
+
+    def test_update_backfills_mtp_drafter_for_existing_catalog_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_dir = root / "models" / "org" / "Model-MTP-GGUF"
+            model_dir.mkdir(parents=True)
+            main_model = model_dir / "model-Q4_K_M.gguf"
+            main_model.write_bytes(b"GGUF")
+            model = ManagedModel(
+                model_id="model-mtp-q4",
+                repo_id="org/Model-MTP-GGUF",
+                quant="Q4_K_M",
+                filename="model-Q4_K_M.gguf",
+                local_path=str(main_model),
+                server_overrides={},
+            )
+
+            class Sibling:
+                def __init__(self, name: str):
+                    self.rfilename = name
+                    self.size = 123
+
+            class Api:
+                def model_info(self, repo_id, token=None):
+                    return Namespace(siblings=[Sibling("model-Q4_K_M.gguf"), Sibling("mtp-model.gguf")])
+
+            def fake_download(**kwargs):
+                destination = kwargs["target_dir"] / kwargs["filename"]
+                destination.write_bytes(b"draft")
+                return str(destination)
+
+            args = Namespace(hf_token=None, models_dir=root / "models")
+            with (
+                mock.patch("llamacpp_stack.cli.HfApi", return_value=Api()),
+                mock.patch("llamacpp_stack.cli.download_hf_file", side_effect=fake_download) as download_mock,
+            ):
+                changed = ensure_catalog_mtp_drafters(
+                    [model],
+                    args,
+                    {"mtp_defaults": {"spec_draft_n_max": 3, "spec_draft_n_min": 0, "spec_draft_p_min": 0.75}},
+                )
+
+            self.assertEqual(changed, 1)
+            self.assertEqual(download_mock.call_args.kwargs["filename"], "mtp-model.gguf")
+            self.assertEqual(model.server_overrides["model_draft"], str(model_dir / "mtp-model.gguf"))
+            self.assertEqual(model.server_overrides["spec_type"], "draft-mtp")
+            self.assertEqual(model.server_overrides["spec_draft_n_max"], 3)
+
+    def test_update_migrates_existing_mtp_override_without_mtp_repo_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_dir = root / "models" / "org" / "Gemma-GGUF"
+            model_dir.mkdir(parents=True)
+            main_model = model_dir / "model-Q4_K_M.gguf"
+            draft_model = model_dir / "mtp-model.gguf"
+            main_model.write_bytes(b"GGUF")
+            draft_model.write_bytes(b"draft")
+            model = ManagedModel(
+                model_id="gemma-q4",
+                repo_id="org/Gemma-GGUF",
+                quant="Q4_K_M",
+                filename="model-Q4_K_M.gguf",
+                local_path=str(main_model),
+                server_overrides={
+                    "model_draft": str(draft_model),
+                    "spec_type": "draft-mtp",
+                    "spec_draft_n_max": 4,
+                },
+            )
+
+            args = Namespace(hf_token=None, models_dir=root / "models")
+            changed = ensure_catalog_mtp_drafters(
+                [model],
+                args,
+                {"mtp_defaults": {"spec_draft_n_max": 3, "spec_draft_n_min": 0, "spec_draft_p_min": 0.75}},
+            )
+
+            self.assertEqual(changed, 1)
+            self.assertEqual(model.server_overrides["spec_draft_n_max"], 3)
 
     def test_render_config_uses_global_idle_ttl(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5183,7 +5286,14 @@ models:
                 encoding="utf-8",
             )
             args = Namespace(server_config=server_config)
-            self.assertEqual(resolve_llama_server_defaults(args), {"flash_attn": True, "threads": 32})
+            defaults = resolve_llama_server_defaults(args)
+            self.assertTrue(defaults["flash_attn"])
+            self.assertEqual(defaults["threads"], 32)
+            self.assertNotIn("mmap", defaults)
+            self.assertNotIn("split_mode", defaults)
+            self.assertEqual(defaults["cache_ram"], 32768)
+            self.assertEqual(defaults["ctx_checkpoints"], 32)
+            self.assertEqual(defaults["checkpoint_min_step"], 1024)
 
     def test_build_llama_server_command_uses_alias_and_defaults(self) -> None:
         model = ManagedModel(

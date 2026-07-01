@@ -348,6 +348,33 @@ def _default_global_replicas_config() -> dict[str, object]:
     }
 
 
+def _default_experimental_config() -> dict[str, object]:
+    return {
+        "chat_tool_continue_repair": {
+            "enabled": False,
+            "max_rounds": 1,
+        }
+    }
+
+
+def _normalize_experimental_config(raw: object) -> dict[str, object]:
+    cfg = _default_experimental_config()
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if key == "chat_tool_continue_repair" and isinstance(value, dict):
+                repair = dict(cfg["chat_tool_continue_repair"])
+                repair.update(value)
+                repair["enabled"] = _as_bool(repair.get("enabled"), False)
+                try:
+                    repair["max_rounds"] = max(0, int(repair.get("max_rounds", 1)))
+                except Exception:
+                    repair["max_rounds"] = 1
+                cfg["chat_tool_continue_repair"] = repair
+            elif key not in cfg:
+                cfg[key] = value
+    return cfg
+
+
 def _default_api_auth_config() -> dict[str, object]:
     return {"enabled": False, "api_key": ""}
 
@@ -390,11 +417,15 @@ def normalize_server_config_payload(payload: dict[str, object]) -> tuple[dict[st
     raw_defaults = result.get("llama_server_defaults")
     if isinstance(raw_defaults, dict):
         normalized_defaults = normalize_server_overrides(raw_defaults)
+        if _migrate_llama_server_defaults(normalized_defaults):
+            changed = True
         if normalized_defaults != raw_defaults:
             result["llama_server_defaults"] = normalized_defaults
             changed = True
     else:
-        result["llama_server_defaults"] = {}
+        normalized_defaults = {}
+        _migrate_llama_server_defaults(normalized_defaults)
+        result["llama_server_defaults"] = normalized_defaults
         changed = True
     raw_replicas = result.get("replicas")
     if not isinstance(raw_replicas, dict):
@@ -418,6 +449,10 @@ def normalize_server_config_payload(payload: dict[str, object]) -> tuple[dict[st
     if result.get("api_https") != https_cfg:
         result["api_https"] = https_cfg
         changed = True
+    experimental_cfg = _normalize_experimental_config(result.get("experimental"))
+    if result.get("experimental") != experimental_cfg:
+        result["experimental"] = experimental_cfg
+        changed = True
     if "api_ctx_factor" not in result:
         result["api_ctx_factor"] = 0.5
         changed = True
@@ -433,6 +468,86 @@ def normalize_server_config_payload(payload: dict[str, object]) -> tuple[dict[st
     if before_meta != after_meta:
         changed = True
     return result, changed
+
+
+def _load_bundled_llama_server_default_values() -> dict[str, object]:
+    defaults_path = Path(__file__).resolve().parent / "bundle" / "llama_server_defaults.yaml"
+    try:
+        payload = yaml.safe_load(defaults_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    base = payload.get("default")
+    if not isinstance(base, dict):
+        base = {}
+    selected: dict[str, object] = {}
+    presets = payload.get("presets")
+    if isinstance(presets, dict):
+        gpu_count = detect_cuda_device_count()
+        for key in (str(gpu_count), gpu_count):
+            preset = presets.get(key)
+            if isinstance(preset, dict):
+                selected = dict(preset)
+                break
+    merged = dict(base)
+    merged.update(selected)
+    mtp_defaults = payload.get("mtp_defaults")
+    if isinstance(mtp_defaults, dict):
+        merged["mtp_defaults"] = dict(mtp_defaults)
+    speculative_defaults = payload.get("speculative_defaults")
+    if isinstance(speculative_defaults, dict):
+        merged.setdefault("speculative_defaults", dict(speculative_defaults))
+    return normalize_server_overrides(merged)
+
+
+def _migrate_llama_server_defaults(defaults: dict[str, object]) -> bool:
+    if not isinstance(defaults, dict):
+        return False
+    changed = False
+
+    # Retire old installer defaults only when they are still exactly the old
+    # values.  Explicit user-tuned mirostat settings remain valid overrides.
+    old_default_values = {
+        "mirostat": 2,
+        "mirostat_ent": 4.5,
+        "mirostat_lr": 0.1,
+    }
+    for key, old_value in old_default_values.items():
+        if key not in defaults:
+            continue
+        current = defaults.get(key)
+        try:
+            same = float(current) == float(old_value)
+        except Exception:
+            same = str(current).strip() == str(old_value)
+        if same:
+            defaults.pop(key, None)
+            changed = True
+
+    bundled = _load_bundled_llama_server_default_values()
+    for key, value in bundled.items():
+        if key not in defaults:
+            defaults[key] = value
+            changed = True
+        elif key == "mtp_defaults" and isinstance(value, dict):
+            target = defaults.get(key)
+            if not isinstance(target, dict):
+                defaults[key] = dict(value)
+                changed = True
+            else:
+                for sub_key, sub_value in value.items():
+                    if (
+                        sub_key == "spec_draft_n_max"
+                        and str(target.get(sub_key, "")).strip() == "2"
+                        and str(sub_value).strip() == "3"
+                    ):
+                        target[sub_key] = sub_value
+                        changed = True
+                    elif sub_key not in target:
+                        target[sub_key] = sub_value
+                        changed = True
+    return changed
 
 
 def _ensure_server_config_metadata(payload: dict[str, object]) -> dict[str, object]:
@@ -885,6 +1000,8 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
             "parallel",
             "main_gpu",
             "ctx_checkpoints",
+            "checkpoint_min_step",
+            "checkpoint_every_n_tokens",
             "cache_ram",
             "n_cpu_moe",
         }:
@@ -922,8 +1039,11 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
                 continue  # Skip: None means omit the flag
             normalized[key] = str(raw_val).strip()
             continue
-        if key in {"split_mode", "cache_type_k", "cache_type_v", "host", "model_draft", "hf_repo_draft", "reasoning_format", "chat_template_file", "chat_template", "device"}:
-            normalized[key] = str(raw_val).strip()
+        if key in {"split_mode", "cache_type_k", "cache_type_v", "host", "model_draft", "hf_repo_draft", "reasoning_format", "chat_template_file", "chat_template", "device", "chat_template_kwargs"}:
+            if key == "chat_template_kwargs" and isinstance(raw_val, dict):
+                normalized[key] = json.dumps(raw_val, ensure_ascii=False, separators=(",", ":"))
+            else:
+                normalized[key] = str(raw_val).strip()
             continue
         # Generic passthrough: include other override keys as-is so callers
         # can provide custom flags (e.g. custom_flag -> --custom-flag).
@@ -1413,7 +1533,10 @@ def _apply_mtp_server_overrides(
         "spec_draft_p_min": mtp_cfg.get("spec_draft_p_min", 0.75),
     }
     for key, value in desired.items():
-        if key not in result:
+        if key == "spec_draft_n_max" and str(result.get(key, "")).strip() in {"2", "4"} and str(value).strip() == "3":
+            result[key] = value
+            changed = True
+        elif key not in result:
             result[key] = value
             changed = True
     return result, changed
@@ -2423,6 +2546,14 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
                 cmd.extend(["--ctx-checkpoints", str(int(value))])
         except (TypeError, ValueError):
             pass
+    elif key in {"checkpoint_min_step", "checkpoint_every_n_tokens"}:
+        try:
+            if _server_supports_or_unknown(server_path, "--checkpoint-min-step"):
+                cmd.extend(["--checkpoint-min-step", str(int(value))])
+            elif _server_supports_or_unknown(server_path, "--checkpoint-every-n-tokens"):
+                cmd.extend(["--checkpoint-every-n-tokens", str(int(value))])
+        except (TypeError, ValueError):
+            pass
     elif key == "cache_ram":
         try:
             if _server_supports_or_unknown(server_path, "--cache-ram"):
@@ -2490,6 +2621,10 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
             cmd.append("--swa-full")
         elif bool_val is False and _server_supports_or_unknown(server_path, "--no-swa-full"):
             cmd.append("--no-swa-full")
+    elif key == "chat_template_kwargs":
+        sval = str(value or "").strip()
+        if sval and _server_supports_or_unknown(server_path, "--chat-template-kwargs"):
+            cmd.extend(["--chat-template-kwargs", sval])
     else:
         # Generic fallback: map unknown keys to --kebab-case and append value.
         try:
@@ -2956,23 +3091,42 @@ def _redact_large_log_value(value, *, max_string: int = 500):
     return value
 
 
-def _payload_contains_images(payload: object) -> bool:
-    def scan(value: object) -> bool:
+def _payload_image_stats(payload: object) -> dict[str, int]:
+    stats = {"input_image_count": 0, "image_url_count": 0, "data_image_count": 0}
+
+    def scan(value: object) -> None:
         if isinstance(value, dict):
             item_type = str(value.get("type") or "").strip()
-            if item_type in {"input_image", "image_url"}:
-                return True
+            is_image_item = False
+            if item_type == "input_image":
+                stats["input_image_count"] += 1
+                is_image_item = True
+            elif item_type == "image_url":
+                stats["image_url_count"] += 1
+                is_image_item = True
             image_url = value.get("image_url")
-            if isinstance(image_url, (str, dict)) and image_url:
-                return True
+            if item_type not in {"input_image", "image_url"} and isinstance(image_url, (str, dict)) and image_url:
+                stats["image_url_count"] += 1
+                is_image_item = True
             if value.get("data") and str(value.get("mime_type") or value.get("media_type") or "").startswith("image/"):
-                return True
-            return any(scan(item) for item in value.values())
+                stats["data_image_count"] += 1
+                is_image_item = True
+            if is_image_item:
+                stats["total_image_count"] = stats.get("total_image_count", 0) + 1
+            for item in value.values():
+                scan(item)
+            return
         if isinstance(value, list):
-            return any(scan(item) for item in value)
-        return False
+            for item in value:
+                scan(item)
 
-    return scan(payload)
+    scan(payload)
+    stats.setdefault("total_image_count", 0)
+    return stats
+
+
+def _payload_contains_images(payload: object) -> bool:
+    return _payload_image_stats(payload).get("total_image_count", 0) > 0
 
 
 def _summarize_api_payload_for_log(payload: dict) -> dict:
@@ -3019,8 +3173,10 @@ def _summarize_api_payload_for_log(payload: dict) -> dict:
                 ]
             tool_summaries.append(entry)
         summary["tools_sample"] = tool_summaries
-    if _payload_contains_images(payload):
+    image_stats = _payload_image_stats(payload)
+    if image_stats.get("total_image_count", 0):
         summary["has_images"] = True
+    summary.update(image_stats)
     raw_input = payload.get("input")
     if isinstance(raw_input, str):
         summary["input_type"] = "str"
@@ -7357,19 +7513,29 @@ class ResponsesToolRegistry:
         if not stripped:
             return raw_args
         starts_like_function = (
-            stripped.startswith("(")
-            or stripped.startswith("async ")
-            or stripped.startswith("function")
+            stripped.startswith("function")
+            or stripped.startswith("async function")
             or stripped.startswith("()=>")
             or stripped.startswith("() =>")
+            or stripped.startswith("async () =>")
+            or stripped.startswith("async()=>")
+            or stripped.startswith("async() =>")
         )
         if starts_like_function:
             return raw_args
-        if stripped.startswith("return ") or stripped.startswith("await "):
-            normalized = dict(raw_args)
+        normalized = dict(raw_args)
+        if (
+            stripped.startswith("return ")
+            or stripped.startswith("await ")
+            or stripped.startswith("var ")
+            or stripped.startswith("let ")
+            or stripped.startswith("const ")
+            or ";" in stripped
+        ):
             normalized["function"] = f"() => {{ {stripped} }}"
             return normalized
-        return raw_args
+        normalized["function"] = f"() => ({stripped})"
+        return normalized
 
     def _deferred_tools_named(self, name: str) -> list[ResponsesDeferredTool]:
         matches: list[ResponsesDeferredTool] = []
@@ -7625,6 +7791,45 @@ def _decode_tool_call_arguments(value: object) -> object:
         except Exception:
             return {}
     return value if isinstance(value, dict) else {}
+
+
+def _sanitize_responses_tool_arguments(name: object, namespace: object, arguments: object) -> tuple[str, bool]:
+    """Normalize tool-call arguments before exposing them as Responses events.
+
+    The Responses item already carries namespace separately. Passing namespace/server
+    inside the function arguments makes Codex try to execute tools with parameters
+    that real MCP/browser tools do not accept. This helper keeps the public
+    function_call shape stable while removing proxy-only routing metadata.
+    """
+    if isinstance(arguments, str):
+        original_text = arguments
+    elif arguments is None:
+        original_text = "{}"
+    else:
+        try:
+            original_text = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            original_text = str(arguments)
+    decoded = _decode_tool_call_arguments(arguments)
+    repaired = False
+    if not isinstance(decoded, dict):
+        return original_text, False
+    normalized = dict(decoded)
+    for routing_key in ("namespace", "server"):
+        if routing_key in normalized:
+            normalized.pop(routing_key, None)
+            repaired = True
+    if (
+        str(name or "").strip() == "evaluate_script"
+        and str(namespace or "").strip().startswith("mcp__chrome_devtools")
+    ):
+        before = normalized
+        normalized = ResponsesToolRegistry._normalize_chrome_evaluate_script_arguments(normalized)
+        if normalized != before:
+            repaired = True
+    if repaired:
+        return json.dumps(normalized, ensure_ascii=False, separators=(",", ":")), True
+    return original_text, False
 
 
 def _translate_internal_deferred_tool_calls_in_chat_response(
@@ -8231,6 +8436,15 @@ def _responses_payload_to_chat_payload(
     return upstream_payload
 
 
+def _responses_internal_round_max_tokens() -> int:
+    raw = os.environ.get("LLAMACPP_RESPONSES_INTERNAL_MAX_TOKENS", "4096")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 4096
+    return max(256, value)
+
+
 
 def _responses_tool_choice_to_chat_tool_choice(tool_choice: object) -> object:
     if not isinstance(tool_choice, dict):
@@ -8323,15 +8537,16 @@ def _chat_response_to_responses_payload(data: dict, model_name: str, request_pay
         func = tc.get("function", {})
         call_id = tc.get("call_id") or tc.get("id") or f"call_{uuid.uuid4().hex}"
         item_id = tc.get("responses_item_id") or tc.get("item_id") or (tc.get("id") if str(tc.get("id") or "").startswith("fc_") else f"fc_{uuid.uuid4().hex}")
+        namespace = tc.get("namespace") or func.get("namespace")
+        arguments, _ = _sanitize_responses_tool_arguments(func.get("name", ""), namespace, func.get("arguments", "{}"))
         output_item = {
             "id": item_id,
             "type": "function_call",
             "status": "completed",
             "call_id": call_id,
             "name": func.get("name", ""),
-            "arguments": func.get("arguments", "{}"),
+            "arguments": arguments,
         }
-        namespace = tc.get("namespace") or func.get("namespace")
         if namespace:
             output_item["namespace"] = namespace
         output_items.append(output_item)
@@ -8495,8 +8710,8 @@ def _responses_payload_sse_events(payload: dict) -> list[tuple[str, dict]]:
             item_id = str(item.get("id") or f"fc_{uuid.uuid4().hex}")
             call_id = str(item.get("call_id") or item_id)
             name = str(item.get("name") or "")
-            arguments = str(item.get("arguments") or "")
             namespace = str(item.get("namespace") or "").strip() or None
+            arguments, _ = _sanitize_responses_tool_arguments(name, namespace, item.get("arguments") or "")
             started_item = _response_function_call_item(item_id, call_id, name, "", "in_progress", namespace)
             seq += 1
             events.append(("response.output_item.added", _responses_event("response.output_item.added", seq, output_index=output_index, item=started_item)))
@@ -8540,6 +8755,140 @@ def _write_responses_sse_error(handler: BaseHTTPRequestHandler, message: str, er
     }
     _write_sse_event(handler, "response.failed", _responses_event("response.failed", seq, response=payload))
     handler.wfile.write(b"data: [DONE]\n\n")
+    handler.wfile.flush()
+
+
+def resolve_chat_tool_continue_repair_config(args = None) -> dict[str, object]:
+    raw = _load_server_config_payload(args).get("experimental")
+    cfg = _normalize_experimental_config(raw).get("chat_tool_continue_repair", {})
+    if not isinstance(cfg, dict):
+        cfg = dict(_default_experimental_config()["chat_tool_continue_repair"])
+    return cfg
+
+
+def _chat_tool_names_from_payload(tools: object, limit: int = 50) -> list[str]:
+    names: list[str] = []
+    if not isinstance(tools, list):
+        return names
+    for item in tools:
+        if not isinstance(item, dict):
+            continue
+        name = ""
+        fn = item.get("function")
+        if isinstance(fn, dict):
+            name = str(fn.get("name") or "").strip()
+        if not name:
+            name = str(item.get("name") or "").strip()
+        if name and name not in names:
+            names.append(name)
+        if len(names) >= limit:
+            break
+    return names
+
+
+def _chat_tool_continue_trigger_reason(content: object, tool_calls: object, tools: object) -> str:
+    if not isinstance(tools, list) or not tools:
+        return ""
+    has_tool_calls = bool(tool_calls)
+    if isinstance(tool_calls, list):
+        has_tool_calls = len(tool_calls) > 0
+    if has_tool_calls:
+        return ""
+    visible = str(content or "").strip()
+    if not visible:
+        return "empty_visible_content"
+    if visible.endswith(":"):
+        return "visible_content_trailing_colon"
+    return ""
+
+
+def _chat_tool_continue_repair_messages(
+    messages: list[dict],
+    assistant_message: dict,
+    tools: object,
+) -> list[dict]:
+    repaired = [dict(item) for item in messages if isinstance(item, dict)]
+    content = str(assistant_message.get("content") or "")
+    repaired.append({"role": "assistant", "content": content})
+    tool_names = _chat_tool_names_from_payload(tools)
+    tool_names_text = ", ".join(tool_names) if tool_names else "(no se pudieron resumir nombres)"
+    repaired.append(
+        {
+            "role": "user",
+            "content": (
+                "Your previous assistant message ended without any tool_calls.\n"
+                "You are in a tool-capable agent environment. If the next step requires reading files, editing files, running commands, searching, inspecting state, or using any external capability, you must call one of the available tools instead of describing the action in text.\n"
+                "Do not answer with empty visible content. Do not answer with a sentence that only sets up an action and ends with a colon.\n"
+                f"Available tool names: {tool_names_text}."
+            ),
+        }
+    )
+    return repaired
+
+
+def _chat_completion_state_from_payload(data: dict) -> dict[str, object]:
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = str(message.get("content") or "")
+    reasoning = str(message.get("reasoning_content") or message.get("reasoning") or "")
+    tool_calls = message.get("tool_calls") or []
+    return {
+        "choice": choice,
+        "message": message,
+        "content": content,
+        "reasoning": reasoning,
+        "tool_calls": tool_calls,
+        "finish_reason": choice.get("finish_reason") or "",
+    }
+
+
+def _chat_completion_state_from_sse_lines(lines: list[bytes]) -> dict[str, object]:
+    content_parts: list[str] = []
+    reasoning_len = 0
+    tool_call_chunks = 0
+    finish_reason = ""
+    for line in lines:
+        if not line or not line.startswith(b"data: ") or line == b"data: [DONE]":
+            continue
+        try:
+            chunk_data = json.loads(line[6:].decode("utf-8", errors="ignore"))
+        except Exception:
+            continue
+        choice0 = (chunk_data.get("choices") or [{}])[0]
+        delta = choice0.get("delta", {}) or {}
+        content = delta.get("content", "") or ""
+        reasoning = delta.get("reasoning_content", "") or ""
+        tool_calls = delta.get("tool_calls") or []
+        if content:
+            content_parts.append(str(content))
+        if reasoning:
+            reasoning_len += len(str(reasoning))
+        if tool_calls:
+            tool_call_chunks += len(tool_calls) if isinstance(tool_calls, list) else 1
+        if choice0.get("finish_reason"):
+            finish_reason = str(choice0.get("finish_reason") or "")
+    content = "".join(content_parts)
+    tool_calls_out: list[dict] = [{}] * tool_call_chunks if tool_call_chunks > 0 else []
+    return {
+        "message": {"role": "assistant", "content": content},
+        "content": content,
+        "reasoning": "",
+        "reasoning_len": reasoning_len,
+        "tool_calls": tool_calls_out,
+        "tool_call_chunks": tool_call_chunks,
+        "finish_reason": finish_reason,
+    }
+
+
+def _write_openai_chat_sse_lines(handler: BaseHTTPRequestHandler, lines: list[bytes], content_type: str = "text/event-stream") -> None:
+    handler.send_response(200)
+    handler.send_header("Content-Type", content_type)
+    handler.end_headers()
+    for line in lines:
+        if line:
+            handler.wfile.write(line + b"\n")
+        else:
+            handler.wfile.write(b"\n")
     handler.wfile.flush()
 
 
@@ -10002,6 +10351,12 @@ def start_ctx_metadata_server(args):
                     upstream_payload["tools"] = _flatten_responses_tools(tools_list)
             
             stream = bool(payload.get("stream"))
+            repair_cfg = resolve_chat_tool_continue_repair_config(args)
+            repair_enabled = bool(repair_cfg.get("enabled")) and bool(upstream_payload.get("tools"))
+            try:
+                repair_max_rounds = max(0, int(repair_cfg.get("max_rounds", 1)))
+            except Exception:
+                repair_max_rounds = 1
             try:
                 response = requests.post(
                     f"http://{client_host}:{int(args.public_port)}/v1/chat/completions",
@@ -10027,7 +10382,86 @@ def start_ctx_metadata_server(args):
                     status=502,
                 )
                 return
+            stream_repair_round_used = 0
             if stream:
+                if repair_enabled and repair_max_rounds > 0:
+                    current_response = response
+                    current_payload = upstream_payload
+                    current_messages = messages
+                    current_content_type = response.headers.get("Content-Type", "text/event-stream")
+                    final_buffered_lines: list[bytes] = []
+                    final_stream_state: dict[str, object] = {}
+                    stream_repair_round_used = 0
+                    while True:
+                        try:
+                            buffered_lines = list(current_response.iter_lines())
+                        except (requests.RequestException, Exception) as exc:
+                            log_api_event("openai_chat_stream_interrupted", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "error": str(exc), "router_state": replica_trace_state_for_base(model_name), "repair_round": stream_repair_round_used})
+                            if upstream_model_name:
+                                REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                            self._send_json({"error": {"message": f"upstream stream failed before repair decision: {exc}", "type": "server_error"}}, status=502)
+                            return
+                        finally:
+                            current_response.close()
+                        stream_state = _chat_completion_state_from_sse_lines(buffered_lines)
+                        trigger_reason = _chat_tool_continue_trigger_reason(
+                            stream_state.get("content"),
+                            stream_state.get("tool_calls"),
+                            upstream_payload.get("tools"),
+                        )
+                        final_buffered_lines = buffered_lines
+                        final_stream_state = stream_state
+                        if not trigger_reason:
+                            break
+                        if stream_repair_round_used >= repair_max_rounds:
+                            log_api_event("openai_chat_tool_continue_repair_exhausted", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "rounds": stream_repair_round_used, "stream": True, "visible_content_len": len(str(stream_state.get("content") or "")), "reasoning_len": int(stream_state.get("reasoning_len") or 0), "finish_reason": stream_state.get("finish_reason") or "", "trigger_reason": trigger_reason})
+                            break
+                        log_api_event("openai_chat_tool_continue_repair_triggered", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "stream": True, "visible_content_len": len(str(stream_state.get("content") or "")), "reasoning_len": int(stream_state.get("reasoning_len") or 0), "finish_reason": stream_state.get("finish_reason") or "", "trigger_reason": trigger_reason})
+                        stream_repair_round_used += 1
+                        repair_payload = dict(upstream_payload)
+                        repair_payload["stream"] = True
+                        current_messages = _chat_tool_continue_repair_messages(
+                            current_messages,
+                            stream_state.get("message") if isinstance(stream_state.get("message"), dict) else {"role": "assistant", "content": ""},
+                            upstream_payload.get("tools"),
+                        )
+                        repair_payload["messages"] = current_messages
+                        log_api_event("openai_chat_tool_continue_repair_round", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "round": stream_repair_round_used, "stream": True, "trigger_reason": trigger_reason})
+                        try:
+                            current_response = requests.post(
+                                f"http://{client_host}:{int(args.public_port)}/v1/chat/completions",
+                                data=json.dumps(repair_payload).encode("utf-8"),
+                                headers={"Content-Type": "application/json"},
+                                timeout=(60, 600),
+                                stream=True,
+                            )
+                            current_content_type = current_response.headers.get("Content-Type", "text/event-stream")
+                            log_api_event("openai_chat_upstream_headers", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "affinity_key": affinity_key, "status": current_response.status_code, "wait_ms": _elapsed_ms(started_at), "stream": True, "repair_round": stream_repair_round_used})
+                        except requests.RequestException as exc:
+                            log_api_event("openai_chat_upstream_network_error", {"request_id": request_id, "error": str(exc), "payload": _summarize_api_payload_for_log(repair_payload), "router_state": replica_trace_state_for_base(model_name), "repair_round": stream_repair_round_used})
+                            if upstream_model_name:
+                                REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                            self._send_json({"error": {"message": f"upstream unavailable during repair: {exc}", "type": "server_error"}}, status=502)
+                            return
+                        if current_response.status_code >= 400:
+                            body_text = current_response.text[:4000]
+                            log_api_event("openai_chat_upstream_error", {"request_id": request_id, "status": current_response.status_code, "body": body_text, "payload": _summarize_api_payload_for_log(repair_payload), "router_state": replica_trace_state_for_base(model_name), "repair_round": stream_repair_round_used})
+                            if upstream_model_name:
+                                REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                            self._send_json({"error": {"message": f"upstream unavailable during repair: HTTP {current_response.status_code}: {body_text[:1000]}", "type": "server_error"}}, status=502)
+                            return
+                    mark_model_activity(model_name, "openai_chat", "stream_closed")
+                    if upstream_model_name:
+                        REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
+                    _write_openai_chat_sse_lines(self, final_buffered_lines, current_content_type)
+                    final_content = str(final_stream_state.get("content") or "")
+                    final_reasoning_len = int(final_stream_state.get("reasoning_len") or 0)
+                    final_tool_call_chunks = int(final_stream_state.get("tool_call_chunks") or 0)
+                    reasoning_only_final = bool(final_reasoning_len) and not final_content and not final_stream_state.get("tool_calls")
+                    log_api_event("openai_chat_total", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": True, "visible_content_len": len(final_content), "reasoning_len": final_reasoning_len, "tool_call_chunks": final_tool_call_chunks, "finish_reason": final_stream_state.get("finish_reason") or "", "reasoning_only_final": reasoning_only_final, "repair_rounds": stream_repair_round_used, "router_state": replica_trace_state_for_base(model_name)})
+                    if reasoning_only_final:
+                        log_api_event("openai_chat_reasoning_only_final", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "reasoning_len": final_reasoning_len, "finish_reason": final_stream_state.get("finish_reason") or ""})
+                    return
                 self.send_response(200)
                 self.send_header("Content-Type", response.headers.get("Content-Type", "text/event-stream"))
                 self.end_headers()
@@ -10057,6 +10491,11 @@ def start_ctx_metadata_server(args):
                 heartbeat_thread.start()
 
                 first_chunk_logged = False
+                stream_visible_content_len = 0
+                stream_reasoning_len = 0
+                stream_tool_call_chunks = 0
+                stream_finish_reason = ""
+                stream_visible_content_parts: list[str] = []
                 try:
                     for line in response.iter_lines():
                         with write_lock:
@@ -10068,15 +10507,29 @@ def start_ctx_metadata_server(args):
                                 if line.startswith(b"data: ") and line != b"data: [DONE]":
                                     try:
                                         chunk_data = json.loads(line[6:].decode("utf-8", errors="ignore"))
-                                        delta = chunk_data.get("choices", [{}])[0].get("delta", {})
-                                        content = delta.get("content", "")
-                                        reasoning = delta.get("reasoning_content", "")
-                                        if content or reasoning:
+                                        choice0 = (chunk_data.get("choices") or [{}])[0]
+                                        delta = choice0.get("delta", {}) or {}
+                                        content = delta.get("content", "") or ""
+                                        reasoning = delta.get("reasoning_content", "") or ""
+                                        tool_calls = delta.get("tool_calls") or []
+                                        finish_reason = choice0.get("finish_reason")
+                                        if finish_reason:
+                                            stream_finish_reason = str(finish_reason)
+                                        if content:
+                                            stream_visible_content_len += len(str(content))
+                                            stream_visible_content_parts.append(str(content))
+                                        if reasoning:
+                                            stream_reasoning_len += len(str(reasoning))
+                                        if tool_calls:
+                                            stream_tool_call_chunks += len(tool_calls) if isinstance(tool_calls, list) else 1
+                                        if content or reasoning or tool_calls or finish_reason:
                                             log_api_event("openai_chat_stream_chunk_received", {
                                                 "request_id": request_id,
-                                                "content_len": len(content),
-                                                "reasoning_len": len(reasoning),
-                                                "preview": (content or reasoning)[:50]
+                                                "content_len": len(str(content)),
+                                                "reasoning_len": len(str(reasoning)),
+                                                "tool_call_chunks": len(tool_calls) if isinstance(tool_calls, list) else (1 if tool_calls else 0),
+                                                "finish_reason": finish_reason or "",
+                                                "preview": (str(content) or str(reasoning))[:50]
                                             })
                                     except Exception:
                                         pass
@@ -10095,7 +10548,14 @@ def start_ctx_metadata_server(args):
                     mark_model_activity(model_name, "openai_chat", "stream_closed")
                     if upstream_model_name:
                         REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
-                    log_api_event("openai_chat_total", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": True, "router_state": replica_trace_state_for_base(model_name)})
+                    reasoning_only_final = stream_reasoning_len > 0 and stream_visible_content_len == 0 and stream_tool_call_chunks == 0
+                    log_api_event("openai_chat_total", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": True, "visible_content_len": stream_visible_content_len, "reasoning_len": stream_reasoning_len, "tool_call_chunks": stream_tool_call_chunks, "finish_reason": stream_finish_reason, "reasoning_only_final": reasoning_only_final, "router_state": replica_trace_state_for_base(model_name)})
+                    if reasoning_only_final:
+                        log_api_event("openai_chat_reasoning_only_final", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "reasoning_len": stream_reasoning_len, "finish_reason": stream_finish_reason})
+                    if stream_repair_round_used:
+                        exhausted_reason = _chat_tool_continue_trigger_reason("".join(stream_visible_content_parts), [] if stream_tool_call_chunks == 0 else [{}], upstream_payload.get("tools"))
+                        if exhausted_reason:
+                            log_api_event("openai_chat_tool_continue_repair_exhausted", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "rounds": stream_repair_round_used, "stream": True, "visible_content_len": stream_visible_content_len, "reasoning_len": stream_reasoning_len, "finish_reason": stream_finish_reason, "trigger_reason": exhausted_reason})
                 return
             try:
                 data = response.json()
@@ -10105,10 +10565,76 @@ def start_ctx_metadata_server(args):
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 self._send_json({"error": {"message": f"upstream invalid response: {exc}", "type": "server_error"}}, status=502)
                 return
+            repair_rounds_used = 0
+            if repair_enabled and repair_max_rounds > 0:
+                while repair_rounds_used < repair_max_rounds:
+                    state = _chat_completion_state_from_payload(data)
+                    trigger_reason = _chat_tool_continue_trigger_reason(
+                        state.get("content"),
+                        state.get("tool_calls"),
+                        upstream_payload.get("tools"),
+                    )
+                    if not trigger_reason:
+                        break
+                    repair_rounds_used += 1
+                    log_api_event("openai_chat_tool_continue_repair_triggered", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "stream": False, "visible_content_len": len(str(state.get("content") or "")), "reasoning_len": len(str(state.get("reasoning") or "")), "finish_reason": state.get("finish_reason") or "", "trigger_reason": trigger_reason})
+                    repair_payload = dict(upstream_payload)
+                    repair_payload["stream"] = False
+                    repair_payload["messages"] = _chat_tool_continue_repair_messages(
+                        messages,
+                        state.get("message") if isinstance(state.get("message"), dict) else {"role": "assistant", "content": ""},
+                        upstream_payload.get("tools"),
+                    )
+                    log_api_event("openai_chat_tool_continue_repair_round", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "round": repair_rounds_used, "stream": False, "trigger_reason": trigger_reason})
+                    try:
+                        repair_response = requests.post(
+                            f"http://{client_host}:{int(args.public_port)}/v1/chat/completions",
+                            data=json.dumps(repair_payload).encode("utf-8"),
+                            headers={"Content-Type": "application/json"},
+                            timeout=(60, 600),
+                            stream=False,
+                        )
+                        log_api_event("openai_chat_upstream_headers", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "affinity_key": affinity_key, "status": repair_response.status_code, "wait_ms": _elapsed_ms(started_at), "stream": False, "repair_round": repair_rounds_used})
+                    except requests.RequestException as exc:
+                        log_api_event("openai_chat_upstream_network_error", {"request_id": request_id, "error": str(exc), "payload": _summarize_api_payload_for_log(repair_payload), "router_state": replica_trace_state_for_base(model_name), "repair_round": repair_rounds_used})
+                        if upstream_model_name:
+                            REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                        self._send_json({"error": {"message": f"upstream unavailable during repair: {exc}", "type": "server_error"}}, status=502)
+                        return
+                    if repair_response.status_code >= 400:
+                        body_text = repair_response.text[:4000]
+                        log_api_event("openai_chat_upstream_error", {"request_id": request_id, "status": repair_response.status_code, "body": body_text, "payload": _summarize_api_payload_for_log(repair_payload), "router_state": replica_trace_state_for_base(model_name), "repair_round": repair_rounds_used})
+                        if upstream_model_name:
+                            REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                        self._send_json({"error": {"message": f"upstream unavailable during repair: HTTP {repair_response.status_code}: {body_text[:1000]}", "type": "server_error"}}, status=502)
+                        return
+                    try:
+                        data = repair_response.json()
+                    except Exception as exc:
+                        log_api_event("openai_chat_upstream_invalid_json", {"request_id": request_id, "error": str(exc), "payload": _summarize_api_payload_for_log(repair_payload), "body": repair_response.text[:4000], "router_state": replica_trace_state_for_base(model_name), "repair_round": repair_rounds_used})
+                        if upstream_model_name:
+                            REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                        self._send_json({"error": {"message": f"upstream invalid response during repair: {exc}", "type": "server_error"}}, status=502)
+                        return
+                final_state = _chat_completion_state_from_payload(data)
+                exhausted_reason = _chat_tool_continue_trigger_reason(
+                    final_state.get("content"),
+                    final_state.get("tool_calls"),
+                    upstream_payload.get("tools"),
+                )
+                if exhausted_reason and repair_rounds_used >= repair_max_rounds:
+                    log_api_event("openai_chat_tool_continue_repair_exhausted", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "rounds": repair_rounds_used, "stream": False, "visible_content_len": len(str(final_state.get("content") or "")), "reasoning_len": len(str(final_state.get("reasoning") or "")), "finish_reason": final_state.get("finish_reason") or "", "trigger_reason": exhausted_reason})
+            choice = (data.get("choices") or [{}])[0]
+            message = choice.get("message") or {}
+            nonstream_content = str(message.get("content") or "")
+            nonstream_reasoning = str(message.get("reasoning_content") or message.get("reasoning") or "")
+            nonstream_tool_calls = message.get("tool_calls") or []
+            nonstream_reasoning_only = bool(nonstream_reasoning) and not nonstream_content and not nonstream_tool_calls
             if upstream_model_name:
                 REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
-            log_api_event("openai_chat_total", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": False, "router_state": replica_trace_state_for_base(model_name)})
-            choice = (data.get("choices") or [{}])[0]
+            log_api_event("openai_chat_total", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": False, "visible_content_len": len(nonstream_content), "reasoning_len": len(nonstream_reasoning), "tool_calls_count": len(nonstream_tool_calls) if isinstance(nonstream_tool_calls, list) else (1 if nonstream_tool_calls else 0), "finish_reason": choice.get("finish_reason") or "", "reasoning_only_final": nonstream_reasoning_only, "router_state": replica_trace_state_for_base(model_name)})
+            if nonstream_reasoning_only:
+                log_api_event("openai_chat_reasoning_only_final", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "reasoning_len": len(nonstream_reasoning), "finish_reason": choice.get("finish_reason") or ""})
             final_payload = {
                 "id": data.get("id") or f"chatcmpl-{uuid.uuid4().hex}",
                 "object": data.get("object") or "chat.completion",
@@ -10385,6 +10911,12 @@ def start_ctx_metadata_server(args):
                     {"model": model_name, "request_id": request_id, "configured_mmproj": str(model_entry.mmproj_path or "")},
                 )
             stream = bool(payload.get("stream"))
+            chat_continue_repair_cfg = resolve_chat_tool_continue_repair_config(args)
+            chat_continue_repair_enabled = bool(chat_continue_repair_cfg.get("enabled")) and bool(upstream_payload.get("tools"))
+            try:
+                chat_continue_repair_max_rounds = max(0, int(chat_continue_repair_cfg.get("max_rounds", 1)))
+            except Exception:
+                chat_continue_repair_max_rounds = 1
             if tool_registry is not None and tool_registry.has_deferred_tools:
                 extra_messages: list[dict] = []
                 accumulated_usage: dict | None = None
@@ -10423,6 +10955,18 @@ def start_ctx_metadata_server(args):
                     # clients we collect the final response and emit Responses SSE
                     # only after internal tool_search rounds have completed.
                     internal_payload["stream"] = False
+                    if extra_messages and "max_tokens" not in internal_payload:
+                        internal_payload["max_tokens"] = _responses_internal_round_max_tokens()
+                        log_api_event(
+                            "openai_responses_internal_round_max_tokens_applied",
+                            {
+                                "model": model_name,
+                                "request_id": request_id,
+                                "round": rounds,
+                                "extra_messages": len(extra_messages),
+                                "max_tokens": internal_payload["max_tokens"],
+                            },
+                        )
                     if stream and sse_started:
                         _write_sse_comment(self, f"internal round {rounds}; repair_rounds={tool_repair_rounds}; extra_messages={len(extra_messages)}")
                     log_api_event(
@@ -10930,23 +11474,247 @@ def start_ctx_metadata_server(args):
                                                 ),
                                             )
 
-                                        if args_delta and tc_state["started"] and not tc_state["blocked"]:
-                                            stream_event(
-                                                "response.function_call_arguments.delta",
-                                                _responses_event(
-                                                    "response.function_call_arguments.delta",
-                                                    next_sequence(),
-                                                    item_id=tc_state["item_id"],
-                                                    output_index=tc_state["output_index"],
-                                                    delta=args_delta,
-                                                ),
-                                            )
-
                                 mark_model_activity(model_name, f"openai_responses:{request_id}", "stream_chunk", log=False)
                             except Exception as exc:
                                 log_api_event("openai_responses_stream_parse_error", {"request_id": request_id, "error": str(exc), "data_len": len(data_bytes)})
                                 continue
                     
+                    responses_stream_repair_rounds = 0
+                    if chat_continue_repair_enabled and chat_continue_repair_max_rounds > 0:
+                        visible_tool_calls_started = any(
+                            bool(tc_info.get("started")) and not bool(tc_info.get("blocked"))
+                            for tc_info in active_tool_calls.values()
+                            if isinstance(tc_info, dict)
+                        )
+                        trigger_reason = _chat_tool_continue_trigger_reason(
+                            full_content,
+                            [{}] if visible_tool_calls_started else [],
+                            upstream_payload.get("tools"),
+                        )
+                        if trigger_reason:
+                            responses_stream_repair_rounds = 1
+                            log_api_event(
+                                "openai_chat_tool_continue_repair_triggered",
+                                {
+                                    "request_id": request_id,
+                                    "model": model_name,
+                                    "upstream_model": upstream_model_name,
+                                    "stream": True,
+                                    "api": "responses",
+                                    "visible_content_len": len(full_content),
+                                    "reasoning_len": len(full_reasoning),
+                                    "finish_reason": "stop",
+                                    "trigger_reason": trigger_reason,
+                                },
+                            )
+                            with write_lock:
+                                _write_sse_comment(self, "internal chat tool continuation repair")
+                            repair_payload = dict(upstream_payload)
+                            repair_payload["stream"] = False
+                            repair_payload["messages"] = _chat_tool_continue_repair_messages(
+                                upstream_payload.get("messages") if isinstance(upstream_payload.get("messages"), list) else [],
+                                {"role": "assistant", "content": full_content},
+                                upstream_payload.get("tools"),
+                            )
+                            log_api_event(
+                                "openai_chat_tool_continue_repair_round",
+                                {
+                                    "request_id": request_id,
+                                    "model": model_name,
+                                    "upstream_model": upstream_model_name,
+                                    "round": responses_stream_repair_rounds,
+                                    "stream": True,
+                                    "api": "responses",
+                                    "trigger_reason": trigger_reason,
+                                },
+                            )
+                            try:
+                                repair_response = requests.post(
+                                    f"http://{client_host}:{int(args.public_port)}/v1/chat/completions",
+                                    data=json.dumps(repair_payload).encode("utf-8"),
+                                    headers={"Content-Type": "application/json"},
+                                    timeout=(60, 600),
+                                    stream=False,
+                                )
+                                log_api_event(
+                                    "openai_responses_upstream_headers",
+                                    {
+                                        "model": model_name,
+                                        "request_id": request_id,
+                                        "status": repair_response.status_code,
+                                        "wait_ms": _elapsed_ms(started_at),
+                                        "stream": False,
+                                        "repair_round": responses_stream_repair_rounds,
+                                    },
+                                )
+                            except requests.RequestException as exc:
+                                log_api_event(
+                                    "openai_chat_upstream_network_error",
+                                    {
+                                        "request_id": request_id,
+                                        "error": str(exc),
+                                        "payload": _summarize_api_payload_for_log(repair_payload),
+                                        "router_state": replica_trace_state_for_base(model_name),
+                                        "repair_round": responses_stream_repair_rounds,
+                                        "api": "responses",
+                                    },
+                                )
+                                repair_response = None
+                            if repair_response is not None and repair_response.status_code < 400:
+                                try:
+                                    repair_data = repair_response.json()
+                                except Exception as exc:
+                                    log_api_event(
+                                        "openai_chat_upstream_invalid_json",
+                                        {
+                                            "request_id": request_id,
+                                            "error": str(exc),
+                                            "payload": _summarize_api_payload_for_log(repair_payload),
+                                            "body": repair_response.text[:4000],
+                                            "router_state": replica_trace_state_for_base(model_name),
+                                            "repair_round": responses_stream_repair_rounds,
+                                            "api": "responses",
+                                        },
+                                    )
+                                    repair_data = {}
+                                repair_state = _chat_completion_state_from_payload(repair_data) if isinstance(repair_data, dict) else {}
+                                repair_content = str(repair_state.get("content") or "")
+                                repair_tool_calls = repair_state.get("tool_calls") or []
+                                if repair_content:
+                                    with write_lock:
+                                        if not message_item_started[0]:
+                                            msg_output_index[0] = allocate_output_index()
+                                            message_item_started[0] = True
+                                            stream_event(
+                                                "response.output_item.added",
+                                                _responses_event(
+                                                    "response.output_item.added",
+                                                    next_sequence(),
+                                                    output_index=msg_output_index[0],
+                                                    item=_response_message_item(msg_item_id, "", "in_progress"),
+                                                ),
+                                            )
+                                            stream_event(
+                                                "response.content_part.added",
+                                                _responses_event(
+                                                    "response.content_part.added",
+                                                    next_sequence(),
+                                                    item_id=msg_item_id,
+                                                    output_index=msg_output_index[0],
+                                                    content_index=0,
+                                                    part={"type": "output_text", "text": "", "annotations": []},
+                                                ),
+                                            )
+                                        full_content += repair_content
+                                        stream_event(
+                                            "response.output_text.delta",
+                                            _responses_event(
+                                                "response.output_text.delta",
+                                                next_sequence(),
+                                                item_id=msg_item_id,
+                                                output_index=msg_output_index[0],
+                                                content_index=0,
+                                                delta=repair_content,
+                                                logprobs=[],
+                                            ),
+                                        )
+                                if isinstance(repair_tool_calls, list):
+                                    with write_lock:
+                                        for tc in repair_tool_calls:
+                                            if not isinstance(tc, dict):
+                                                continue
+                                            function_payload = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+                                            legacy_name = str(function_payload.get("name") or "").strip()
+                                            if not legacy_name:
+                                                continue
+                                            mapped_tool = namespace_tool_map.get(legacy_name, {}) if isinstance(namespace_tool_map, dict) else {}
+                                            responses_name = str(mapped_tool.get("name") or legacy_name)
+                                            namespace = str(mapped_tool.get("namespace") or "") or None
+                                            blocked = bool(allowed_legacy_tool_names and legacy_name not in allowed_legacy_tool_names)
+                                            item_id = str(tc.get("responses_item_id") or tc.get("id") or f"fc_{uuid.uuid4().hex}")
+                                            call_id = str(tc.get("call_id") or tc.get("id") or f"call_{uuid.uuid4().hex}")
+                                            output_index = allocate_output_index()
+                                            tc_state = {
+                                                "item_id": item_id,
+                                                "call_id": call_id,
+                                                "name": legacy_name,
+                                                "responses_name": responses_name,
+                                                "namespace": namespace or "",
+                                                "args_buf": str(function_payload.get("arguments") or ""),
+                                                "output_index": output_index,
+                                                "started": not blocked,
+                                                "blocked": blocked,
+                                            }
+                                            active_tool_calls[f"repair_{len(active_tool_calls)}"] = tc_state
+                                            if blocked:
+                                                log_api_event(
+                                                    "openai_responses_tool_call_blocked_not_forwarded",
+                                                    {
+                                                        "request_id": request_id,
+                                                        "name": legacy_name,
+                                                        "call_id": call_id,
+                                                        "allowed_tool_names": sorted(name for name in allowed_legacy_tool_names if name)[:80],
+                                                        "repair_round": responses_stream_repair_rounds,
+                                                    },
+                                                )
+                                                continue
+                                            stream_event(
+                                                "response.output_item.added",
+                                                _responses_event(
+                                                    "response.output_item.added",
+                                                    next_sequence(),
+                                                    output_index=output_index,
+                                                    item=_response_function_call_item(
+                                                        item_id,
+                                                        call_id,
+                                                        responses_name,
+                                                        "",
+                                                        "in_progress",
+                                                        namespace,
+                                                    ),
+                                                ),
+                                            )
+                                repaired_tool_calls_started = any(
+                                    bool(tc_info.get("started")) and not bool(tc_info.get("blocked"))
+                                    for tc_info in active_tool_calls.values()
+                                    if isinstance(tc_info, dict)
+                                )
+                                exhausted_reason = _chat_tool_continue_trigger_reason(
+                                    full_content,
+                                    [{}] if repaired_tool_calls_started else [],
+                                    upstream_payload.get("tools"),
+                                )
+                                if exhausted_reason:
+                                    log_api_event(
+                                        "openai_chat_tool_continue_repair_exhausted",
+                                        {
+                                            "request_id": request_id,
+                                            "model": model_name,
+                                            "upstream_model": upstream_model_name,
+                                            "rounds": responses_stream_repair_rounds,
+                                            "stream": True,
+                                            "api": "responses",
+                                            "visible_content_len": len(full_content),
+                                            "reasoning_len": len(full_reasoning),
+                                            "finish_reason": "stop",
+                                            "trigger_reason": exhausted_reason,
+                                        },
+                                    )
+                            elif repair_response is not None:
+                                body_text = repair_response.text[:4000]
+                                log_api_event(
+                                    "openai_chat_upstream_error",
+                                    {
+                                        "request_id": request_id,
+                                        "status": repair_response.status_code,
+                                        "body": body_text,
+                                        "payload": _summarize_api_payload_for_log(repair_payload),
+                                        "router_state": replica_trace_state_for_base(model_name),
+                                        "repair_round": responses_stream_repair_rounds,
+                                        "api": "responses",
+                                    },
+                                )
+
                     # End of stream
                     with write_lock:
                         if full_reasoning and reasoning_item_started[0]:
@@ -11021,6 +11789,40 @@ def start_ctx_metadata_server(args):
                                     },
                                 )
                                 continue
+                            responses_name = str(tc_info.get("responses_name") or tc_info["name"] or "")
+                            namespace = str(tc_info.get("namespace") or "") or None
+                            raw_arguments = str(tc_info.get("args_buf") or "")
+                            final_arguments, arguments_sanitized = _sanitize_responses_tool_arguments(
+                                responses_name,
+                                namespace,
+                                raw_arguments,
+                            )
+                            if arguments_sanitized:
+                                log_api_event(
+                                    "openai_responses_stream_tool_arguments_sanitized",
+                                    {
+                                        "request_id": request_id,
+                                        "item_id": tc_info["item_id"],
+                                        "call_id": tc_info["call_id"],
+                                        "name": responses_name,
+                                        "namespace": namespace or "",
+                                        "raw_arguments_len": len(raw_arguments),
+                                        "raw_arguments_preview": raw_arguments[:500],
+                                        "final_arguments_len": len(final_arguments),
+                                        "final_arguments_preview": final_arguments[:500],
+                                    },
+                                )
+                            if final_arguments:
+                                stream_event(
+                                    "response.function_call_arguments.delta",
+                                    _responses_event(
+                                        "response.function_call_arguments.delta",
+                                        next_sequence(),
+                                        item_id=tc_info["item_id"],
+                                        output_index=tc_info["output_index"],
+                                        delta=final_arguments,
+                                    ),
+                                )
                             stream_event(
                                 "response.function_call_arguments.done",
                                 _responses_event(
@@ -11028,8 +11830,8 @@ def start_ctx_metadata_server(args):
                                     next_sequence(),
                                     item_id=tc_info["item_id"],
                                     output_index=tc_info["output_index"],
-                                    name=str(tc_info.get("responses_name") or tc_info["name"] or ""),
-                                    arguments=tc_info["args_buf"],
+                                    name=responses_name,
+                                    arguments=final_arguments,
                                 ),
                             )
                             stream_event(
@@ -11041,10 +11843,10 @@ def start_ctx_metadata_server(args):
                                     item=_response_function_call_item(
                                         tc_info["item_id"],
                                         tc_info["call_id"],
-                                        str(tc_info.get("responses_name") or tc_info["name"] or ""),
-                                        tc_info["args_buf"],
+                                        responses_name,
+                                        final_arguments,
                                         "completed",
-                                        str(tc_info.get("namespace") or "") or None,
+                                        namespace,
                                     ),
                                 ),
                             )
@@ -11054,11 +11856,11 @@ def start_ctx_metadata_server(args):
                                     "request_id": request_id,
                                     "item_id": tc_info["item_id"],
                                     "call_id": tc_info["call_id"],
-                                    "name": str(tc_info.get("responses_name") or tc_info["name"] or ""),
-                                    "namespace": str(tc_info.get("namespace") or ""),
+                                    "name": responses_name,
+                                    "namespace": namespace or "",
                                     "legacy_name": str(tc_info["name"] or ""),
-                                    "arguments_len": len(tc_info["args_buf"]),
-                                    "arguments_preview": tc_info["args_buf"][:500],
+                                    "arguments_len": len(final_arguments),
+                                    "arguments_preview": final_arguments[:500],
                                     "output_index": tc_info["output_index"],
                                 },
                             )
@@ -11067,13 +11869,13 @@ def start_ctx_metadata_server(args):
                                 "responses_item_id": tc_info["item_id"],
                                 "type": "function",
                                 "function": {
-                                    "name": tc_info.get("responses_name") or tc_info["name"],
-                                    "arguments": tc_info["args_buf"],
+                                    "name": responses_name,
+                                    "arguments": final_arguments,
                                 },
                             }
-                            if tc_info.get("namespace"):
-                                tc_entry["namespace"] = str(tc_info.get("namespace") or "")
-                                tc_entry["function"]["namespace"] = str(tc_info.get("namespace") or "")
+                            if namespace:
+                                tc_entry["namespace"] = namespace
+                                tc_entry["function"]["namespace"] = namespace
                             tc_list.append(tc_entry)
                             
                         final_message = {"role": "assistant", "content": full_content}
@@ -13484,6 +14286,74 @@ def delete_downloaded_files(target_dir: Path, filenames: list[str]):
                     pass
     return removed
 
+
+def ensure_catalog_mtp_drafters(
+    models: list[ManagedModel],
+    args,
+    server_defaults: dict[str, object] | None,
+    progress_callback=None,
+) -> int:
+    """Backfill MTP drafter files/flags for already-installed local GGUF models.
+
+    llama.cpp can auto-discover a repo-root MTP drafter when launched with
+    `-hf`, but superserver launches downloaded GGUFs with `--model`.  Existing
+    installs therefore need an explicit local drafter file and `--model-draft`.
+    """
+    token = getattr(args, "hf_token", None) or os.environ.get("HF_TOKEN")
+    api = HfApi()
+    changed = 0
+    size_cache: dict[str, dict[str, int | None]] = {}
+    for model in models:
+        repo_id = str(getattr(model, "repo_id", "") or "").strip()
+        filename = str(getattr(model, "filename", "") or "").strip()
+        overrides = normalize_server_overrides(getattr(model, "server_overrides", {}) or {})
+        draft_path = str(overrides.get("model_draft") or "").strip()
+        haystack = " ".join([repo_id, filename, str(getattr(model, "model_id", "") or "")]).lower()
+        if not repo_id or not filename or filename == "hf-native" or ("mtp" not in haystack and not draft_path):
+            continue
+        if draft_path and Path(draft_path).exists():
+            updated, mtp_changed = _apply_mtp_server_overrides(overrides, draft_path, server_defaults)
+            if mtp_changed or updated != overrides:
+                model.server_overrides = updated
+                changed += 1
+            continue
+        try:
+            mtp_filename = _detect_mtp_drafter_file(api, repo_id, token, filename)
+        except Exception as exc:
+            log_api_event("mtp_drafter_detect_failed", {"model": model.model_id, "repo_id": repo_id, "error": str(exc)})
+            continue
+        if not mtp_filename:
+            continue
+        target_dir = Path(model.local_path).parent if model.local_path else Path(getattr(args, "models_dir", DEFAULT_MODELS_DIR)) / repo_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        local_path = target_dir / mtp_filename
+        if not local_path.exists():
+            try:
+                if repo_id not in size_cache:
+                    size_cache[repo_id] = _repo_sibling_sizes(api, repo_id, token)
+                download_hf_file(
+                    repo_id=repo_id,
+                    filename=mtp_filename,
+                    token=token,
+                    target_dir=target_dir,
+                    label=f"MTP drafter {Path(mtp_filename).name}",
+                    progress_callback=progress_callback,
+                    expected_size=size_cache.get(repo_id, {}).get(mtp_filename),
+                )
+            except Exception as exc:
+                log_api_event("mtp_drafter_download_failed", {"model": model.model_id, "repo_id": repo_id, "filename": mtp_filename, "error": str(exc)})
+                continue
+        updated, mtp_changed = _apply_mtp_server_overrides(overrides, local_path, server_defaults)
+        if mtp_changed or updated != overrides:
+            model.server_overrides = updated
+            changed += 1
+            _emit_message(
+                f"Detected MTP drafter for {model.model_id}: {mtp_filename}; enabling draft-mtp.",
+                progress_callback,
+            )
+    return changed
+
+
 def update_config(args, progress_callback = None):
     # Always migrate/canonicalize the global server config on update, including
     # when update is executed inside the manager daemon rather than via main().
@@ -13801,6 +14671,9 @@ def update_config(args, progress_callback = None):
         else:
             updated_ctx = 0
             missing_ctx = 0
+    mtp_updated = ensure_catalog_mtp_drafters(target_models, args, resolve_llama_server_defaults(args), progress_callback=progress_callback)
+    if mtp_updated:
+        _emit_message(f"MTP drafter configuration updated for {mtp_updated} model(s).", progress_callback)
     save_catalog(args.catalog, catalog)
     replica_defaults = resolve_global_replica_config(args)
     render_llamaswap_config(
@@ -14094,9 +14967,9 @@ def start_catalog_auto_update_watch(args, *, poll_s: float = 2.0, debounce_s: fl
             except Exception as exc:
                 log_api_event("auto_update_watch_error", {"error": str(exc)})
             if stop_event is not None:
-                stop_event.wait(max(0.5, poll_s))
+                stop_event.wait(max(0.01, poll_s))
             else:
-                time.sleep(max(0.5, poll_s))
+                time.sleep(max(0.01, poll_s))
 
     thread = threading.Thread(target=loop, daemon=True)
     thread.start()

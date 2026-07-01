@@ -29,6 +29,76 @@ def test_normalize_server_overrides_preserves_fit_keys():
     assert normalized["fitc"] == 131072
 
 
+def test_normalize_server_overrides_preserves_long_context_cache_keys():
+    normalized = cli.normalize_server_overrides(
+        {
+            "cache-ram": "32768",
+            "ctx-checkpoints": "32",
+            "checkpoint-every-n-tokens": "1024",
+            "chat-template-kwargs": {"preserve_thinking": True},
+        }
+    )
+
+    assert normalized["cache_ram"] == 32768
+    assert normalized["ctx_checkpoints"] == 32
+    assert normalized["checkpoint_every_n_tokens"] == 1024
+    assert normalized["chat_template_kwargs"] == '{"preserve_thinking":true}'
+
+
+def test_build_command_emits_long_context_cache_flags(monkeypatch):
+    monkeypatch.setattr(cli, "_server_supports_or_unknown", lambda _server_path, _flag: True)
+    model = cli.ManagedModel(
+        model_id="test",
+        repo_id="test/repo",
+        quant=None,
+        filename="model.gguf",
+        local_path="/tmp/model.gguf",
+        ctx_size=4096,
+        tensor_split="1",
+        server_overrides={
+            "cache_ram": 32768,
+            "ctx_checkpoints": 32,
+            "checkpoint_every_n_tokens": 1024,
+            "chat_template_kwargs": {"preserve_thinking": True},
+        },
+    )
+
+    cmd = cli.build_llama_server_command(model, Path("/bin/llama-server"), port="12345")
+    joined = " ".join(cmd)
+
+    assert "--cache-ram 32768" in joined
+    assert "--ctx-checkpoints 32" in joined
+    assert "--checkpoint-min-step 1024" in joined
+    assert '--chat-template-kwargs {"preserve_thinking":true}' in joined
+
+
+def test_normalize_server_config_migrates_new_defaults_and_removes_legacy_mirostat(monkeypatch):
+    monkeypatch.setattr(cli, "detect_cuda_device_count", lambda: 2)
+
+    normalized, changed = cli.normalize_server_config_payload(
+        {
+            "llama_server_defaults": {
+                "mirostat": 2,
+                "mirostat_ent": 4.5,
+                "mirostat_lr": 0.1,
+                "mtp_defaults": {"spec_draft_n_max": 2},
+            }
+        }
+    )
+
+    assert changed is True
+    defaults = normalized["llama_server_defaults"]
+    assert "mirostat" not in defaults
+    assert "mirostat_ent" not in defaults
+    assert "mirostat_lr" not in defaults
+    assert defaults["cache_ram"] == 32768
+    assert defaults["ctx_checkpoints"] == 32
+    assert defaults["checkpoint_min_step"] == 1024
+    assert defaults["chat_template_kwargs"] == '{"preserve_thinking":true}'
+    assert defaults["tensor_split"] == "1,1"
+    assert defaults["mtp_defaults"]["spec_draft_n_max"] == 3
+
+
 def test_normalize_server_overrides_drops_tuning_internals_but_keeps_draft_layers_sentinel():
     normalized = cli.normalize_server_overrides({
         "gpu_set": [0, 1],

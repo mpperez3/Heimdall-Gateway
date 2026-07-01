@@ -11,6 +11,10 @@ default:
   keep: 20000
   cache_type_k: q8_0
   cache_type_v: q8_0
+  cache_ram: 32768
+  ctx_checkpoints: 32
+  checkpoint_min_step: 1024
+  chat_template_kwargs: '{"preserve_thinking":true}'
   batch_size: 4096
   ubatch_size: 2048
   threads: 16
@@ -60,6 +64,6 @@ speculative_defaults:
 # Applied to the main model when an MTP drafter file is detected.
 # Can be overridden per-model via server_overrides in the catalog.
 mtp_defaults:
-  spec_draft_n_max: 2
+  spec_draft_n_max: 3
   spec_draft_n_min: 0
   spec_draft_p_min: 0.75
