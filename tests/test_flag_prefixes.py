@@ -296,3 +296,11 @@ def test_emitted_flags_are_supported_by_local_llama_server():
     cmd = cli.build_llama_server_command(model, server_bin, port="18090")
     emitted_flags = {token for token in cmd if token.startswith("-")}
     assert emitted_flags <= supported
+
+
+def test_chat_template_kwargs_normalizes_config_style_booleans():
+    from llamacpp_stack.cli import normalize_server_overrides
+
+    normalized = normalize_server_overrides({"chat_template_kwargs": '{"preserve_thinking":off}'})
+
+    assert normalized["chat_template_kwargs"] == '{"preserve_thinking":false}'

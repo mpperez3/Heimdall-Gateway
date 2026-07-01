@@ -6,6 +6,7 @@ import json
 import socket
 import ssl
 import subprocess
+import struct
 import sys
 import tempfile
 import threading
@@ -19,6 +20,7 @@ from pathlib import Path
 from unittest import mock
 
 import yaml
+import llamacpp_stack.cli as cli
 
 from llamacpp_stack.cli import (
     ManagedModel,
@@ -71,6 +73,9 @@ from llamacpp_stack.cli import (
     restart_service_to_free_vram,
     service_commands_for_mode,
     save_catalog,
+    sort_catalog_for_json,
+    get_model_context_size,
+    is_gemma4_sliding_window_long_context_model,
     summarize_configured_replicas,
     start_catalog_auto_update_watch,
     start_ctx_metadata_server,
@@ -158,7 +163,64 @@ def find_free_test_port() -> int:
         return int(sock.getsockname()[1])
 
 
+
+def _write_minimal_gguf(path: Path, entries: list[tuple[str, int, object]]) -> None:
+    with path.open("wb") as fh:
+        fh.write(b"GGUF")
+        fh.write(struct.pack("<I", 3))
+        fh.write(struct.pack("<Q", 0))
+        fh.write(struct.pack("<Q", len(entries)))
+        for key, value_type, value in entries:
+            key_bytes = key.encode("utf-8")
+            fh.write(struct.pack("<Q", len(key_bytes)))
+            fh.write(key_bytes)
+            fh.write(struct.pack("<I", value_type))
+            if value_type == 4:
+                fh.write(struct.pack("<I", int(value)))
+            elif value_type == 10:
+                fh.write(struct.pack("<Q", int(value)))
+            elif value_type == 7:
+                fh.write(b"\x01" if value else b"\x00")
+            else:
+                raise AssertionError(f"unsupported test GGUF value type {value_type}")
+
+
 class InstallHelpersTest(unittest.TestCase):
+
+
+    def test_catalog_json_sorts_newest_downloaded_first(self) -> None:
+        old = ManagedModel(
+            model_id="old",
+            repo_id="org/old",
+            quant=None,
+            filename="old.gguf",
+            local_path="/missing/old.gguf",
+            downloaded_at="2026-01-01T00:00:00+00:00",
+        )
+        new = ManagedModel(
+            model_id="new",
+            repo_id="org/new",
+            quant=None,
+            filename="new.gguf",
+            local_path="/missing/new.gguf",
+            downloaded_at="2026-02-01T00:00:00+00:00",
+        )
+
+        self.assertEqual([m.model_id for m in sort_catalog_for_json([old, new])], ["new", "old"])
+
+    def test_catalog_json_sort_falls_back_to_model_file_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            old_path = root / "old.gguf"
+            new_path = root / "new.gguf"
+            old_path.write_bytes(b"old")
+            new_path.write_bytes(b"new")
+            os.utime(old_path, (1000, 1000))
+            os.utime(new_path, (2000, 2000))
+            old = ManagedModel("old", "org/old", None, old_path.name, str(old_path))
+            new = ManagedModel("new", "org/new", None, new_path.name, str(new_path))
+
+            self.assertEqual([m.model_id for m in sort_catalog_for_json([old, new])], ["new", "old"])
 
     def test_api_auth_matches_bearer_and_x_api_key(self) -> None:
         class Headers(dict):
@@ -3366,7 +3428,7 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertIn("experimental", normalized)
         self.assertEqual(
             normalized["experimental"]["chat_tool_continue_repair"],
-            {"enabled": False, "max_rounds": 1},
+            {"enabled": False, "max_rounds": 1, "max_tokens": 2048, "stream_keepalive_seconds": 15},
         )
         self.assertNotIn("example", normalized["_meta"])
         defaults = normalized["llama_server_defaults"]
@@ -4096,6 +4158,56 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertEqual(model.server_overrides["spec_type"], "draft-mtp")
             self.assertEqual(model.server_overrides["spec_draft_n_max"], 3)
             self.assertEqual(model.server_overrides["parallel"], 1)
+
+
+    def test_integrated_mtp_model_gets_draft_mtp_without_model_draft(self) -> None:
+        model = ManagedModel(
+            model_id="qwen-agentworld-35b-a3b-ud-q4_k_xl-mtp",
+            repo_id="vadikulous-ai/Qwen-AgentWorld-35B-A3B-UD-Q4_K_XL-MTP-GGUF",
+            quant=None,
+            filename="Qwen-AgentWorld-35B-A3B-UD-Q4_K_XL-MTP.gguf",
+            local_path="/models/Qwen-AgentWorld-35B-A3B-UD-Q4_K_XL-MTP.gguf",
+            ctx_size=262144,
+        )
+        model.server_overrides, changed = cli._apply_mtp_server_overrides(
+            model.server_overrides,
+            None,
+            {"mtp_defaults": {"image_min_tokens": 1024, "spec_draft_n_max": 3, "spec_draft_n_min": 0, "spec_draft_p_min": 0.75}},
+        )
+
+        self.assertTrue(changed)
+        self.assertNotIn("model_draft", model.server_overrides)
+        cmd = build_llama_server_command(model, Path("/bin/llama-server"), port="12345", server_defaults={})
+        joined = " ".join(cmd)
+        self.assertIn("--image-min-tokens 1024", joined)
+        self.assertIn("--spec-type draft-mtp", joined)
+        self.assertIn("--spec-draft-n-max 3", joined)
+        self.assertIn("--spec-draft-p-min 0.75", joined)
+        self.assertNotIn("--model-draft", joined)
+
+    def test_mtp_model_draft_does_not_emit_duplicate_draft_max(self) -> None:
+        model = ManagedModel(
+            model_id="speculative-qwen",
+            repo_id="org/qwen",
+            quant=None,
+            filename="qwen.gguf",
+            local_path="/models/qwen.gguf",
+            ctx_size=262144,
+            server_overrides={
+                "model_draft": "/models/draft.gguf",
+                "spec_type": "draft-mtp",
+                "spec_draft_n_max": 3,
+                "draft": 16,
+            },
+        )
+
+        cmd = build_llama_server_command(model, Path("/bin/llama-server"), port="12345", server_defaults={})
+        joined = " ".join(cmd)
+        self.assertIn("--model-draft /models/draft.gguf", joined)
+        self.assertEqual(joined.count("--spec-draft-n-max"), 1)
+        self.assertIn("--spec-draft-n-max 3", joined)
+        self.assertNotIn("--spec-draft-n-max 16", joined)
+        self.assertNotIn("--draft-max 16", joined)
 
     def test_update_backfills_mtp_drafter_for_existing_catalog_model(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4939,6 +5051,75 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertIn("--reasoning-format", cmd)
         idx = cmd.index("--reasoning-format")
         self.assertEqual(cmd[idx + 1], "none")
+
+    def test_build_llama_server_command_applies_case_insensitive_family_defaults(self) -> None:
+        model = ManagedModel(
+            model_id="Qwen3.6-27B-UD-Q5_K_XL",
+            repo_id="unsloth/Qwen3.6-27B-MTP-GGUF",
+            quant="Q5_K_XL",
+            filename="Qwen3.6-27B-UD-Q5_K_XL.gguf",
+            local_path="/models/qwen.gguf",
+        )
+        server_defaults = {
+            "__family_defaults": {
+                "qwen": {
+                    "predict": 16384,
+                    "reasoning": "on",
+                    "reasoning_budget": 2048,
+                    "reasoning_budget_message": "Okay, I have thought enough. I will now provide the final answer",
+                    "chat_template_kwargs": {"preserve_thinking": False},
+                }
+            }
+        }
+
+        with mock.patch("llamacpp_stack.cli.server_supports_flag", return_value=True):
+            cmd = build_llama_server_command(model, Path("/tmp/llama-server"), port="12345", server_defaults=server_defaults)
+
+        self.assertEqual(cmd[cmd.index("--predict") + 1], "16384")
+        self.assertEqual(cmd[cmd.index("--reasoning") + 1], "on")
+        self.assertEqual(cmd[cmd.index("--reasoning-budget") + 1], "2048")
+        self.assertEqual(
+            cmd[cmd.index("--reasoning-budget-message") + 1],
+            "Okay, I have thought enough. I will now provide the final answer",
+        )
+        self.assertEqual(cmd[cmd.index("--chat-template-kwargs") + 1], '{"preserve_thinking":false}')
+
+
+    def test_build_llama_server_command_qwopus_uses_qwen_family_defaults(self) -> None:
+        model = ManagedModel(
+            model_id="qwopus3.6-35b-a3b-coder-mtp-q4_k_m",
+            repo_id="Jackrong/Qwopus3.6-35B-A3B-Coder-MTP-GGUF",
+            quant="Q4_K_M",
+            filename="Qwopus3.6-35B-A3B-Coder-MTP-Q4_K_M.gguf",
+            local_path="/models/qwopus.gguf",
+        )
+        server_defaults = {"__family_defaults": {"qwen": {"predict": 36384, "reasoning": "off"}}}
+
+        with mock.patch("llamacpp_stack.cli.server_supports_flag", return_value=True):
+            cmd = build_llama_server_command(model, Path("/tmp/llama-server"), port="12345", server_defaults=server_defaults)
+
+        self.assertEqual(cmd[cmd.index("--predict") + 1], "36384")
+        self.assertEqual(cmd[cmd.index("--reasoning") + 1], "off")
+
+    def test_build_llama_server_command_model_overrides_win_over_family_defaults(self) -> None:
+        model = ManagedModel(
+            model_id="qwen-small",
+            repo_id="org/qwen",
+            quant="Q4",
+            filename="qwen.gguf",
+            local_path="/models/qwen.gguf",
+            server_overrides={"predict": 4096},
+        )
+
+        with mock.patch("llamacpp_stack.cli.server_supports_flag", return_value=True):
+            cmd = build_llama_server_command(
+                model,
+                Path("/tmp/llama-server"),
+                port="12345",
+                server_defaults={"__family_defaults": {"QWEN": {"predict": 16384}}},
+            )
+
+        self.assertEqual(cmd[cmd.index("--predict") + 1], "4096")
 
     def test_build_llama_server_command_emits_mtp_spec_flags(self) -> None:
         model = ManagedModel(
@@ -5874,6 +6055,36 @@ models:
 
         self.assertEqual(payload["metadata"]["load_capabilities"], ["image", "image-text-to-text"])
         self.assertTrue(payload["metadata"]["vision"])
+
+
+    def test_gemma4_sliding_window_long_context_trusts_gguf_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            gguf = Path(td) / "gemma-4-31B-it-qat-UD-Q4_K_XL.gguf"
+            _write_minimal_gguf(
+                gguf,
+                [
+                    ("gemma4.context_length", 4, 262144),
+                    ("gemma4.attention.sliding_window", 4, 1024),
+                ],
+            )
+            model = ManagedModel(
+                model_id="gemma-4-31b-it-qat-ud-q4_k_xl",
+                repo_id="unsloth/gemma-4-31B-it-qat-GGUF",
+                quant="UD-Q4_K_XL",
+                filename=gguf.name,
+                local_path=str(gguf),
+                ctx_size=59392,
+            )
+
+            self.assertEqual(get_model_context_size(model), 262144)
+            self.assertTrue(is_gemma4_sliding_window_long_context_model(model))
+            with mock.patch("llamacpp_stack.cli.probe_model_ctx") as probe:
+                selected, status, info = choose_auto_ctx(model, Path("/tmp/llama-server"))
+
+            probe.assert_not_called()
+            self.assertEqual(selected, 262144)
+            self.assertEqual(status, "metadata-selected")
+            self.assertEqual(info["selected_ctx"], 262144)
 
     def test_build_openai_model_payload_exposes_ctx_probe_metrics_with_nc_defaults(self) -> None:
         model = ManagedModel(

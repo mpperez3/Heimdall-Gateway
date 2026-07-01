@@ -15,6 +15,11 @@ default:
   ctx_checkpoints: 32
   checkpoint_min_step: 1024
   chat_template_kwargs: '{"preserve_thinking":true}'
+  top_k: 20
+  top_p: 0.95
+  min_p: 0.0
+  repeat_penalty: 1.0
+  presence_penalty: 0.0
   batch_size: 4096
   ubatch_size: 2048
   threads: 16
@@ -27,6 +32,15 @@ default:
   parallel: 1
   use_fitc: false
   swa_full: true
+
+family_defaults:
+  qwen:
+    predict: 16384
+    reasoning: "on"
+    reasoning_budget: 2048
+    reasoning_budget_message: "Okay, I have thought enough. I will now provide the final answer"
+    chat_template_kwargs:
+      preserve_thinking: false
 
 
 presets:
@@ -64,6 +78,7 @@ speculative_defaults:
 # Applied to the main model when an MTP drafter file is detected.
 # Can be overridden per-model via server_overrides in the catalog.
 mtp_defaults:
+  image_min_tokens: 1024
   spec_draft_n_max: 3
   spec_draft_n_min: 0
   spec_draft_p_min: 0.75

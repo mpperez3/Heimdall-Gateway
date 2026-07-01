@@ -18,11 +18,19 @@ from llamacpp_stack.cli import (
     _chat_response_internal_tool_repair_followup_messages,
     _chat_tool_continue_repair_messages,
     _chat_tool_continue_trigger_reason,
+    _apply_chat_tool_continue_repair_token_cap,
+    _force_tool_choice_for_chat_repair,
+    _send_openai_chat_sse_status,
+    _buffer_openai_chat_sse_with_keepalive,
     _sanitize_responses_tool_arguments,
+    _summarize_chat_tool_message_diagnostics,
+    _strip_chat_tool_repair_notice_text,
+    _sanitize_chat_tool_repair_notices_in_messages,
 )
 import inspect
 import io
 import json
+import threading
 import llamacpp_stack.cli as cli
 
 
@@ -45,6 +53,24 @@ def _sample_chat_tools() -> list[dict]:
     ]
 
 
+
+def test_chat_tool_message_diagnostics_flags_suppressed_sudo_output():
+    summary = _summarize_chat_tool_message_diagnostics([
+        {"role": "user", "content": "hi"},
+        {
+            "role": "tool",
+            "tool_call_id": "call_terminal",
+            "name": "terminal",
+            "content": "sudo systemctl restart demo\n[terminal output suppressed]",
+        },
+    ])
+
+    assert summary["tool_message_count"] == 1
+    assert summary["matches"][0]["tool_call_id"] == "call_terminal"
+    assert "terminal_output_suppressed" in summary["matches"][0]["patterns"]
+    assert "sudo" in summary["matches"][0]["patterns"]
+    assert "[terminal output suppressed]" in summary["matches"][0]["preview"]
+
 def test_chat_tool_continue_triggers_only_on_empty_visible_content_or_trailing_colon():
     tools = _sample_chat_tools()
 
@@ -54,6 +80,30 @@ def test_chat_tool_continue_triggers_only_on_empty_visible_content_or_trailing_c
     assert _chat_tool_continue_trigger_reason("Déjame editar el archivo", [], tools) == ""
     assert _chat_tool_continue_trigger_reason("Let me edit the file", [], tools) == ""
 
+
+
+
+def test_chat_tool_continue_repair_notice_is_stripped_from_visible_content_and_history():
+    notice = "↻ Retrying tool call generation (attempt 1/4); the previous model turn did not produce a valid tool call. Waiting for the repaired tool call…"
+    contaminated = f"Voy a escribir la documentación por partes. Primera sección:\n\n{notice}"
+
+    assert _strip_chat_tool_repair_notice_text(contaminated) == "Voy a escribir la documentación por partes. Primera sección:"
+    assert _chat_tool_continue_trigger_reason(contaminated, [], _sample_chat_tools()) == "visible_content_trailing_colon"
+
+    sanitized = _sanitize_chat_tool_repair_notices_in_messages([
+        {"role": "assistant", "content": contaminated},
+        {"role": "user", "content": "continua"},
+    ])
+    assert sanitized[0]["content"] == "Voy a escribir la documentación por partes. Primera sección:"
+    assert sanitized[1]["content"] == "continua"
+
+
+def test_chat_tool_continue_repair_think_notice_is_stripped():
+    notice = "<think>\n↻ Retrying tool call generation (attempt 2/4); the previous model turn did not produce a valid tool call. Waiting for the repaired tool call…\n</think>"
+    contaminated = f"Let me use a different approach:\n{notice}"
+
+    assert _strip_chat_tool_repair_notice_text(contaminated) == "Let me use a different approach:"
+    assert _chat_tool_continue_trigger_reason(contaminated, [], _sample_chat_tools()) == "visible_content_trailing_colon"
 
 def test_chat_tool_continue_does_not_trigger_without_tools_or_with_tool_calls():
     tools = _sample_chat_tools()
@@ -74,6 +124,287 @@ def test_chat_tool_continue_repair_message_lists_available_tools():
     assert "Your previous assistant message ended without any tool_calls" in repaired[-1]["content"]
     assert "you must call one of the available tools" in repaired[-1]["content"]
     assert "exec_command" in repaired[-1]["content"]
+
+
+
+
+def test_chat_tool_continue_repair_status_notice_is_visible_sse_delta():
+    class Handler:
+        def __init__(self):
+            self.wfile = io.BytesIO()
+
+    handler = Handler()
+    _send_openai_chat_sse_status(
+        handler,
+        request_id="chat_req_test",
+        model="local/model",
+        content="\n↻ Retrying tool call generation (attempt 1/4)…\n",
+    )
+
+    raw = handler.wfile.getvalue().decode("utf-8")
+    assert raw.startswith("data: ")
+    payload = json.loads(raw.split("data: ", 1)[1])
+    assert payload["choices"][0]["delta"]["content"].startswith("\n↻ Retrying")
+    assert payload["choices"][0]["finish_reason"] is None
+
+
+
+def test_chat_tool_continue_repair_buffer_suppresses_fast_visible_notice():
+    class Handler:
+        def __init__(self):
+            self.wfile = io.BytesIO()
+
+    class Response:
+        def iter_lines(self):
+            yield b"data: [DONE]"
+
+        def close(self):
+            pass
+
+    handler = Handler()
+    lines, passthrough, state = _buffer_openai_chat_sse_with_keepalive(
+        handler,
+        Response(),
+        request_id="chat_req_test",
+        keepalive_seconds=30,
+        write_lock=threading.Lock(),
+        visible_status={"request_id": "chat_req_test", "model": "local/model", "content": "visible repair"},
+        visible_notice_after_seconds=4,
+    )
+
+    assert lines == [b"data: [DONE]"]
+    assert passthrough is False
+    assert handler.wfile.getvalue() == b""
+
+
+def test_chat_tool_continue_repair_buffer_can_emit_immediate_visible_notice():
+    class Handler:
+        def __init__(self):
+            self.wfile = io.BytesIO()
+
+    class Response:
+        def iter_lines(self):
+            yield b"data: [DONE]"
+
+        def close(self):
+            pass
+
+    handler = Handler()
+    _buffer_openai_chat_sse_with_keepalive(
+        handler,
+        Response(),
+        request_id="chat_req_test",
+        keepalive_seconds=30,
+        write_lock=threading.Lock(),
+        visible_status={"request_id": "chat_req_test", "model": "local/model", "content": "visible repair"},
+        visible_notice_after_seconds=0,
+    )
+
+    assert b"visible repair" in handler.wfile.getvalue()
+
+
+
+def test_chat_tool_continue_repair_buffer_passthroughs_when_tool_call_seen():
+    class Handler:
+        def __init__(self):
+            self.wfile = io.BytesIO()
+
+    class Response:
+        def iter_lines(self):
+            yield b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1"}]}}]}'
+            yield b"data: [DONE]"
+
+        def close(self):
+            pass
+
+    handler = Handler()
+    lines, passthrough, state = _buffer_openai_chat_sse_with_keepalive(
+        handler,
+        Response(),
+        request_id="chat_req_test",
+        keepalive_seconds=30,
+        write_lock=threading.Lock(),
+        passthrough_tool_calls=True,
+    )
+
+    assert lines == []
+    assert passthrough is True
+    assert state["passthrough_reason"] == "tool_call_seen"
+    assert b"call_1" in handler.wfile.getvalue()
+
+
+def test_chat_tool_continue_repair_buffer_passthroughs_long_visible_text():
+    class Handler:
+        def __init__(self):
+            self.wfile = io.BytesIO()
+
+    class Response:
+        def iter_lines(self):
+            yield b'data: {"choices":[{"delta":{"content":"hello world"}}]}'
+            __import__("time").sleep(1.05)
+            yield b"data: [DONE]"
+
+        def close(self):
+            pass
+
+    handler = Handler()
+    lines, passthrough, state = _buffer_openai_chat_sse_with_keepalive(
+        handler,
+        Response(),
+        request_id="chat_req_test",
+        keepalive_seconds=30,
+        write_lock=threading.Lock(),
+        passthrough_visible_chars=5,
+    )
+
+    assert lines == []
+    assert passthrough is True
+    assert state["passthrough_reason"] == "visible_content_threshold"
+    assert b"hello world" in handler.wfile.getvalue()
+
+
+
+
+
+def test_chat_tool_continue_repair_notice_suppression_reports_visible_passthrough(monkeypatch):
+    events = []
+    monkeypatch.setattr(cli, "log_api_event", lambda kind, payload: events.append((kind, payload)))
+
+    class Handler:
+        def __init__(self):
+            self.wfile = io.BytesIO()
+
+    class Response:
+        def iter_lines(self):
+            yield b'data: {"choices":[{"delta":{"content":"hello world"}}]}'
+            __import__("time").sleep(1.05)
+            yield b"data: [DONE]"
+
+        def close(self):
+            pass
+
+    _buffer_openai_chat_sse_with_keepalive(
+        Handler(),
+        Response(),
+        request_id="chat_req_test",
+        keepalive_seconds=30,
+        write_lock=threading.Lock(),
+        visible_status={
+            "request_id": "chat_req_test",
+            "model": "local/model",
+            "upstream_model": "local/model",
+            "round": 1,
+            "trigger_reason": "visible_content_trailing_colon",
+            "content": "retrying",
+        },
+        visible_notice_after_seconds=1,
+        passthrough_visible_chars=5,
+    )
+
+    suppressed = [payload for kind, payload in events if kind == "openai_chat_tool_continue_repair_user_notice_suppressed"]
+    assert suppressed
+    assert suppressed[-1]["reason"] == "passthrough_started"
+    assert suppressed[-1]["passthrough_reason"] == "visible_content_threshold"
+    assert suppressed[-1]["tool_call_chunks"] == 0
+
+def test_chat_tool_continue_repair_passthrough_tracks_tool_argument_metrics_to_finish():
+    class Handler:
+        def __init__(self):
+            self.wfile = io.BytesIO()
+
+    class Response:
+        def iter_lines(self):
+            chunks = [
+                {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": "write_file", "arguments": "{\"path\":"}}]}}]},
+                {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "\"x.md\"}"}}]}}]},
+                {"choices": [{"finish_reason": "tool_calls", "delta": {}}]},
+            ]
+            for chunk in chunks:
+                yield ("data: " + json.dumps(chunk)).encode("utf-8")
+            yield b"data: [DONE]"
+
+        def close(self):
+            pass
+
+    handler = Handler()
+    lines, passthrough, state = _buffer_openai_chat_sse_with_keepalive(
+        handler,
+        Response(),
+        request_id="chat_req_test",
+        keepalive_seconds=30,
+        write_lock=threading.Lock(),
+        passthrough_tool_calls=True,
+    )
+
+    assert lines == []
+    assert passthrough is True
+    assert state["passthrough_reason"] == "tool_call_seen"
+    assert state["finish_reason"] == "tool_calls"
+    assert state["tool_names"] == ["write_file"]
+    assert state["tool_argument_chars"] > 0
+
+
+
+def test_chat_tool_continue_repair_buffers_tool_calls_by_default_to_catch_length():
+    class Handler:
+        def __init__(self):
+            self.wfile = io.BytesIO()
+
+    class Response:
+        def iter_lines(self):
+            chunks = [
+                {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": "terminal", "arguments": "{\"cmd\":"}}]}}]},
+                {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "\"ls"}}]}}]},
+                {"choices": [{"finish_reason": "length", "delta": {}}]},
+            ]
+            for chunk in chunks:
+                yield ("data: " + json.dumps(chunk)).encode("utf-8")
+            yield b"data: [DONE]"
+
+        def close(self):
+            pass
+
+    handler = Handler()
+    lines, passthrough, state = _buffer_openai_chat_sse_with_keepalive(
+        handler,
+        Response(),
+        request_id="chat_req_test",
+        keepalive_seconds=30,
+        write_lock=threading.Lock(),
+    )
+
+    assert passthrough is False
+    assert len(lines) == 4
+    assert handler.wfile.getvalue() == b""
+    assert state["finish_reason"] == "length"
+    assert state["tool_call_chunks"] > 0
+    assert state["tool_argument_json_valid_by_index"]["0"] is False
+
+def test_chat_tool_continue_repair_forces_required_tool_choice_when_auto():
+    payload = {"model": "local/model", "tool_choice": "auto", "tools": _sample_chat_tools()}
+
+    repaired = _force_tool_choice_for_chat_repair(payload)
+
+    assert repaired["tool_choice"] == "required"
+    assert payload["tool_choice"] == "auto"
+
+
+def test_chat_tool_continue_repair_preserves_explicit_tool_choice():
+    explicit = {"type": "function", "function": {"name": "exec_command"}}
+    payload = {"model": "local/model", "tool_choice": explicit, "tools": _sample_chat_tools()}
+
+    repaired = _force_tool_choice_for_chat_repair(payload)
+
+    assert repaired["tool_choice"] == explicit
+
+def test_chat_tool_continue_repair_token_cap_limits_internal_rounds():
+    payload = {"model": "local/model", "stream": True, "max_tokens": 65536, "n_predict": 65536}
+
+    capped = _apply_chat_tool_continue_repair_token_cap(payload, 2048)
+
+    assert capped["max_tokens"] == 2048
+    assert capped["n_predict"] == 2048
+    assert payload["max_tokens"] == 65536
 
 
 def test_responses_payload_does_not_convert_builtin_tools_for_legacy_chat_fallback():

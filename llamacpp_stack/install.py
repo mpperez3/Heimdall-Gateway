@@ -118,6 +118,8 @@ def _default_experimental_config() -> dict[str, object]:
         "chat_tool_continue_repair": {
             "enabled": False,
             "max_rounds": 1,
+            "max_tokens": 2048,
+            "stream_keepalive_seconds": 15,
         }
     }
 
@@ -134,6 +136,14 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
                     repair["max_rounds"] = max(0, int(repair.get("max_rounds", 1)))
                 except Exception:
                     repair["max_rounds"] = 1
+                try:
+                    repair["max_tokens"] = max(0, int(repair.get("max_tokens", 2048)))
+                except Exception:
+                    repair["max_tokens"] = 2048
+                try:
+                    repair["stream_keepalive_seconds"] = max(1, int(repair.get("stream_keepalive_seconds", 15)))
+                except Exception:
+                    repair["stream_keepalive_seconds"] = 15
                 cfg["chat_tool_continue_repair"] = repair
             elif key not in cfg:
                 cfg[key] = value
@@ -177,10 +187,34 @@ def _normalize_llama_server_defaults_payload(value: object) -> dict[str, object]
             key = "n_gpu_layers"
         if not key:
             continue
+        if key == "reasoning":
+            if isinstance(raw_val, bool):
+                normalized[key] = "on" if raw_val else "off"
+            elif isinstance(raw_val, str) and raw_val.strip().lower() in {"1", "true", "yes"}:
+                normalized[key] = "on"
+            elif isinstance(raw_val, str) and raw_val.strip().lower() in {"0", "false", "no"}:
+                normalized[key] = "off"
+            else:
+                normalized[key] = str(raw_val).strip()
+            continue
         if key == "speculative_defaults" and isinstance(raw_val, dict):
             normalized[key] = _normalize_llama_server_defaults_payload(raw_val)
         else:
             normalized[key] = raw_val
+    return normalized
+
+
+def _normalize_llama_server_family_defaults_payload(value: object) -> dict[str, dict[str, object]]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, dict[str, object]] = {}
+    for raw_pattern, raw_defaults in value.items():
+        pattern = str(raw_pattern or "").strip()
+        if not pattern or not isinstance(raw_defaults, dict):
+            continue
+        defaults = _normalize_llama_server_defaults_payload(raw_defaults)
+        if defaults:
+            normalized[pattern] = defaults
     return normalized
 
 
@@ -193,6 +227,7 @@ def _normalize_server_config_payload(payload: dict[str, object]) -> dict[str, ob
     # calling this normalizer, then strips the legacy block.
     result.pop("models", None)
     result["llama_server_defaults"] = _normalize_llama_server_defaults_payload(result.get("llama_server_defaults"))
+    result["llama_server_family_defaults"] = _normalize_llama_server_family_defaults_payload(result.get("llama_server_family_defaults"))
     replicas = _default_global_replicas_config()
     raw_replicas = result.get("replicas")
     if isinstance(raw_replicas, dict):
@@ -273,6 +308,35 @@ def _load_llama_server_defaults_preset(config_dir: Path) -> dict[str, object]:
     merged = dict(base_defaults)
     merged.update(selected)
     return merged
+
+
+def _load_llama_server_family_defaults_preset(config_dir: Path) -> dict[str, dict[str, object]]:
+    defaults_path = _ensure_llama_server_defaults_file(config_dir)
+    try:
+        payload = yaml.safe_load(defaults_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return _normalize_llama_server_family_defaults_payload(payload.get("family_defaults"))
+
+
+def _merge_missing_llama_server_family_defaults(target: dict[str, dict[str, object]], config_dir: Path) -> bool:
+    if not isinstance(target, dict):
+        return False
+    preset_defaults = _load_llama_server_family_defaults_preset(config_dir)
+    changed = False
+    for pattern, defaults in preset_defaults.items():
+        current = target.get(pattern)
+        if not isinstance(current, dict):
+            target[pattern] = dict(defaults)
+            changed = True
+            continue
+        for key, value in defaults.items():
+            if key not in current:
+                current[key] = value
+                changed = True
+    return changed
 
 
 def _merge_missing_llama_server_defaults(target: dict[str, object], config_dir: Path) -> bool:
@@ -3177,6 +3241,13 @@ def _ensure_basic_server_config(layout: InstallLayout) -> None:
 
     if _merge_missing_llama_server_defaults(server_config["llama_server_defaults"], layout.config_dir):
         server_changed = True
+    family_defaults = server_config.setdefault("llama_server_family_defaults", {})
+    if not isinstance(family_defaults, dict):
+        family_defaults = {}
+        server_config["llama_server_family_defaults"] = family_defaults
+        server_changed = True
+    if _merge_missing_llama_server_family_defaults(family_defaults, layout.config_dir):
+        server_changed = True
     normalized_server_config = _normalize_server_config_payload(server_config)
     if normalized_server_config != server_config:
         server_config = normalized_server_config
@@ -3694,6 +3765,11 @@ def write_api_security_config(layout: InstallLayout, api_auth_config: dict[str, 
         server_config_data["llama_server_defaults"] = llama_defaults
     _ensure_llama_server_defaults_file(layout.config_dir)
     _merge_missing_llama_server_defaults(llama_defaults, layout.config_dir)
+    family_defaults = server_config_data.setdefault("llama_server_family_defaults", {})
+    if not isinstance(family_defaults, dict):
+        family_defaults = {}
+        server_config_data["llama_server_family_defaults"] = family_defaults
+    _merge_missing_llama_server_family_defaults(family_defaults, layout.config_dir)
     server_config_data = _normalize_server_config_payload(server_config_data)
     server_config_path.write_text(json.dumps(server_config_data, indent=2) + "\n", encoding="utf-8")
     legacy_server_config_path = layout.config_dir / LEGACY_SERVER_CONFIG_BASENAME
@@ -4138,6 +4214,11 @@ def install_stack(args: argparse.Namespace) -> int:
             server_config_data["llama_server_defaults"] = llama_defaults
         _ensure_llama_server_defaults_file(layout.config_dir)
         _merge_missing_llama_server_defaults(llama_defaults, layout.config_dir)
+        family_defaults = server_config_data.setdefault("llama_server_family_defaults", {})
+        if not isinstance(family_defaults, dict):
+            family_defaults = {}
+            server_config_data["llama_server_family_defaults"] = family_defaults
+        _merge_missing_llama_server_family_defaults(family_defaults, layout.config_dir)
         server_config_data = _normalize_server_config_payload(server_config_data)
         server_config_payload = json.dumps(server_config_data, indent=2) + "\n"
         server_config_path.write_text(
