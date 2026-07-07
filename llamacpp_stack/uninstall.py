@@ -76,21 +76,19 @@ def uninstall_systemd_units(layout: InstallLayout, dry_run: bool) -> None:
         base_systemctl = _sudo_prefix() + ["systemctl"]
         unit_dir = Path("/etc/systemd/system")
 
-    # 1. Dynamically find any other llama-related units that might be running
-    try:
-        list_units_cmd = base_systemctl + ["list-units", "--all", "--full", "--no-legend", "*llama*"]
-        result = _run(list_units_cmd, check=False)
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if parts:
-                unit_name = parts[0]
-                # Filter for llama but exclude ollama
-                is_llama = "llama" in unit_name.lower()
-                is_ollama = "ollama" in unit_name.lower()
-                if unit_name.endswith(".service") and is_llama and not is_ollama and unit_name not in all_service_names:
-                    all_service_names.append(unit_name)
-    except Exception:
-        pass
+    # 1. Dynamically find Heimdall units plus explicit legacy service names.
+    for pattern in ("*heimdall*", "*llamacpp-superserver*", "*llamaswap*"):
+        try:
+            list_units_cmd = base_systemctl + ["list-units", "--all", "--full", "--no-legend", pattern]
+            result = _run(list_units_cmd, check=False)
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if parts:
+                    unit_name = parts[0]
+                    if unit_name.endswith(".service") and unit_name not in all_service_names:
+                        all_service_names.append(unit_name)
+        except Exception:
+            pass
 
     # 2. Stop and disable all of them
     if all_service_names:
@@ -140,14 +138,14 @@ def uninstall_stack(args: argparse.Namespace) -> int:
         resolved_mode = detect_existing_mode()
 
     if not resolved_mode:
-        # Check systemctl for any llama related services
+        # Check systemctl for any Heimdall or legacy services
         for mode in ("user", "system"):
             base_cmd = ["systemctl"]
             if mode == "user":
                 base_cmd.append("--user")
             try:
                 result = subprocess.run(
-                    base_cmd + ["list-units", "--all", "--full", "--no-legend", "*llama*"],
+                    base_cmd + ["list-units", "--all", "--full", "--no-legend", "*heimdall*"],
                     capture_output=True,
                     text=True,
                     check=False,
@@ -159,7 +157,7 @@ def uninstall_stack(args: argparse.Namespace) -> int:
                 continue
 
     if not resolved_mode:
-        resolved_mode = "system" if Path("/etc/llamacpp-superserver").exists() else "user"
+        resolved_mode = "system" if (Path("/etc/heimdall-gateway").exists() or Path("/etc/llamacpp-superserver").exists()) else "user"
 
     layout = choose_layout(resolved_mode, args.public_host, args.public_port, args=args)
     uninstall_systemd_units(layout, args.dry_run)
@@ -186,6 +184,10 @@ def uninstall_stack(args: argparse.Namespace) -> int:
             # Ensure older wrapper names are also cleaned up
             layout.bin_dir / "llamacpp-manager-start",
             layout.bin_dir / "llamaswap-start",
+            layout.bin_dir / "llamacpp-superserver",
+            layout.bin_dir / "llamacpp-server",
+            layout.bin_dir / "llamacpp-stack-install",
+            layout.bin_dir / "llamacpp-stack-uninstall",
         ])
 
     if not args.keep_models:
@@ -222,12 +224,12 @@ def uninstall_stack(args: argparse.Namespace) -> int:
     for target in legacy_targets:
         _remove_path(target, args.dry_run)
 
-    print(f"llamacpp stack ({resolved_mode} mode) uninstalled.")
+    print(f"Heimdall Gateway ({resolved_mode} mode) uninstalled.")
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Uninstall llama.cpp + llama-swap stack.")
+    parser = argparse.ArgumentParser(description="Uninstall Heimdall Gateway.")
     parser.add_argument("--mode", choices=("system", "user"))
     parser.add_argument("--public-host", default="127.0.0.1")
     parser.add_argument("--public-port", type=int)

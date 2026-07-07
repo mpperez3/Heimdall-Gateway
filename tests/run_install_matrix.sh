@@ -55,8 +55,8 @@ run_case "public_host_0.0.0.0" "${BASE_CMD[@]}" --llama-cpp-mode source --public
 run_case "mode_system_dryrun" python -m llamacpp_stack.install --mode system --llama-cpp-mode source --models-dir /workspace/test_models --idle-ttl 300 --dry-run || true
 
 # 3. Speculative behavior: when no server config and with existing server config
-STATE_DIR="$HOME/.local/state/llamacpp-superserver"
-CONFIG_DIR="$HOME/.config/llamacpp-superserver"
+STATE_DIR="$HOME/.local/state/heimdall-gateway"
+CONFIG_DIR="$HOME/.config/heimdall-gateway"
 rm -rf "$STATE_DIR" || true
 mkdir -p "$STATE_DIR"
 cat > "$STATE_DIR/catalog.json" <<'JSON'

@@ -94,10 +94,69 @@ def test_normalize_server_config_migrates_new_defaults_and_removes_legacy_mirost
     assert defaults["cache_ram"] == 32768
     assert defaults["ctx_checkpoints"] == 32
     assert defaults["checkpoint_min_step"] == 1024
-    assert defaults["chat_template_kwargs"] == '{"preserve_thinking":true}'
+    assert "chat_template_kwargs" not in defaults
+    assert defaults["top_k"] == 20
+    assert defaults["top_p"] == 0.95
+    assert defaults["min_p"] == 0.0
+    assert defaults["repeat_penalty"] == 1.0
+    assert defaults["presence_penalty"] == 0.0
     assert defaults["tensor_split"] == "1,1"
     assert defaults["mtp_defaults"]["spec_draft_n_max"] == 3
 
+
+
+
+def test_normalize_server_config_retires_unsafe_global_defaults(monkeypatch):
+    monkeypatch.setattr(cli, "detect_cuda_device_count", lambda: 2)
+
+    normalized, changed = cli.normalize_server_config_payload(
+        {
+            "llama_server_defaults": {
+                "cache_type_k": "f16",
+                "cache_type_v": "f16",
+                "chat_template_kwargs": '{"preserve_thinking":true}',
+                "mul_mat_q": True,
+                "grp_attn_n": 16,
+            }
+        }
+    )
+
+    assert changed is True
+    defaults = normalized["llama_server_defaults"]
+    assert "cache_type_k" not in defaults
+    assert "cache_type_v" not in defaults
+    assert "chat_template_kwargs" not in defaults
+    assert "mul_mat_q" not in defaults
+    assert "grp_attn_n" not in defaults
+    assert defaults["top_k"] == 20
+    assert defaults["top_p"] == 0.95
+    assert defaults["min_p"] == 0.0
+    assert defaults["repeat_penalty"] == 1.0
+    assert defaults["presence_penalty"] == 0.0
+
+
+def test_build_command_does_not_emit_cache_type_for_gguf_defaults(monkeypatch):
+    monkeypatch.setattr(cli, "_server_supports_or_unknown", lambda _server_path, _flag: True)
+    model = cli.ManagedModel(
+        model_id="test",
+        repo_id="test/repo",
+        quant="Q4_K_M",
+        filename="model.gguf",
+        local_path="/tmp/model.gguf",
+        ctx_size=4096,
+        tensor_split="1",
+    )
+
+    cmd = cli.build_llama_server_command(
+        model,
+        Path("/bin/llama-server"),
+        port="12345",
+        server_defaults={"cache_type_k": "q8_0", "cache_type_v": "q8_0"},
+    )
+    joined = " ".join(cmd)
+
+    assert "--cache-type-k" not in joined
+    assert "--cache-type-v" not in joined
 
 def test_normalize_server_overrides_drops_tuning_internals_but_keeps_draft_layers_sentinel():
     normalized = cli.normalize_server_overrides({

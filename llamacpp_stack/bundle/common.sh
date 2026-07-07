@@ -384,7 +384,7 @@ run_bundle_module() {
   else
     export PYTHONPATH="$(dirname "${STACK_ROOT}")${PYTHONPATH:+:${PYTHONPATH}}"
   fi
-  export LLAMACPP_BOOTSTRAP_UV="${BOOTSTRAP_UV_BIN}"
+  export HEIMDALL_GATEWAY_BOOTSTRAP_UV="${BOOTSTRAP_UV_BIN}"
   if [ "${STACK_LAYOUT}" = "script" ]; then
     "${BOOTSTRAP_PYTHON}" "${STACK_ROOT}/${resolved_module}.py" "$@"
   else

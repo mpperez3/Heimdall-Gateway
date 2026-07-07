@@ -1,10 +1,10 @@
-# llamacpp-superserver
+# heimdall-gateway
 
 Manager for a local llama.cpp / llama-swap stack with **optional vLLM beta support**.
 
 It provides:
 
-- `llamacpp-superserver`, a Python control CLI and API shim.
+- `heimdall-gateway`, a Python control CLI and API shim.
 - install/uninstall entry points for the full stack.
 - a bundled shell installer in `llamacpp_stack/bundle/`.
 - helpers for Hugging Face GGUF downloads, model cataloguing, runtime validation, llama-swap config rendering, and Ollama-compatible endpoints.
@@ -27,8 +27,8 @@ It provides:
 
 ### With llama.cpp (default)
 ```bash
-llamacpp-superserver install
-llamacpp-superserver run -hf meta-llama/Llama-2-7b-hf:Q4_K_M
+heimdall-gateway install
+heimdall-gateway run -hf meta-llama/Llama-2-7b-hf:Q4_K_M
 ```
 
 ### With vLLM (beta)
@@ -37,8 +37,8 @@ llamacpp-superserver run -hf meta-llama/Llama-2-7b-hf:Q4_K_M
 ./test-vllm.sh
 
 # Option 2: System install
-llamacpp-superserver install  # Select "vllm-beta" when prompted
-llamacpp-superserver run -hf meta-llama/Llama-2-7b-hf
+heimdall-gateway install  # Select "vllm-beta" when prompted
+heimdall-gateway run -hf meta-llama/Llama-2-7b-hf
 ```
 
 ### With Ollama (Local Testing)
@@ -59,7 +59,7 @@ ollama pull tinystories  # ~27MB lightweight model
 - ✅ Local development and iteration
 - ✅ Fast testing cycles (TinyStories: ~100ms latency)
 - ✅ Low-resource environments
-- ❌ Production deployments (use llamacpp-superserver instead)
+- ❌ Production deployments (use heimdall-gateway instead)
 
 See [docs/LOCAL_OLLAMA_SETUP.md](docs/LOCAL_OLLAMA_SETUP.md) for detailed setup instructions.
 
@@ -74,7 +74,7 @@ pip install -e .
 ## Run
 
 ```bash
-llamacpp-superserver --help
+heimdall-gateway --help
 llamacpp-stack-install --help
 ```
 
@@ -84,7 +84,7 @@ The standalone bundle can be run directly:
 ./llamacpp_stack/bundle/install_llamacpp_stack.sh --dry-run
 ```
 
-Note: The interactive installer now asks whether to run the full installer by default (`Y`), and answering `n`/`no` will perform a package-only update of `llamacpp-superserver` (leaving binaries, config, and auto-ctx untouched).
+Note: The interactive installer now asks whether to run the full installer by default (`Y`), and answering `n`/`no` will perform a package-only update of `heimdall-gateway` (leaving binaries, config, and auto-ctx untouched).
 
 Installer-managed llama-server defaults are written using the project's kebab-case config keys, matching the runtime flags used by the local llamacpp stack.
 

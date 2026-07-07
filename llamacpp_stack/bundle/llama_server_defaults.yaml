@@ -1,4 +1,4 @@
-# Editable defaults for llamacpp-superserver installs.
+# Editable defaults for heimdall-gateway installs.
 #
 # The installer copies this file to the config directory on first install as
 # `llama_server_defaults.yaml`. Edit the copied file to change the defaults
@@ -9,12 +9,9 @@
 
 default:
   keep: 20000
-  cache_type_k: q8_0
-  cache_type_v: q8_0
   cache_ram: 32768
   ctx_checkpoints: 32
   checkpoint_min_step: 1024
-  chat_template_kwargs: '{"preserve_thinking":true}'
   top_k: 20
   top_p: 0.95
   min_p: 0.0
@@ -27,8 +24,6 @@ default:
   numa: distribute
   flash_attn: true
   n_gpu_layers: -1
-  mul_mat_q: true
-  grp_attn_n: 16
   parallel: 1
   use_fitc: false
   swa_full: true

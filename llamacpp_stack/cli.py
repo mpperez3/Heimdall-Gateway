@@ -61,6 +61,8 @@ except ImportError:
 # Paths & Constants
 def _load_installed_env() -> None:
     candidates = [
+        Path.home() / ".config/heimdall-gateway/heimdall-gateway.env",
+        Path("/etc/heimdall-gateway/heimdall-gateway.env"),
         Path.home() / ".config/llamacpp-superserver/llamacpp-superserver.env",
         Path("/etc/llamacpp-superserver/llamacpp-superserver.env"),
         Path.home() / ".config/llamacpp/llamacpp-stack.env",
@@ -114,40 +116,58 @@ def _env_path(name: str, default: str) -> Path:
     return Path(os.environ.get(name, default)).expanduser()
 
 
-SOCKET_PATH = os.environ.get("LLAMACPP_MANAGER_SOCKET", "/run/llamacpp-superserver/manager.sock")
-DEFAULT_MODELS_DIR = _env_path("LLAMACPP_MODELS", "/workvols/data3/LLAMACPP_MODELS")
-DEFAULT_CONFIG_PATH = _env_path("LLAMACPP_CONFIG", "/var/lib/llamacpp-superserver/config.yaml")
-DEFAULT_CATALOG_PATH = _env_path("LLAMACPP_CATALOG", "/var/lib/llamacpp-superserver/catalog.json")
+def _env_value(primary: str, legacy: str | None = None, default: str = "") -> str:
+    if os.environ.get(primary):
+        return str(os.environ[primary])
+    if legacy and os.environ.get(legacy):
+        return str(os.environ[legacy])
+    return default
+
+
+def _env_path2(primary: str, legacy: str | None, default: str) -> Path:
+    return Path(_env_value(primary, legacy, default)).expanduser()
+
+
+PRODUCT_NAME = "Heimdall Gateway"
+PRODUCT_SLUG = "heimdall-gateway"
+SOCKET_PATH = _env_value("HEIMDALL_GATEWAY_MANAGER_SOCKET", "LLAMACPP_MANAGER_SOCKET", f"/run/{PRODUCT_SLUG}/manager.sock")
+DEFAULT_MODELS_DIR = _env_path2("HEIMDALL_GATEWAY_MODELS", "LLAMACPP_MODELS", f"/var/lib/{PRODUCT_SLUG}/models")
+DEFAULT_CONFIG_PATH = _env_path2("HEIMDALL_GATEWAY_CONFIG", "LLAMACPP_CONFIG", f"/var/lib/{PRODUCT_SLUG}/config.yaml")
+DEFAULT_CATALOG_PATH = _env_path2("HEIMDALL_GATEWAY_CATALOG", "LLAMACPP_CATALOG", f"/var/lib/{PRODUCT_SLUG}/catalog.json")
 DEFAULT_SERVER_CONFIG_PATH = _env_path(
-    "LLAMACPP_SERVER_CONFIG",
-    "/etc/llamacpp-superserver/llamacpp-superserver.json"
+    "HEIMDALL_GATEWAY_SERVER_CONFIG",
+    _env_value(
+        "HEIMDALL_GATEWAY_SERVER_CONFIG",
+        "LLAMACPP_SERVER_CONFIG",
+        f"/etc/{PRODUCT_SLUG}/conf.json"
     if os.geteuid() == 0
-    else str(Path.home() / ".config/llamacpp-superserver/llamacpp-superserver.json"),
+        else str(Path.home() / ".config" / PRODUCT_SLUG / "conf.json"),
+    ),
 )
 ALTERNATE_SERVER_CONFIG_BASENAME = "conf.json"
-DEFAULT_SERVICE_NAME = os.environ.get("LLAMACPP_SERVICE_NAME", "llamaswap")
-CLI_COMMAND = "llamacpp-superserver"
-LEGACY_CLI_COMMAND = "llamacpp-server"
-MANAGER_SERVICE_NAME = "llamacpp-superserver-manager"
-SWAP_SERVICE_NAME = "llamacpp-superserver-swap"
-DEFAULT_LLAMA_SERVER = _env_path("LLAMA_SERVER_BIN", "/opt/llamacpp-superserver/llama.cpp/build/bin/llama-server")
+DEFAULT_SERVICE_NAME = _env_value("HEIMDALL_GATEWAY_SERVICE_NAME", "LLAMACPP_SERVICE_NAME", "llamaswap")
+CLI_COMMAND = "heimdall-gateway"
+LEGACY_CLI_COMMAND = "llamacpp-superserver"
+MANAGER_SERVICE_NAME = "heimdall-gateway-manager"
+SWAP_SERVICE_NAME = "heimdall-gateway-router"
+DEFAULT_LLAMA_SERVER = _env_path("LLAMA_SERVER_BIN", f"/opt/{PRODUCT_SLUG}/llama.cpp/build/bin/llama-server")
 def _is_vllm_backend() -> bool:
-    backend = os.environ.get("LLAMACPP_BACKEND")
+    backend = _env_value("HEIMDALL_GATEWAY_BACKEND", "LLAMACPP_BACKEND", "")
     # Debug print to stderr so it shows up in logs even if stdout is captured
-    if os.environ.get("DEBUG_LLAMACPP"):
-        print(f"DEBUG: _is_vllm_backend check. LLAMACPP_BACKEND='{backend}'", file=sys.stderr)
+    if _env_value("HEIMDALL_GATEWAY_DEBUG", "DEBUG_LLAMACPP", ""):
+        print(f"DEBUG: _is_vllm_backend check. HEIMDALL_GATEWAY_BACKEND='{backend}'", file=sys.stderr)
     return backend == "vllm-beta"
 
 DEFAULT_CTX_SIZE = 8192
 try:
     DEFAULT_API_CTX_FACTOR = float(
-        os.environ.get("LLAMACPP_API_CTX_FACTOR", os.environ.get("LLAMACPP_CTX_DISPLAY_RATIO", "0.5"))
+        os.environ.get("HEIMDALL_GATEWAY_API_CTX_FACTOR", os.environ.get("LLAMACPP_API_CTX_FACTOR", os.environ.get("LLAMACPP_CTX_DISPLAY_RATIO", "0.5")))
     )
 except ValueError:
     DEFAULT_API_CTX_FACTOR = 0.5
 DEFAULT_N_GPU_LAYERS = 999
-DEFAULT_IDLE_TTL = int(os.environ.get("LLAMACPP_IDLE_TTL", os.environ.get("LLAMACPP_DEFAULT_TTL", "300")))
-DEFAULT_MODEL_SWITCH_GRACE_S = int(os.environ.get("LLAMACPP_MODEL_SWITCH_GRACE_S", "30"))
+DEFAULT_IDLE_TTL = int(_env_value("HEIMDALL_GATEWAY_IDLE_TTL", "LLAMACPP_IDLE_TTL", os.environ.get("LLAMACPP_DEFAULT_TTL", "300")))
+DEFAULT_MODEL_SWITCH_GRACE_S = int(_env_value("HEIMDALL_GATEWAY_MODEL_SWITCH_GRACE_S", "LLAMACPP_MODEL_SWITCH_GRACE_S", "30"))
 LLAMASWAP_UPSTREAM_STATIC_BLOCKED_BASENAMES = {
     "sw.js",
     "service-worker.js",
@@ -227,22 +247,27 @@ def default_tensor_split() -> str:
 
 DEFAULT_TENSOR_SPLIT = default_tensor_split()
 DEFAULT_START_PORT = 18080
-DEFAULT_PUBLIC_HOST = os.environ.get("LLAMACPP_PUBLIC_HOST", "127.0.0.1")
-DEFAULT_PUBLIC_PORT = int(os.environ.get("LLAMACPP_PUBLIC_PORT", "11437"))
-DEFAULT_API_PORT = int(os.environ.get("LLAMACPP_API_PORT", str(DEFAULT_PUBLIC_PORT - 1)))
+DEFAULT_PUBLIC_HOST = _env_value("HEIMDALL_GATEWAY_PUBLIC_HOST", "LLAMACPP_PUBLIC_HOST", "127.0.0.1")
+DEFAULT_PUBLIC_PORT = int(_env_value("HEIMDALL_GATEWAY_PUBLIC_PORT", "LLAMACPP_PUBLIC_PORT", "11437"))
+DEFAULT_API_PORT = int(_env_value("HEIMDALL_GATEWAY_API_PORT", "LLAMACPP_API_PORT", str(DEFAULT_PUBLIC_PORT - 1)))
 DEFAULT_REQUESTS_LOG_PATH = _env_path(
-    "LLAMACPP_REQUESTS_LOG",
-    "/var/lib/llamacpp-superserver/api-requests.log"
+    "HEIMDALL_GATEWAY_REQUESTS_LOG",
+    "/var/lib/heimdall-gateway/api-requests.log"
     if os.geteuid() == 0
-    else str(Path.home() / ".local/state/llamacpp-superserver/api-requests.log"),
+    else str(Path.home() / ".local/state/heimdall-gateway/api-requests.log"),
 )
-SYSTEM_REQUESTS_LOG_PATH = Path("/var/lib/llamacpp-superserver/api-requests.log")
+DEFAULT_LAST_CHAT_RESPONSE_LOG_PATH = Path(_env_value(
+    "HEIMDALL_GATEWAY_LAST_CHAT_RESPONSE_LOG",
+    "LLAMACPP_LAST_CHAT_RESPONSE_LOG",
+    str(DEFAULT_REQUESTS_LOG_PATH.with_name("last-chat-response.json")),
+)).expanduser()
+SYSTEM_REQUESTS_LOG_PATH = Path("/var/lib/heimdall-gateway/api-requests.log")
 MODEL_ACTIVITY_LOCK = threading.Lock()
 MODEL_ACTIVITY: dict[str, dict[str, float | str]] = {}
 LAST_ACTIVITY_MODEL_ID = ""
 
 LLAMASWAP_CONFIG_HEADER = (
-    "# llamacpp-superserver config.yaml\n"
+    "# Heimdall Gateway config.yaml\n"
     "# Purpose: llama-swap routing and per-model command map generated from catalog.\n"
     "# This file is regenerated by install/update operations.\n"
     "# Example:\n"
@@ -423,6 +448,105 @@ def _log_chat_stop_without_tools(
         },
     )
 
+
+def resolve_chat_last_response_log_config(args = None) -> dict[str, object]:
+    raw = _load_server_config_payload(args).get("experimental")
+    cfg = _normalize_experimental_config(raw).get("chat_last_response_log", {})
+    if not isinstance(cfg, dict):
+        cfg = dict(_default_experimental_config()["chat_last_response_log"])
+    return cfg
+
+
+def _truncate_debug_text(value: object, max_chars: int) -> tuple[str, bool]:
+    text = str(value or "")
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text, False
+    return text[:max_chars], True
+
+
+def _tool_call_debug_summary(tool_calls: object, max_items: int = 20, max_arg_chars: int = 2000) -> list[dict[str, object]]:
+    if not isinstance(tool_calls, list):
+        return []
+    out: list[dict[str, object]] = []
+    for index, item in enumerate(tool_calls[:max_items]):
+        if not isinstance(item, dict):
+            out.append({"index": index, "type": type(item).__name__})
+            continue
+        fn = item.get("function") if isinstance(item.get("function"), dict) else {}
+        args, args_truncated = _truncate_debug_text(fn.get("arguments") if isinstance(fn, dict) else "", max_arg_chars)
+        out.append(
+            {
+                "index": index,
+                "id": str(item.get("id") or "")[:200],
+                "type": str(item.get("type") or "")[:80],
+                "name": str(fn.get("name") or item.get("name") or "")[:200] if isinstance(fn, dict) else str(item.get("name") or "")[:200],
+                "arguments": args,
+                "arguments_truncated": args_truncated,
+                "arguments_len": len(str(fn.get("arguments") or "")) if isinstance(fn, dict) else 0,
+            }
+        )
+    return out
+
+
+def _write_chat_last_response_log(
+    args,
+    *,
+    request_id: str,
+    model: str,
+    upstream_model: str | None,
+    stream: bool,
+    content: object,
+    reasoning: object = "",
+    reasoning_len: int | None = None,
+    tool_calls: object = None,
+    tool_call_chunks: int = 0,
+    finish_reason: object = "",
+    repair_rounds: int = 0,
+) -> None:
+    cfg = resolve_chat_last_response_log_config(args)
+    if not bool(cfg.get("enabled")):
+        return
+    try:
+        max_chars = max(0, int(cfg.get("max_chars", 20000)))
+    except Exception:
+        max_chars = 20000
+    path_text = str(cfg.get("path") or "").strip()
+    path = Path(path_text) if path_text else DEFAULT_LAST_CHAT_RESPONSE_LOG_PATH
+    visible_text = str(content or "")
+    visible_preview, visible_truncated = _truncate_debug_text(visible_text, max_chars)
+    include_reasoning = bool(cfg.get("include_reasoning"))
+    reasoning_text = str(reasoning or "")
+    reasoning_preview, reasoning_truncated = _truncate_debug_text(reasoning_text, max_chars) if include_reasoning else ("", False)
+    entry: dict[str, object] = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "request_id": request_id,
+        "model": model,
+        "upstream_model": upstream_model,
+        "stream": stream,
+        "finish_reason": str(finish_reason or ""),
+        "repair_rounds": int(repair_rounds or 0),
+        "visible_content": visible_preview,
+        "visible_content_len": len(visible_text),
+        "visible_content_truncated": visible_truncated,
+        "reasoning_len": int(reasoning_len if reasoning_len is not None else len(reasoning_text)),
+        "reasoning_included": include_reasoning,
+        "tool_call_chunks": int(tool_call_chunks or 0),
+    }
+    if include_reasoning:
+        entry["reasoning"] = reasoning_preview
+        entry["reasoning_truncated"] = reasoning_truncated
+    if bool(cfg.get("include_tool_calls", True)):
+        entry["tool_calls"] = _tool_call_debug_summary(tool_calls)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.tmp")
+        tmp.write_text(json.dumps(entry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+        log_api_event("openai_chat_last_response_logged", {"request_id": request_id, "path": str(path), "visible_content_len": len(visible_text), "visible_content_truncated": visible_truncated})
+    except Exception as exc:
+        log_api_event("openai_chat_last_response_log_error", {"request_id": request_id, "path": str(path), "error": str(exc)})
+
+
 def _default_global_replicas_config() -> dict[str, object]:
     return {
         "enabled": False,
@@ -440,8 +564,36 @@ def _default_experimental_config() -> dict[str, object]:
             "max_tokens": 2048,
             "stream_keepalive_seconds": 15,
             "visible_notice_after_seconds": 4,
+            "trigger_prefixes": [
+                "[terminal command",
+                "Voy a",
+            ],
+            "loop_guard": {
+                "enabled": True,
+                "no_tool_call_max_chars": 12000,
+                "repeated_tail_min_chars": 3000,
+                "repeated_tail_repetitions": 4,
+            },
+        },
+        "chat_last_response_log": {
+            "enabled": False,
+            "path": "",
+            "max_chars": 20000,
+            "include_reasoning": False,
+            "include_tool_calls": True,
         }
     }
+
+
+def _normalize_chat_tool_continue_trigger_prefixes(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    prefixes: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if text and text not in prefixes:
+            prefixes.append(text)
+    return prefixes
 
 
 def _normalize_experimental_config(raw: object) -> dict[str, object]:
@@ -468,7 +620,39 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
                     repair["visible_notice_after_seconds"] = max(0, int(repair.get("visible_notice_after_seconds", 4)))
                 except Exception:
                     repair["visible_notice_after_seconds"] = 4
+                repair["trigger_prefixes"] = _normalize_chat_tool_continue_trigger_prefixes(repair.get("trigger_prefixes"))
+                loop_guard = repair.get("loop_guard")
+                default_loop_guard = _default_experimental_config()["chat_tool_continue_repair"]["loop_guard"]
+                if not isinstance(loop_guard, dict):
+                    loop_guard = dict(default_loop_guard)
+                else:
+                    merged_loop_guard = dict(default_loop_guard)
+                    merged_loop_guard.update(loop_guard)
+                    loop_guard = merged_loop_guard
+                loop_guard["enabled"] = _as_bool(loop_guard.get("enabled"), True)
+                for lk, dv in (
+                    ("no_tool_call_max_chars", 12000),
+                    ("repeated_tail_min_chars", 3000),
+                    ("repeated_tail_repetitions", 4),
+                ):
+                    try:
+                        loop_guard[lk] = max(0, int(loop_guard.get(lk, dv)))
+                    except Exception:
+                        loop_guard[lk] = dv
+                repair["loop_guard"] = loop_guard
                 cfg["chat_tool_continue_repair"] = repair
+            elif key == "chat_last_response_log" and isinstance(value, dict):
+                response_log = dict(cfg["chat_last_response_log"])
+                response_log.update(value)
+                response_log["enabled"] = _as_bool(response_log.get("enabled"), False)
+                response_log["path"] = str(response_log.get("path") or "").strip()
+                try:
+                    response_log["max_chars"] = max(0, int(response_log.get("max_chars", 20000)))
+                except Exception:
+                    response_log["max_chars"] = 20000
+                response_log["include_reasoning"] = _as_bool(response_log.get("include_reasoning"), False)
+                response_log["include_tool_calls"] = _as_bool(response_log.get("include_tool_calls"), True)
+                cfg["chat_last_response_log"] = response_log
             elif key not in cfg:
                 cfg[key] = value
     return cfg
@@ -487,7 +671,7 @@ def _normalize_api_auth_config(raw: object) -> dict[str, object]:
     if isinstance(raw, dict):
         cfg.update({k: v for k, v in raw.items() if k in cfg})
     cfg["enabled"] = _as_bool(cfg.get("enabled"), False)
-    cfg["api_key"] = str(cfg.get("api_key") or os.environ.get("LLAMACPP_API_KEY", "")).strip()
+    cfg["api_key"] = str(cfg.get("api_key") or _env_value("HEIMDALL_GATEWAY_API_KEY", "LLAMACPP_API_KEY", "")).strip()
     return cfg
 
 
@@ -664,18 +848,34 @@ def _migrate_llama_server_defaults(defaults: dict[str, object]) -> bool:
         "mirostat": 2,
         "mirostat_ent": 4.5,
         "mirostat_lr": 0.1,
+        # Retired global defaults. They are either model-family specific,
+        # not valid/safe for all llama.cpp builds, or not valid for GGUF
+        # models as global defaults. Per-model overrides remain explicit.
+        "chat_template_kwargs": None,
+        "cache_type_k": None,
+        "cache_type_v": None,
+        "mul_mat_q": None,
+        "grp_attn_n": None,
     }
     for key, old_value in old_default_values.items():
         if key not in defaults:
             continue
         current = defaults.get(key)
-        try:
-            same = float(current) == float(old_value)
-        except Exception:
-            same = str(current).strip() == str(old_value)
+        if old_value is None:
+            same = True
+        else:
+            try:
+                same = float(current) == float(old_value)
+            except Exception:
+                same = str(current).strip() == str(old_value)
         if same:
             defaults.pop(key, None)
             changed = True
+
+    use_fitc_value = _normalize_bool_flag(defaults.get("use_fitc"))
+    if use_fitc_value is False and "fit_target" in defaults:
+        defaults.pop("fit_target", None)
+        changed = True
 
     bundled = _load_bundled_llama_server_default_values()
     for key, value in bundled.items():
@@ -706,15 +906,15 @@ def _ensure_server_config_metadata(payload: dict[str, object]) -> dict[str, obje
     meta = payload.get("_meta")
     if not isinstance(meta, dict):
         meta = {}
-    # _meta is documentation owned by superserver, not user configuration.
+    # _meta is documentation owned by Heimdall Gateway, not user configuration.
     # Do not store example config values here: they look like duplicated active
     # settings and can contradict the real top-level keys.
-    meta["purpose"] = "Global superserver settings consumed by CLI/services."
+    meta["purpose"] = "Global Heimdall Gateway settings consumed by CLI/services."
     meta[
         "note"
     ] = "Active settings are top-level keys only. Model definitions live in catalog.json; config.yaml is generated for llama-swap."
     meta.pop("example", None)
-    meta["security"] = "Set api_auth.enabled/api_auth.api_key for Bearer or X-API-Key auth. Set api_https.enabled with cert_file/key_file to serve the Superserver API over HTTPS."
+    meta["security"] = "Set api_auth.enabled/api_auth.api_key for Bearer or X-API-Key auth. Set api_https.enabled with cert_file/key_file to serve the Heimdall Gateway API over HTTPS."
     meta["service_restart_help"] = {
         "system_mode": f"sudo systemctl restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
         "user_mode": f"systemctl --user restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
@@ -985,7 +1185,7 @@ def _normalize_bool_flag(value: object) -> bool | None:
 
 
 def _is_vllm_backend() -> bool:
-    return os.environ.get("LLAMACPP_BACKEND") == "vllm-beta"
+    return _env_value("HEIMDALL_GATEWAY_BACKEND", "LLAMACPP_BACKEND", "") == "vllm-beta"
 
 
 # Cache of parsed help flags per server binary path
@@ -1007,8 +1207,8 @@ def _server_help_env(server_path: Path | str | None) -> dict[str, str]:
             p.parent / "nccl" / "lib",
             p.parent.parent / "nccl" / "lib",
             p.parent.parent / "build" / "bin",
-            Path.home() / ".local" / "opt" / "llamacpp-superserver" / "cuda" / "lib",
-            Path.home() / ".local" / "opt" / "llamacpp-superserver" / "nccl" / "lib",
+            Path.home() / ".local" / "opt" / PRODUCT_SLUG / "cuda" / "lib",
+            Path.home() / ".local" / "opt" / PRODUCT_SLUG / "nccl" / "lib",
         ]
         existing = env.get("LD_LIBRARY_PATH", "")
         parts = [str(d) for d in lib_dirs if d.exists()]
@@ -1609,10 +1809,10 @@ def choose_gguf_file(api, repo_id, quant, explicit_file, token):
     all_files = sorted(s.rfilename for s in info.siblings if s.rfilename and s.rfilename.lower().endswith(".gguf"))
     if not all_files:
         if _is_vllm_backend():
-            if os.environ.get("DEBUG_LLAMACPP"):
+            if _env_value("HEIMDALL_GATEWAY_DEBUG", "DEBUG_LLAMACPP", ""):
                 print(f"DEBUG: No GGUF files found in {repo_id}, but vLLM backend is active. Returning None.", file=sys.stderr)
             return None
-        raise RuntimeError(f"No GGUF in {repo_id}. If you want to use a native HuggingFace model, set LLAMACPP_BACKEND=vllm-beta")
+        raise RuntimeError(f"No GGUF in {repo_id}. If you want to use a native HuggingFace model, set HEIMDALL_GATEWAY_BACKEND=vllm-beta")
     
     # Exclude mmproj files from main model search (they're selected separately)
     files = [f for f in all_files if "mmproj" not in f.lower()]
@@ -1700,13 +1900,41 @@ def _is_integrated_mtp_model_filename(filename: str | None) -> bool:
     stem = re.sub(r"(?i)\.gguf$", "", name)
     return bool(re.search(r"(^|[-_.])mtp($|[-_.])", stem)) and not name.startswith("mtp-")
 
+
+def _should_probe_repo_for_mtp_drafter(repo_id: str, filename: str, model_id: str = "", draft_path: str = "") -> bool:
+    haystack = " ".join([repo_id, filename, model_id, draft_path]).lower()
+    if "mtp" in haystack or str(draft_path or "").strip():
+        return True
+    # Some Unsloth Gemma 4 GGUF repos ship an MTP drafter (`mtp-gemma-4-31B-it.gguf`)
+    # while the repo and selected main model filenames do not contain "mtp".
+    # Heimdall Gateway launches local GGUFs with --model, so it must explicitly
+    # discover/download this drafter instead of relying on llama.cpp -hf magic.
+    return "unsloth/gemma-4-31b-it" in haystack and str(filename or "").strip().lower().endswith(".gguf")
+
+
 def _detect_mtp_drafter_file(api, repo_id: str, token: str | None, selected_file: str | None = None) -> str | None:
     try:
         info = api.model_info(repo_id=repo_id, token=token)
     except Exception:
-        return None
+        info = None
     selected = str(selected_file or "").strip()
-    siblings = [s.rfilename for s in getattr(info, "siblings", []) or [] if getattr(s, "rfilename", None)]
+    siblings = [s.rfilename for s in getattr(info, "siblings", []) or [] if getattr(s, "rfilename", None)] if info is not None else []
+    if not siblings:
+        try:
+            for item in api.list_repo_tree(repo_id=repo_id, recursive=True, token=token):
+                item_type = type(item).__name__.lower()
+                if "folder" in item_type:
+                    continue
+                name = ""
+                for attr in ("rfilename", "path", "name"):
+                    value = getattr(item, attr, None)
+                    if isinstance(value, str) and value:
+                        name = value
+                        break
+                if name:
+                    siblings.append(name)
+        except Exception:
+            return None
     candidates = sorted(f for f in siblings if f != selected and _is_mtp_drafter_filename(str(f)))
     if not candidates:
         return None
@@ -2568,6 +2796,14 @@ def _family_defaults_for_model(model: ManagedModel, family_defaults: object) -> 
     return matched
 
 
+def _is_gemma4_model(model: ManagedModel) -> bool:
+    try:
+        haystack = _model_family_match_text(model)
+    except Exception:
+        haystack = ""
+    return any(token in haystack for token in ("gemma-4", "gemma4"))
+
+
 def _server_supports_or_unknown(server_path: Path | str | None, flag: str) -> bool:
     try:
         return server_path is None or server_supports_flag(server_path, flag)
@@ -3011,7 +3247,13 @@ def build_llama_server_command(
         pass
     model_overrides = normalize_server_overrides(model.server_overrides)
     effective.update(model_overrides)
-    # Replica orchestration config is consumed by the superserver proxy/config
+    if _is_gemma4_model(model) and "swa_full" not in model_overrides:
+        # Gemma4 uses sliding-window attention.  A global --swa-full default
+        # turns that into a full-size KV cache; at 262k ctx this can request
+        # >100 GiB on a single GPU and make llama-server exit during load.
+        # Keep an explicit per-model override for advanced manual testing.
+        effective.pop("swa_full", None)
+    # Replica orchestration config is consumed by the Heimdall Gateway proxy/config
     # renderer and must never be forwarded as a llama-server CLI flag.
     effective.pop("replicas", None)
     effective.pop("auto_performance", None)
@@ -3058,10 +3300,23 @@ def build_llama_server_command(
         ):
             effective.pop(risky_key, None)
 
-    if str(effective.get("model_draft") or "").strip() and "draft" in effective:
+    if (
+        str(effective.get("model_draft") or "").strip()
+        and "draft" in effective
+        and (str(effective.get("spec_type") or "").strip() == "draft-mtp" or "spec_draft_n_max" in effective)
+    ):
         # Avoid rendering both MTP-specific --spec-draft-n-max and legacy
         # --draft/--draft-max aliases for the same drafter.
         effective.pop("draft", None)
+
+    # KV cache quantization defaults are not safe as a global/default flag for
+    # GGUF models in this stack. Keep them only for non-GGUF backends/models.
+    try:
+        if str(getattr(model, "local_path", "") or "").lower().endswith(".gguf"):
+            effective.pop("cache_type_k", None)
+            effective.pop("cache_type_v", None)
+    except Exception:
+        pass
 
     # Auto-enable draft-mtp for models whose id ends with '-mtp' unless
     # explicitly overridden by server_overrides. Downstream code emits
@@ -3251,7 +3506,7 @@ def build_llama_server_command(
         "reasoning_budget_message",
     ):
         if key in effective:
-            # Defaults generated by superserver should be conservative and must
+            # Defaults generated by Heimdall Gateway should be conservative and must
             # not inject unsupported flags into older/different llama.cpp builds.
             # Explicit per-model catalog overrides are different: if the user
             # configured a flag, emit it and let llama.cpp decide.
@@ -3356,9 +3611,39 @@ def persist_server_config(args) -> None:
     if getattr(args, "flatten", None) is not None:
         payload["flatten_namespace_tools"] = bool(args.flatten)
     normalized, changed = normalize_server_config_payload(payload)
+    if _rewrite_legacy_api_https_paths(normalized, path):
+        changed = True
     if changed or not path.exists() or any(getattr(args, name, None) is not None for name in ("idle_ttl", "api_port", "api_ctx_factor", "flatten")):
         path.write_text(json.dumps(normalized, indent=2) + "\n", encoding="utf-8")
 
+
+
+
+def _rewrite_legacy_api_https_paths(payload: dict[str, object], server_config_path: Path) -> bool:
+    https = payload.get("api_https")
+    if not isinstance(https, dict):
+        return False
+    changed = False
+    certs_dir = server_config_path.parent / "certs"
+    mapping = {
+        "cert_file": ("superserver-api.crt", "heimdall-gateway-api.crt"),
+        "key_file": ("superserver-api.key", "heimdall-gateway-api.key"),
+    }
+    for key, (legacy_name, new_name) in mapping.items():
+        raw = str(https.get(key) or "").strip()
+        if "llamacpp-superserver" not in raw and legacy_name not in raw:
+            continue
+        src = Path(raw).expanduser()
+        dst = certs_dir / new_name
+        if src.exists() and not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(src, dst)
+            except Exception:
+                pass
+        https[key] = str(dst)
+        changed = True
+    return changed
 
 def _server_config_summary_for_print(text: str) -> dict[str, object]:
     try:
@@ -3401,7 +3686,7 @@ def log_api_event(kind: str, payload: dict, log_path: Path = DEFAULT_REQUESTS_LO
         **payload,
     }
     line = json.dumps(entry, ensure_ascii=False) + "\n"
-    fallback_path = Path(os.environ.get("LLAMACPP_REQUESTS_LOG_FALLBACK", "/tmp/llamacpp-superserver-api-requests.log"))
+    fallback_path = Path(_env_value("HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK", "LLAMACPP_REQUESTS_LOG_FALLBACK", "/tmp/heimdall-gateway-api-requests.log"))
     
     errors = []
     for candidate in (Path(log_path), fallback_path):
@@ -3416,7 +3701,7 @@ def log_api_event(kind: str, payload: dict, log_path: Path = DEFAULT_REQUESTS_LO
             
     # If we got here, all attempts failed.
     # We print to stderr so it shows up in systemd journal, but don't crash the server.
-    if os.environ.get("LLAMACPP_DEBUG_LOGGING"):
+    if _env_value("HEIMDALL_GATEWAY_DEBUG_LOGGING", "LLAMACPP_DEBUG_LOGGING", ""):
         print(f"[!] log_api_event failed to write to any candidate: {', '.join(errors)}", file=sys.stderr)
 
 
@@ -4265,11 +4550,11 @@ def _hf_resolve_url(repo_id: str, filename: str) -> str:
 
 
 def _download_backend() -> str:
-    return os.environ.get("LLAMACPP_DOWNLOAD_BACKEND", "parallel").strip().lower()
+    return _env_value("HEIMDALL_GATEWAY_DOWNLOAD_BACKEND", "LLAMACPP_DOWNLOAD_BACKEND", "parallel").strip().lower()
 
 
 def _should_use_hf_transfer() -> bool:
-    raw = os.environ.get("LLAMACPP_USE_HF_TRANSFER", "1").strip().lower()
+    raw = _env_value("HEIMDALL_GATEWAY_USE_HF_TRANSFER", "LLAMACPP_USE_HF_TRANSFER", "1").strip().lower()
     return raw not in {"0", "false", "no", "off"}
 
 
@@ -4292,7 +4577,7 @@ def _probe_range_download(url: str, headers: dict[str, str]) -> tuple[int | None
 
 
 def _parallel_download_workers() -> int:
-    raw = os.environ.get("LLAMACPP_DOWNLOAD_WORKERS", "8").strip()
+    raw = _env_value("HEIMDALL_GATEWAY_DOWNLOAD_WORKERS", "LLAMACPP_DOWNLOAD_WORKERS", "8").strip()
     try:
         value = int(raw)
     except Exception:
@@ -4739,7 +5024,7 @@ def manager_hint() -> str:
 
 def infer_install_mode() -> str:
     """Infer whether this runtime is using system or user installation paths."""
-    explicit = os.environ.get("LLAMACPP_INSTALL_MODE", "").strip().lower()
+    explicit = _env_value("HEIMDALL_GATEWAY_INSTALL_MODE", "LLAMACPP_INSTALL_MODE", "").strip().lower()
     if explicit in {"system", "user"}:
         return explicit
 
@@ -4762,16 +5047,16 @@ def infer_install_mode() -> str:
         return "user"
 
     system_markers = (
-        "/etc/llamacpp-superserver",
-        "/var/lib/llamacpp-superserver",
-        "/opt/llamacpp-superserver",
+        "/etc/heimdall-gateway",
+        "/var/lib/heimdall-gateway",
+        "/opt/heimdall-gateway",
     )
     config_values = [str(path.expanduser()) for path in config_paths]
     if any(any(marker in value for marker in system_markers) for value in config_values):
         return "system"
 
     socket_path = str(Path(SOCKET_PATH).expanduser())
-    if "/run/llamacpp-superserver" in socket_path:
+    if "/run/heimdall-gateway" in socket_path:
         return "system"
     if str(home) in socket_path:
         return "user"
@@ -4812,7 +5097,7 @@ def _show_local_catalog_fallback(args, reason: Exception) -> None:
     elif _has_gguf_files(args.models_dir):
         print(
             "Detected GGUF files in the models directory, but there are no registered catalog entries yet. "
-            "Register models first with 'llamacpp-superserver run <hf-repo[:quant]>' or 'add'."
+            "Register models first with 'heimdall-gateway run <hf-repo[:quant]>' or 'add'."
         )
 
 def _ask_confirmation(prompt: str, progress_callback = None, default: bool = False) -> bool:
@@ -5235,6 +5520,11 @@ def ensure_model_available(args, progress_callback = None):
                     f"Detected MTP drafter for {existing.model_id}: {mtp_filename}; enabling draft-mtp.",
                     progress_callback,
                 )
+            elif str(normalize_server_overrides(existing.server_overrides).get("model_draft") or "").strip() == mtp_path:
+                _emit_message(
+                    f"MTP drafter already configured for {existing.model_id}: {mtp_filename}.",
+                    progress_callback,
+                )
         elif _is_integrated_mtp_model_filename(selected_file):
             updated_overrides, mtp_changed = _apply_mtp_server_overrides(existing.server_overrides, None, active_server_defaults)
             if mtp_changed or updated_overrides != normalize_server_overrides(existing.server_overrides):
@@ -5461,7 +5751,7 @@ def ensure_model_available(args, progress_callback = None):
         if model_partials:
             _emit_message(
                 "Detected partial downloads for this model; skipping automatic ctx probe. "
-                "Re-run with `llamacpp-superserver update --auto --model-id {}` after downloads finish.".format(mid),
+                "Re-run with `heimdall-gateway update --auto --model-id {}` after downloads finish.".format(mid),
                 progress_callback,
             )
             # Keep desired_ctx as-is (fallback or default) and avoid probing.
@@ -6694,8 +6984,8 @@ def model_has_enough_free_vram_to_load(model: ManagedModel, *, safety_vram_mib: 
 def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DEFAULT_PUBLIC_HOST, port=DEFAULT_PUBLIC_PORT) -> str | None:
     """Generate a user-friendly error message for GPU conflicts.
     
-    Uses only the local llamacpp-superserver installation for model management.
-    If a GPU conflict is detected, suggests using 'llamacpp-superserver unload' to free resources.
+    Uses only the local Heimdall Gateway installation for model management.
+    If a GPU conflict is detected, suggests using 'heimdall-gateway unload' to free resources.
     """
     processes = get_llama_server_processes()
     process_by_pid = {proc["pid"]: proc for proc in processes}
@@ -6738,7 +7028,7 @@ def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DE
         joined += f"; +{len(conflicts) - 4} more"
     return (
         f"Cannot load model '{model_id}' because the GPU is already in use: {joined}. "
-        "Use 'llamacpp-superserver unload <model>' to free resources, or wait for those workloads to finish."
+        "Use 'heimdall-gateway unload <model>' to free resources, or wait for those workloads to finish."
     )
 
 
@@ -6916,17 +7206,28 @@ def build_openai_model_list_payload(model: ManagedModel) -> dict:
     # Keep /v1/models fast and side-effect free. Some clients call this during
     # startup and expect a quick OpenAI-compatible list; detailed metadata is
     # available through /api/show and /api/ctx.  Include lightweight capability
-    # hints so OpenAI-compatible clients can avoid sending images to text-only
-    # GGUF models.
+    # and context hints so OpenAI-compatible clients can avoid sending images
+    # to text-only GGUF models and do not have to guess/cache the context
+    # window for custom endpoints.
     load_capabilities = _normalize_load_capabilities(getattr(model, "load_capabilities", []))
+    cfg_ctx = displayed_configured_ctx(model)
+    api_ctx = displayed_api_ctx(model) if cfg_ctx > 0 else 0
+    ctx_status = ctx_evaluation_status(model)
+    context_length = cfg_ctx if cfg_ctx > 0 and ctx_status != "ERROR" else None
+    api_context_length = api_ctx if api_ctx > 0 and ctx_status != "ERROR" else None
     return {
         "id": model.model_id,
         "object": "model",
         "created": 0,
         "owned_by": "llama-swap",
+        "context_length": context_length,
         "metadata": {
             "vision": _has_vision_runtime(model),
             "load_capabilities": load_capabilities,
+            "context_length": context_length,
+            "configured_context_length": context_length,
+            "api_context_length": api_context_length,
+            "api_context_status": ctx_status,
         },
     }
 
@@ -8152,7 +8453,7 @@ def _responses_tool_search_emulation_enabled(server_cfg: dict | None = None) -> 
     cfg = server_cfg.get("responses_tool_search_emulation")
     if isinstance(cfg, dict) and "enabled" in cfg:
         return bool(cfg.get("enabled"))
-    raw = os.environ.get("LLAMACPP_RESPONSES_TOOL_SEARCH_EMULATION")
+    raw = _env_value("HEIMDALL_GATEWAY_RESPONSES_TOOL_SEARCH_EMULATION", "LLAMACPP_RESPONSES_TOOL_SEARCH_EMULATION", "")
     if raw:
         return raw.strip().lower() in {"1", "true", "yes", "on"}
     return True
@@ -8834,7 +9135,7 @@ def _responses_payload_to_chat_payload(
 
 
 def _responses_internal_round_max_tokens() -> int:
-    raw = os.environ.get("LLAMACPP_RESPONSES_INTERNAL_MAX_TOKENS", "4096")
+    raw = _env_value("HEIMDALL_GATEWAY_RESPONSES_INTERNAL_MAX_TOKENS", "LLAMACPP_RESPONSES_INTERNAL_MAX_TOKENS", "4096")
     try:
         value = int(raw)
     except (TypeError, ValueError):
@@ -8856,12 +9157,12 @@ def _responses_tool_choice_to_chat_tool_choice(tool_choice: object) -> object:
     return tool_choice
 
 def _responses_raw_passthrough_enabled() -> bool:
-    value = os.environ.get("LLAMACPP_SUPERSERVER_RESPONSES_RAW_PASSTHROUGH", "")
+    value = _env_value("HEIMDALL_GATEWAY_RESPONSES_RAW_PASSTHROUGH", "LLAMACPP_SUPERSERVER_RESPONSES_RAW_PASSTHROUGH", "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _safe_runtime_enabled() -> bool:
-    value = os.environ.get("LLAMACPP_SAFE_RUNTIME", "")
+    value = _env_value("HEIMDALL_GATEWAY_SAFE_RUNTIME", "HEIMDALL_GATEWAY_SAFE_RUNTIME", "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -9226,7 +9527,12 @@ def _chat_tool_names_from_payload(tools: object, limit: int = 50) -> list[str]:
     return names
 
 
-def _chat_tool_continue_trigger_reason(content: object, tool_calls: object, tools: object) -> str:
+def _chat_tool_continue_trigger_reason(
+    content: object,
+    tool_calls: object,
+    tools: object,
+    trigger_prefixes: object = None,
+) -> str:
     if not isinstance(tools, list) or not tools:
         return ""
     has_tool_calls = bool(tool_calls)
@@ -9239,7 +9545,24 @@ def _chat_tool_continue_trigger_reason(content: object, tool_calls: object, tool
         return "empty_visible_content"
     if visible.endswith(":"):
         return "visible_content_trailing_colon"
+    visible_lines = [line.lstrip() for line in visible.splitlines()]
+    visible_line_starts = [line.casefold() for line in visible_lines]
+    visible_start = visible.lstrip().casefold()
+    for prefix in _normalize_chat_tool_continue_trigger_prefixes(trigger_prefixes):
+        folded_prefix = prefix.casefold()
+        if visible_start.startswith(folded_prefix):
+            return "visible_content_configured_prefix"
+        if any(line.startswith(folded_prefix) for line in visible_line_starts if line):
+            return "visible_content_configured_prefix_line"
+    tool_names = {name.casefold() for name in _chat_tool_names_from_payload(tools, limit=200)}
+    for line in visible_lines:
+        if not line.startswith("["):
+            continue
+        match = re.match(r"^\[([A-Za-z_][A-Za-z0-9_.-]*)(?:\s|\]|=)", line)
+        if match and match.group(1).casefold() in tool_names:
+            return "visible_content_pseudo_tool_line"
     return ""
+
 
 
 def _chat_tool_continue_repair_messages(
@@ -9264,6 +9587,8 @@ def _chat_tool_continue_repair_messages(
         }
     )
     return repaired
+
+
 
 
 
@@ -9413,6 +9738,42 @@ def _apply_chat_tool_continue_repair_token_cap(payload: dict, max_tokens: object
     return capped
 
 
+def _chat_tool_continue_loop_guard_reason(state: dict[str, object], loop_guard: dict[str, object] | None) -> str:
+    if not isinstance(loop_guard, dict) or not _as_bool(loop_guard.get("enabled"), True):
+        return ""
+    if int(state.get("tool_call_chunks") or 0) > 0:
+        return ""
+    visible_len = int(state.get("visible_content_len") or 0)
+    reasoning_len = int(state.get("reasoning_len") or 0)
+    generated_chars = visible_len + reasoning_len
+    try:
+        no_tool_limit = max(0, int(loop_guard.get("no_tool_call_max_chars", 12000)))
+    except Exception:
+        no_tool_limit = 12000
+    if no_tool_limit > 0 and generated_chars >= no_tool_limit:
+        return "no_tool_call_generation_limit"
+    tail = str(state.get("_loop_text_tail") or "")
+    try:
+        min_chars = max(0, int(loop_guard.get("repeated_tail_min_chars", 3000)))
+    except Exception:
+        min_chars = 3000
+    try:
+        repetitions = max(2, int(loop_guard.get("repeated_tail_repetitions", 4)))
+    except Exception:
+        repetitions = 4
+    if min_chars <= 0 or len(tail) < min_chars:
+        return ""
+    normalized_tail = " ".join(tail.lower().split())
+    if len(normalized_tail) < min_chars:
+        return ""
+    segment_len = min(512, max(120, min_chars // 6))
+    segment = normalized_tail[-segment_len:]
+    if not segment.strip():
+        return ""
+    if normalized_tail.count(segment) >= repetitions:
+        return "repeated_tail"
+    return ""
+
 
 def _send_openai_chat_sse_status(
     handler: BaseHTTPRequestHandler,
@@ -9456,8 +9817,9 @@ def _buffer_openai_chat_sse_with_keepalive(
     write_lock: threading.Lock,
     visible_status: dict[str, object] | None = None,
     visible_notice_after_seconds: int | None = None,
-    passthrough_visible_chars: int = 1024,
+    passthrough_visible_chars: int = 0,
     passthrough_tool_calls: bool = False,
+    loop_guard: dict[str, object] | None = None,
 ) -> tuple[list[bytes], bool, dict[str, object]]:
     buffered_lines: list[bytes] = []
     stop_heartbeat = threading.Event()
@@ -9465,6 +9827,7 @@ def _buffer_openai_chat_sse_with_keepalive(
     started_at = time.monotonic()
     state: dict[str, object] = {
         "visible_content_len": 0,
+        "reasoning_len": 0,
         "tool_call_chunks": 0,
         "tool_argument_chars": 0,
         "tool_names": [],
@@ -9475,6 +9838,8 @@ def _buffer_openai_chat_sse_with_keepalive(
         "tool_argument_lengths_by_index": {},
         "tool_argument_json_valid_by_index": {},
         "tool_argument_tail_by_index": {},
+        "buffer_abort_reason": "",
+        "_loop_text_tail": "",
     }
     tool_argument_parts_by_index: dict[str, list[str]] = {}
 
@@ -9510,9 +9875,22 @@ def _buffer_openai_chat_sse_with_keepalive(
         choice0 = (chunk_data.get("choices") or [{}])[0]
         delta = choice0.get("delta", {}) or {}
         content = delta.get("content", "") or ""
+        reasoning = delta.get("reasoning_content", "")
+        if reasoning in (None, ""):
+            reasoning = delta.get("reasoning", "")
+        if reasoning in (None, ""):
+            reasoning = delta.get("thinking", "")
         tool_calls = delta.get("tool_calls") or []
         if content:
-            state["visible_content_len"] = int(state.get("visible_content_len") or 0) + len(str(content))
+            content_text = str(content)
+            state["visible_content_len"] = int(state.get("visible_content_len") or 0) + len(content_text)
+            tail = str(state.get("_loop_text_tail") or "") + content_text
+            state["_loop_text_tail"] = tail[-24000:]
+        if reasoning:
+            reasoning_text = str(reasoning)
+            state["reasoning_len"] = int(state.get("reasoning_len") or 0) + len(reasoning_text)
+            tail = str(state.get("_loop_text_tail") or "") + reasoning_text
+            state["_loop_text_tail"] = tail[-24000:]
         if choice0.get("finish_reason"):
             finish_reason = str(choice0.get("finish_reason") or "")
             state["finish_reason"] = finish_reason
@@ -9631,7 +10009,19 @@ def _buffer_openai_chat_sse_with_keepalive(
                 break
             try:
                 with write_lock:
-                    log_api_event("openai_chat_stream_repair_buffer_pulse", {"request_id": request_id})
+                    log_api_event(
+                        "openai_chat_stream_repair_buffer_pulse",
+                        {
+                            "request_id": request_id,
+                            "elapsed_ms": int((time.monotonic() - started_at) * 1000),
+                            "visible_content_len": state.get("visible_content_len") or 0,
+                            "reasoning_len": state.get("reasoning_len") or 0,
+                            "tool_call_chunks": state.get("tool_call_chunks") or 0,
+                            "tool_argument_chars": state.get("tool_argument_chars") or 0,
+                            "finish_reason": state.get("finish_reason") or "",
+                            "buffer_abort_reason": state.get("buffer_abort_reason") or "",
+                        },
+                    )
                     handler.wfile.write(b": chat-tool-continue-repair-buffering\n\n")
                     handler.wfile.flush()
             except Exception:
@@ -9653,9 +10043,19 @@ def _buffer_openai_chat_sse_with_keepalive(
                 raise BrokenPipeError("client disconnected while buffering chat repair stream")
             buffered_lines.append(line)
             observe_line(line)
+            loop_reason = _chat_tool_continue_loop_guard_reason(state, loop_guard)
+            if loop_reason:
+                state["buffer_abort_reason"] = loop_reason
+                state.pop("_loop_text_tail", None)
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                break
             if should_passthrough():
                 passthrough = True
                 suppress_visible_notice.set()
+                state.pop("_loop_text_tail", None)
                 with write_lock:
                     for buffered in buffered_lines:
                         write_sse_line(buffered)
@@ -9690,6 +10090,7 @@ def _buffer_openai_chat_sse_with_keepalive(
         stop_heartbeat.set()
         heartbeat_thread.join(timeout=1.0)
         notice_thread.join(timeout=1.0)
+        state.pop("_loop_text_tail", None)
     return buffered_lines, passthrough, state
 
 
@@ -9793,7 +10194,7 @@ def run_llamaswap_guard(args) -> int:
     backend_host = "127.0.0.1"
     backend_port = int(getattr(args, "backend_port", None) or _next_llamaswap_guard_backend_port(listen_port))
     llamaswap_bin = Path(getattr(args, "llamaswap_bin", None) or os.environ.get("LLAMASWAP_BIN", "llama-swap"))
-    config_path = Path(getattr(args, "config", None) or os.environ.get("LLAMACPP_CONFIG", DEFAULT_CONFIG_PATH))
+    config_path = Path(getattr(args, "config", None) or os.environ.get("HEIMDALL_GATEWAY_CONFIG", _env_value("HEIMDALL_GATEWAY_CONFIG", "LLAMACPP_CONFIG", str(DEFAULT_CONFIG_PATH))))
     child_cmd = [
         str(llamaswap_bin),
         "--config",
@@ -10041,7 +10442,7 @@ def _candidate_request_log_paths(explicit_path: Path | None = None) -> list[Path
         candidates.append(explicit_path)
     
     # Check current user's local log
-    user_log = Path.home() / ".local/state/llamacpp-superserver/api-requests.log"
+    user_log = Path.home() / ".local/state/heimdall-gateway/api-requests.log"
     if user_log not in candidates:
         candidates.append(user_log)
         
@@ -10053,7 +10454,7 @@ def _candidate_request_log_paths(explicit_path: Path | None = None) -> list[Path
     if DEFAULT_REQUESTS_LOG_PATH not in candidates:
         candidates.append(DEFAULT_REQUESTS_LOG_PATH)
 
-    env_path = os.environ.get("LLAMACPP_REQUESTS_LOG")
+    env_path = _env_value("HEIMDALL_GATEWAY_REQUESTS_LOG", "HEIMDALL_GATEWAY_REQUESTS_LOG", "")
     if env_path:
         path = Path(env_path).expanduser()
         if path not in candidates:
@@ -10408,7 +10809,7 @@ def start_ctx_metadata_server(args):
             base_url = f"{scheme}://{host}"
             if not self._is_local_request():
                 self._send_json({
-                    "service": "llamacpp-superserver",
+                    "service": "heimdall-gateway",
                     "api": "openai-compatible",
                     "models_endpoint": "/v1/models",
                     "auth_required": api_auth_enabled,
@@ -10447,7 +10848,7 @@ def start_ctx_metadata_server(args):
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>llamacpp-superserver API</title>
+  <title>Heimdall Gateway API</title>
   <style>
     body {{ font-family: system-ui, sans-serif; max-width: 980px; margin: 32px auto; padding: 0 18px; line-height: 1.45; }}
     code, pre {{ background: #f4f4f5; border-radius: 6px; padding: 2px 5px; }}
@@ -10459,7 +10860,7 @@ def start_ctx_metadata_server(args):
   </style>
 </head>
 <body>
-  <h1>llamacpp-superserver API</h1>
+  <h1>Heimdall Gateway API</h1>
   <p>Esta pagina muestra informacion sensible y solo se sirve completa a clientes locales/loopback.</p>
   <table>
     <tr><th>Base URL</th><td><code>{escaped_base}</code></td></tr>
@@ -10538,7 +10939,7 @@ def start_ctx_metadata_server(args):
                 self._send_json({"models": running})
                 return
             if parsed.path == "/api/version":
-                self._send_json({"version": f"{get_superserver_version()}-llamacpp-superserver"})
+                self._send_json({"version": f"{get_heimdall_gateway_version()}-heimdall-gateway"})
                 return
             if parsed.path == "/api/ctx":
                 self._send_json({
@@ -11173,6 +11574,8 @@ def start_ctx_metadata_server(args):
                 repair_visible_notice_after_seconds = max(0, int(repair_cfg.get("visible_notice_after_seconds", 4)))
             except Exception:
                 repair_visible_notice_after_seconds = 4
+            repair_trigger_prefixes = _normalize_chat_tool_continue_trigger_prefixes(repair_cfg.get("trigger_prefixes"))
+            repair_loop_guard = repair_cfg.get("loop_guard") if isinstance(repair_cfg.get("loop_guard"), dict) else {}
             try:
                 response = requests.post(
                     f"http://{client_host}:{int(args.public_port)}/v1/chat/completions",
@@ -11222,13 +11625,61 @@ def start_ctx_metadata_server(args):
                                 write_lock=repair_write_lock,
                                 visible_status=pending_visible_status,
                                 visible_notice_after_seconds=repair_visible_notice_after_seconds,
+                                loop_guard=repair_loop_guard,
                             )
                             pending_visible_status = None
+                            if passthrough_state.get("buffer_abort_reason"):
+                                log_api_event(
+                                    "openai_chat_tool_continue_repair_loop_detected",
+                                    {
+                                        "request_id": request_id,
+                                        "model": model_name,
+                                        "upstream_model": upstream_model_name,
+                                        "repair_round": stream_repair_round_used,
+                                        "reason": passthrough_state.get("buffer_abort_reason") or "",
+                                        "visible_content_len": int(passthrough_state.get("visible_content_len") or 0),
+                                        "reasoning_len": int(passthrough_state.get("reasoning_len") or 0),
+                                        "tool_call_chunks": int(passthrough_state.get("tool_call_chunks") or 0),
+                                        "tool_argument_chars": int(passthrough_state.get("tool_argument_chars") or 0),
+                                        "finish_reason": passthrough_state.get("finish_reason") or "",
+                                        "elapsed_ms": _elapsed_ms(started_at),
+                                    },
+                                )
+                                with repair_write_lock:
+                                    _send_openai_chat_sse_status(
+                                        self,
+                                        request_id=request_id,
+                                        model=model_name,
+                                        content=(
+                                            "\n<think>\n"
+                                            "Tool-call repair loop detected; stopping this response instead of consuming more tokens.\n"
+                                            "</think>\n"
+                                        ),
+                                    )
+                                    self.wfile.write(b"data: [DONE]\n\n")
+                                    self.wfile.flush()
+                                mark_model_activity(model_name, "openai_chat", "stream_repair_loop_detected")
+                                if upstream_model_name:
+                                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                                _write_chat_last_response_log(
+                                    args,
+                                    request_id=request_id,
+                                    model=model_name,
+                                    upstream_model=upstream_model_name,
+                                    stream=True,
+                                    content="",
+                                    reasoning_len=int(passthrough_state.get("reasoning_len") or 0),
+                                    tool_calls=[],
+                                    tool_call_chunks=0,
+                                    finish_reason=str(passthrough_state.get("buffer_abort_reason") or ""),
+                                    repair_rounds=stream_repair_round_used,
+                                )
+                                return
                             if passthrough_done:
                                 mark_model_activity(model_name, "openai_chat", "stream_passthrough_closed")
                                 if upstream_model_name:
                                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
-                                log_api_event("openai_chat_total", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": True, "visible_content_len": int(passthrough_state.get("visible_content_len") or 0), "reasoning_len": 0, "tool_call_chunks": int(passthrough_state.get("tool_call_chunks") or 0), "tool_argument_chars": int(passthrough_state.get("tool_argument_chars") or 0), "tool_names": passthrough_state.get("tool_names") or [], "finish_reason": passthrough_state.get("finish_reason") or "passthrough", "finish_reasons_seen": passthrough_state.get("finish_reasons_seen") or [], "passthrough_reason": passthrough_state.get("passthrough_reason") or "", "tool_call_indices": passthrough_state.get("tool_call_indices") or [], "tool_argument_lengths_by_index": passthrough_state.get("tool_argument_lengths_by_index") or {}, "tool_argument_json_valid_by_index": passthrough_state.get("tool_argument_json_valid_by_index") or {}, "tool_argument_tail_by_index": passthrough_state.get("tool_argument_tail_by_index") or {}, "reasoning_only_final": False, "repair_rounds": stream_repair_round_used, "router_state": replica_trace_state_for_base(model_name)})
+                                log_api_event("openai_chat_total", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": True, "visible_content_len": int(passthrough_state.get("visible_content_len") or 0), "reasoning_len": int(passthrough_state.get("reasoning_len") or 0), "tool_call_chunks": int(passthrough_state.get("tool_call_chunks") or 0), "tool_argument_chars": int(passthrough_state.get("tool_argument_chars") or 0), "tool_names": passthrough_state.get("tool_names") or [], "finish_reason": passthrough_state.get("finish_reason") or "passthrough", "finish_reasons_seen": passthrough_state.get("finish_reasons_seen") or [], "passthrough_reason": passthrough_state.get("passthrough_reason") or "", "tool_call_indices": passthrough_state.get("tool_call_indices") or [], "tool_argument_lengths_by_index": passthrough_state.get("tool_argument_lengths_by_index") or {}, "tool_argument_json_valid_by_index": passthrough_state.get("tool_argument_json_valid_by_index") or {}, "tool_argument_tail_by_index": passthrough_state.get("tool_argument_tail_by_index") or {}, "reasoning_only_final": False, "repair_rounds": stream_repair_round_used, "router_state": replica_trace_state_for_base(model_name)})
                                 return
                         except (requests.RequestException, Exception) as exc:
                             log_api_event("openai_chat_stream_interrupted", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "error": str(exc), "router_state": replica_trace_state_for_base(model_name), "repair_round": stream_repair_round_used})
@@ -11243,6 +11694,7 @@ def start_ctx_metadata_server(args):
                             stream_state.get("content"),
                             stream_state.get("tool_calls"),
                             upstream_payload.get("tools"),
+                            repair_trigger_prefixes,
                         )
                         truncated_trigger_reason = _chat_tool_truncated_trigger_reason(stream_state)
                         final_buffered_lines = buffered_lines
@@ -11325,6 +11777,7 @@ def start_ctx_metadata_server(args):
                     final_tool_call_chunks = int(final_stream_state.get("tool_call_chunks") or 0)
                     reasoning_only_final = bool(final_reasoning_len) and not final_content and not final_stream_state.get("tool_calls")
                     log_api_event("openai_chat_total", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": True, "visible_content_len": len(final_content), "reasoning_len": final_reasoning_len, "tool_call_chunks": final_tool_call_chunks, "finish_reason": final_stream_state.get("finish_reason") or "", "reasoning_only_final": reasoning_only_final, "repair_rounds": stream_repair_round_used, "router_state": replica_trace_state_for_base(model_name)})
+                    _write_chat_last_response_log(args, request_id=request_id, model=model_name, upstream_model=upstream_model_name, stream=True, content=final_content, reasoning_len=final_reasoning_len, tool_calls=final_stream_state.get("tool_calls"), tool_call_chunks=final_tool_call_chunks, finish_reason=final_stream_state.get("finish_reason") or "", repair_rounds=stream_repair_round_used)
                     if final_tool_call_chunks == 0:
                         _log_chat_stop_without_tools(request_id, model_name, upstream_model_name, stream=True, content=final_content, reasoning_len=final_reasoning_len, finish_reason=final_stream_state.get("finish_reason") or "", repair_rounds=stream_repair_round_used)
                     if reasoning_only_final:
@@ -11418,12 +11871,13 @@ def start_ctx_metadata_server(args):
                         REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
                     reasoning_only_final = stream_reasoning_len > 0 and stream_visible_content_len == 0 and stream_tool_call_chunks == 0
                     log_api_event("openai_chat_total", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": True, "visible_content_len": stream_visible_content_len, "reasoning_len": stream_reasoning_len, "tool_call_chunks": stream_tool_call_chunks, "finish_reason": stream_finish_reason, "reasoning_only_final": reasoning_only_final, "router_state": replica_trace_state_for_base(model_name)})
+                    _write_chat_last_response_log(args, request_id=request_id, model=model_name, upstream_model=upstream_model_name, stream=True, content="".join(stream_visible_content_parts), reasoning_len=stream_reasoning_len, tool_calls=[{}] * stream_tool_call_chunks if stream_tool_call_chunks > 0 else [], tool_call_chunks=stream_tool_call_chunks, finish_reason=stream_finish_reason, repair_rounds=stream_repair_round_used)
                     if stream_tool_call_chunks == 0:
                         _log_chat_stop_without_tools(request_id, model_name, upstream_model_name, stream=True, content="".join(stream_visible_content_parts), reasoning_len=stream_reasoning_len, finish_reason=stream_finish_reason, repair_rounds=stream_repair_round_used)
                     if reasoning_only_final:
                         log_api_event("openai_chat_reasoning_only_final", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "reasoning_len": stream_reasoning_len, "finish_reason": stream_finish_reason})
                     if stream_repair_round_used:
-                        exhausted_reason = _chat_tool_continue_trigger_reason("".join(stream_visible_content_parts), [] if stream_tool_call_chunks == 0 else [{}], upstream_payload.get("tools"))
+                        exhausted_reason = _chat_tool_continue_trigger_reason("".join(stream_visible_content_parts), [] if stream_tool_call_chunks == 0 else [{}], upstream_payload.get("tools"), repair_trigger_prefixes)
                         if exhausted_reason:
                             log_api_event("openai_chat_tool_continue_repair_exhausted", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "rounds": stream_repair_round_used, "stream": True, "visible_content_len": stream_visible_content_len, "reasoning_len": stream_reasoning_len, "finish_reason": stream_finish_reason, "trigger_reason": exhausted_reason})
                 return
@@ -11443,6 +11897,7 @@ def start_ctx_metadata_server(args):
                         state.get("content"),
                         state.get("tool_calls"),
                         upstream_payload.get("tools"),
+                        repair_trigger_prefixes,
                     )
                     if not trigger_reason:
                         break
@@ -11491,6 +11946,7 @@ def start_ctx_metadata_server(args):
                     final_state.get("content"),
                     final_state.get("tool_calls"),
                     upstream_payload.get("tools"),
+                    repair_trigger_prefixes,
                 )
                 if exhausted_reason and repair_rounds_used >= repair_max_rounds:
                     log_api_event("openai_chat_tool_continue_repair_exhausted", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "rounds": repair_rounds_used, "stream": False, "visible_content_len": len(str(final_state.get("content") or "")), "reasoning_len": len(str(final_state.get("reasoning") or "")), "finish_reason": final_state.get("finish_reason") or "", "trigger_reason": exhausted_reason})
@@ -11503,6 +11959,7 @@ def start_ctx_metadata_server(args):
             if upstream_model_name:
                 REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
             log_api_event("openai_chat_total", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": False, "visible_content_len": len(nonstream_content), "reasoning_len": len(nonstream_reasoning), "tool_calls_count": len(nonstream_tool_calls) if isinstance(nonstream_tool_calls, list) else (1 if nonstream_tool_calls else 0), "finish_reason": choice.get("finish_reason") or "", "reasoning_only_final": nonstream_reasoning_only, "router_state": replica_trace_state_for_base(model_name)})
+            _write_chat_last_response_log(args, request_id=request_id, model=model_name, upstream_model=upstream_model_name, stream=False, content=nonstream_content, reasoning=nonstream_reasoning, tool_calls=nonstream_tool_calls, tool_call_chunks=len(nonstream_tool_calls) if isinstance(nonstream_tool_calls, list) else (1 if nonstream_tool_calls else 0), finish_reason=choice.get("finish_reason") or "", repair_rounds=repair_rounds_used)
             if not nonstream_tool_calls:
                 _log_chat_stop_without_tools(request_id, model_name, upstream_model_name, stream=False, content=nonstream_content, reasoning_len=len(nonstream_reasoning), finish_reason=choice.get("finish_reason") or "", repair_rounds=repair_rounds_used)
             if nonstream_reasoning_only:
@@ -11789,6 +12246,7 @@ def start_ctx_metadata_server(args):
                 chat_continue_repair_max_rounds = max(0, int(chat_continue_repair_cfg.get("max_rounds", 1)))
             except Exception:
                 chat_continue_repair_max_rounds = 1
+            chat_continue_repair_trigger_prefixes = _normalize_chat_tool_continue_trigger_prefixes(chat_continue_repair_cfg.get("trigger_prefixes"))
             if tool_registry is not None and tool_registry.has_deferred_tools:
                 extra_messages: list[dict] = []
                 accumulated_usage: dict | None = None
@@ -11813,7 +12271,7 @@ def start_ctx_metadata_server(args):
                 if stream:
                     _start_responses_sse_stream(self)
                     sse_started = True
-                    _write_sse_comment(self, "llamacpp-superserver internal Responses fallback started")
+                    _write_sse_comment(self, "heimdall-gateway internal Responses fallback started")
                 while True:
                     internal_payload = _responses_payload_to_chat_payload(
                         payload,
@@ -12362,6 +12820,7 @@ def start_ctx_metadata_server(args):
                             full_content,
                             [{}] if visible_tool_calls_started else [],
                             upstream_payload.get("tools"),
+                            chat_continue_repair_trigger_prefixes,
                         )
                         if trigger_reason:
                             responses_stream_repair_rounds = 1
@@ -12555,6 +13014,7 @@ def start_ctx_metadata_server(args):
                                     full_content,
                                     [{}] if repaired_tool_calls_started else [],
                                     upstream_payload.get("tools"),
+                                    chat_continue_repair_trigger_prefixes,
                                 )
                                 if exhausted_reason:
                                     log_api_event(
@@ -13381,7 +13841,7 @@ def show_hacks(args):
     print("  - GGML_CUDA_FORCE_MMQ")
     print("  - GGML_CUDA_GRAPHS")
     print("  - GGML_CUDA_FA_ALL_QUANTS")
-    print("    Disable for rebuild with: LLAMACPP_DISABLE_AGGRESSIVE_CUDA=1")
+    print("    Disable for rebuild with: HEIMDALL_GATEWAY_DISABLE_AGGRESSIVE_CUDA=1")
     print()
     print("Runtime knobs most relevant to native segfault isolation:")
     print("  - flash_attn")
@@ -13390,13 +13850,13 @@ def show_hacks(args):
     print("  - cont_batching")
     print("  - draft/speculative/MTP")
     print("  - ctx_checkpoints")
-    print("    Disable conservatively with: LLAMACPP_SAFE_RUNTIME=1, then regenerate config/restart.")
+    print("    Disable conservatively with: HEIMDALL_GATEWAY_SAFE_RUNTIME=1, then regenerate config/restart.")
     print()
     print("Active env in this CLI process:")
     for key in (
-        "LLAMACPP_DISABLE_AGGRESSIVE_CUDA",
-        "LLAMACPP_SAFE_RUNTIME",
-        "LLAMACPP_REQUESTS_LOG",
+        "HEIMDALL_GATEWAY_DISABLE_AGGRESSIVE_CUDA",
+        "HEIMDALL_GATEWAY_SAFE_RUNTIME",
+        "HEIMDALL_GATEWAY_REQUESTS_LOG",
     ):
         print(f"  {key}={os.environ.get(key, '')!r}")
     return 0
@@ -13662,8 +14122,8 @@ def refresh_templates(args) -> None:
     Speculative models are not affected by this operation.
     """
     templates_dir = None
-    if os.environ.get("LLAMACPP_TEMPLATES_DIR"):
-        templates_dir = Path(os.environ.get("LLAMACPP_TEMPLATES_DIR")).expanduser()
+    if _env_value("HEIMDALL_GATEWAY_TEMPLATES_DIR", "LLAMACPP_TEMPLATES_DIR", ""):
+        templates_dir = Path(_env_value("HEIMDALL_GATEWAY_TEMPLATES_DIR", "LLAMACPP_TEMPLATES_DIR", "")).expanduser()
     else:
         server_conf = Path(args.server_config) if getattr(args, "server_config", None) else Path(DEFAULT_SERVER_CONFIG_PATH)
         templates_dir = server_conf.expanduser().parent / "templates"
@@ -13911,8 +14371,8 @@ def _stop_process(proc):
 def _probe_runtime_env() -> dict[str, str] | None:
     env = os.environ.copy()
     lib_paths: list[str] = []
-    cuda_root = env.get("LLAMACPP_CUDA_ROOT", "").strip()
-    nccl_root = env.get("LLAMACPP_NCCL_ROOT", "").strip()
+    cuda_root = _env_value("HEIMDALL_GATEWAY_CUDA_ROOT", "LLAMACPP_CUDA_ROOT", "").strip()
+    nccl_root = _env_value("HEIMDALL_GATEWAY_NCCL_ROOT", "LLAMACPP_NCCL_ROOT", "").strip()
     if cuda_root:
         env["CUDA_PATH"] = cuda_root
         lib_paths.extend([f"{cuda_root}/lib64", f"{cuda_root}/lib"])
@@ -14387,7 +14847,7 @@ def choose_auto_ctx(model: ManagedModel, llama_server: Path, progress_callback =
     if _has_vision_runtime(model):
         _emit_message(f"{model.model_id}: vision runtime detected, each ctx probe will include a valid image plus text.", progress_callback, timestamp=True)
 
-    probe_max_first = os.environ.get("LLAMACPP_AUTO_CTX_MAX_FIRST", "").lower() in ("1", "true", "yes", "on")
+    probe_max_first = _env_value("HEIMDALL_GATEWAY_AUTO_CTX_MAX_FIRST", "LLAMACPP_AUTO_CTX_MAX_FIRST", "").lower() in ("1", "true", "yes", "on")
 
     # Detect whether a previous configured ctx value or prior probe metrics exist.
     prev_ctx_present = False
@@ -15190,7 +15650,7 @@ def ensure_catalog_mtp_drafters(
     """Backfill MTP drafter files/flags for already-installed local GGUF models.
 
     llama.cpp can auto-discover a repo-root MTP drafter when launched with
-    `-hf`, but superserver launches downloaded GGUFs with `--model`.  Existing
+    `-hf`, but Heimdall Gateway launches downloaded GGUFs with `--model`.  Existing
     installs therefore need an explicit local drafter file and `--model-draft`.
     """
     token = getattr(args, "hf_token", None) or os.environ.get("HF_TOKEN")
@@ -15202,8 +15662,12 @@ def ensure_catalog_mtp_drafters(
         filename = str(getattr(model, "filename", "") or "").strip()
         overrides = normalize_server_overrides(getattr(model, "server_overrides", {}) or {})
         draft_path = str(overrides.get("model_draft") or "").strip()
-        haystack = " ".join([repo_id, filename, str(getattr(model, "model_id", "") or "")]).lower()
-        if not repo_id or not filename or filename == "hf-native" or ("mtp" not in haystack and not draft_path):
+        if (
+            not repo_id
+            or not filename
+            or filename == "hf-native"
+            or not _should_probe_repo_for_mtp_drafter(repo_id, filename, str(getattr(model, "model_id", "") or ""), draft_path)
+        ):
             continue
         if draft_path and Path(draft_path).exists():
             updated, mtp_changed = _apply_mtp_server_overrides(overrides, draft_path, server_defaults)
@@ -15702,7 +16166,7 @@ def _print_warmup_failure(model_id: str, host: str, port: int, exc: Exception) -
         print(f"{type(exc).__name__}: {exc}")
     print(f"Recent request log: {DEFAULT_REQUESTS_LOG_PATH}")
     print("Run for details:")
-    print("  llamacpp-superserver requests --lines 80")
+    print("  heimdall-gateway requests --lines 80")
     print(f"  sudo journalctl -u {SWAP_SERVICE_NAME} -u {MANAGER_SERVICE_NAME} -n 120 --no-pager")
 
 
@@ -15895,7 +16359,7 @@ def daemon_mode(args):
         raise RuntimeError(f"Could not create manager socket directory for {SOCKET_PATH}: {exc}") from exc
     ctx_metadata_server = start_ctx_metadata_server(args)
     if ctx_metadata_server is None:
-        raise RuntimeError(f"Could not start Superserver API on {args.public_host}:{resolve_api_port(args)}")
+        raise RuntimeError(f"Could not start Heimdall Gateway API on {args.public_host}:{resolve_api_port(args)}")
     unload_guard_thread = start_unexpected_unload_guard(args)
     auto_update_thread = start_catalog_auto_update_watch(args)
     
@@ -16056,12 +16520,12 @@ def read_install_manifest():
     return payload if isinstance(payload, dict) else {}
 
 
-def get_superserver_version() -> str:
-    forced = os.environ.get("LLAMACPP_SUPERSERVER_VERSION", "").strip()
+def get_heimdall_gateway_version() -> str:
+    forced = _env_value("HEIMDALL_GATEWAY_VERSION", "LLAMACPP_SUPERSERVER_VERSION", "").strip()
     if forced:
         return forced
     try:
-        return version("llamacpp-superserver")
+        return version("heimdall-gateway")
     except PackageNotFoundError:
         pass
     except Exception:
@@ -16078,7 +16542,7 @@ def get_superserver_version() -> str:
     return "0.0.0"
 
 
-def render_superserver_banner() -> str:
+def render_heimdall_gateway_banner() -> str:
     divider = "=" * 72
     return (
         f"{divider}\n"
@@ -16088,8 +16552,8 @@ def render_superserver_banner() -> str:
         "| | | (_| | | | | | | (_| | (__| |  | |_| |_) |\n"
         "|_|_|\\__,_|_| |_| |_|\\__,_|\\___|_|   \\__| .__/\n"
         "                                           |_|   \n"
-        "              llama.cpp  SuperServer\n"
-        f"         llamacpp-superserver v{get_superserver_version()}\n"
+        "              Heimdall Gateway\n"
+        f"         heimdall-gateway v{get_heimdall_gateway_version()}\n"
         f"{divider}"
     )
 
@@ -16120,8 +16584,8 @@ def build_info_text(args = None) -> str:
     server_config_path = _args_server_config_path(args)
     llama_server_path = Path(getattr(args, "llama_server", DEFAULT_LLAMA_SERVER))
     install_root = _install_root_from_llama_server(llama_server_path)
-    # Templates directory: can be overridden with LLAMACPP_TEMPLATES_DIR
-    templates_env = os.environ.get("LLAMACPP_TEMPLATES_DIR")
+    # Templates directory: can be overridden with HEIMDALL_GATEWAY_TEMPLATES_DIR
+    templates_env = _env_value("HEIMDALL_GATEWAY_TEMPLATES_DIR", "LLAMACPP_TEMPLATES_DIR", "")
     if templates_env:
         templates_dir = Path(templates_env).expanduser()
     else:
@@ -16130,7 +16594,7 @@ def build_info_text(args = None) -> str:
     return (
         "Default endpoints:\n"
         f"  llama-swap UI/backend: {ui_url}\n"
-        f"  Superserver API:       {api_url}\n"
+        f"  Heimdall Gateway API:       {api_url}\n"
         "Installed versions:\n"
         f"  llama.cpp:           {llama_cpp_tag}\n"
         f"  llama-swap:          {llamaswap_tag}\n"
@@ -16169,7 +16633,7 @@ def build_info_text(args = None) -> str:
 
 
 def show_info(args):
-    print(render_superserver_banner())
+    print(render_heimdall_gateway_banner())
     print()
     print(build_info_text(args))
     return 0
@@ -16584,7 +17048,7 @@ def parse_cli_args(
 ) -> argparse.Namespace:
     argv_list = list(sys.argv[1:] if argv is None else argv)
     if any(token in {"-info", "--info"} for token in argv_list):
-        parser.error("Use the 'info' subcommand without dashes: llamacpp-superserver info")
+        parser.error("Use the 'info' subcommand without dashes: heimdall-gateway info")
     try:
         return parser.parse_args(argv_list)
     except SystemExit as exc:

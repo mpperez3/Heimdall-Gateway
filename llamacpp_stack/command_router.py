@@ -55,7 +55,7 @@ def manager_unavailable_error(exc: Exception, service_name: str) -> RuntimeError
     
     Args:
         exc: Original exception from manager
-        service_name: Name of manager service (e.g., "llamacpp-superserver-manager")
+        service_name: Name of manager service (e.g., "heimdall-gateway-manager")
     
     Returns:
         RuntimeError with actionable message

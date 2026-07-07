@@ -54,33 +54,62 @@ DEFAULT_LLAMASWAP_REPO = "mostlygeek/llama-swap"
 DEFAULT_IDLE_TTL = 300
 DEFAULT_SERVER_KEEP = 512
 DEFAULT_SERVICE_USER = "llamaswap"
-MANAGER_SERVICE_NAME = "llamacpp-superserver-manager.service"
-SWAP_SERVICE_NAME = "llamacpp-superserver-swap.service"
-LEGACY_MANAGER_SERVICE_NAME = "llamacpp-manager.service"
-LEGACY_SWAP_SERVICE_NAME = "llamaswap.service"
-CLI_COMMAND = "llamacpp-superserver"
-LEGACY_CLI_COMMAND = "llamacpp-server"
-MANAGER_WRAPPER_NAME = "llamacpp-superserver-manager-start"
-SWAP_WRAPPER_NAME = "llamacpp-superserver-swap-start"
+PRODUCT_NAME = "Heimdall Gateway"
+PRODUCT_SLUG = "heimdall-gateway"
+PRODUCT_ENV_PREFIX = "HEIMDALL_GATEWAY"
+MANAGER_SERVICE_NAME = "heimdall-gateway-manager.service"
+SWAP_SERVICE_NAME = "heimdall-gateway-router.service"
+CLI_COMMAND = "heimdall-gateway"
+MANAGER_WRAPPER_NAME = "heimdall-gateway-manager-start"
+SWAP_WRAPPER_NAME = "heimdall-gateway-router-start"
+# Legacy names are only used for one-way migration/cleanup from pre-Heimdall installs.
+LEGACY_INSTALL_NAMES = {
+    "product_slug": "llamacpp-superserver",
+    "cli_commands": ("llamacpp-superserver", "llamacpp-server", "llamacpp-stack-install", "llamacpp-stack-uninstall"),
+    "manager_services": ("llamacpp-superserver-manager.service", "llamacpp-manager.service"),
+    "router_services": ("llamacpp-superserver-swap.service", "llamaswap.service"),
+    "manager_wrappers": ("llamacpp-superserver-manager-start",),
+    "router_wrappers": ("llamacpp-superserver-swap-start",),
+    "config_dirs": ("llamacpp-superserver", "llamacpp"),
+    "state_dirs": ("llamacpp-superserver",),
+    "install_roots": ("llamacpp-superserver",),
+    "env_files": ("llamacpp-superserver.env", "llamacpp-stack.env"),
+    "server_configs": ("conf.json", "llamacpp-superserver.json", "llamacpp-server.json"),
+}
+LEGACY_MANAGER_SERVICE_NAME = LEGACY_INSTALL_NAMES["manager_services"][0]
+LEGACY_SWAP_SERVICE_NAME = LEGACY_INSTALL_NAMES["router_services"][0]
+LEGACY_CLI_COMMAND = LEGACY_INSTALL_NAMES["cli_commands"][0]
 OLLAMA_DEFAULT_PORT = 11434
 SERVER_CONFIG_BASENAME = "conf.json"
 LLAMA_SERVER_DEFAULTS_BASENAME = "llama_server_defaults.yaml"
 TEMPLATES_BASENAME = "templates"
 LEGACY_SERVER_CONFIG_BASENAME = "llamacpp-server.json"
-ENV_BASENAME = "llamacpp-superserver.env"
+ENV_BASENAME = "heimdall-gateway.env"
 LEGACY_ENV_BASENAME = "llamacpp-stack.env"
 LLAMA_CPP_MODES = ("native", "prebuilt", "source")
 BACKEND_OPTIONS = ("llama.cpp", "vllm-beta")  # Beta: vLLM as alternative backend
-ELEVATED_INSTALL_ENV = "LLAMACPP_INSTALL_ELEVATED"
-DISABLE_AGGRESSIVE_CUDA_ENV = "LLAMACPP_DISABLE_AGGRESSIVE_CUDA"
-LLAMA_CPP_REF_ENV = "LLAMACPP_LLAMA_CPP_REF"
-LLAMA_CPP_REF_PROMPTED_ENV = "LLAMACPP_LLAMA_CPP_REF_PROMPTED"
+ELEVATED_INSTALL_ENV = "HEIMDALL_GATEWAY_INSTALL_ELEVATED"
+LEGACY_ELEVATED_INSTALL_ENV = "LLAMACPP_INSTALL_ELEVATED"
+DISABLE_AGGRESSIVE_CUDA_ENV = "HEIMDALL_GATEWAY_DISABLE_AGGRESSIVE_CUDA"
+LEGACY_DISABLE_AGGRESSIVE_CUDA_ENV = "LLAMACPP_DISABLE_AGGRESSIVE_CUDA"
+LLAMA_CPP_REF_ENV = "HEIMDALL_GATEWAY_LLAMA_CPP_REF"
+LEGACY_LLAMA_CPP_REF_ENV = "LLAMACPP_LLAMA_CPP_REF"
+LLAMA_CPP_REF_PROMPTED_ENV = "HEIMDALL_GATEWAY_LLAMA_CPP_REF_PROMPTED"
+LEGACY_LLAMA_CPP_REF_PROMPTED_ENV = "LLAMACPP_LLAMA_CPP_REF_PROMPTED"
+for _new_env_name, _legacy_env_name in (
+    (ELEVATED_INSTALL_ENV, LEGACY_ELEVATED_INSTALL_ENV),
+    (DISABLE_AGGRESSIVE_CUDA_ENV, LEGACY_DISABLE_AGGRESSIVE_CUDA_ENV),
+    (LLAMA_CPP_REF_ENV, LEGACY_LLAMA_CPP_REF_ENV),
+    (LLAMA_CPP_REF_PROMPTED_ENV, LEGACY_LLAMA_CPP_REF_PROMPTED_ENV),
+):
+    if _legacy_env_name in os.environ and _new_env_name not in os.environ:
+        os.environ[_new_env_name] = os.environ[_legacy_env_name]
 
 CONFIG_YAML_HEADER = textwrap.dedent(
     """\
-    # llamacpp-superserver config.yaml
+    # Heimdall Gateway config.yaml
     # Purpose: llama-swap runtime routing + per-model launch command map.
-    # This file is generated/updated by installer and `llamacpp-superserver update`.
+    # This file is generated/updated by installer and `heimdall-gateway update`.
     # Example:
     #   models:
     #     my-model-id:
@@ -93,12 +122,12 @@ CONFIG_YAML_HEADER = textwrap.dedent(
 
 ENV_FILE_HEADER = textwrap.dedent(
     """\
-    # llamacpp-superserver.env
-    # Purpose: global process environment consumed by manager/swap wrappers.
+    # heimdall-gateway.env
+    # Purpose: global process environment consumed by Heimdall Gateway wrappers.
     # Example:
-    #   LLAMACPP_CATALOG=/var/lib/llamacpp-superserver/catalog.json
-    #   LLAMACPP_SERVER_CONFIG=/etc/llamacpp-superserver/conf.json
-    #   LLAMACPP_IDLE_TTL=300
+    #   HEIMDALL_GATEWAY_CATALOG=/var/lib/heimdall-gateway/catalog.json
+    #   HEIMDALL_GATEWAY_SERVER_CONFIG=/etc/heimdall-gateway/conf.json
+    #   HEIMDALL_GATEWAY_IDLE_TTL=300
 
     """
 )
@@ -120,8 +149,31 @@ def _default_experimental_config() -> dict[str, object]:
             "max_rounds": 1,
             "max_tokens": 2048,
             "stream_keepalive_seconds": 15,
+            "visible_notice_after_seconds": 4,
+            "trigger_prefixes": [
+                "[terminal command",
+                "Voy a",
+            ],
+        },
+        "chat_last_response_log": {
+            "enabled": False,
+            "path": "",
+            "max_chars": 20000,
+            "include_reasoning": False,
+            "include_tool_calls": True,
         }
     }
+
+
+def _normalize_chat_tool_continue_trigger_prefixes(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    prefixes: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if text and text not in prefixes:
+            prefixes.append(text)
+    return prefixes
 
 
 def _normalize_experimental_config(raw: object) -> dict[str, object]:
@@ -144,7 +196,24 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
                     repair["stream_keepalive_seconds"] = max(1, int(repair.get("stream_keepalive_seconds", 15)))
                 except Exception:
                     repair["stream_keepalive_seconds"] = 15
+                try:
+                    repair["visible_notice_after_seconds"] = max(0, int(repair.get("visible_notice_after_seconds", 4)))
+                except Exception:
+                    repair["visible_notice_after_seconds"] = 4
+                repair["trigger_prefixes"] = _normalize_chat_tool_continue_trigger_prefixes(repair.get("trigger_prefixes"))
                 cfg["chat_tool_continue_repair"] = repair
+            elif key == "chat_last_response_log" and isinstance(value, dict):
+                response_log = dict(cfg["chat_last_response_log"])
+                response_log.update(value)
+                response_log["enabled"] = bool(response_log.get("enabled"))
+                response_log["path"] = str(response_log.get("path") or "").strip()
+                try:
+                    response_log["max_chars"] = max(0, int(response_log.get("max_chars", 20000)))
+                except Exception:
+                    response_log["max_chars"] = 20000
+                response_log["include_reasoning"] = bool(response_log.get("include_reasoning"))
+                response_log["include_tool_calls"] = bool(response_log.get("include_tool_calls", True))
+                cfg["chat_last_response_log"] = response_log
             elif key not in cfg:
                 cfg[key] = value
     return cfg
@@ -250,15 +319,15 @@ def _ensure_server_config_metadata(payload: dict[str, object]) -> dict[str, obje
     meta = payload.get("_meta")
     if not isinstance(meta, dict):
         meta = {}
-    # _meta is documentation owned by superserver, not user configuration.
+    # _meta is documentation owned by Heimdall Gateway, not user configuration.
     # Do not store example config values here: they look like duplicated active
     # settings and can contradict the real top-level keys.
-    meta["purpose"] = "Global superserver settings consumed by CLI/services."
+    meta["purpose"] = "Global Heimdall Gateway settings consumed by Heimdall Gateway CLI/services."
     meta[
         "note"
     ] = "Active settings are top-level keys only. Model definitions live in catalog.json; config.yaml is generated for llama-swap."
     meta.pop("example", None)
-    meta["security"] = "api_auth enables Bearer/X-API-Key auth on the Superserver API. api_https enables TLS for the Superserver API when cert_file/key_file are configured."
+    meta["security"] = "api_auth enables Bearer/X-API-Key auth on the Heimdall Gateway API. api_https enables TLS for the Heimdall Gateway API when cert_file/key_file are configured."
     meta["service_restart_help"] = {
         "system_mode": f"sudo systemctl restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
         "user_mode": f"systemctl --user restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
@@ -358,17 +427,41 @@ def _merge_missing_llama_server_defaults(target: dict[str, object], config_dir: 
         "mirostat_ent": 4.5,
         "mirostat-lr": 0.1,
         "mirostat_lr": 0.1,
+        # Retired global defaults. Keep these out of active install confs;
+        # chat templates now belong in family/per-model defaults and cache
+        # quantization is not safe as a global default for GGUF deployments.
+        "chat-template-kwargs": None,
+        "chat_template_kwargs": None,
+        "cache-type-k": None,
+        "cache_type_k": None,
+        "cache-type-v": None,
+        "cache_type_v": None,
+        "mul-mat-q": None,
+        "mul_mat_q": None,
+        "grp-attn-n": None,
+        "grp_attn_n": None,
     }
     for key, legacy_value in legacy_defaults.items():
         if key not in target:
             continue
-        try:
-            same = float(target.get(key)) == float(legacy_value)
-        except Exception:
-            same = str(target.get(key)).strip() == str(legacy_value)
+        if legacy_value is None:
+            same = True
+        else:
+            try:
+                same = float(target.get(key)) == float(legacy_value)
+            except Exception:
+                same = str(target.get(key)).strip() == str(legacy_value)
         if same:
             target.pop(key, None)
             changed = True
+
+    use_fitc_raw = target.get("use-fitc", target.get("use_fitc"))
+    if str(use_fitc_raw).strip().lower() in {"false", "0", "off", "no"} and "fit-target" in target:
+        target.pop("fit-target", None)
+        changed = True
+    if str(use_fitc_raw).strip().lower() in {"false", "0", "off", "no"} and "fit_target" in target:
+        target.pop("fit_target", None)
+        changed = True
 
     # Merge all missing keys from bundled presets into the target config.
     # Existing keys are never overwritten so user-tuned values are preserved.
@@ -650,7 +743,7 @@ def prompt_existing_install_action() -> str:
             ),
             (
                 "package-only",
-                "Only update llamacpp-superserver itself; leave binaries, config, and auto-ctx untouched.",
+                "Only update Heimdall Gateway itself; leave binaries, config, and auto-ctx untouched.",
             ),
         ],
         default="full",
@@ -686,8 +779,8 @@ def resolve_llama_cpp_mode(requested_mode: str | None) -> str:
     if (
         selected == "source"
         and sys.stdin.isatty()
-        and not os.environ.get(LLAMA_CPP_REF_ENV)
-        and not os.environ.get(LLAMA_CPP_REF_PROMPTED_ENV)
+        and not (os.environ.get(LLAMA_CPP_REF_ENV) or os.environ.get(LEGACY_LLAMA_CPP_REF_ENV))
+        and not (os.environ.get(LLAMA_CPP_REF_PROMPTED_ENV) or os.environ.get(LEGACY_LLAMA_CPP_REF_PROMPTED_ENV))
     ):
         source_choice = prompt_choice(
             "Which llama.cpp source version should be built?",
@@ -709,12 +802,12 @@ def resolve_llama_cpp_mode(requested_mode: str | None) -> str:
 
 
 def resolve_llama_cpp_ref(requested_ref: str | None, llama_cpp_mode: str) -> str:
-    ref = str(requested_ref or os.environ.get(LLAMA_CPP_REF_ENV, "")).strip()
+    ref = str(requested_ref or os.environ.get(LLAMA_CPP_REF_ENV) or os.environ.get(LEGACY_LLAMA_CPP_REF_ENV, "")).strip()
     if ref:
         return ref
     if llama_cpp_mode != "source" or not sys.stdin.isatty():
         return ""
-    if os.environ.get(LLAMA_CPP_REF_PROMPTED_ENV):
+    if os.environ.get(LLAMA_CPP_REF_PROMPTED_ENV) or os.environ.get(LEGACY_LLAMA_CPP_REF_PROMPTED_ENV):
         return ""
     source_choice = prompt_choice(
         "Which llama.cpp source version should be built?",
@@ -752,12 +845,14 @@ def resolve_backend_choice(requested_backend: str | None) -> str:
     )
 
 
-def resolve_public_host(requested_host: str | None) -> str:
+def resolve_public_host(requested_host: str | None, existing_host: str | None = None) -> str:
     if requested_host and requested_host != "127.0.0.1":
         return requested_host
+    if existing_host:
+        return existing_host
     if not sys.stdin.isatty():
         return requested_host or "127.0.0.1"
-    if prompt_bool("Expose superserver API and llama-swap on all network interfaces (0.0.0.0)?", default=False):
+    if prompt_bool("Expose Heimdall Gateway API and llama-swap on all network interfaces (0.0.0.0)?", default=False):
         return "0.0.0.0"
     return "127.0.0.1"
 
@@ -1041,7 +1136,7 @@ def _args_to_cli(argv: argparse.Namespace, chosen_mode: str, chosen_llama_cpp_mo
 
 
 def maybe_reexec_system_install(argv: argparse.Namespace, chosen_mode: str, chosen_llama_cpp_mode: str, chosen_models_dir: Path) -> int | None:
-    if chosen_mode != "system" or os.geteuid() == 0 or os.environ.get(ELEVATED_INSTALL_ENV) == "1":
+    if chosen_mode != "system" or os.geteuid() == 0 or os.environ.get(ELEVATED_INSTALL_ENV) == "1" or os.environ.get(LEGACY_ELEVATED_INSTALL_ENV) == "1":
         return None
     cmd = [
         "sudo",
@@ -1088,7 +1183,7 @@ def detect_cuda_toolkit_package() -> str | None:
 
 
 def resolve_uv_executable() -> str | None:
-    bootstrap_uv = os.environ.get("LLAMACPP_BOOTSTRAP_UV")
+    bootstrap_uv = os.environ.get("HEIMDALL_GATEWAY_BOOTSTRAP_UV") or os.environ.get("LLAMACPP_BOOTSTRAP_UV")
     if bootstrap_uv and Path(bootstrap_uv).exists():
         return bootstrap_uv
     if uv_bin := shutil.which("uv"):
@@ -1364,21 +1459,46 @@ def detect_ollama_models_dir() -> Path | None:
     return None
 
 
-def existing_public_port(mode: str) -> int | None:
-    env_path = env_path_for_mode(mode)
-    if not env_path.exists():
+def _env_file_value(path: Path, keys: tuple[str, ...]) -> str | None:
+    if not path.exists():
         return None
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        clean = line.strip()
-        if clean.startswith("LLAMACPP_PUBLIC_PORT="):
-            raw = clean.split("=", 1)[1].strip()
-            if raw.isdigit():
-                return int(raw)
+    try:
+        if path.suffix == ".json":
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                for key in keys:
+                    value = payload.get(key.lower()) or payload.get(key)
+                    if value is not None:
+                        return str(value).strip()
+            return None
+        for line in path.read_text(encoding="utf-8").splitlines():
+            clean = line.strip()
+            for key in keys:
+                if clean.startswith(f"{key}="):
+                    return clean.split("=", 1)[1].strip()
+    except Exception:
+        return None
+    return None
+
+
+def existing_public_host(mode: str) -> str | None:
+    for env_path in env_paths_for_mode(mode):
+        raw = _env_file_value(env_path, ("HEIMDALL_GATEWAY_PUBLIC_HOST", "LLAMACPP_PUBLIC_HOST"))
+        if raw:
+            return raw
+    return None
+
+
+def existing_public_port(mode: str) -> int | None:
+    for env_path in env_paths_for_mode(mode):
+        raw = _env_file_value(env_path, ("HEIMDALL_GATEWAY_PUBLIC_PORT", "LLAMACPP_PUBLIC_PORT"))
+        if raw and raw.isdigit():
+            return int(raw)
     return None
 
 
 def env_path_for_mode(mode: str) -> Path:
-    base = Path("/etc/llamacpp-superserver") if mode == "system" else Path.home() / ".config/llamacpp-superserver"
+    base = Path(f"/etc/{PRODUCT_SLUG}") if mode == "system" else Path.home() / ".config" / PRODUCT_SLUG
     return base / ENV_BASENAME
 
 
@@ -1386,10 +1506,28 @@ def legacy_env_path_for_mode(mode: str) -> Path:
     return Path("/etc/llamacpp/llamacpp-stack.env") if mode == "system" else Path.home() / ".config/llamacpp/llamacpp-stack.env"
 
 
+def legacy_env_paths_for_mode(mode: str) -> list[Path]:
+    if mode == "system":
+        return [
+            Path("/etc/llamacpp-superserver/llamacpp-superserver.env"),
+            Path("/etc/llamacpp-superserver/conf.json"),
+            Path("/etc/llamacpp/llamacpp-stack.env"),
+        ]
+    return [
+        Path.home() / ".config/llamacpp-superserver/llamacpp-superserver.env",
+        Path.home() / ".config/llamacpp-superserver/conf.json",
+        Path.home() / ".config/llamacpp/llamacpp-stack.env",
+    ]
+
+
+def env_paths_for_mode(mode: str) -> list[Path]:
+    return [env_path_for_mode(mode), *legacy_env_paths_for_mode(mode)]
+
+
 def detect_existing_mode() -> str | None:
-    if env_path_for_mode("system").exists() or legacy_env_path_for_mode("system").exists():
+    if any(path.exists() for path in env_paths_for_mode("system")):
         return "system"
-    if env_path_for_mode("user").exists() or legacy_env_path_for_mode("user").exists():
+    if any(path.exists() for path in env_paths_for_mode("user")):
         return "user"
     return None
 
@@ -1406,13 +1544,14 @@ def _same_models_dir(selected: Path, existing: Path | None) -> bool:
 
 
 def existing_models_dir(mode: str) -> Path | None:
-    for env_path in (env_path_for_mode(mode), legacy_env_path_for_mode(mode)):
+    for env_path in env_paths_for_mode(mode):
         if not env_path.exists():
             continue
         for line in env_path.read_text(encoding="utf-8").splitlines():
             clean = line.strip()
-            if clean.startswith("LLAMACPP_MODELS="):
-                return Path(clean.split("=", 1)[1].strip()).expanduser()
+            for key in ("HEIMDALL_GATEWAY_MODELS", "LLAMACPP_MODELS"):
+                if clean.startswith(f"{key}="):
+                    return Path(clean.split("=", 1)[1].strip()).expanduser()
     return None
 
 
@@ -1422,8 +1561,8 @@ def derive_models_dir(base: Path | None, mode: str) -> Path:
         if mode == "system" or os.access(base.parent, os.W_OK):
             return sibling
     if mode == "system":
-        return Path("/var/lib/llamacpp-superserver/models")
-    return Path.home() / ".local/share/llamacpp-superserver/models"
+        return Path(f"/var/lib/{PRODUCT_SLUG}/models")
+    return Path.home() / ".local/share" / PRODUCT_SLUG / "models"
 
 
 def choose_layout(
@@ -1439,18 +1578,18 @@ def choose_layout(
     ollama_models = detect_ollama_models_dir()
     resolved_models_dir = models_dir or existing_models_dir(resolved_mode) or derive_models_dir(ollama_models, resolved_mode)
     if resolved_mode == "system":
-        install_root = Path("/opt/llamacpp-superserver")
-        state_dir = Path("/var/lib/llamacpp-superserver")
-        config_dir = Path("/etc/llamacpp-superserver")
-        run_dir = Path("/run/llamacpp-superserver")
+        install_root = Path(f"/opt/{PRODUCT_SLUG}")
+        state_dir = Path(f"/var/lib/{PRODUCT_SLUG}")
+        config_dir = Path(f"/etc/{PRODUCT_SLUG}")
+        run_dir = Path(f"/run/{PRODUCT_SLUG}")
         user = DEFAULT_SERVICE_USER
         group = user
         bin_dir = Path("/usr/local/bin")
     else:
-        install_root = Path.home() / ".local/opt/llamacpp-superserver"
-        state_dir = Path.home() / ".local/state/llamacpp-superserver"
-        config_dir = Path.home() / ".config/llamacpp-superserver"
-        run_dir = Path.home() / ".local/run/llamacpp-superserver"
+        install_root = Path.home() / ".local/opt" / PRODUCT_SLUG
+        state_dir = Path.home() / ".local/state" / PRODUCT_SLUG
+        config_dir = Path.home() / ".config" / PRODUCT_SLUG
+        run_dir = Path.home() / ".local/run" / PRODUCT_SLUG
         user = os.environ.get("USER", "unknown")
         group = user
         bin_dir = Path.home() / ".local/bin"
@@ -1473,6 +1612,198 @@ def choose_layout(
         nccl_root=install_root / "nccl",
         backend=backend,
     )
+
+
+def legacy_layout_paths(mode: str) -> dict[str, Path]:
+    if mode == "system":
+        return {
+            "config_dir": Path("/etc/llamacpp-superserver"),
+            "alt_config_dir": Path("/etc/llamacpp"),
+            "state_dir": Path("/var/lib/llamacpp-superserver"),
+            "install_root": Path("/opt/llamacpp-superserver"),
+            "run_dir": Path("/run/llamacpp-superserver"),
+            "systemd_dir": Path("/etc/systemd/system"),
+            "bin_dir": Path("/usr/local/bin"),
+        }
+    return {
+        "config_dir": Path.home() / ".config/llamacpp-superserver",
+        "alt_config_dir": Path.home() / ".config/llamacpp",
+        "state_dir": Path.home() / ".local/state/llamacpp-superserver",
+        "install_root": Path.home() / ".local/opt/llamacpp-superserver",
+        "run_dir": Path.home() / ".local/run/llamacpp-superserver",
+        "systemd_dir": Path.home() / ".config/systemd/user",
+        "bin_dir": Path.home() / ".local/bin",
+    }
+
+
+def _migration_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+
+
+def _backup_before_heimdall_migration(path: Path, stamp: str, dry_run: bool) -> Path | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    backup = path.with_name(f"{path.name}.pre-heimdall-migration-{stamp}")
+    if dry_run:
+        print(f"[dry-run] would back up {path} to {backup}")
+        return backup
+    if backup.exists():
+        return backup
+    if path.is_dir() and not path.is_symlink():
+        shutil.copytree(path, backup, symlinks=True)
+    else:
+        shutil.copy2(path, backup, follow_symlinks=False)
+    return backup
+
+
+def _copy_legacy_path_if_missing(src: Path, dst: Path, stamp: str, dry_run: bool) -> bool:
+    if not src.exists() and not src.is_symlink():
+        return False
+    if dst.exists() or dst.is_symlink():
+        return False
+    if dry_run:
+        print(f"[dry-run] would migrate {src} -> {dst}")
+        return True
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    _backup_before_heimdall_migration(src, stamp, dry_run=False)
+    if src.is_dir() and not src.is_symlink():
+        shutil.copytree(src, dst, symlinks=True)
+    else:
+        shutil.copy2(src, dst, follow_symlinks=False)
+    return True
+
+
+def _remove_legacy_path(path: Path, stamp: str, dry_run: bool) -> bool:
+    if not path.exists() and not path.is_symlink():
+        return False
+    if dry_run:
+        print(f"[dry-run] would remove legacy path {path}")
+        return True
+    _backup_before_heimdall_migration(path, stamp, dry_run=False)
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        path.unlink(missing_ok=True)
+    return True
+
+
+
+
+def _migrate_legacy_install_root_minimal(src: Path, dst: Path, stamp: str, dry_run: bool) -> bool:
+    """Create a lightweight new install root from a legacy root.
+
+    Avoid recursively copying caches, source trees, tarballs and venv contents.
+    Existing binaries/runtime dirs are referenced by symlink so package-only
+    migrations are fast; a later full binary update can replace them.
+    """
+    if not src.exists() or dst.exists() or dst.is_symlink():
+        return False
+    runtime_entries = (
+        "llama-server",
+        "llama-server.realpath",
+        "llama-swap",
+        "cuda",
+        "nccl",
+        "venv",
+    )
+    existing = [name for name in runtime_entries if (src / name).exists() or (src / name).is_symlink()]
+    if not existing:
+        return False
+    if dry_run:
+        print(f"[dry-run] would create lightweight install root {dst} from {src}: {', '.join(existing)}")
+        return True
+    _backup_before_heimdall_migration(src, stamp, dry_run=False)
+    dst.mkdir(parents=True, exist_ok=True)
+    for name in existing:
+        target = src / name
+        link = dst / name
+        if link.exists() or link.is_symlink():
+            continue
+        link.symlink_to(target, target_is_directory=target.is_dir())
+    return True
+
+def migrate_legacy_installation(layout: InstallLayout, dry_run: bool) -> int:
+    """Migrate pre-Heimdall install files into the new layout.
+
+    New Heimdall files are authoritative. Legacy files are copied only when the
+    corresponding new file/directory is missing, then legacy units/wrappers are
+    disabled/removed so no old service keeps running.
+    """
+    legacy = legacy_layout_paths(layout.mode)
+    stamp = _migration_stamp()
+    changed = 0
+
+    config_dir = legacy["config_dir"]
+    alt_config_dir = legacy["alt_config_dir"]
+    state_dir = legacy["state_dir"]
+
+    # Small, user-authored/runtime files. Do not move large model trees.
+    for src, dst in (
+        (config_dir / SERVER_CONFIG_BASENAME, layout.config_dir / SERVER_CONFIG_BASENAME),
+        (config_dir / "heimdall-gateway.json", layout.config_dir / SERVER_CONFIG_BASENAME),
+        (config_dir / LEGACY_SERVER_CONFIG_BASENAME, layout.config_dir / SERVER_CONFIG_BASENAME),
+        (config_dir / "llamacpp-superserver.env", layout.config_dir / ENV_BASENAME),
+        (alt_config_dir / LEGACY_ENV_BASENAME, layout.config_dir / ENV_BASENAME),
+        (state_dir / "catalog.json", layout.state_dir / "catalog.json"),
+        (state_dir / "config.yaml", layout.state_dir / "config.yaml"),
+        (state_dir / "api-requests.log", layout.state_dir / "api-requests.log"),
+        (state_dir / "last-chat-response.json", layout.state_dir / "last-chat-response.json"),
+        (state_dir / "install-manifest.json", layout.state_dir / "install-manifest.json"),
+    ):
+        if _copy_legacy_path_if_missing(src, dst, stamp, dry_run):
+            changed += 1
+
+    if _copy_legacy_path_if_missing(config_dir / TEMPLATES_BASENAME, layout.config_dir / TEMPLATES_BASENAME, stamp, dry_run):
+        changed += 1
+
+    # If the old install root exists and the new one does not, copy binaries/runtime.
+    # This preserves package-only upgrades without moving model storage.
+    old_root = legacy["install_root"]
+    if old_root.exists() and not layout.install_root.exists():
+        if _migrate_legacy_install_root_minimal(old_root, layout.install_root, stamp, dry_run):
+            changed += 1
+
+    legacy_services = [
+        *LEGACY_INSTALL_NAMES["manager_services"],
+        *LEGACY_INSTALL_NAMES["router_services"],
+    ]
+    if shutil.which("systemctl") is not None and not dry_run:
+        try:
+            _run(_systemctl_cmd(layout.mode, "stop", *legacy_services))
+        except Exception:
+            pass
+        try:
+            _run(_systemctl_cmd(layout.mode, "disable", *legacy_services))
+        except Exception:
+            pass
+
+    systemd_dir = legacy["systemd_dir"]
+    for service_name in legacy_services:
+        for path in (
+            systemd_dir / service_name,
+            systemd_dir / "default.target.wants" / service_name,
+            systemd_dir / "multi-user.target.wants" / service_name,
+        ):
+            if _remove_legacy_path(path, stamp, dry_run):
+                changed += 1
+    if shutil.which("systemctl") is not None and not dry_run:
+        try:
+            _run(_systemctl_cmd(layout.mode, "daemon-reload"))
+        except Exception:
+            pass
+
+    bin_dir = legacy["bin_dir"]
+    for name in (
+        *LEGACY_INSTALL_NAMES["manager_wrappers"],
+        *LEGACY_INSTALL_NAMES["router_wrappers"],
+        *LEGACY_INSTALL_NAMES["cli_commands"],
+    ):
+        if _remove_legacy_path(bin_dir / name, stamp, dry_run):
+            changed += 1
+
+    if changed:
+        print(f"Migrated legacy install names to {PRODUCT_NAME}: {changed} item(s).")
+    return changed
 
 
 def _user_exists(name: str) -> bool:
@@ -1753,44 +2084,33 @@ def _render_env(
     cuda_root: Path | None,
     nccl_root: Path | None,
 ) -> str:
-    extra = ""
-    if cuda_root is not None:
-        extra = textwrap.dedent(
-            f"""\
-            LLAMACPP_CUDA_ROOT={cuda_root}
-            """
-        )
-    if nccl_root is not None:
-        extra += textwrap.dedent(
-            f"""\
-            LLAMACPP_NCCL_ROOT={nccl_root}
-            """
-        )
-    backend_extra = ""
+    lines = [
+        f"HEIMDALL_GATEWAY_ROOT={layout.install_root}",
+        f"HEIMDALL_GATEWAY_MODELS={layout.models_dir}",
+        f"HEIMDALL_GATEWAY_CONFIG={layout.state_dir / 'config.yaml'}",
+        f"HEIMDALL_GATEWAY_CATALOG={layout.state_dir / 'catalog.json'}",
+        f"HEIMDALL_GATEWAY_SERVER_CONFIG={layout.config_dir / SERVER_CONFIG_BASENAME}",
+        f"HEIMDALL_GATEWAY_MANAGER_SOCKET={layout.manager_socket}",
+        f"LLAMA_SERVER_BIN={llama_server}",
+        f"LLAMASWAP_BIN={llamaswap}",
+        f"HEIMDALL_GATEWAY_PUBLIC_HOST={layout.public_host}",
+        f"HEIMDALL_GATEWAY_PUBLIC_PORT={layout.public_port}",
+        f"HEIMDALL_GATEWAY_API_PORT={layout.public_port - 1}",
+        f"HEIMDALL_GATEWAY_IDLE_TTL={idle_ttl}",
+        f"HEIMDALL_GATEWAY_INSTALL_MODE={layout.mode}",
+        f"HEIMDALL_GATEWAY_BACKEND={layout.backend}",
+        f"HEIMDALL_GATEWAY_SERVICE_NAME={SWAP_SERVICE_NAME}",
+        "HEIMDALL_GATEWAY_RESPONSES_INTERNAL_MAX_TOKENS=4096",
+        f"PYTHON_BIN={python_exec}",
+        f"HEIMDALL_GATEWAY_PYTHONPATH={python_path}",
+    ]
     if layout.backend == "vllm-beta":
-        backend_extra = "VLLM_WORKER_MULTIPROC_METHOD=spawn\n"
-    return ENV_FILE_HEADER + textwrap.dedent(
-        f"""\
-        LLAMACPP_STACK_ROOT={layout.install_root}
-        LLAMACPP_MODELS={layout.models_dir}
-        LLAMACPP_CONFIG={layout.state_dir / 'config.yaml'}
-        LLAMACPP_CATALOG={layout.state_dir / 'catalog.json'}
-        LLAMACPP_SERVER_CONFIG={layout.config_dir / SERVER_CONFIG_BASENAME}
-        LLAMACPP_MANAGER_SOCKET={layout.manager_socket}
-        LLAMA_SERVER_BIN={llama_server}
-        LLAMASWAP_BIN={llamaswap}
-        LLAMACPP_PUBLIC_HOST={layout.public_host}
-        LLAMACPP_PUBLIC_PORT={layout.public_port}
-        LLAMACPP_API_PORT={layout.public_port - 1}
-        LLAMACPP_IDLE_TTL={idle_ttl}
-        LLAMACPP_INSTALL_MODE={layout.mode}
-        LLAMACPP_BACKEND={layout.backend}
-        LLAMACPP_SERVICE_NAME={SWAP_SERVICE_NAME}
-        LLAMACPP_RESPONSES_INTERNAL_MAX_TOKENS=4096
-        PYTHON_BIN={python_exec}
-        LLAMACPP_PYTHONPATH={python_path}
-        {backend_extra}{extra}"""
-    )
+        lines.append("VLLM_WORKER_MULTIPROC_METHOD=spawn")
+    if cuda_root is not None:
+        lines.append(f"HEIMDALL_GATEWAY_CUDA_ROOT={cuda_root}")
+    if nccl_root is not None:
+        lines.append(f"HEIMDALL_GATEWAY_NCCL_ROOT={nccl_root}")
+    return ENV_FILE_HEADER + "\n".join(lines) + "\n"
 
 
 def render_manager_service(layout: InstallLayout) -> str:
@@ -1802,7 +2122,7 @@ def render_manager_service(layout: InstallLayout) -> str:
         runtime_lines = [f"RuntimeDirectory={layout.run_dir.name}", "RuntimeDirectoryMode=0755"]
     service_lines = [
         "[Unit]",
-        "Description=llamacpp superserver manager",
+        "Description=Heimdall Gateway manager",
         "After=network-online.target",
         "",
         "[Service]",
@@ -1826,7 +2146,7 @@ def render_llamaswap_service(layout: InstallLayout) -> str:
         identity_lines = [f"User={layout.service_user}", f"Group={layout.service_group}"]
     service_lines = [
         "[Unit]",
-        "Description=llamacpp superserver llama-swap backend",
+        "Description=Heimdall Gateway router",
         f"After=network-online.target {MANAGER_SERVICE_NAME}",
         "",
         "[Service]",
@@ -1849,17 +2169,17 @@ def render_manager_wrapper(layout: InstallLayout) -> str:
         #!/usr/bin/env bash
         set -euo pipefail
                 if [[ ! -f {env_file} ]]; then
-                    echo "[llamacpp-manager] Missing env file: {env_file}" >&2
+                    echo "[heimdall-gateway-manager] Missing env file: {env_file}" >&2
                     exit 1
                 fi
         set -a
         source {env_file}
         set +a
                 if [[ -z "${{PYTHON_BIN:-}}" ]] || [[ ! -x "$PYTHON_BIN" ]]; then
-                    echo "[llamacpp-manager] PYTHON_BIN is missing or not executable: '${{PYTHON_BIN:-}}'" >&2
+                    echo "[heimdall-gateway-manager] PYTHON_BIN is missing or not executable: '${{PYTHON_BIN:-}}'" >&2
                     exit 1
                 fi
-        export PYTHONPATH="$LLAMACPP_PYTHONPATH${{PYTHONPATH:+:$PYTHONPATH}}"
+        export PYTHONPATH="$HEIMDALL_GATEWAY_PYTHONPATH${{PYTHONPATH:+:$PYTHONPATH}}"
                 if [[ -n "${{LLAMA_SERVER_BIN:-}}" ]] && [[ -e "$LLAMA_SERVER_BIN" || -L "$LLAMA_SERVER_BIN" ]]; then
                     LLAMA_SERVER_REAL="$(readlink -f "$LLAMA_SERVER_BIN" || printf '%s' "$LLAMA_SERVER_BIN")"
                     if [[ -n "$LLAMA_SERVER_REAL" ]]; then
@@ -1867,23 +2187,23 @@ def render_manager_wrapper(layout: InstallLayout) -> str:
                         export LD_LIBRARY_PATH="$LLAMA_SERVER_LIB_DIR${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
                     fi
                 else
-                    echo "[llamacpp-manager] Warning: LLAMA_SERVER_BIN not found yet: '${{LLAMA_SERVER_BIN:-}}'" >&2
+                    echo "[heimdall-gateway-manager] Warning: LLAMA_SERVER_BIN not found yet: '${{LLAMA_SERVER_BIN:-}}'" >&2
                 fi
-        if [[ -n "${{LLAMACPP_CUDA_ROOT:-}}" ]]; then
-          export CUDA_PATH="$LLAMACPP_CUDA_ROOT"
-          export LD_LIBRARY_PATH="$LLAMACPP_CUDA_ROOT/lib64:$LLAMACPP_CUDA_ROOT/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+        if [[ -n "${{HEIMDALL_GATEWAY_CUDA_ROOT:-}}" ]]; then
+          export CUDA_PATH="$HEIMDALL_GATEWAY_CUDA_ROOT"
+          export LD_LIBRARY_PATH="$HEIMDALL_GATEWAY_CUDA_ROOT/lib64:$HEIMDALL_GATEWAY_CUDA_ROOT/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
         fi
-        if [[ -n "${{LLAMACPP_NCCL_ROOT:-}}" ]]; then
-          export LD_LIBRARY_PATH="$LLAMACPP_NCCL_ROOT/lib64:$LLAMACPP_NCCL_ROOT/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+        if [[ -n "${{HEIMDALL_GATEWAY_NCCL_ROOT:-}}" ]]; then
+          export LD_LIBRARY_PATH="$HEIMDALL_GATEWAY_NCCL_ROOT/lib64:$HEIMDALL_GATEWAY_NCCL_ROOT/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
         fi
-        mkdir -p "$(dirname "$LLAMACPP_MANAGER_SOCKET")" || true
+        mkdir -p "$(dirname "$HEIMDALL_GATEWAY_MANAGER_SOCKET")" || true
         exec "$PYTHON_BIN" -m llamacpp_stack.cli \\
-          --models-dir "$LLAMACPP_MODELS" \\
-          --config "$LLAMACPP_CONFIG" \\
-          --catalog "$LLAMACPP_CATALOG" \\
+          --models-dir "$HEIMDALL_GATEWAY_MODELS" \\
+          --config "$HEIMDALL_GATEWAY_CONFIG" \\
+          --catalog "$HEIMDALL_GATEWAY_CATALOG" \\
           --llama-server "$LLAMA_SERVER_BIN" \\
-          --public-host "$LLAMACPP_PUBLIC_HOST" \\
-          --public-port "$LLAMACPP_PUBLIC_PORT" \\
+          --public-host "$HEIMDALL_GATEWAY_PUBLIC_HOST" \\
+          --public-port "$HEIMDALL_GATEWAY_PUBLIC_PORT" \\
           daemon
         """
     )
@@ -1898,7 +2218,7 @@ def render_llamaswap_wrapper(layout: InstallLayout) -> str:
         set -a
         source {env_file}
         set +a
-        export PYTHONPATH="$LLAMACPP_PYTHONPATH${{PYTHONPATH:+:$PYTHONPATH}}"
+        export PYTHONPATH="$HEIMDALL_GATEWAY_PYTHONPATH${{PYTHONPATH:+:$PYTHONPATH}}"
         if [[ -n "${{LLAMA_SERVER_BIN:-}}" ]] && [[ -e "$LLAMA_SERVER_BIN" || -L "$LLAMA_SERVER_BIN" ]]; then
           LLAMA_SERVER_REAL="$(readlink -f "$LLAMA_SERVER_BIN" || printf '%s' "$LLAMA_SERVER_BIN")"
           if [[ -n "$LLAMA_SERVER_REAL" ]]; then
@@ -1906,21 +2226,21 @@ def render_llamaswap_wrapper(layout: InstallLayout) -> str:
             export LD_LIBRARY_PATH="$LLAMA_SERVER_LIB_DIR${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
           fi
         fi
-        if [[ -n "${{LLAMACPP_CUDA_ROOT:-}}" ]]; then
-          export CUDA_PATH="$LLAMACPP_CUDA_ROOT"
-          export LD_LIBRARY_PATH="$LLAMACPP_CUDA_ROOT/lib64:$LLAMACPP_CUDA_ROOT/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+        if [[ -n "${{HEIMDALL_GATEWAY_CUDA_ROOT:-}}" ]]; then
+          export CUDA_PATH="$HEIMDALL_GATEWAY_CUDA_ROOT"
+          export LD_LIBRARY_PATH="$HEIMDALL_GATEWAY_CUDA_ROOT/lib64:$HEIMDALL_GATEWAY_CUDA_ROOT/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
         fi
-        if [[ -n "${{LLAMACPP_NCCL_ROOT:-}}" ]]; then
-          export LD_LIBRARY_PATH="$LLAMACPP_NCCL_ROOT/lib64:$LLAMACPP_NCCL_ROOT/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+        if [[ -n "${{HEIMDALL_GATEWAY_NCCL_ROOT:-}}" ]]; then
+          export LD_LIBRARY_PATH="$HEIMDALL_GATEWAY_NCCL_ROOT/lib64:$HEIMDALL_GATEWAY_NCCL_ROOT/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
         fi
         exec "$PYTHON_BIN" -m llamacpp_stack.cli \\
-          --config "$LLAMACPP_CONFIG" \\
-          --public-host "$LLAMACPP_PUBLIC_HOST" \\
-          --public-port "$LLAMACPP_PUBLIC_PORT" \\
+          --config "$HEIMDALL_GATEWAY_CONFIG" \\
+          --public-host "$HEIMDALL_GATEWAY_PUBLIC_HOST" \\
+          --public-port "$HEIMDALL_GATEWAY_PUBLIC_PORT" \\
           llama-swap-guard \\
           --llamaswap-bin "$LLAMASWAP_BIN" \\
-          --listen-host "$LLAMACPP_PUBLIC_HOST" \\
-          --listen-port "$LLAMACPP_PUBLIC_PORT"
+          --listen-host "$HEIMDALL_GATEWAY_PUBLIC_HOST" \\
+          --listen-port "$HEIMDALL_GATEWAY_PUBLIC_PORT"
         """
     )
 
@@ -2429,12 +2749,12 @@ def read_install_manifest(layout: InstallLayout) -> dict[str, object]:
     return payload if isinstance(payload, dict) else {}
 
 
-def get_superserver_version() -> str:
-    forced = os.environ.get("LLAMACPP_SUPERSERVER_VERSION", "").strip()
+def get_heimdall_gateway_version() -> str:
+    forced = os.environ.get("HEIMDALL_GATEWAY_VERSION", "").strip()
     if forced:
         return forced
     try:
-        return version("llamacpp-superserver")
+        return version("heimdall-gateway")
     except PackageNotFoundError:
         pass
     except Exception:
@@ -2450,7 +2770,7 @@ def get_superserver_version() -> str:
     return "0.0.0"
 
 
-def render_superserver_banner() -> str:
+def render_heimdall_gateway_banner() -> str:
     divider = "=" * 72
     return (
         f"{divider}\n"
@@ -2460,8 +2780,8 @@ def render_superserver_banner() -> str:
         "| | | (_| | | | | | | (_| | (__| |  | |_| |_) |\n"
         "|_|_|\\__,_|_| |_| |_|\\__,_|\\___|_|   \\__| .__/\n"
         "                                           |_|   \n"
-        "              llama.cpp  SuperServer\n"
-        f"         llamacpp-superserver v{get_superserver_version()}\n"
+        "              Heimdall Gateway\n"
+        f"         heimdall-gateway v{get_heimdall_gateway_version()}\n"
         f"{divider}"
     )
 
@@ -2647,7 +2967,7 @@ def print_install_summary(layout: InstallLayout, install_services: bool, api_htt
         restart_cmd = f"systemctl --user restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}"
         status_cmd = f"systemctl --user status {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}"
 
-    print(render_superserver_banner())
+    print(render_heimdall_gateway_banner())
     print("\nInstallation complete.")
     print("Use:")
     print(f"  {CLI_COMMAND} --help")
@@ -2656,7 +2976,7 @@ def print_install_summary(layout: InstallLayout, install_services: bool, api_htt
     print(f"  {CLI_COMMAND} run <repo-or-hf-ref>")
     print(f"Installed llama.cpp: {current_llama_cpp}")
     print(f"Installed llama-swap: {current_llamaswap}")
-    print(f"Superserver API:     {api_url}")
+    print(f"Heimdall Gateway API:     {api_url}")
     if api_scheme == "https":
         print("  HTTPS is enabled for remote clients; loopback http://127.0.0.1:11435 remains available for local API clients.")
     print(f"UI activity:         {ui_url}")
@@ -3529,10 +3849,10 @@ def maybe_rerun_auto_ctx(layout: InstallLayout, install_services: bool, dry_run:
 
 def maybe_refresh_runtime_package_only(layout: InstallLayout, dry_run: bool, args: argparse.Namespace) -> None:
     if dry_run:
-        print(f"[dry-run] would refresh the llamacpp-superserver runtime package at {layout.install_root}")
+        print(f"[dry-run] would refresh the heimdall-gateway runtime package at {layout.install_root}")
         return
     ensure_runtime_python(layout, dry_run, skip_pip_install=args.skip_venv_install)
-    print("\n✓ Updated llamacpp-superserver Python package with latest features and fixes.")
+    print("\n✓ Updated heimdall-gateway Python package with latest features and fixes.")
     print("  (Binaries, config, and auto-ctx settings were left untouched.)")
     print("  Run the full installer if you need to refresh llama.cpp binaries or reconfigure the system.\n")
 
@@ -3689,8 +4009,8 @@ def _cert_subject_alt_names(cert_file: Path) -> list[str]:
 
 def _generate_self_signed_api_cert(layout: InstallLayout, host: str, dry_run: bool, extra_sans: list[str] | None = None, force: bool = False) -> tuple[str, str]:
     cert_dir = layout.config_dir / "certs"
-    cert_file = cert_dir / "superserver-api.crt"
-    key_file = cert_dir / "superserver-api.key"
+    cert_file = cert_dir / "heimdall-gateway-api.crt"
+    key_file = cert_dir / "heimdall-gateway-api.key"
     san_parts = _api_cert_san_entries(host, extra_sans=extra_sans)
     if dry_run:
         print(f"[dry-run] API certificate SANs: {', '.join(san_parts)}")
@@ -3705,7 +4025,7 @@ def _generate_self_signed_api_cert(layout: InstallLayout, host: str, dry_run: bo
             shutil.copy2(cert_file, cert_file.with_suffix(f".crt.bak-{stamp}"))
         if key_file.exists():
             shutil.copy2(key_file, key_file.with_suffix(f".key.bak-{stamp}"))
-    subj = "/CN=llamacpp-superserver"
+    subj = "/CN=heimdall-gateway"
     cmd = [
         "openssl", "req", "-x509", "-newkey", "rsa:4096", "-sha256",
         "-days", "825", "-nodes", "-keyout", str(key_file), "-out", str(cert_file),
@@ -3714,7 +4034,7 @@ def _generate_self_signed_api_cert(layout: InstallLayout, host: str, dry_run: bo
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         key_file.chmod(0o600)
-        print("Generated self-signed Superserver API certificate with SANs:")
+        print("Generated self-signed Heimdall Gateway API certificate with SANs:")
         for san in san_parts:
             print(f"  - {san}")
     except Exception as exc:
@@ -3817,19 +4137,19 @@ def resolve_api_security_options(args: argparse.Namespace, layout: InstallLayout
         if existing_https.get("enabled"):
             https_enabled = True
         elif sys.stdin.isatty():
-            https_enabled = prompt_bool("Enable HTTPS on the Superserver API (11435)?", default=False)
+            https_enabled = prompt_bool("Enable HTTPS on the Heimdall Gateway API (11435)?", default=False)
     https_enabled = bool(https_enabled)
     cert_file = str(getattr(args, "api_cert_file", "") or "").strip() or str(existing_https.get("cert_file") or "").strip()
     key_file = str(getattr(args, "api_key_file", "") or "").strip() or str(existing_https.get("key_file") or "").strip()
     if https_enabled and (not cert_file or not key_file):
         if sys.stdin.isatty():
             if prompt_bool("Generate a self-signed HTTPS certificate now? Remote clients must trust it manually.", default=True):
-                cert_file, key_file = _generate_self_signed_api_cert(layout, layout.public_host, getattr(args, "dry_run", False), extra_sans=_parse_extra_api_cert_sans(getattr(args, "api_cert_sans", "") or os.environ.get("LLAMACPP_API_CERT_SANS", "")), force=bool(getattr(args, "regenerate_api_cert", False)))
+                cert_file, key_file = _generate_self_signed_api_cert(layout, layout.public_host, getattr(args, "dry_run", False), extra_sans=_parse_extra_api_cert_sans(getattr(args, "api_cert_sans", "") or os.environ.get("HEIMDALL_GATEWAY_API_CERT_SANS") or os.environ.get("LLAMACPP_API_CERT_SANS", "")), force=bool(getattr(args, "regenerate_api_cert", False)))
             else:
                 print("HTTPS requested but no certificate/key configured; leaving HTTPS disabled.")
                 https_enabled = False
         else:
-            cert_file, key_file = _generate_self_signed_api_cert(layout, layout.public_host, getattr(args, "dry_run", False), extra_sans=_parse_extra_api_cert_sans(getattr(args, "api_cert_sans", "") or os.environ.get("LLAMACPP_API_CERT_SANS", "")), force=bool(getattr(args, "regenerate_api_cert", False)))
+            cert_file, key_file = _generate_self_signed_api_cert(layout, layout.public_host, getattr(args, "dry_run", False), extra_sans=_parse_extra_api_cert_sans(getattr(args, "api_cert_sans", "") or os.environ.get("HEIMDALL_GATEWAY_API_CERT_SANS") or os.environ.get("LLAMACPP_API_CERT_SANS", "")), force=bool(getattr(args, "regenerate_api_cert", False)))
     return (
         {"enabled": auth_enabled, "api_key": api_key if auth_enabled else ""},
         {"enabled": https_enabled, "cert_file": cert_file if https_enabled else "", "key_file": key_file if https_enabled else ""},
@@ -3838,7 +4158,8 @@ def resolve_api_security_options(args: argparse.Namespace, layout: InstallLayout
 
 def install_stack(args: argparse.Namespace) -> int:
     pre_mode = resolve_install_mode(args.mode)
-    chosen_public_host = resolve_public_host(args.public_host)
+    existing_host = existing_public_host(pre_mode)
+    chosen_public_host = resolve_public_host(args.public_host, existing_host)
     previous_models_dir = existing_models_dir(pre_mode)
     suggested_models_dir = previous_models_dir or derive_models_dir(detect_ollama_models_dir(), pre_mode)
     chosen_models_dir = Path(args.models_dir).expanduser() if args.models_dir else prompt_path("Models directory", suggested_models_dir)
@@ -3848,6 +4169,7 @@ def install_stack(args: argparse.Namespace) -> int:
 
     # 1. First tentative layout to stop services if they exist
     layout = choose_layout(pre_mode, chosen_public_host, args.public_port, chosen_models_dir, args=args)
+    migrate_legacy_installation(layout, args.dry_run)
     if args.install_services:
         # Stop existing services early so ports they occupy can be re-assigned or migrated to.
         stop_systemd_units(layout, args.dry_run)
@@ -3869,7 +4191,7 @@ def install_stack(args: argparse.Namespace) -> int:
                 # The interactive default is package-only; answering yes here
                 # runs the full installer (binaries/config/auto-ctx refresh).
                 run_full_installer = prompt_bool(
-                    "Run the full installer? (y=refresh llama.cpp, llama-swap, config, auto-ctx; n=package-only)",
+                    "Run the full installer? (y=refresh backends, config, auto-ctx; n=package-only)",
                     default=False,
                 )
                 package_only_update = not run_full_installer
@@ -3905,8 +4227,8 @@ def install_stack(args: argparse.Namespace) -> int:
         print(f"Keeping existing llama.cpp mode: {llama_cpp_mode}")
     api_auth_config, api_https_config = resolve_api_security_options(args, layout)
     api_scheme = "https" if api_https_config.get("enabled") else "http"
-    print(f"Superserver API:     {api_scheme}://{layout.public_host}:{layout.public_port - 1}")
-    print(f"Superserver API key: {'enabled' if api_auth_config.get('enabled') else 'disabled'}")
+    print(f"Heimdall Gateway API:     {api_scheme}://{layout.public_host}:{layout.public_port - 1}")
+    print(f"Heimdall Gateway API key: {'enabled' if api_auth_config.get('enabled') else 'disabled'}")
 
     reexec_status = maybe_reexec_system_install(args, pre_mode, llama_cpp_mode, chosen_models_dir)
     if reexec_status is not None:
@@ -3916,7 +4238,7 @@ def install_stack(args: argparse.Namespace) -> int:
         maybe_refresh_runtime_package_only(layout, args.dry_run, args)
         write_api_security_config(layout, api_auth_config, api_https_config, args.dry_run)
         if api_auth_config.get("enabled"):
-            print(f"Superserver API key saved in {layout.config_dir / SERVER_CONFIG_BASENAME} -> api_auth.api_key")
+            print(f"Heimdall Gateway API key saved in {layout.config_dir / SERVER_CONFIG_BASENAME} -> api_auth.api_key")
         # Ensure services are installed/enabled as well as restarted. A package-only
         # reinstall may run on a machine where the unit files exist under our
         # config dir but systemd currently says "Unit not loaded". enable --now
@@ -4171,10 +4493,6 @@ def install_stack(args: argparse.Namespace) -> int:
         print(swap_unit)
     else:
         (layout.config_dir / ENV_BASENAME).write_text(env_text, encoding="utf-8")
-        legacy_env_path = layout.config_dir.parent / "llamacpp" / LEGACY_ENV_BASENAME
-        if not legacy_env_path.exists():
-            legacy_env_path.parent.mkdir(parents=True, exist_ok=True)
-            legacy_env_path.write_text(env_text, encoding="utf-8")
         server_config_path = layout.config_dir / SERVER_CONFIG_BASENAME
         server_config_data: dict[str, object] = {}
         if server_config_path.exists():
@@ -4226,10 +4544,7 @@ def install_stack(args: argparse.Namespace) -> int:
             encoding="utf-8",
         )
         if api_auth_config.get("enabled"):
-            print(f"Superserver API key saved in {server_config_path} -> api_auth.api_key")
-        legacy_server_config_path = layout.config_dir / LEGACY_SERVER_CONFIG_BASENAME
-        if not legacy_server_config_path.exists():
-            legacy_server_config_path.write_text(server_config_payload, encoding="utf-8")
+            print(f"Heimdall Gateway API key saved in {server_config_path} -> api_auth.api_key")
         config_path = layout.state_dir / "config.yaml"
         catalog_path = layout.state_dir / "catalog.json"
         if not config_path.exists():
@@ -4257,21 +4572,18 @@ def install_stack(args: argparse.Namespace) -> int:
             "set -a\n"
             f"source {layout.config_dir / ENV_BASENAME}\n"
             "set +a\n"
-            "export PYTHONPATH=\"$LLAMACPP_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}\"\n"
-            "if [[ -n \"${LLAMACPP_CUDA_ROOT:-}\" ]]; then\n"
-            "  export CUDA_PATH=\"$LLAMACPP_CUDA_ROOT\"\n"
-            "  export LD_LIBRARY_PATH=\"$LLAMACPP_CUDA_ROOT/lib64:$LLAMACPP_CUDA_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"\n"
+            "export PYTHONPATH=\"$HEIMDALL_GATEWAY_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}\"\n"
+            "if [[ -n \"${HEIMDALL_GATEWAY_CUDA_ROOT:-}\" ]]; then\n"
+            "  export CUDA_PATH=\"$HEIMDALL_GATEWAY_CUDA_ROOT\"\n"
+            "  export LD_LIBRARY_PATH=\"$HEIMDALL_GATEWAY_CUDA_ROOT/lib64:$HEIMDALL_GATEWAY_CUDA_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"\n"
             "fi\n"
-            "if [[ -n \"${LLAMACPP_NCCL_ROOT:-}\" ]]; then\n"
-            "  export LD_LIBRARY_PATH=\"$LLAMACPP_NCCL_ROOT/lib64:$LLAMACPP_NCCL_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"\n"
+            "if [[ -n \"${HEIMDALL_GATEWAY_NCCL_ROOT:-}\" ]]; then\n"
+            "  export LD_LIBRARY_PATH=\"$HEIMDALL_GATEWAY_NCCL_ROOT/lib64:$HEIMDALL_GATEWAY_NCCL_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"\n"
             "fi\n"
             "exec \"$PYTHON_BIN\" -m llamacpp_stack.llamacpp_api_install \"$@\"\n",
             encoding="utf-8",
         )
         target_wrapper.chmod(0o755)
-        legacy_wrapper = layout.bin_dir / LEGACY_CLI_COMMAND
-        if not legacy_wrapper.exists() and not legacy_wrapper.is_symlink():
-            legacy_wrapper.symlink_to(target_wrapper)
         ensure_service_writable_dirs(layout, args.dry_run)
 
     write_manifest(layout, target_llama_cpp_tag, target_llamaswap_tag, strategy, backend, args.dry_run)
@@ -4294,7 +4606,7 @@ def install_stack(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Install llama.cpp + llama-swap stack.")
+    parser = argparse.ArgumentParser(description="Install Heimdall Gateway.")
     parser.add_argument("--mode", choices=("system", "user"))
     parser.add_argument("--backend", choices=BACKEND_OPTIONS, help="Inference backend to install: llama.cpp or vLLM beta.")
     parser.add_argument(
@@ -4310,11 +4622,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--public-port",
         type=int,
-        help="llama-swap backend port. By default new installs use ollama_port+2 and reserve ollama_port+1 for the superserver API.",
+        help="llama-swap backend port. By default new installs use ollama_port+2 and reserve ollama_port+1 for the Heimdall Gateway API.",
     )
-    parser.add_argument("--api-auth", action=argparse.BooleanOptionalAction, default=None, help="Require an API key on the Superserver API port.")
+    parser.add_argument("--api-auth", action=argparse.BooleanOptionalAction, default=None, help="Require an API key on the Heimdall Gateway API port.")
     parser.add_argument("--api-key", help="API key to write to conf.json when --api-auth is enabled. Generated if omitted.")
-    parser.add_argument("--api-https", action=argparse.BooleanOptionalAction, default=None, help="Serve the Superserver API over HTTPS.")
+    parser.add_argument("--api-https", action=argparse.BooleanOptionalAction, default=None, help="Serve the Heimdall Gateway API over HTTPS.")
     parser.add_argument("--api-cert-file", help="Certificate file for --api-https.")
     parser.add_argument("--api-key-file", help="Private key file for --api-https.")
     parser.add_argument("--api-cert-sans", help="Comma/space separated extra DNS names or IPs to include in generated API HTTPS certificate SANs.")

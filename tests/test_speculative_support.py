@@ -42,7 +42,7 @@ class SpeculativeSupportTest(unittest.TestCase):
         self.assertEqual(target["cache-ram"], 32768)
         self.assertEqual(target["ctx-checkpoints"], 32)
         self.assertEqual(target["checkpoint-min-step"], 1024)
-        self.assertEqual(target["chat-template-kwargs"], '{"preserve_thinking":true}')
+        self.assertNotIn("chat-template-kwargs", target)
         self.assertEqual(target["mtp_defaults"]["spec_draft_n_max"], 3)
 
     def test_cli_parser_accepts_speculative_flag(self) -> None:
@@ -403,7 +403,7 @@ class SpeculativeSupportTest(unittest.TestCase):
                 public_host="127.0.0.1",
                 public_port=11435,
                 idle_ttl=10,
-                server_config=root / "llamacpp-superserver.json",
+                server_config=root / "conf.json",
                 models_dir=models_dir,
             )
 

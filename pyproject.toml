@@ -1,7 +1,7 @@
 [project]
-name = "llamacpp-superserver"
+name = "heimdall-gateway"
 version = "0.1.0"
-description = "llama.cpp and llama-swap manager with an Ollama-compatible API shim."
+description = "Heimdall Gateway: local inference gateway and model orchestration layer."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -13,10 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
-llamacpp-superserver = "llamacpp_stack.llamacpp_api_install:main"
-llamacpp-server = "llamacpp_stack.llamacpp_api_install:main"
-llamacpp-stack-install = "llamacpp_stack.install:main"
-llamacpp-stack-uninstall = "llamacpp_stack.uninstall:main"
+heimdall-gateway = "llamacpp_stack.llamacpp_api_install:main"
 
 [build-system]
 requires = ["setuptools>=80.0"]

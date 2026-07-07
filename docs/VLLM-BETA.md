@@ -36,17 +36,17 @@ docker-compose -f docker-compose-vllm.yaml logs -f vllm
 When running the installer, select "vllm-beta" when prompted, or pass it explicitly:
 
 ```bash
-llamacpp-superserver install
+heimdall-gateway install
 # When asked: "Which inference backend would you like to use?"
 # → Select "vllm-beta"
 
-llamacpp-superserver install --backend vllm-beta
+heimdall-gateway install --backend vllm-beta
 ```
 
 The installer will:
 1. Create the runtime Python environment with `uv`
 2. Install vLLM and its torch backend with `uv pip install --torch-backend=auto`
-3. Set up vLLM in your llamacpp-superserver installation
+3. Set up vLLM in your heimdall-gateway installation
 4. Configure llama-swap to use vLLM's OpenAI API endpoint
 
 ### Option 3: Manual Setup
@@ -68,10 +68,10 @@ python -m vllm.entrypoints.openai.api_server \
 
 ```bash
 # Using the CLI
-llamacpp-superserver run -hf meta-llama/Llama-2-7b-hf
+heimdall-gateway run -hf meta-llama/Llama-2-7b-hf
 
 # Or with custom parameters
-llamacpp-superserver run \
+heimdall-gateway run \
   -hf meta-llama/Llama-2-7b-hf \
   --n-gpu-layers 40 \
   --ctx-size 4096
@@ -143,10 +143,10 @@ If you need to revert to llama.cpp:
 
 ```bash
 # Reinstall with llama.cpp backend
-llamacpp-superserver install --backend llama.cpp --update-binaries
+heimdall-gateway install --backend llama.cpp --update-binaries
 
 # Or manually specify
-llamacpp-superserver install --backend llama.cpp --llama-cpp-mode prebuilt
+heimdall-gateway install --backend llama.cpp --llama-cpp-mode prebuilt
 ```
 
 ## Environment Variables
@@ -186,7 +186,7 @@ export VLLM_GPU_MEMORY_UTILIZATION=0.9         # GPU memory usage percentage
 export VLLM_GPU_MEMORY_UTILIZATION=0.7
 
 # Or use smaller model
-llamacpp-superserver run -hf meta-llama/Llama-2-7b-chat-hf
+heimdall-gateway run -hf meta-llama/Llama-2-7b-chat-hf
 ```
 
 ### Model not found

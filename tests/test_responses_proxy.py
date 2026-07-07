@@ -26,12 +26,71 @@ from llamacpp_stack.cli import (
     _summarize_chat_tool_message_diagnostics,
     _strip_chat_tool_repair_notice_text,
     _sanitize_chat_tool_repair_notices_in_messages,
+    _normalize_experimental_config,
 )
 import inspect
 import io
 import json
 import threading
 import llamacpp_stack.cli as cli
+
+
+def test_chat_last_response_log_config_normalizes_defaults_and_overrides():
+    normalized = _normalize_experimental_config({
+        "chat_last_response_log": {
+            "enabled": True,
+            "path": " /tmp/last.json ",
+            "max_chars": "123",
+            "include_reasoning": True,
+            "include_tool_calls": False,
+        }
+    })
+
+    cfg = normalized["chat_last_response_log"]
+    assert cfg["enabled"] is True
+    assert cfg["path"] == "/tmp/last.json"
+    assert cfg["max_chars"] == 123
+    assert cfg["include_reasoning"] is True
+    assert cfg["include_tool_calls"] is False
+
+
+def test_chat_last_response_log_writes_bounded_snapshot(monkeypatch, tmp_path):
+    target = tmp_path / "last-chat-response.json"
+    monkeypatch.setattr(
+        cli,
+        "resolve_chat_last_response_log_config",
+        lambda args=None: {
+            "enabled": True,
+            "path": str(target),
+            "max_chars": 5,
+            "include_reasoning": True,
+            "include_tool_calls": True,
+        },
+    )
+    monkeypatch.setattr(cli, "log_api_event", lambda *args, **kwargs: None)
+
+    cli._write_chat_last_response_log(
+        None,
+        request_id="chat_req_test",
+        model="public-model",
+        upstream_model="internal-model",
+        stream=True,
+        content="abcdefghi",
+        reasoning="razonamiento largo",
+        tool_calls=[{"id": "call_1", "type": "function", "function": {"name": "terminal", "arguments": "{\"cmd\":\"ls\"}"}}],
+        tool_call_chunks=1,
+        finish_reason="tool_calls",
+        repair_rounds=1,
+    )
+
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    assert payload["request_id"] == "chat_req_test"
+    assert payload["visible_content"] == "abcde"
+    assert payload["visible_content_len"] == 9
+    assert payload["visible_content_truncated"] is True
+    assert payload["reasoning"] == "razon"
+    assert payload["reasoning_included"] is True
+    assert payload["tool_calls"][0]["name"] == "terminal"
 
 
 def _feedback_json_from_tool_content(content: str) -> dict:
@@ -71,7 +130,7 @@ def test_chat_tool_message_diagnostics_flags_suppressed_sudo_output():
     assert "sudo" in summary["matches"][0]["patterns"]
     assert "[terminal output suppressed]" in summary["matches"][0]["preview"]
 
-def test_chat_tool_continue_triggers_only_on_empty_visible_content_or_trailing_colon():
+def test_chat_tool_continue_triggers_on_empty_trailing_colon_or_configured_prefix():
     tools = _sample_chat_tools()
 
     assert _chat_tool_continue_trigger_reason("", [], tools) == "empty_visible_content"
@@ -79,6 +138,15 @@ def test_chat_tool_continue_triggers_only_on_empty_visible_content_or_trailing_c
     assert _chat_tool_continue_trigger_reason("Déjame editar:", [], tools) == "visible_content_trailing_colon"
     assert _chat_tool_continue_trigger_reason("Déjame editar el archivo", [], tools) == ""
     assert _chat_tool_continue_trigger_reason("Let me edit the file", [], tools) == ""
+    assert _chat_tool_continue_trigger_reason("Voy a ejecutar el comando", [], tools, ["Voy a"]) == "visible_content_configured_prefix"
+    assert _chat_tool_continue_trigger_reason("  [terminal command] sudo systemctl restart", [], tools, ["[terminal command"]) == "visible_content_configured_prefix"
+    assert _chat_tool_continue_trigger_reason("voy a ejecutar el comando", [], tools, ["Voy a"]) == "visible_content_configured_prefix"
+    assert _chat_tool_continue_trigger_reason("Te explico: voy a ejecutar el comando", [], tools, ["Voy a"]) == ""
+    assert _chat_tool_continue_trigger_reason("Voy a revisar:\n[terminal command=\"sg docker -c 'docker compose ls'\" timeout=10]", [], tools, ["[terminal command"]) == "visible_content_configured_prefix_line"
+    tools_with_search = tools + [{"type": "function", "function": {"name": "search_files"}}]
+    assert _chat_tool_continue_trigger_reason("[search_files output_mode=\"files_only\" path=\"/tmp\"]", [], tools_with_search) == "visible_content_pseudo_tool_line"
+    assert _chat_tool_continue_trigger_reason("Voy a revisar:\n[search_files output_mode=\"files_only\" path=\"/tmp\"]", [], tools_with_search) == "visible_content_pseudo_tool_line"
+    assert _chat_tool_continue_trigger_reason("[unknown_tool foo=\"bar\"]", [], tools_with_search) == ""
 
 
 
@@ -263,6 +331,34 @@ def test_chat_tool_continue_repair_buffer_passthroughs_long_visible_text():
     assert b"hello world" in handler.wfile.getvalue()
 
 
+def test_chat_tool_continue_repair_buffer_does_not_passthrough_visible_text_by_default():
+    class Handler:
+        def __init__(self):
+            self.wfile = io.BytesIO()
+
+    class Response:
+        def iter_lines(self):
+            yield b'data: {"choices":[{"delta":{"content":"[terminal command=\\\\\\"sg docker -c test\\\\\\"]"}}]}'
+            yield b"data: [DONE]"
+
+        def close(self):
+            pass
+
+    handler = Handler()
+    lines, passthrough, state = _buffer_openai_chat_sse_with_keepalive(
+        handler,
+        Response(),
+        request_id="chat_req_test",
+        keepalive_seconds=30,
+        write_lock=threading.Lock(),
+    )
+
+    assert passthrough is False
+    assert len(lines) == 2
+    assert state["visible_content_len"] > 0
+    assert handler.wfile.getvalue() == b""
+
+
 
 
 
@@ -380,6 +476,95 @@ def test_chat_tool_continue_repair_buffers_tool_calls_by_default_to_catch_length
     assert state["tool_call_chunks"] > 0
     assert state["tool_argument_json_valid_by_index"]["0"] is False
 
+
+def test_chat_tool_continue_repair_loop_guard_aborts_reasoning_without_tool_calls():
+    class Handler:
+        def __init__(self):
+            self.wfile = io.BytesIO()
+
+    class Response:
+        def __init__(self):
+            self.closed = False
+
+        def iter_lines(self):
+            chunks = [
+                {"choices": [{"delta": {"reasoning_content": "thinking "}}]},
+                {"choices": [{"delta": {"reasoning_content": "still thinking "}}]},
+                {"choices": [{"delta": {"reasoning_content": "more hidden text"}}]},
+                {"choices": [{"finish_reason": "length", "delta": {}}]},
+            ]
+            for chunk in chunks:
+                yield ("data: " + json.dumps(chunk)).encode("utf-8")
+            yield b"data: [DONE]"
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+    handler = Handler()
+    lines, passthrough, state = _buffer_openai_chat_sse_with_keepalive(
+        handler,
+        response,
+        request_id="chat_req_test",
+        keepalive_seconds=30,
+        write_lock=threading.Lock(),
+        loop_guard={
+            "enabled": True,
+            "no_tool_call_max_chars": 10,
+            "repeated_tail_min_chars": 0,
+            "repeated_tail_repetitions": 4,
+        },
+    )
+
+    assert passthrough is False
+    assert state["buffer_abort_reason"] == "no_tool_call_generation_limit"
+    assert state["reasoning_len"] >= 10
+    assert response.closed is True
+    assert handler.wfile.getvalue() == b""
+    assert lines
+
+
+def test_chat_tool_continue_repair_loop_guard_allows_large_tool_arguments():
+    class Handler:
+        def __init__(self):
+            self.wfile = io.BytesIO()
+
+    class Response:
+        def iter_lines(self):
+            long_args = "x" * 200
+            chunks = [
+                {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": "write_file", "arguments": long_args}}]}}]},
+                {"choices": [{"finish_reason": "tool_calls", "delta": {}}]},
+            ]
+            for chunk in chunks:
+                yield ("data: " + json.dumps(chunk)).encode("utf-8")
+            yield b"data: [DONE]"
+
+        def close(self):
+            pass
+
+    handler = Handler()
+    lines, passthrough, state = _buffer_openai_chat_sse_with_keepalive(
+        handler,
+        Response(),
+        request_id="chat_req_test",
+        keepalive_seconds=30,
+        write_lock=threading.Lock(),
+        loop_guard={
+            "enabled": True,
+            "no_tool_call_max_chars": 10,
+            "repeated_tail_min_chars": 0,
+            "repeated_tail_repetitions": 4,
+        },
+    )
+
+    assert passthrough is False
+    assert state["buffer_abort_reason"] == ""
+    assert state["tool_call_chunks"] > 0
+    assert state["tool_argument_chars"] == 200
+    assert len(lines) == 3
+
+
 def test_chat_tool_continue_repair_forces_required_tool_choice_when_auto():
     payload = {"model": "local/model", "tool_choice": "auto", "tools": _sample_chat_tools()}
 
@@ -405,6 +590,7 @@ def test_chat_tool_continue_repair_token_cap_limits_internal_rounds():
     assert capped["max_tokens"] == 2048
     assert capped["n_predict"] == 2048
     assert payload["max_tokens"] == 65536
+
 
 
 def test_responses_payload_does_not_convert_builtin_tools_for_legacy_chat_fallback():
@@ -439,13 +625,13 @@ def test_responses_payload_does_not_convert_builtin_tools_for_legacy_chat_fallba
 
 
 def test_responses_internal_round_max_tokens_has_safe_default(monkeypatch):
-    monkeypatch.delenv("LLAMACPP_RESPONSES_INTERNAL_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("HEIMDALL_GATEWAY_RESPONSES_INTERNAL_MAX_TOKENS", raising=False)
     assert _responses_internal_round_max_tokens() == 4096
 
-    monkeypatch.setenv("LLAMACPP_RESPONSES_INTERNAL_MAX_TOKENS", "64")
+    monkeypatch.setenv("HEIMDALL_GATEWAY_RESPONSES_INTERNAL_MAX_TOKENS", "64")
     assert _responses_internal_round_max_tokens() == 256
 
-    monkeypatch.setenv("LLAMACPP_RESPONSES_INTERNAL_MAX_TOKENS", "8192")
+    monkeypatch.setenv("HEIMDALL_GATEWAY_RESPONSES_INTERNAL_MAX_TOKENS", "8192")
     assert _responses_internal_round_max_tokens() == 8192
 
 
@@ -1023,11 +1209,11 @@ def test_responses_legacy_tool_output_extracts_inline_base64_data_url_as_image_p
     }
 
 def test_raw_responses_passthrough_is_disabled_by_default(monkeypatch):
-    monkeypatch.delenv("LLAMACPP_SUPERSERVER_RESPONSES_RAW_PASSTHROUGH", raising=False)
+    monkeypatch.delenv("HEIMDALL_GATEWAY_RESPONSES_RAW_PASSTHROUGH", raising=False)
 
     assert _responses_raw_passthrough_enabled() is False
 
-    monkeypatch.setenv("LLAMACPP_SUPERSERVER_RESPONSES_RAW_PASSTHROUGH", "1")
+    monkeypatch.setenv("HEIMDALL_GATEWAY_RESPONSES_RAW_PASSTHROUGH", "1")
 
     assert _responses_raw_passthrough_enabled() is True
 

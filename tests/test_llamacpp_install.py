@@ -82,6 +82,7 @@ from llamacpp_stack.cli import (
     is_llamaswap_upstream_static_autoload_path,
     _api_auth_matches,
     _detect_mtp_drafter_file,
+    _should_probe_repo_for_mtp_drafter,
     summarize_download_state,
     request_looks_like_model_probe,
     recent_activity_blocking_model_switch,
@@ -96,8 +97,10 @@ from llamacpp_stack.install import (
     CLI_COMMAND,
     DEFAULT_SERVICE_USER,
     ELEVATED_INSTALL_ENV,
+    ENV_BASENAME,
     MANAGER_SERVICE_NAME,
     LLAMA_SERVER_DEFAULTS_BASENAME,
+    PRODUCT_SLUG,
     SERVER_CONFIG_BASENAME,
     SWAP_SERVICE_NAME,
     _export_nvcc_path,
@@ -141,15 +144,20 @@ from llamacpp_stack.install import (
     maybe_rerun_auto_ctx,
     prompt_choice,
     render_manager_wrapper,
+    render_manager_service,
+    render_llamaswap_service,
+    _render_env,
     render_llamaswap_wrapper,
     render_vllm_server_wrapper,
     restart_systemd_units,
     stop_systemd_units,
     wait_for_manager_socket,
     resolve_public_host,
+    existing_public_host,
     resolve_uv_executable,
     resolve_install_mode,
     install_stack,
+    migrate_legacy_installation,
     resolve_api_security_options,
     _api_cert_san_entries,
     _generate_self_signed_api_cert,
@@ -187,6 +195,17 @@ def _write_minimal_gguf(path: Path, entries: list[tuple[str, int, object]]) -> N
 
 class InstallHelpersTest(unittest.TestCase):
 
+
+
+    def test_resolve_public_host_preserves_legacy_exposed_host(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            legacy = home / ".config" / "llamacpp-superserver"
+            legacy.mkdir(parents=True)
+            (legacy / "llamacpp-superserver.env").write_text("LLAMACPP_PUBLIC_HOST=0.0.0.0\n", encoding="utf-8")
+            with mock.patch("pathlib.Path.home", return_value=home):
+                self.assertEqual(existing_public_host("user"), "0.0.0.0")
+                self.assertEqual(resolve_public_host(None, existing_public_host("user")), "0.0.0.0")
 
     def test_catalog_json_sorts_newest_downloaded_first(self) -> None:
         old = ManagedModel(
@@ -297,7 +316,7 @@ class InstallHelpersTest(unittest.TestCase):
             try:
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=3) as response:
                     body = response.read().decode("utf-8")
-                self.assertIn("llamacpp-superserver API", body)
+                self.assertIn("Heimdall Gateway API", body)
                 self.assertIn("secret-local", body)
                 self.assertIn("/v1/models", body)
                 self.assertIn(str(server_config), body)
@@ -422,8 +441,8 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertTrue(auth["enabled"])
             self.assertTrue(str(auth["api_key"]).startswith("lcsk_"))
             self.assertTrue(https["enabled"])
-            self.assertTrue(str(https["cert_file"]).endswith("superserver-api.crt"))
-            self.assertTrue(str(https["key_file"]).endswith("superserver-api.key"))
+            self.assertTrue(str(https["cert_file"]).endswith("heimdall-gateway-api.crt"))
+            self.assertTrue(str(https["key_file"]).endswith("heimdall-gateway-api.key"))
 
 
 
@@ -598,6 +617,23 @@ class InstallHelpersTest(unittest.TestCase):
             "gemma-4-31B-it-qat-UD-Q4_K_XL.gguf",
         )
 
+    def test_choose_gguf_file_matches_gemma4_non_qat_ud_quant_with_mtp_present(self) -> None:
+        sibling_names = [
+            "BF16/gemma-4-31B-it-BF16-00001-of-00002.gguf",
+            "BF16/gemma-4-31B-it-BF16-00002-of-00002.gguf",
+            "MTP/gemma-4-31B-it-BF16-MTP.gguf",
+            "gemma-4-31B-it-UD-Q4_K_XL.gguf",
+            "gemma-4-31B-it-Q4_K_M.gguf",
+            "mtp-gemma-4-31B-it.gguf",
+            "mmproj-BF16.gguf",
+        ]
+        api = mock.MagicMock()
+        api.model_info.return_value.siblings = [mock.Mock(rfilename=name) for name in sibling_names]
+        self.assertEqual(
+            choose_gguf_file(api, "unsloth/gemma-4-31B-it-GGUF", "UD-Q4_K_XL", None, None),
+            "gemma-4-31B-it-UD-Q4_K_XL.gguf",
+        )
+
     def test_choose_gguf_file_matches_ud_q5_xl_not_default_q4(self) -> None:
         sibling_names = [
             "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
@@ -627,6 +663,113 @@ class InstallHelpersTest(unittest.TestCase):
             ),
             "mtp-gemma-4-31B-it.gguf",
         )
+
+    def test_detect_mtp_drafter_for_gemma4_qat_and_non_qat_repos(self) -> None:
+        for repo_id, selected in (
+            ("unsloth/gemma-4-31B-it-qat-GGUF", "gemma-4-31B-it-qat-UD-Q4_K_XL.gguf"),
+            ("unsloth/gemma-4-31B-it-GGUF", "gemma-4-31B-it-UD-Q4_K_XL.gguf"),
+        ):
+            with self.subTest(repo_id=repo_id):
+                api = mock.MagicMock()
+                api.model_info.return_value.siblings = [
+                    mock.Mock(rfilename=selected),
+                    mock.Mock(rfilename="MTP/gemma-4-31B-it-BF16-MTP.gguf"),
+                    mock.Mock(rfilename="MTP/gemma-4-31B-it-Q8_0-MTP.gguf"),
+                    mock.Mock(rfilename="mtp-gemma-4-31B-it.gguf"),
+                ]
+                self.assertEqual(
+                    _detect_mtp_drafter_file(api, repo_id, None, selected),
+                    "mtp-gemma-4-31B-it.gguf",
+                )
+
+    def test_detect_mtp_drafter_falls_back_to_repo_tree(self) -> None:
+        api = mock.MagicMock()
+        api.model_info.side_effect = RuntimeError("siblings unavailable")
+        api.list_repo_tree.return_value = [
+            mock.Mock(path="MTP"),
+            mock.Mock(path="gemma-4-31B-it-qat-UD-Q4_K_XL.gguf"),
+            mock.Mock(path="MTP/gemma-4-31B-it-Q8_0-MTP.gguf"),
+            mock.Mock(path="mtp-gemma-4-31B-it.gguf"),
+        ]
+
+        self.assertEqual(
+            _detect_mtp_drafter_file(
+                api,
+                "unsloth/gemma-4-31B-it-qat-GGUF",
+                None,
+                "gemma-4-31B-it-qat-UD-Q4_K_XL.gguf",
+            ),
+            "mtp-gemma-4-31B-it.gguf",
+        )
+        api.list_repo_tree.assert_called_once_with(
+            repo_id="unsloth/gemma-4-31B-it-qat-GGUF",
+            recursive=True,
+            token=None,
+        )
+
+    def test_gemma4_repos_probe_for_mtp_even_without_mtp_in_selected_filename(self) -> None:
+        self.assertTrue(
+            _should_probe_repo_for_mtp_drafter(
+                "unsloth/gemma-4-31B-it-GGUF",
+                "gemma-4-31B-it-UD-Q4_K_XL.gguf",
+                "gemma-4-31b-it-ud-q4_k_xl",
+            )
+        )
+        self.assertTrue(
+            _should_probe_repo_for_mtp_drafter(
+                "unsloth/gemma-4-31B-it-qat-GGUF",
+                "gemma-4-31B-it-qat-UD-Q4_K_XL.gguf",
+                "gemma-4-31b-it-qat-ud-q4_k_xl",
+            )
+        )
+
+    def test_ensure_catalog_mtp_drafters_backfills_gemma4_plain_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_path = root / "unsloth/gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf"
+            model_path.parent.mkdir(parents=True)
+            model_path.write_bytes(b"main")
+            model = ManagedModel(
+                model_id="gemma-4-31b-it-ud-q4_k_xl",
+                repo_id="unsloth/gemma-4-31B-it-GGUF",
+                quant="UD-Q4_K_XL",
+                filename="gemma-4-31B-it-UD-Q4_K_XL.gguf",
+                local_path=str(model_path),
+                description="Gemma 4",
+            )
+            args = argparse.Namespace(models_dir=root, hf_token=None)
+
+            def fake_download(**kwargs):
+                target = Path(kwargs["target_dir"]) / kwargs["filename"]
+                target.write_bytes(b"mtp")
+
+            with (
+                mock.patch("llamacpp_stack.cli.HfApi") as api_cls,
+                mock.patch("llamacpp_stack.cli._repo_sibling_sizes", return_value={"mtp-gemma-4-31B-it.gguf": 3}),
+                mock.patch("llamacpp_stack.cli.download_hf_file", side_effect=fake_download) as download_mock,
+            ):
+                api_cls.return_value.model_info.return_value.siblings = [
+                    mock.Mock(rfilename="gemma-4-31B-it-UD-Q4_K_XL.gguf"),
+                    mock.Mock(rfilename="mtp-gemma-4-31B-it.gguf"),
+                    mock.Mock(rfilename="MTP/gemma-4-31B-it-Q8_0-MTP.gguf"),
+                ]
+
+                changed = ensure_catalog_mtp_drafters(
+                    [model],
+                    args,
+                    {"mtp_defaults": {"spec_draft_n_max": 3, "spec_draft_n_min": 0, "spec_draft_p_min": 0.75}},
+                )
+
+            self.assertEqual(changed, 1)
+            self.assertTrue(download_mock.called)
+            self.assertEqual(model.server_overrides["model_draft"], str(model_path.parent / "mtp-gemma-4-31B-it.gguf"))
+            self.assertEqual(model.server_overrides["spec_type"], "draft-mtp")
+            self.assertEqual(model.server_overrides["spec_draft_n_max"], 3)
+            rendered = " ".join(build_llama_server_command(model, root / "llama-server", port="18080"))
+            self.assertIn("--model-draft", rendered)
+            self.assertIn("mtp-gemma-4-31B-it.gguf", rendered)
+            self.assertIn("--spec-type draft-mtp", rendered)
+            self.assertIn("--spec-draft-n-max 3", rendered)
 
     def test_download_guard_refuses_when_llama_server_active_unless_forced(self) -> None:
         catalog = [ManagedModel(
@@ -863,11 +1006,11 @@ class InstallHelpersTest(unittest.TestCase):
 
     def test_resolve_llama_cpp_ref_prompts_for_specific_commit(self) -> None:
         with (
-            mock.patch.dict("os.environ", {"LLAMACPP_LLAMA_CPP_REF_PROMPTED": ""}, clear=False),
+            mock.patch.dict("os.environ", {"HEIMDALL_GATEWAY_LLAMA_CPP_REF_PROMPTED": ""}, clear=False),
             mock.patch("sys.stdin.isatty", return_value=True),
             mock.patch("builtins.input", side_effect=["2", "e8023568d05ffdb9d0ac65695c521ea7e72c6b75"]),
         ):
-            os.environ.pop("LLAMACPP_LLAMA_CPP_REF_PROMPTED", None)
+            os.environ.pop("HEIMDALL_GATEWAY_LLAMA_CPP_REF_PROMPTED", None)
             self.assertEqual(
                 resolve_llama_cpp_ref(None, "source"),
                 "e8023568d05ffdb9d0ac65695c521ea7e72c6b75",
@@ -881,7 +1024,7 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertEqual(resolve_llama_cpp_ref(None, "source"), "")
 
     def test_resolve_llama_cpp_ref_uses_env_default(self) -> None:
-        with mock.patch.dict("os.environ", {"LLAMACPP_LLAMA_CPP_REF": "abc123"}, clear=False):
+        with mock.patch.dict("os.environ", {"HEIMDALL_GATEWAY_LLAMA_CPP_REF": "abc123"}, clear=False):
             self.assertEqual(resolve_llama_cpp_ref(None, "source"), "abc123")
 
     def test_build_llama_cpp_from_source_passes_cuda_compiler(self) -> None:
@@ -1158,7 +1301,7 @@ class InstallHelpersTest(unittest.TestCase):
             mock.patch("builtins.input", side_effect=["1", "2", "e8023568"]),
         ):
             self.assertEqual(resolve_llama_cpp_mode(None), "source")
-            self.assertEqual(os.environ.get("LLAMACPP_LLAMA_CPP_REF"), "e8023568")
+            self.assertEqual(os.environ.get("HEIMDALL_GATEWAY_LLAMA_CPP_REF"), "e8023568")
 
     def test_resolve_llama_cpp_ref_does_not_reprompt_after_latest_choice(self) -> None:
         with (
@@ -1343,16 +1486,16 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertIn("ps", help_text)
         self.assertIn("requests [-n LINES]", help_text)
         self.assertIn("info", help_text)
-        self.assertIn("Example: llamacpp-superserver add", help_text)
-        self.assertIn("Example: llamacpp-superserver run", help_text)
-        self.assertIn("Example: llamacpp-superserver remove", help_text)
-        self.assertIn("Example: llamacpp-superserver rm", help_text)
-        self.assertIn("Example: llamacpp-superserver update", help_text)
-        self.assertIn("Example: llamacpp-superserver validate", help_text)
-        self.assertIn("Example: llamacpp-superserver daemon", help_text)
-        self.assertIn("Example: llamacpp-superserver list", help_text)
-        self.assertIn("Example: llamacpp-superserver ps", help_text)
-        self.assertIn("Example: llamacpp-superserver requests", help_text)
+        self.assertIn("Example: heimdall-gateway add", help_text)
+        self.assertIn("Example: heimdall-gateway run", help_text)
+        self.assertIn("Example: heimdall-gateway remove", help_text)
+        self.assertIn("Example: heimdall-gateway rm", help_text)
+        self.assertIn("Example: heimdall-gateway update", help_text)
+        self.assertIn("Example: heimdall-gateway validate", help_text)
+        self.assertIn("Example: heimdall-gateway daemon", help_text)
+        self.assertIn("Example: heimdall-gateway list", help_text)
+        self.assertIn("Example: heimdall-gateway ps", help_text)
+        self.assertIn("Example: heimdall-gateway requests", help_text)
         self.assertIn("For endpoints/runtime/service/config details run", help_text)
         self.assertNotIn("Default endpoints:", help_text)
         self.assertNotIn("Installed versions:", help_text)
@@ -1367,7 +1510,7 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertFalse(help_text.startswith("=" * 72))
         self.assertNotIn("llama.cpp  SuperServer", help_text)
         self.assertNotRegex(help_text, r"(?m)^\s*llamacpp-superserver v\d")
-        self.assertRegex(help_text, r"usage: llamacpp-superserver")
+        self.assertRegex(help_text, r"usage: heimdall-gateway")
         self.assertIn("info", help_text)
         self.assertNotIn("llama-swap-guard", help_text)
         self.assertNotIn("==SUPPRESS==", help_text)
@@ -1407,7 +1550,7 @@ class InstallHelpersTest(unittest.TestCase):
             info_text = build_info_text(args)
 
         self.assertIn("Default endpoints:", info_text)
-        self.assertIn("Superserver API:       http://0.0.0.0:11435", info_text)
+        self.assertIn("Heimdall Gateway API:       http://0.0.0.0:11435", info_text)
         self.assertIn("Installed versions:", info_text)
         self.assertIn("llama.cpp:           b8808", info_text)
         self.assertIn("llama-swap:          v202", info_text)
@@ -1930,15 +2073,15 @@ class InstallHelpersTest(unittest.TestCase):
         with mock.patch.dict(
             os.environ,
             {
-                "LLAMACPP_NCCL_ROOT": "/opt/llamacpp-superserver/nccl",
+                "HEIMDALL_GATEWAY_NCCL_ROOT": "/opt/heimdall-gateway/nccl",
                 "LD_LIBRARY_PATH": "/existing/lib",
             },
-            clear=False,
+            clear=True,
         ):
             env = _probe_runtime_env()
         self.assertIsNotNone(env)
-        self.assertIn("/opt/llamacpp-superserver/nccl/lib64", env["LD_LIBRARY_PATH"])
-        self.assertIn("/opt/llamacpp-superserver/nccl/lib", env["LD_LIBRARY_PATH"])
+        self.assertIn("/opt/heimdall-gateway/nccl/lib64", env["LD_LIBRARY_PATH"])
+        self.assertIn("/opt/heimdall-gateway/nccl/lib", env["LD_LIBRARY_PATH"])
         self.assertIn("/existing/lib", env["LD_LIBRARY_PATH"])
 
     def test_print_install_summary_invokes_help_when_command_exists(self) -> None:
@@ -2515,7 +2658,7 @@ class InstallHelpersTest(unittest.TestCase):
             payload = json.loads(server_config.read_text(encoding="utf-8"))
             llama_defaults = payload["llama_server_defaults"]
             self.assertEqual(llama_defaults["keep"], 256)
-            self.assertEqual(llama_defaults["cache_type_k"], "q4_0")
+            self.assertNotIn("cache_type_k", llama_defaults)
             self.assertNotIn("models", payload)
             self.assertEqual(llama_defaults["batch_size"], 4096)
             self.assertEqual(llama_defaults["ubatch_size"], 2048)
@@ -3309,7 +3452,7 @@ class InstallHelpersTest(unittest.TestCase):
                     server_defaults={"mul_mat_q": True, "grp_attn_n": 1},
                 )
             )
-        self.assertIn("--parallel 2", rendered)
+        self.assertRegex(rendered, r"--parallel\s+2")
         self.assertNotIn("--mul-mat-q", rendered)
         self.assertNotIn("--grp-attn-n", rendered)
 
@@ -3340,7 +3483,7 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertEqual(model.tensor_split, "1,1,1")
             self.assertEqual(model.server_overrides, {"parallel": 2})
             self.assertIn("--tensor-split 1,1,1", rendered)
-            self.assertIn("--parallel 2", rendered)
+            self.assertRegex(rendered, r"--parallel\s+2")
             saved = json.loads(catalog_path.read_text(encoding="utf-8"))[0]
             self.assertEqual(saved["tensor_split"], "1,1,1")
             self.assertNotIn("tensor_split", saved["server_overrides"])
@@ -3373,7 +3516,7 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertEqual(model.tensor_split, "1,1,1")
             self.assertIn("--tensor-split 1,1,1", rendered)
             self.assertIn("/usr/bin/env CUDA_VISIBLE_DEVICES=0,1,2", rendered)
-            self.assertIn("--parallel 2", rendered)
+            self.assertRegex(rendered, r"--parallel\s+2")
             self.assertNotIn("--tensor-split 1,1,1,1,1,1,1", rendered)
 
     def test_unknown_catalog_keys_become_llama_server_overrides(self) -> None:
@@ -3401,7 +3544,7 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertEqual(model.server_overrides["parallel"], 2)
             self.assertIsNone(model.server_overrides["example"])
             rendered = " ".join(build_llama_server_command(model, root / "llama-server", port="18080"))
-            self.assertIn("--parallel 2", rendered)
+            self.assertRegex(rendered, r"--parallel\s+2")
             self.assertIn("--example", rendered)
 
     def test_server_config_payload_adds_replicas_and_canonicalizes_defaults(self) -> None:
@@ -3426,10 +3569,29 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertIn("replicas", normalized)
         self.assertEqual(normalized["replicas"]["enabled"], False)
         self.assertIn("experimental", normalized)
+        repair = normalized["experimental"]["chat_tool_continue_repair"]
+        self.assertEqual(repair["enabled"], False)
+        self.assertEqual(repair["max_rounds"], 1)
+        self.assertEqual(repair["max_tokens"], 2048)
+        self.assertEqual(repair["stream_keepalive_seconds"], 15)
+        self.assertEqual(repair["visible_notice_after_seconds"], 4)
+        self.assertEqual(repair["trigger_prefixes"], ["[terminal command", "Voy a"])
         self.assertEqual(
-            normalized["experimental"]["chat_tool_continue_repair"],
-            {"enabled": False, "max_rounds": 1, "max_tokens": 2048, "stream_keepalive_seconds": 15},
+            repair["loop_guard"],
+            {
+                "enabled": True,
+                "no_tool_call_max_chars": 12000,
+                "repeated_tail_min_chars": 3000,
+                "repeated_tail_repetitions": 4,
+            },
         )
+        self.assertNotIn("self_check", repair)
+        response_log = normalized["experimental"]["chat_last_response_log"]
+        self.assertEqual(response_log["enabled"], False)
+        self.assertEqual(response_log["path"], "")
+        self.assertEqual(response_log["max_chars"], 20000)
+        self.assertEqual(response_log["include_reasoning"], False)
+        self.assertEqual(response_log["include_tool_calls"], True)
         self.assertNotIn("example", normalized["_meta"])
         defaults = normalized["llama_server_defaults"]
         self.assertEqual(defaults["batch_size"], 4096)
@@ -3637,7 +3799,7 @@ class InstallHelpersTest(unittest.TestCase):
 
             self.assertEqual(result, "updated")
             rendered = config_path.read_text(encoding="utf-8")
-            self.assertIn("--parallel 2", rendered)
+            self.assertRegex(rendered, r"--parallel\s+2")
 
     def test_update_config_preserves_ctx_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3807,10 +3969,11 @@ class InstallHelpersTest(unittest.TestCase):
                 mock.patch("llamacpp_stack.cli.temporarily_unload_published_models"),
                 mock.patch(
                     "llamacpp_stack.cli.choose_auto_ctx",
-                    side_effect=[
-                        (None, "min-failed", {"min_ctx": 8192, "reason": "timeout"}),
-                        (16384, "selected", {"selected_ctx": 16384}),
-                    ],
+                    side_effect=lambda model, *a, **k: (
+                        (None, "min-failed", {"min_ctx": 8192, "reason": "timeout"})
+                        if getattr(model, "model_id", "") == "fail-model"
+                        else (16384, "selected", {"selected_ctx": 16384})
+                    ),
                 ),
                 mock.patch("llamacpp_stack.cli.resolve_llama_server_defaults", return_value={}),
                 mock.patch("llamacpp_stack.cli._ask_confirmation", return_value=True) as ask_mock,
@@ -4311,7 +4474,7 @@ class InstallHelpersTest(unittest.TestCase):
             rendered_text = config_path.read_text(encoding="utf-8")
             self.assertIn("ttl: 10", rendered_text)
             self.assertIn("sendLoadingState: false", rendered_text)
-            self.assertTrue(rendered_text.startswith("# llamacpp-superserver config.yaml"))
+            self.assertTrue(rendered_text.startswith("# Heimdall Gateway config.yaml"))
 
 
     def test_global_replica_enabled_ignores_stale_per_model_disabled_flag(self) -> None:
@@ -5145,6 +5308,51 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertIn("--spec-draft-n-max", cmd)
         self.assertEqual(cmd[cmd.index("--spec-draft-n-max") + 1], "4")
 
+    def test_build_llama_server_command_drops_global_swa_full_for_gemma4(self) -> None:
+        model = ManagedModel(
+            model_id="gemma-4-31b-it-qat-ud-q4_k_xl",
+            repo_id="unsloth/gemma-4-31B-it-qat-GGUF",
+            quant="UD-Q4_K_XL",
+            filename="gemma-4-31B-it-qat-UD-Q4_K_XL.gguf",
+            local_path="/models/gemma.gguf",
+            server_overrides={
+                "model_draft": "/models/mtp-gemma-4-31B-it.gguf",
+                "spec_type": "draft-mtp",
+                "spec_draft_n_max": 3,
+            },
+        )
+
+        with mock.patch("llamacpp_stack.cli.server_supports_flag", return_value=True):
+            cmd = build_llama_server_command(
+                model,
+                Path("/tmp/llama-server"),
+                port="12345",
+                server_defaults={"swa_full": True},
+            )
+
+        self.assertNotIn("--swa-full", cmd)
+        self.assertNotIn("--no-swa-full", cmd)
+
+    def test_build_llama_server_command_keeps_explicit_gemma4_swa_full_override(self) -> None:
+        model = ManagedModel(
+            model_id="gemma-4-31b-it-qat-ud-q4_k_xl",
+            repo_id="unsloth/gemma-4-31B-it-qat-GGUF",
+            quant="UD-Q4_K_XL",
+            filename="gemma-4-31B-it-qat-UD-Q4_K_XL.gguf",
+            local_path="/models/gemma.gguf",
+            server_overrides={"swa_full": True},
+        )
+
+        with mock.patch("llamacpp_stack.cli.server_supports_flag", return_value=True):
+            cmd = build_llama_server_command(
+                model,
+                Path("/tmp/llama-server"),
+                port="12345",
+                server_defaults={"swa_full": False},
+            )
+
+        self.assertIn("--swa-full", cmd)
+
     def test_build_llama_server_command_uses_ctx_size_direct_when_use_fitc_false(self) -> None:
         model = ManagedModel(
             model_id="repo-q4",
@@ -5493,7 +5701,7 @@ models:
         )
         rendered = " ".join(cmd)
         self.assertIn("--threads 32", rendered)
-        self.assertIn("--cache-type-k q8_0", rendered)
+        self.assertNotIn("--cache-type-k", rendered)
         self.assertNotIn("--gpu-layers all", rendered)
         self.assertNotIn("--no-mmap", rendered)
 
@@ -5539,8 +5747,8 @@ models:
         self.assertIn("--mirostat-ent 4.5", rendered)
         self.assertIn("--mirostat-lr 0.1", rendered)
         self.assertIn("--keep 512", rendered)
-        self.assertIn("--cache-type-k q8_0", rendered)
-        self.assertIn("--cache-type-v q8_0", rendered)
+        self.assertNotIn("--cache-type-k", rendered)
+        self.assertNotIn("--cache-type-v", rendered)
 
 
     def test_get_gpu_conflict_message_ignores_target_when_already_loaded(self) -> None:
@@ -5690,7 +5898,7 @@ models:
             message = get_gpu_conflict_message("model-b", [model_a, model_b])
         self.assertIn("Cannot load model 'model-b'", message)
         self.assertIn("model-a (pid 123, 4096 MiB)", message)
-        self.assertIn("llamacpp-superserver unload", message)
+        self.assertIn("heimdall-gateway unload", message)
 
     def test_get_gpu_conflict_message_ignores_foreign_process(self) -> None:
         model = ManagedModel(
@@ -6055,6 +6263,28 @@ models:
 
         self.assertEqual(payload["metadata"]["load_capabilities"], ["image", "image-text-to-text"])
         self.assertTrue(payload["metadata"]["vision"])
+
+    def test_build_openai_model_list_payload_exposes_context_metadata_without_gguf_read(self) -> None:
+        model = ManagedModel(
+            model_id="gemma-4-31b-it-qat-ud-q4_k_xl",
+            repo_id="unsloth/gemma-4-31B-it-qat-GGUF",
+            quant="UD-Q4_K_XL",
+            filename="gemma-4-31B-it-qat-UD-Q4_K_XL.gguf",
+            local_path="/tmp/gemma.gguf",
+            ctx_size=262144,
+            load_capabilities=["text-to-text"],
+        )
+
+        with mock.patch(
+            "llamacpp_stack.cli.get_model_context_size",
+            side_effect=AssertionError("/v1/models must not read GGUF metadata"),
+        ):
+            payload = build_openai_model_list_payload(model)
+
+        self.assertEqual(payload["context_length"], 262144)
+        self.assertEqual(payload["metadata"]["context_length"], 262144)
+        self.assertEqual(payload["metadata"]["configured_context_length"], 262144)
+        self.assertGreater(payload["metadata"]["api_context_length"], 0)
 
 
     def test_gemma4_sliding_window_long_context_trusts_gguf_metadata(self) -> None:
@@ -6455,6 +6685,142 @@ models:
 
             prompt_mock.assert_not_called()
             run_mock.assert_not_called()
+
+    def test_heimdall_layout_uses_new_user_and_system_paths(self) -> None:
+        with (
+            mock.patch("llamacpp_stack.install.detect_existing_mode", return_value=None),
+            mock.patch("llamacpp_stack.install.existing_public_port", return_value=None),
+            mock.patch("llamacpp_stack.install.detect_ollama_models_dir", return_value=None),
+            mock.patch("llamacpp_stack.install._port_is_free", return_value=True),
+        ):
+            user_layout = choose_layout("user", "127.0.0.1", 11436, None)
+            system_layout = choose_layout("system", "127.0.0.1", 11436, None)
+
+        self.assertEqual(user_layout.install_root, Path.home() / ".local/opt" / PRODUCT_SLUG)
+        self.assertEqual(user_layout.state_dir, Path.home() / ".local/state" / PRODUCT_SLUG)
+        self.assertEqual(user_layout.config_dir, Path.home() / ".config" / PRODUCT_SLUG)
+        self.assertEqual(user_layout.run_dir, Path.home() / ".local/run" / PRODUCT_SLUG)
+        self.assertEqual(system_layout.install_root, Path("/opt") / PRODUCT_SLUG)
+        self.assertEqual(system_layout.state_dir, Path("/var/lib") / PRODUCT_SLUG)
+        self.assertEqual(system_layout.config_dir, Path("/etc") / PRODUCT_SLUG)
+        self.assertEqual(system_layout.run_dir, Path("/run") / PRODUCT_SLUG)
+
+    def test_heimdall_env_and_services_use_new_names_without_generated_llamacpp_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            layout = InstallLayout(
+                mode="user",
+                state_dir=root / "state",
+                bin_dir=root / "bin",
+                install_root=root / "opt" / PRODUCT_SLUG,
+                models_dir=root / "models",
+                config_dir=root / "config" / PRODUCT_SLUG,
+                run_dir=root / "run" / PRODUCT_SLUG,
+                service_user="user",
+                service_group="user",
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / PRODUCT_SLUG / "manager.sock",
+                python_root=root / "opt" / PRODUCT_SLUG / "python",
+                runtime_venv=root / "opt" / PRODUCT_SLUG / "venv",
+                cuda_root=root / "opt" / PRODUCT_SLUG / "cuda",
+            )
+            env_text = _render_env(layout, root / "llama-server", root / "llama-swap", "/usr/bin/python3", layout.python_root, 300, None, None)
+            manager_unit = render_manager_service(layout)
+            router_unit = render_llamaswap_service(layout)
+
+        self.assertIn("HEIMDALL_GATEWAY_ROOT=", env_text)
+        self.assertIn("HEIMDALL_GATEWAY_CONFIG=", env_text)
+        self.assertIn("LLAMA_SERVER_BIN=", env_text)
+        self.assertIn("LLAMASWAP_BIN=", env_text)
+        self.assertNotIn("LLAMACPP_", env_text)
+        self.assertIn("Description=Heimdall Gateway manager", manager_unit)
+        self.assertIn("Description=Heimdall Gateway router", router_unit)
+        self.assertIn("heimdall-gateway-manager-start", manager_unit)
+        self.assertIn("heimdall-gateway-router-start", router_unit)
+
+    def test_migrate_legacy_user_install_copies_small_state_and_removes_legacy_wrappers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_config = root / "old-config"
+            old_alt_config = root / "old-alt-config"
+            old_state = root / "old-state"
+            old_install = root / "old-install"
+            old_bin = root / "bin"
+            old_systemd = root / "systemd"
+            for path in (old_config, old_alt_config, old_state, old_install, old_bin, old_systemd):
+                path.mkdir(parents=True)
+            (old_config / "conf.json").write_text('{"idle_ttl": 777}\n', encoding="utf-8")
+            (old_config / "llamacpp-superserver.env").write_text("LLAMACPP_MODELS=/models-old\n", encoding="utf-8")
+            (old_config / "templates").mkdir()
+            (old_config / "templates" / "chat.jinja").write_text("template", encoding="utf-8")
+            (old_state / "catalog.json").write_text('[{"model_id":"m"}]\n', encoding="utf-8")
+            (old_state / "config.yaml").write_text("models: {}\n", encoding="utf-8")
+            (old_state / "api-requests.log").write_text("log\n", encoding="utf-8")
+            (old_state / "install-manifest.json").write_text('{"models_dir":"/models-old"}\n', encoding="utf-8")
+            (old_bin / "llamacpp-superserver").write_text("#!/bin/sh\n", encoding="utf-8")
+            (old_systemd / "llamacpp-superserver-manager.service").write_text("old", encoding="utf-8")
+
+            layout = InstallLayout(
+                mode="user",
+                state_dir=root / "new-state",
+                bin_dir=old_bin,
+                install_root=root / "new-install",
+                models_dir=root / "models",
+                config_dir=root / "new-config",
+                run_dir=root / "new-run",
+                service_user="user",
+                service_group="user",
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "new-run" / "manager.sock",
+                python_root=root / "new-install" / "python",
+                runtime_venv=root / "new-install" / "venv",
+                cuda_root=root / "new-install" / "cuda",
+            )
+
+            with (
+                mock.patch("llamacpp_stack.install.legacy_layout_paths", return_value={
+                    "config_dir": old_config,
+                    "alt_config_dir": old_alt_config,
+                    "state_dir": old_state,
+                    "install_root": old_install,
+                    "run_dir": root / "old-run",
+                    "systemd_dir": old_systemd,
+                    "bin_dir": old_bin,
+                }),
+                mock.patch("llamacpp_stack.install.shutil.which", return_value=None),
+            ):
+                changed = migrate_legacy_installation(layout, dry_run=False)
+
+            self.assertGreater(changed, 0)
+            self.assertEqual((layout.config_dir / "conf.json").read_text(encoding="utf-8"), '{"idle_ttl": 777}\n')
+            self.assertTrue((layout.config_dir / ENV_BASENAME).exists())
+            self.assertEqual((layout.state_dir / "catalog.json").read_text(encoding="utf-8"), '[{"model_id":"m"}]\n')
+            self.assertEqual((layout.config_dir / "templates" / "chat.jinja").read_text(encoding="utf-8"), "template")
+            self.assertFalse((old_bin / "llamacpp-superserver").exists())
+            self.assertFalse((old_systemd / "llamacpp-superserver-manager.service").exists())
+            self.assertTrue(list(old_config.glob("conf.json.pre-heimdall-migration-*")))
+
+    def test_legacy_product_strings_are_confined_to_migration_allowlist(self) -> None:
+        allowed = {
+            Path("llamacpp_stack/install.py"),
+            Path("llamacpp_stack/uninstall.py"),
+            Path("llamacpp_stack/cli.py"),
+            Path("tests/test_llamacpp_install.py"),
+            Path("tests/test_speculative_support.py"),
+            Path("tests/test_autotuning_validation.py"),
+        }
+        offenders: list[str] = []
+        for rel in [Path("llamacpp_stack"), Path("tests"), Path("README.md"), Path("pyproject.toml")]:
+            paths = rel.rglob("*") if rel.is_dir() else [rel]
+            for path in paths:
+                if not path.is_file() or path.suffix in {".pyc", ".png"}:
+                    continue
+                text = path.read_text(encoding="utf-8", errors="ignore")
+                if "llamacpp-superserver" in text and path not in allowed:
+                    offenders.append(str(path))
+        self.assertEqual(offenders, [])
 
 if __name__ == "__main__":
     unittest.main()

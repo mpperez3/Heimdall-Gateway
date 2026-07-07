@@ -328,9 +328,9 @@ def _ensure_optuna():
             "  1. Install system-wide:\n"
             "     sudo apt install python3-optuna\n"
             "  2. Use pipx to install the full package:\n"
-            "     pipx install llamacpp-superserver\n"
+            "     pipx install heimdall-gateway\n"
             "  3. Manually install optuna in the venv:\n"
-            "     /opt/llamacpp-superserver/venv/bin/pip install optuna"
+            "     /opt/heimdall-gateway/venv/bin/pip install optuna"
         )
 
 
@@ -787,12 +787,12 @@ def _normalize_ctx_size(user_ctx: int, candidate_ctx: int | None = None) -> int:
 
 
 def _resolve_catalog_path(args) -> Path:
-    candidate = getattr(args, "catalog", None) or os.environ.get("LLAMACPP_CATALOG") or DEFAULT_CATALOG_PATH
+    candidate = getattr(args, "catalog", None) or os.environ.get("HEIMDALL_GATEWAY_CATALOG") or DEFAULT_CATALOG_PATH
     return Path(candidate)
 
 
 def _resolve_auto_perf_log_path(args, model_id: str | None = None) -> Path:
-    explicit = getattr(args, "auto_perf_log", None) or os.environ.get("LLAMACPP_AUTO_PERF_LOG")
+    explicit = getattr(args, "auto_perf_log", None) or os.environ.get("HEIMDALL_GATEWAY_AUTO_PERF_LOG")
     if explicit:
         return Path(explicit).expanduser().resolve()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1258,7 +1258,7 @@ def _refresh_llamaswap_config_after_auto_perf(args, catalog_items: list[ManagedM
     expensive downloads/probes and avoids sudo.
     """
     try:
-        config_path = Path(getattr(args, "config", None) or (Path.home() / ".local/state/llamacpp-superserver/config.yaml"))
+        config_path = Path(getattr(args, "config", None) or (Path.home() / ".local/state/heimdall-gateway/config.yaml"))
         llama_server = Path(getattr(args, "llama_server", None) or DEFAULT_LLAMA_SERVER)
         start_port = int(getattr(args, "start_port", 12000) or 12000)
         render_llamaswap_config(
@@ -1275,7 +1275,7 @@ def _refresh_llamaswap_config_after_auto_perf(args, catalog_items: list[ManagedM
         return True
     except Exception as exc:
         print(f"⚠️  Catalogo guardado, pero no se pudo regenerar config.yaml automaticamente: {exc}")
-        print("Ejecuta `llamacpp-superserver update --model-id <modelo>` para regenerarla manualmente.")
+        print("Ejecuta `heimdall-gateway update --model-id <modelo>` para regenerarla manualmente.")
         return False
 
 
@@ -1396,7 +1396,7 @@ def _upsert_profile(row: dict) -> Path | None:
         except Exception:
             # If fallback also fails, try a user cache path before giving up.
             try:
-                user_cache_dir = Path.home() / ".cache" / "llamacpp-superserver"
+                user_cache_dir = Path.home() / ".cache" / "heimdall-gateway"
                 user_cache_dir.mkdir(parents=True, exist_ok=True)
                 cache_path = user_cache_dir / f"auto_performance_profiles_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
                 cache_path.write_text(json.dumps([row], indent=2, ensure_ascii=False), encoding="utf-8")
@@ -2114,7 +2114,7 @@ def _server_library_paths(server_path: Path | str) -> list[str]:
     if build_bin.is_dir():
         paths.append(str(build_bin))
 
-    # Local superserver packaging keeps CUDA/NCCL runtime libs under the root
+    # Local Heimdall Gateway packaging keeps CUDA/NCCL runtime libs under the root
     # install directory, which is a few levels above the resolved binary.
     try:
         install_root = resolved.parents[3]
@@ -2125,7 +2125,7 @@ def _server_library_paths(server_path: Path | str) -> list[str]:
             candidate = install_root / rel
             if candidate.is_dir():
                 paths.append(str(candidate))
-    user_runtime_root = Path.home() / ".local" / "opt" / "llamacpp-superserver"
+    user_runtime_root = Path.home() / ".local" / "opt" / "heimdall-gateway"
     for rel in ("cuda/lib", "nccl/lib"):
         candidate = user_runtime_root / rel
         if candidate.is_dir():
@@ -3291,7 +3291,7 @@ def probe_max_ctx(model_path: str, base_params: dict, gpu_set: list[int], max_ct
 def _ask_yes_no(args, prompt: str, default: str = "n") -> bool:
     normalized_prompt = str(prompt or "").lower()
     final_catalog_prompt = "aplicar" in normalized_prompt or "catalog" in normalized_prompt or "sobrescribir" in normalized_prompt
-    if final_catalog_prompt and (bool(getattr(args, "unattended", False)) or str(os.environ.get("LLAMACPP_AUTO_PERF_UNATTENDED", "")).strip().lower() in {"1", "true", "yes", "y"}):
+    if final_catalog_prompt and (bool(getattr(args, "unattended", False)) or str(os.environ.get("HEIMDALL_GATEWAY_AUTO_PERF_UNATTENDED", "")).strip().lower() in {"1", "true", "yes", "y"}):
         # In unattended tuning, run all benchmark phases automatically but
         # still stop for the final persistent catalog mutation decision.
         unattended_was_set = bool(getattr(args, "unattended", False))
@@ -3299,21 +3299,21 @@ def _ask_yes_no(args, prompt: str, default: str = "n") -> bool:
             setattr(args, "unattended", False)
         except Exception:
             pass
-        old_env = os.environ.pop("LLAMACPP_AUTO_PERF_UNATTENDED", None)
+        old_env = os.environ.pop("HEIMDALL_GATEWAY_AUTO_PERF_UNATTENDED", None)
         try:
             return _ask_yes_no(args, prompt, default)
         finally:
             if old_env is not None:
-                os.environ["LLAMACPP_AUTO_PERF_UNATTENDED"] = old_env
+                os.environ["HEIMDALL_GATEWAY_AUTO_PERF_UNATTENDED"] = old_env
             try:
                 setattr(args, "unattended", unattended_was_set)
             except Exception:
                 pass
     if bool(getattr(args, "assume_no", False)) or bool(getattr(args, "no_prompt", False)):
         return False
-    if str(os.environ.get("LLAMACPP_AUTO_PERF_ASSUME_NO", "")).strip().lower() in {"1", "true", "yes", "y"}:
+    if str(os.environ.get("HEIMDALL_GATEWAY_AUTO_PERF_ASSUME_NO", "")).strip().lower() in {"1", "true", "yes", "y"}:
         return False
-    if bool(getattr(args, "unattended", False)) or str(os.environ.get("LLAMACPP_AUTO_PERF_UNATTENDED", "")).strip().lower() in {"1", "true", "yes", "y"}:
+    if bool(getattr(args, "unattended", False)) or str(os.environ.get("HEIMDALL_GATEWAY_AUTO_PERF_UNATTENDED", "")).strip().lower() in {"1", "true", "yes", "y"}:
         # Unattended means: run all optimization/refresh phases, but do not
         # make the final destructive/persistent catalog overwrite decision.
         print(f"{prompt} [Y/n]: y (unattended)")
