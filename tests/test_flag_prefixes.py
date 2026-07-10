@@ -106,7 +106,7 @@ def test_normalize_server_config_migrates_new_defaults_and_removes_legacy_mirost
 
 
 
-def test_normalize_server_config_retires_unsafe_global_defaults(monkeypatch):
+def test_normalize_server_config_keeps_managed_kv_cache_fp16_defaults(monkeypatch):
     monkeypatch.setattr(cli, "detect_cuda_device_count", lambda: 2)
 
     normalized, changed = cli.normalize_server_config_payload(
@@ -123,8 +123,8 @@ def test_normalize_server_config_retires_unsafe_global_defaults(monkeypatch):
 
     assert changed is True
     defaults = normalized["llama_server_defaults"]
-    assert "cache_type_k" not in defaults
-    assert "cache_type_v" not in defaults
+    assert defaults["cache_type_k"] == "f16"
+    assert defaults["cache_type_v"] == "f16"
     assert "chat_template_kwargs" not in defaults
     assert "mul_mat_q" not in defaults
     assert "grp_attn_n" not in defaults
@@ -135,7 +135,7 @@ def test_normalize_server_config_retires_unsafe_global_defaults(monkeypatch):
     assert defaults["presence_penalty"] == 0.0
 
 
-def test_build_command_does_not_emit_cache_type_for_gguf_defaults(monkeypatch):
+def test_build_command_emits_cache_type_for_gguf_defaults(monkeypatch):
     monkeypatch.setattr(cli, "_server_supports_or_unknown", lambda _server_path, _flag: True)
     model = cli.ManagedModel(
         model_id="test",
@@ -151,12 +151,12 @@ def test_build_command_does_not_emit_cache_type_for_gguf_defaults(monkeypatch):
         model,
         Path("/bin/llama-server"),
         port="12345",
-        server_defaults={"cache_type_k": "q8_0", "cache_type_v": "q8_0"},
+        server_defaults={"cache_type_k": "f16", "cache_type_v": "f16"},
     )
     joined = " ".join(cmd)
 
-    assert "--cache-type-k" not in joined
-    assert "--cache-type-v" not in joined
+    assert "--cache-type-k f16" in joined
+    assert "--cache-type-v f16" in joined
 
 def test_normalize_server_overrides_drops_tuning_internals_but_keeps_draft_layers_sentinel():
     normalized = cli.normalize_server_overrides({
@@ -363,3 +363,22 @@ def test_chat_template_kwargs_normalizes_config_style_booleans():
     normalized = normalize_server_overrides({"chat_template_kwargs": '{"preserve_thinking":off}'})
 
     assert normalized["chat_template_kwargs"] == '{"preserve_thinking":false}'
+
+
+def test_normalize_server_overrides_normalizes_cache_type_aliases():
+    normalized = cli.normalize_server_overrides({"cache_type_k": "Q8", "cache_type_v": "fp16"})
+
+    assert normalized["cache_type_k"] == "q8_0"
+    assert normalized["cache_type_v"] == "f16"
+
+
+def test_normalize_server_overrides_omits_invalid_cache_type_and_reports_warning():
+    normalized = cli.normalize_server_overrides({"cache_type_k": "banana", "cache_type_v": "q8_0"})
+    warnings = cli._server_config_validation_warnings(
+        {"llama_server_defaults": {"cache_type_k": "banana", "cache_type_v": "Q8"}}
+    )
+
+    assert "cache_type_k" not in normalized
+    assert normalized["cache_type_v"] == "q8_0"
+    assert any("Invalid llama_server_defaults.cache_type_k" in warning for warning in warnings)
+    assert any("normalized to 'q8_0'" in warning for warning in warnings)

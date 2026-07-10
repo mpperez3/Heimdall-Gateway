@@ -34,6 +34,7 @@ from llamacpp_stack.cli import (
     _prepare_manager_socket_path,
     _probe_runtime_env,
     build_llama_server_command,
+    catalog_key_warnings,
     build_help_epilog,
     build_cli_parser,
     choose_gguf_file,
@@ -61,6 +62,8 @@ from llamacpp_stack.cli import (
     render_llamaswap_config,
     iter_catalog_with_replicas,
     resolve_request_affinity_key,
+    resolve_request_conversation_key,
+    CONVERSATION_SWITCH_STATE,
     _replica_gpu_sets,
     _raise_if_download_unsafe_while_active,
     select_replica_for_request,
@@ -91,6 +94,7 @@ from llamacpp_stack.cli import (
     unload_models,
     update_models,
     update_config,
+    sync_config_from_server_config_for_startup,
     main as cli_main,
 )
 from llamacpp_stack.install import (
@@ -1546,6 +1550,18 @@ class InstallHelpersTest(unittest.TestCase):
                 "llamacpp_stack.cli.get_public_endpoint_status",
                 return_value="reachable on http://0.0.0.0:11436 via 127.0.0.1 (97 models listed)",
             ),
+            mock.patch(
+                "llamacpp_stack.cli.resolve_llama_server_defaults",
+                return_value={
+                    "keep": 20000,
+                    "cache_type_k": "f16",
+                    "cache_type_v": "f16",
+                    "parallel": 1,
+                    "batch_size": 4096,
+                    "ubatch_size": 2048,
+                    "swa_full": True,
+                },
+            ),
         ):
             info_text = build_info_text(args)
 
@@ -1561,6 +1577,8 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertIn("Install mode:        system", info_text)
         self.assertIn("Config knobs:", info_text)
         self.assertIn("API_CTX factor:", info_text)
+        self.assertIn("--cache-type-k f16", info_text)
+        self.assertIn("--cache-type-v f16", info_text)
         self.assertIn("API status:          reachable on http://0.0.0.0:11435 via 127.0.0.1 (13 catalog models listed)", info_text)
         self.assertIn("UI status:           reachable on http://0.0.0.0:11436 via 127.0.0.1 (97 models listed)", info_text)
 
@@ -2584,6 +2602,63 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertIn("legacy-alias", model["aliases"])
             self.assertEqual(model["description"], "legacy description")
 
+
+    def test_startup_sync_renders_conf_defaults_without_waiting_for_public_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.yaml"
+            catalog_path = root / "catalog.json"
+            server_config = root / "conf.json"
+            model_path = root / "model.gguf"
+            model_path.write_text("x", encoding="utf-8")
+            save_catalog(
+                catalog_path,
+                [
+                    ManagedModel(
+                        model_id="repo-q4",
+                        repo_id="org/repo",
+                        quant="Q4",
+                        filename="model.gguf",
+                        local_path=str(model_path),
+                        ctx_size=4096,
+                        tensor_split="1",
+                    )
+                ],
+            )
+            server_config.write_text(
+                json.dumps(
+                    {
+                        "idle_ttl": 300,
+                        "api_port": 11435,
+                        "llama_server_defaults": {
+                            "cache_type_k": "f16",
+                            "cache_type_v": "f16",
+                            "parallel": 1,
+                        },
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            args = Namespace(
+                config=config_path,
+                catalog=catalog_path,
+                server_config=server_config,
+                llama_server=Path("/bin/llama-server"),
+                start_port=12000,
+                public_host="127.0.0.1",
+                public_port=11436,
+                idle_ttl=300,
+            )
+
+            sync_config_from_server_config_for_startup(args)
+
+            rendered = config_path.read_text(encoding="utf-8")
+            rendered_flat = " ".join(rendered.split())
+            self.assertIn("--cache-type-k f16", rendered_flat)
+            self.assertIn("--cache-type-v f16", rendered_flat)
+
     def test_maybe_rerun_auto_ctx_merges_missing_llama_server_defaults_without_overwriting(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2658,7 +2733,8 @@ class InstallHelpersTest(unittest.TestCase):
             payload = json.loads(server_config.read_text(encoding="utf-8"))
             llama_defaults = payload["llama_server_defaults"]
             self.assertEqual(llama_defaults["keep"], 256)
-            self.assertNotIn("cache_type_k", llama_defaults)
+            self.assertEqual(llama_defaults["cache_type_k"], "q4_0")
+            self.assertEqual(llama_defaults["cache_type_v"], "f16")
             self.assertNotIn("models", payload)
             self.assertEqual(llama_defaults["batch_size"], 4096)
             self.assertEqual(llama_defaults["ubatch_size"], 2048)
@@ -3456,6 +3532,34 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertNotIn("--mul-mat-q", rendered)
         self.assertNotIn("--grp-attn-n", rendered)
 
+    def test_top_level_dashed_managed_key_warns_without_silent_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            catalog_path = root / "catalog.json"
+            catalog_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "model_id": "repo-q4",
+                            "repo_id": "org/repo",
+                            "quant": "Q4",
+                            "filename": "model-q4.gguf",
+                            "local_path": str(root / "model-q4.gguf"),
+                            "tensor_split": "1,1",
+                            "tensor-split": "0.58,0.42",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            model = load_catalog(catalog_path)[0]
+            warnings = catalog_key_warnings(catalog_path)
+
+            self.assertEqual(model.tensor_split, "1,1")
+            self.assertTrue(any("tensor-split" in warning and "tensor_split" in warning for warning in warnings))
+            self.assertNotIn("tensor-split", model.server_overrides)
+
     def test_server_override_tensor_split_is_migrated_to_model_field(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3575,7 +3679,12 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertEqual(repair["max_tokens"], 2048)
         self.assertEqual(repair["stream_keepalive_seconds"], 15)
         self.assertEqual(repair["visible_notice_after_seconds"], 4)
-        self.assertEqual(repair["trigger_prefixes"], ["[terminal command", "Voy a"])
+        self.assertEqual(repair["trigger_prefixes"], ["[terminal command", "[terminal_inline", "</terminal_inline>", "Voy a", "Empezando por"])
+        self.assertIn("Your previous assistant message ended without any tool_calls", repair["prompt"])
+        self.assertIn("{tool_names}", repair["prompt"])
+        self.assertIn("tool_call but it was truncated", repair["truncated_tool_call_prompt"])
+        self.assertIn("{tool_names}", repair["truncated_tool_call_prompt"])
+        self.assertEqual(repair["include_failed_assistant_message"], False)
         self.assertEqual(
             repair["loop_guard"],
             {
@@ -4348,6 +4457,58 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertIn("--spec-draft-p-min 0.75", joined)
         self.assertNotIn("--model-draft", joined)
 
+
+    def test_integrated_mtp_repo_name_gets_draft_mtp_without_mtp_in_filename(self) -> None:
+        model = ManagedModel(
+            model_id="qwen3.6-27b-ud-q5_k_xl",
+            repo_id="unsloth/Qwen3.6-27B-MTP-GGUF",
+            quant="UD-Q5_K_XL",
+            filename="Qwen3.6-27B-UD-Q5_K_XL.gguf",
+            local_path="/models/unsloth/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-Q5_K_XL.gguf",
+            ctx_size=262144,
+        )
+
+        self.assertTrue(cli._looks_like_integrated_mtp_model(model.repo_id, model.filename, model.model_id, model.local_path))
+        model.server_overrides, changed = cli._apply_mtp_server_overrides(
+            model.server_overrides,
+            None,
+            {"mtp_defaults": {"image_min_tokens": 1024, "spec_draft_n_max": 3, "spec_draft_n_min": 0, "spec_draft_p_min": 0.75}},
+        )
+
+        self.assertTrue(changed)
+        self.assertNotIn("model_draft", model.server_overrides)
+        cmd = build_llama_server_command(model, Path("/bin/llama-server"), port="12345", server_defaults={})
+        joined = " ".join(cmd)
+        self.assertIn("--spec-type draft-mtp", joined)
+        self.assertIn("--spec-draft-n-max 3", joined)
+        self.assertNotIn("--model-draft", joined)
+
+    def test_ensure_catalog_mtp_drafters_backfills_integrated_mtp_repo_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_path = root / "unsloth/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-Q5_K_XL.gguf"
+            model_path.parent.mkdir(parents=True)
+            model_path.write_bytes(b"main")
+            model = ManagedModel(
+                model_id="qwen3.6-27b-ud-q5_k_xl",
+                repo_id="unsloth/Qwen3.6-27B-MTP-GGUF",
+                quant="UD-Q5_K_XL",
+                filename="Qwen3.6-27B-UD-Q5_K_XL.gguf",
+                local_path=str(model_path),
+            )
+            args = argparse.Namespace(models_dir=root, hf_token=None)
+
+            changed = ensure_catalog_mtp_drafters(
+                [model],
+                args,
+                {"mtp_defaults": {"spec_draft_n_max": 3, "spec_draft_n_min": 0, "spec_draft_p_min": 0.75}},
+            )
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(model.server_overrides["spec_type"], "draft-mtp")
+        self.assertEqual(model.server_overrides["spec_draft_n_max"], 3)
+        self.assertNotIn("model_draft", model.server_overrides)
+
     def test_mtp_model_draft_does_not_emit_duplicate_draft_max(self) -> None:
         model = ManagedModel(
             model_id="speculative-qwen",
@@ -4701,6 +4862,48 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertIn("thread-a", codex_key)
         self.assertNotEqual(agent_a, agent_b)
 
+
+
+    def test_conversation_key_is_model_agnostic_but_affinity_key_is_model_scoped(self) -> None:
+        payload = {"messages": [{"role": "user", "content": "hello"}]}
+        headers = {"thread-id": "thread-a", "x-agent-id": "agent-a"}
+        conv_key = resolve_request_conversation_key(payload, headers)
+        gemma_affinity = resolve_request_affinity_key("gemma", payload, headers)
+        qwen_affinity = resolve_request_affinity_key("qwen", payload, headers)
+        self.assertEqual(conv_key, "session:thread-a:agent:agent-a")
+        self.assertNotIn("gemma", conv_key)
+        self.assertNotIn("qwen", conv_key)
+        self.assertNotEqual(gemma_affinity, qwen_affinity)
+
+
+    def test_conversation_key_has_model_agnostic_fallback_without_session_headers(self) -> None:
+        payload = {"messages": [{"role": "system", "content": "agent"}, {"role": "user", "content": "hello"}]}
+        gemma_key = resolve_request_conversation_key({**payload, "model": "gemma"}, {})
+        qwen_key = resolve_request_conversation_key({**payload, "model": "qwen"}, {})
+        self.assertEqual(gemma_key, qwen_key)
+        self.assertTrue(gemma_key.startswith("fallback:"))
+        self.assertNotIn("gemma", gemma_key)
+        self.assertNotIn("qwen", qwen_key)
+
+    def test_conversation_switch_state_cancels_previous_model_same_conversation(self) -> None:
+        state = cli.ConversationSwitchState()
+        key = "session:same:agent:main"
+        gemma_token, first_reason = state.start(key, "gemma")
+        self.assertEqual(first_reason, "new_conversation")
+        self.assertEqual(state.should_cancel(gemma_token), (False, ""))
+        qwen_token, second_reason = state.start(key, "qwen")
+        self.assertEqual(second_reason, "model_changed")
+        self.assertEqual(state.should_cancel(gemma_token), (True, "conversation_generation_changed"))
+        self.assertEqual(state.should_cancel(qwen_token), (False, ""))
+        state.finish(gemma_token)
+        state.finish(qwen_token)
+
+    def test_conversation_switch_state_keeps_distinct_agents_independent(self) -> None:
+        state = cli.ConversationSwitchState()
+        agent_a, _ = state.start("session:same:agent:a", "gemma")
+        agent_b, _ = state.start("session:same:agent:b", "qwen")
+        self.assertEqual(state.should_cancel(agent_a), (False, ""))
+        self.assertEqual(state.should_cancel(agent_b), (False, ""))
 
     def test_select_replica_enabled_with_missing_route_falls_back_to_base(self) -> None:
         REPLICA_ROUTER_STATE.records.clear()
@@ -5701,7 +5904,7 @@ models:
         )
         rendered = " ".join(cmd)
         self.assertIn("--threads 32", rendered)
-        self.assertNotIn("--cache-type-k", rendered)
+        self.assertIn("--cache-type-k q8_0", rendered)
         self.assertNotIn("--gpu-layers all", rendered)
         self.assertNotIn("--no-mmap", rendered)
 
@@ -5747,8 +5950,8 @@ models:
         self.assertIn("--mirostat-ent 4.5", rendered)
         self.assertIn("--mirostat-lr 0.1", rendered)
         self.assertIn("--keep 512", rendered)
-        self.assertNotIn("--cache-type-k", rendered)
-        self.assertNotIn("--cache-type-v", rendered)
+        self.assertIn("--cache-type-k q8_0", rendered)
+        self.assertIn("--cache-type-v q8_0", rendered)
 
 
     def test_get_gpu_conflict_message_ignores_target_when_already_loaded(self) -> None:
@@ -6282,9 +6485,25 @@ models:
             payload = build_openai_model_list_payload(model)
 
         self.assertEqual(payload["context_length"], 262144)
+        self.assertEqual(payload["context_window"], 262144)
+        self.assertEqual(payload["context_size"], 262144)
+        self.assertEqual(payload["max_context_length"], 262144)
+        self.assertEqual(payload["max_model_len"], 262144)
+        self.assertEqual(payload["max_input_tokens"], 262144)
+        self.assertNotIn("max_tokens", payload)
+        self.assertNotIn("limit", payload)
         self.assertEqual(payload["metadata"]["context_length"], 262144)
+        self.assertEqual(payload["metadata"]["context_window"], 262144)
+        self.assertEqual(payload["metadata"]["max_model_len"], 262144)
+        self.assertEqual(payload["metadata"]["max_input_tokens"], 262144)
         self.assertEqual(payload["metadata"]["configured_context_length"], 262144)
         self.assertGreater(payload["metadata"]["api_context_length"], 0)
+        self.assertEqual(payload["max_output_tokens"], payload["metadata"]["api_context_length"])
+        self.assertEqual(payload["max_completion_tokens"], payload["metadata"]["api_context_length"])
+        self.assertNotIn("max_tokens", payload["metadata"])
+        self.assertNotIn("limit", payload["metadata"])
+        self.assertNotIn("input", payload["metadata"])
+        self.assertNotIn("output", payload["metadata"])
 
 
     def test_gemma4_sliding_window_long_context_trusts_gguf_metadata(self) -> None:
@@ -6751,6 +6970,7 @@ models:
             for path in (old_config, old_alt_config, old_state, old_install, old_bin, old_systemd):
                 path.mkdir(parents=True)
             (old_config / "conf.json").write_text('{"idle_ttl": 777}\n', encoding="utf-8")
+            (old_config / "llamacpp-superserver.json").write_text('{"idle_ttl": 111}\n', encoding="utf-8")
             (old_config / "llamacpp-superserver.env").write_text("LLAMACPP_MODELS=/models-old\n", encoding="utf-8")
             (old_config / "templates").mkdir()
             (old_config / "templates" / "chat.jinja").write_text("template", encoding="utf-8")
@@ -6800,7 +7020,9 @@ models:
             self.assertEqual((layout.config_dir / "templates" / "chat.jinja").read_text(encoding="utf-8"), "template")
             self.assertFalse((old_bin / "llamacpp-superserver").exists())
             self.assertFalse((old_systemd / "llamacpp-superserver-manager.service").exists())
+            self.assertFalse((old_config / "llamacpp-superserver.json").exists())
             self.assertTrue(list(old_config.glob("conf.json.pre-heimdall-migration-*")))
+            self.assertTrue(list(old_config.glob("llamacpp-superserver.json.pre-heimdall-migration-*")))
 
     def test_legacy_product_strings_are_confined_to_migration_allowlist(self) -> None:
         allowed = {

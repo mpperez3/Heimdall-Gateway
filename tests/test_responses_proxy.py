@@ -17,7 +17,10 @@ from llamacpp_stack.cli import (
     _chat_response_internal_tool_search_followup_messages,
     _chat_response_internal_tool_repair_followup_messages,
     _chat_tool_continue_repair_messages,
+    _chat_tool_truncated_repair_messages,
     _chat_tool_continue_trigger_reason,
+    _chat_completion_state_from_sse_lines,
+    _extract_chat_tool_call_examples_from_messages,
     _apply_chat_tool_continue_repair_token_cap,
     _force_tool_choice_for_chat_repair,
     _send_openai_chat_sse_status,
@@ -26,6 +29,7 @@ from llamacpp_stack.cli import (
     _summarize_chat_tool_message_diagnostics,
     _strip_chat_tool_repair_notice_text,
     _sanitize_chat_tool_repair_notices_in_messages,
+    _normalize_trailing_assistant_messages_for_llamacpp,
     _normalize_experimental_config,
 )
 import inspect
@@ -140,6 +144,9 @@ def test_chat_tool_continue_triggers_on_empty_trailing_colon_or_configured_prefi
     assert _chat_tool_continue_trigger_reason("Let me edit the file", [], tools) == ""
     assert _chat_tool_continue_trigger_reason("Voy a ejecutar el comando", [], tools, ["Voy a"]) == "visible_content_configured_prefix"
     assert _chat_tool_continue_trigger_reason("  [terminal command] sudo systemctl restart", [], tools, ["[terminal command"]) == "visible_content_configured_prefix"
+    assert _chat_tool_continue_trigger_reason("[terminal_inline command=\"ls\"]", [], tools, ["[terminal_inline"]) == "visible_content_terminal_inline_markup"
+    assert _chat_tool_continue_trigger_reason("</terminal_inline>", [], tools, ["</terminal_inline>"]) == "visible_content_terminal_inline_markup"
+    assert _chat_tool_continue_trigger_reason("echo hi</terminal_inline>", [], tools) == "visible_content_terminal_inline_markup"
     assert _chat_tool_continue_trigger_reason("voy a ejecutar el comando", [], tools, ["Voy a"]) == "visible_content_configured_prefix"
     assert _chat_tool_continue_trigger_reason("Te explico: voy a ejecutar el comando", [], tools, ["Voy a"]) == ""
     assert _chat_tool_continue_trigger_reason("Voy a revisar:\n[terminal command=\"sg docker -c 'docker compose ls'\" timeout=10]", [], tools, ["[terminal command"]) == "visible_content_configured_prefix_line"
@@ -173,6 +180,30 @@ def test_chat_tool_continue_repair_think_notice_is_stripped():
     assert _strip_chat_tool_repair_notice_text(contaminated) == "Let me use a different approach:"
     assert _chat_tool_continue_trigger_reason(contaminated, [], _sample_chat_tools()) == "visible_content_trailing_colon"
 
+
+def test_normalize_trailing_assistant_messages_merges_plain_tail_for_llamacpp():
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+        {"role": "assistant", "content": "thinking prefill"},
+        {"role": "assistant", "content": "continue prefill"},
+    ]
+
+    normalized = _normalize_trailing_assistant_messages_for_llamacpp(messages)
+
+    assert [m["role"] for m in normalized] == ["system", "user", "assistant"]
+    assert normalized[-1]["content"] == "thinking prefill\ncontinue prefill"
+
+
+def test_normalize_trailing_assistant_messages_does_not_merge_tool_call_tail():
+    messages = [
+        {"role": "user", "content": "u"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1"}]},
+        {"role": "assistant", "content": "prefill"},
+    ]
+
+    assert _normalize_trailing_assistant_messages_for_llamacpp(messages) == messages
+
 def test_chat_tool_continue_does_not_trigger_without_tools_or_with_tool_calls():
     tools = _sample_chat_tools()
 
@@ -187,14 +218,127 @@ def test_chat_tool_continue_repair_message_lists_available_tools():
         _sample_chat_tools(),
     )
 
-    assert repaired[-2] == {"role": "assistant", "content": "Déjame editar:"}
+    assert repaired == [
+        {"role": "user", "content": "hazlo"},
+        repaired[-1],
+    ]
     assert repaired[-1]["role"] == "user"
     assert "Your previous assistant message ended without any tool_calls" in repaired[-1]["content"]
     assert "you must call one of the available tools" in repaired[-1]["content"]
     assert "exec_command" in repaired[-1]["content"]
+    assert "Previous visible response that failed" in repaired[-1]["content"]
+    assert "Déjame editar:" in repaired[-1]["content"]
 
 
 
+
+
+def test_chat_tool_continue_repair_message_uses_configured_prompt_template():
+    repaired = _chat_tool_continue_repair_messages(
+        [{"role": "user", "content": "hazlo"}],
+        {"role": "assistant", "content": "[terminal_inline]ls</terminal_inline>"},
+        _sample_chat_tools(),
+        "Custom repair. Tools: {tool_names}",
+    )
+
+    assert repaired == [
+        {"role": "user", "content": "hazlo"},
+        repaired[-1],
+    ]
+    assert repaired[-1]["role"] == "user"
+    assert repaired[-1]["content"].startswith("Custom repair. Tools: ")
+    assert "exec_command" in repaired[-1]["content"]
+    assert "[terminal_inline]ls</terminal_inline>" in repaired[-1]["content"]
+
+
+
+def test_chat_tool_continue_repair_can_include_failed_assistant_message_when_enabled():
+    repaired = _chat_tool_continue_repair_messages(
+        [{"role": "user", "content": "hazlo"}],
+        {"role": "assistant", "content": "[terminal_inline]ls</terminal_inline>"},
+        _sample_chat_tools(),
+        "Custom repair. Tools: {tool_names}",
+        True,
+    )
+
+    assert repaired[-2] == {"role": "assistant", "content": "[terminal_inline]ls</terminal_inline>"}
+    assert repaired[-1]["role"] == "user"
+    assert repaired[-1]["content"].startswith("Custom repair. Tools: ")
+
+
+def test_chat_tool_continue_repair_prompt_includes_valid_tool_call_example():
+    repaired = _chat_tool_continue_repair_messages(
+        [{"role": "user", "content": "hazlo"}],
+        {"role": "assistant", "content": "Lo ejecuto:\n```bash\nls -la\n```"},
+        _sample_chat_tools(),
+        "Custom repair. Tools: {tool_names}",
+        False,
+        {"tool_name": "exec_command", "arguments": "{\"cmd\":\"ls -la\"}"},
+    )
+
+    content = repaired[-1]["content"]
+    assert "Recent valid tool_call example" in content
+    assert "Tool name: exec_command" in content
+    assert '{"cmd":"ls -la"}' in content
+    assert "Do not copy this exact example" in content
+
+
+def test_extract_chat_tool_call_examples_from_messages_uses_recent_valid_calls():
+    examples = _extract_chat_tool_call_examples_from_messages(
+        [
+            {"role": "assistant", "tool_calls": [{"function": {"name": "exec_command", "arguments": "{\"cmd\":\"old\"}"}}]},
+            {"role": "assistant", "tool_calls": [{"function": {"name": "exec_command", "arguments": "{\"cmd\":\"new\"}"}}]},
+        ],
+        _sample_chat_tools(),
+    )
+
+    assert examples[0] == {"tool_name": "exec_command", "arguments": '{"cmd":"new"}'}
+
+
+def test_chat_tool_continue_triggers_for_shell_fenced_code_block():
+    reason = _chat_tool_continue_trigger_reason(
+        "Parece que hubo un problema. Voy a verificar directamente:\n```bash\ncd /tmp/castano && python3 list24sheets.py\n```",
+        [],
+        _sample_chat_tools(),
+    )
+
+    assert reason == "visible_content_fenced_tool_like_block"
+
+
+def test_chat_tool_continue_triggers_for_pseudo_function_tool_call():
+    reason = _chat_tool_continue_trigger_reason(
+        "Voy a hacerlo con exec_command({\"cmd\":\"ls\"})",
+        [],
+        _sample_chat_tools(),
+    )
+
+    assert reason == "visible_content_pseudo_tool_call"
+
+
+def test_chat_completion_state_from_sse_reconstructs_tool_calls():
+    lines = [
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"exec_command","arguments":"{\\"cmd\\":"}}]}}]}',
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"ls\\"}"}}]}}]}',
+        b'data: {"choices":[{"finish_reason":"tool_calls","delta":{}}]}',
+        b"data: [DONE]",
+    ]
+
+    state = _chat_completion_state_from_sse_lines(lines)
+
+    assert state["finish_reason"] == "tool_calls"
+    assert state["tool_calls"][0]["function"]["name"] == "exec_command"
+    assert state["tool_calls"][0]["function"]["arguments"] == '{"cmd":"ls"}'
+
+def test_chat_tool_truncated_repair_message_uses_configured_prompt_template():
+    repaired = _chat_tool_truncated_repair_messages(
+        [{"role": "user", "content": "hazlo"}],
+        _sample_chat_tools(),
+        "Truncated repair. Tools: {tool_names}",
+    )
+
+    assert repaired[-1]["role"] == "user"
+    assert repaired[-1]["content"].startswith("Truncated repair. Tools: ")
+    assert "exec_command" in repaired[-1]["content"]
 
 def test_chat_tool_continue_repair_status_notice_is_visible_sse_delta():
     class Handler:
@@ -271,6 +415,40 @@ def test_chat_tool_continue_repair_buffer_can_emit_immediate_visible_notice():
     assert b"visible repair" in handler.wfile.getvalue()
 
 
+
+
+def test_chat_tool_continue_repair_buffer_cancels_on_conversation_model_switch():
+    class Handler:
+        def __init__(self):
+            self.wfile = io.BytesIO()
+
+    class Response:
+        def __init__(self):
+            self.closed = False
+
+        def iter_lines(self):
+            yield b'data: {"choices":[{"delta":{"content":""}}]}'
+            yield b"data: [DONE]"
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+    handler = Handler()
+    lines, passthrough, state = _buffer_openai_chat_sse_with_keepalive(
+        handler,
+        response,
+        request_id="chat_req_test",
+        keepalive_seconds=30,
+        write_lock=threading.Lock(),
+        cancel_check=lambda: (True, "conversation_generation_changed"),
+    )
+
+    assert lines == []
+    assert passthrough is False
+    assert state["buffer_abort_reason"] == "conversation_generation_changed"
+    assert response.closed is True
+    assert handler.wfile.getvalue() == b""
 
 def test_chat_tool_continue_repair_buffer_passthroughs_when_tool_call_seen():
     class Handler:
@@ -582,14 +760,23 @@ def test_chat_tool_continue_repair_preserves_explicit_tool_choice():
 
     assert repaired["tool_choice"] == explicit
 
-def test_chat_tool_continue_repair_token_cap_limits_internal_rounds():
+def test_chat_tool_continue_repair_token_cap_preserves_external_request_budget():
     payload = {"model": "local/model", "stream": True, "max_tokens": 65536, "n_predict": 65536}
 
     capped = _apply_chat_tool_continue_repair_token_cap(payload, 2048)
 
-    assert capped["max_tokens"] == 2048
-    assert capped["n_predict"] == 2048
+    assert capped["max_tokens"] == 65536
+    assert capped["n_predict"] == 65536
     assert payload["max_tokens"] == 65536
+
+
+def test_chat_tool_continue_repair_token_cap_uses_config_when_request_omits_budget():
+    payload = {"model": "local/model", "stream": True}
+
+    capped = _apply_chat_tool_continue_repair_token_cap(payload, 32000)
+
+    assert capped["max_tokens"] == 32000
+    assert "n_predict" not in capped
 
 
 

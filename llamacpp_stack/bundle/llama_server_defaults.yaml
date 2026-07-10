@@ -10,6 +10,8 @@
 default:
   keep: 20000
   cache_ram: 32768
+  cache_type_k: f16
+  cache_type_v: f16
   ctx_checkpoints: 32
   checkpoint_min_step: 1024
   top_k: 20

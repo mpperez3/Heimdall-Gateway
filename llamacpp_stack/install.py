@@ -152,8 +152,23 @@ def _default_experimental_config() -> dict[str, object]:
             "visible_notice_after_seconds": 4,
             "trigger_prefixes": [
                 "[terminal command",
+                "[terminal_inline",
+                "</terminal_inline>",
                 "Voy a",
             ],
+            "prompt": (
+                "Your previous assistant message ended without any tool_calls.\n"
+                "You are in a tool-capable agent environment. If the next step requires reading files, editing files, running commands, searching, inspecting state, or using any external capability, you must call one of the available tools instead of describing the action in text.\n"
+                "Do not answer with empty visible content. Do not answer with a sentence that only sets up an action and ends with a colon.\n"
+                "Available tool names: {tool_names}."
+            ),
+            "truncated_tool_call_prompt": (
+                "Your previous assistant message started a tool_call but it was truncated before the JSON arguments were complete.\n"
+                "Retry now with exactly one complete, valid tool_call. Keep the arguments minimal and valid JSON. "
+                "Do not stream or repeat partial arguments. Do not include explanatory text before the tool_call.\n"
+                "Available tool names: {tool_names}."
+            ),
+            "include_failed_assistant_message": False,
         },
         "chat_last_response_log": {
             "enabled": False,
@@ -201,6 +216,14 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
                 except Exception:
                     repair["visible_notice_after_seconds"] = 4
                 repair["trigger_prefixes"] = _normalize_chat_tool_continue_trigger_prefixes(repair.get("trigger_prefixes"))
+                for prompt_key in ("prompt", "truncated_tool_call_prompt"):
+                    prompt_value = repair.get(prompt_key)
+                    default_prompt = _default_experimental_config()["chat_tool_continue_repair"].get(prompt_key, "")
+                    if not isinstance(prompt_value, str) or not prompt_value.strip():
+                        repair[prompt_key] = default_prompt
+                    else:
+                        repair[prompt_key] = prompt_value
+                repair["include_failed_assistant_message"] = bool(repair.get("include_failed_assistant_message"))
                 cfg["chat_tool_continue_repair"] = repair
             elif key == "chat_last_response_log" and isinstance(value, dict):
                 response_log = dict(cfg["chat_last_response_log"])
@@ -428,14 +451,10 @@ def _merge_missing_llama_server_defaults(target: dict[str, object], config_dir: 
         "mirostat-lr": 0.1,
         "mirostat_lr": 0.1,
         # Retired global defaults. Keep these out of active install confs;
-        # chat templates now belong in family/per-model defaults and cache
-        # quantization is not safe as a global default for GGUF deployments.
+        # chat templates now belong in family/per-model defaults. KV cache
+        # defaults are installer-managed globally as f16.
         "chat-template-kwargs": None,
         "chat_template_kwargs": None,
-        "cache-type-k": None,
-        "cache_type_k": None,
-        "cache-type-v": None,
-        "cache_type_v": None,
         "mul-mat-q": None,
         "mul_mat_q": None,
         "grp-attn-n": None,
@@ -1741,6 +1760,7 @@ def migrate_legacy_installation(layout: InstallLayout, dry_run: bool) -> int:
     for src, dst in (
         (config_dir / SERVER_CONFIG_BASENAME, layout.config_dir / SERVER_CONFIG_BASENAME),
         (config_dir / "heimdall-gateway.json", layout.config_dir / SERVER_CONFIG_BASENAME),
+        (config_dir / "llamacpp-superserver.json", layout.config_dir / SERVER_CONFIG_BASENAME),
         (config_dir / LEGACY_SERVER_CONFIG_BASENAME, layout.config_dir / SERVER_CONFIG_BASENAME),
         (config_dir / "llamacpp-superserver.env", layout.config_dir / ENV_BASENAME),
         (alt_config_dir / LEGACY_ENV_BASENAME, layout.config_dir / ENV_BASENAME),
@@ -1755,6 +1775,21 @@ def migrate_legacy_installation(layout: InstallLayout, dry_run: bool) -> int:
 
     if _copy_legacy_path_if_missing(config_dir / TEMPLATES_BASENAME, layout.config_dir / TEMPLATES_BASENAME, stamp, dry_run):
         changed += 1
+
+    # After Heimdall config exists, archive/remove legacy editable config files
+    # so users do not keep editing a stale llamacpp-superserver conf.json that
+    # services no longer read. Backups are created before removal.
+    legacy_editable_files = [
+        config_dir / SERVER_CONFIG_BASENAME,
+        config_dir / "heimdall-gateway.json",
+        config_dir / "llamacpp-superserver.json",
+        config_dir / LEGACY_SERVER_CONFIG_BASENAME,
+        config_dir / "llamacpp-superserver.env",
+        alt_config_dir / LEGACY_ENV_BASENAME,
+    ]
+    for legacy_file in legacy_editable_files:
+        if _remove_legacy_path(legacy_file, stamp, dry_run):
+            changed += 1
 
     # If the old install root exists and the new one does not, copy binaries/runtime.
     # This preserves package-only upgrades without moving model storage.

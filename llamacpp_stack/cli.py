@@ -42,7 +42,7 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 # Dependencies
 try:
@@ -566,8 +566,24 @@ def _default_experimental_config() -> dict[str, object]:
             "visible_notice_after_seconds": 4,
             "trigger_prefixes": [
                 "[terminal command",
+                "[terminal_inline",
+                "</terminal_inline>",
                 "Voy a",
+                "Empezando por",
             ],
+            "prompt": (
+                "Your previous assistant message ended without any tool_calls.\n"
+                "You are in a tool-capable agent environment. If the next step requires reading files, editing files, running commands, searching, inspecting state, or using any external capability, you must call one of the available tools instead of describing the action in text.\n"
+                "Do not answer with empty visible content. Do not answer with a sentence that only sets up an action and ends with a colon.\n"
+                "Available tool names: {tool_names}."
+            ),
+            "truncated_tool_call_prompt": (
+                "Your previous assistant message started a tool_call but it was truncated before the JSON arguments were complete.\n"
+                "Retry now with exactly one complete, valid tool_call. Keep the arguments minimal and valid JSON. "
+                "Do not stream or repeat partial arguments. Do not include explanatory text before the tool_call.\n"
+                "Available tool names: {tool_names}."
+            ),
+            "include_failed_assistant_message": False,
             "loop_guard": {
                 "enabled": True,
                 "no_tool_call_max_chars": 12000,
@@ -621,6 +637,14 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
                 except Exception:
                     repair["visible_notice_after_seconds"] = 4
                 repair["trigger_prefixes"] = _normalize_chat_tool_continue_trigger_prefixes(repair.get("trigger_prefixes"))
+                for prompt_key in ("prompt", "truncated_tool_call_prompt"):
+                    prompt_value = repair.get(prompt_key)
+                    default_prompt = _default_experimental_config()["chat_tool_continue_repair"].get(prompt_key, "")
+                    if not isinstance(prompt_value, str) or not prompt_value.strip():
+                        repair[prompt_key] = default_prompt
+                    else:
+                        repair[prompt_key] = prompt_value
+                repair["include_failed_assistant_message"] = _as_bool(repair.get("include_failed_assistant_message"), False)
                 loop_guard = repair.get("loop_guard")
                 default_loop_guard = _default_experimental_config()["chat_tool_continue_repair"]["loop_guard"]
                 if not isinstance(loop_guard, dict):
@@ -848,12 +872,11 @@ def _migrate_llama_server_defaults(defaults: dict[str, object]) -> bool:
         "mirostat": 2,
         "mirostat_ent": 4.5,
         "mirostat_lr": 0.1,
-        # Retired global defaults. They are either model-family specific,
-        # not valid/safe for all llama.cpp builds, or not valid for GGUF
-        # models as global defaults. Per-model overrides remain explicit.
+        # Retired global defaults. They are either model-family specific
+        # or not valid/safe for all llama.cpp builds. Per-model overrides
+        # remain explicit. KV cache defaults are intentionally allowed: the
+        # installer now manages cache_type_k/v globally as f16.
         "chat_template_kwargs": None,
-        "cache_type_k": None,
-        "cache_type_v": None,
         "mul_mat_q": None,
         "grp_attn_n": None,
     }
@@ -1404,6 +1427,11 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
                 normalized[key] = str(raw_val).strip()
             continue
         if key in {"split_mode", "cache_type_k", "cache_type_v", "host", "model_draft", "hf_repo_draft", "reasoning_format", "reasoning_budget_message", "chat_template_file", "chat_template", "device", "chat_template_kwargs"}:
+            if key in {"cache_type_k", "cache_type_v"}:
+                normalized_cache_type = _normalize_cache_type_value(raw_val)
+                if normalized_cache_type is not None:
+                    normalized[key] = normalized_cache_type
+                continue
             if key == "chat_template_kwargs":
                 if isinstance(raw_val, dict):
                     normalized[key] = json.dumps(raw_val, ensure_ascii=False, separators=(",", ":"))
@@ -1608,12 +1636,25 @@ def load_catalog_with_diagnostics(path: Path, server_config_path: Path | None = 
             extra = {k: v for k, v in raw_item.items() if k not in model_field_names}
             if extra:
                 overrides = dict(known.get("server_overrides") or {})
+                managed_aliases = {
+                    k: v
+                    for k, v in extra.items()
+                    if "-" in str(k) and str(k).strip().lower().replace("-", "_") in model_field_names
+                }
                 # Unknown top-level catalog keys are treated as llama.cpp
                 # server overrides. This keeps manual edits like
                 # `"parallel": 2` backward-compatible and avoids rejecting
                 # new llama.cpp flags before the dataclass schema knows them.
-                overrides.update(extra)
-                known["server_overrides"] = overrides
+                # Exception: dash aliases of managed model fields, e.g.
+                # `tensor-split`, are intentionally not migrated silently.
+                # They are ignored here and reported by catalog-key warnings;
+                # raw llama.cpp flags belong under server_overrides.
+                for extra_key, extra_value in extra.items():
+                    if extra_key in managed_aliases:
+                        continue
+                    overrides[extra_key] = extra_value
+                if overrides:
+                    known["server_overrides"] = overrides
             items.append(ManagedModel(**known))
     except Exception as exc:
         _clear_catalog_cache(path)
@@ -1899,6 +1940,26 @@ def _is_integrated_mtp_model_filename(filename: str | None) -> bool:
         return False
     stem = re.sub(r"(?i)\.gguf$", "", name)
     return bool(re.search(r"(^|[-_.])mtp($|[-_.])", stem)) and not name.startswith("mtp-")
+
+
+def _looks_like_integrated_mtp_model(
+    repo_id: str | None = None,
+    filename: str | None = None,
+    model_id: str | None = None,
+    local_path: str | Path | None = None,
+) -> bool:
+    """Detect GGUFs that embed MTP even when the selected filename omits MTP.
+
+    Some repos are named `*-MTP-GGUF` while the main file itself is named only
+    by model and quant, e.g. `Qwen3.6-27B-UD-Q5_K_XL.gguf`.  llama.cpp still
+    needs the draft-mtp flags for these integrated MTP files.
+    """
+    if _is_integrated_mtp_model_filename(filename):
+        return True
+    if not str(filename or local_path or "").lower().endswith(".gguf"):
+        return False
+    haystack = " ".join(str(x or "") for x in (repo_id, model_id, local_path)).lower()
+    return bool(re.search(r"(^|[/\-_.])mtp($|[/\-_.])", haystack))
 
 
 def _should_probe_repo_for_mtp_drafter(repo_id: str, filename: str, model_id: str = "", draft_path: str = "") -> bool:
@@ -3309,15 +3370,6 @@ def build_llama_server_command(
         # --draft/--draft-max aliases for the same drafter.
         effective.pop("draft", None)
 
-    # KV cache quantization defaults are not safe as a global/default flag for
-    # GGUF models in this stack. Keep them only for non-GGUF backends/models.
-    try:
-        if str(getattr(model, "local_path", "") or "").lower().endswith(".gguf"):
-            effective.pop("cache_type_k", None)
-            effective.pop("cache_type_v", None)
-    except Exception:
-        pass
-
     # Auto-enable draft-mtp for models whose id ends with '-mtp' unless
     # explicitly overridden by server_overrides. Downstream code emits
     # the corresponding `--draft-mtp` flag when present.
@@ -3847,6 +3899,7 @@ class ReplicaRouterState:
         self.response_to_replica: dict[str, tuple[str, float]] = {}
         self.gpu_snapshot: tuple[float, dict[int, dict[str, float]]] = (0.0, {})
 
+
     def prune(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
         with self.lock:
@@ -3903,6 +3956,232 @@ class ReplicaRouterState:
 
 
 REPLICA_ROUTER_STATE = ReplicaRouterState()
+
+
+class ConversationRequestToken:
+    def __init__(self, key: str, model: str, generation: int):
+        self.key = key
+        self.model = model
+        self.generation = generation
+
+
+class ConversationSwitchState:
+    """Tracks model changes per real conversation/agent, independent of model id.
+
+    This is intentionally separate from replica affinity. Replica affinity is
+    model-scoped; cancellation needs to know that the same conversation moved
+    from Gemma to Qwen so old repair loops stop reloading Gemma.
+    """
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.generation_by_key: dict[str, int] = {}
+        self.active_model_by_key: dict[str, str] = {}
+        self.in_flight_by_key: dict[str, int] = {}
+        self.last_seen_by_key: dict[str, float] = {}
+
+    def prune(self, ttl_s: float = 3600.0) -> None:
+        now = time.monotonic()
+        with self.lock:
+            stale = [
+                key for key, last_seen in self.last_seen_by_key.items()
+                if self.in_flight_by_key.get(key, 0) <= 0 and now - last_seen > ttl_s
+            ]
+            for key in stale:
+                self.generation_by_key.pop(key, None)
+                self.active_model_by_key.pop(key, None)
+                self.in_flight_by_key.pop(key, None)
+                self.last_seen_by_key.pop(key, None)
+
+    def start(self, key: str, model: str) -> tuple[ConversationRequestToken | None, str]:
+        if not key:
+            return None, ""
+        now = time.monotonic()
+        model = str(model or "")
+        with self.lock:
+            previous_model = self.active_model_by_key.get(key, "")
+            generation = int(self.generation_by_key.get(key, 0))
+            reason = ""
+            if previous_model and previous_model != model:
+                generation += 1
+                reason = "model_changed"
+            elif key not in self.generation_by_key:
+                generation = 1
+                reason = "new_conversation"
+            self.generation_by_key[key] = generation
+            self.active_model_by_key[key] = model
+            self.in_flight_by_key[key] = max(0, int(self.in_flight_by_key.get(key, 0))) + 1
+            self.last_seen_by_key[key] = now
+            return ConversationRequestToken(key, model, generation), reason
+
+    def finish(self, token: ConversationRequestToken | None) -> None:
+        if token is None or not token.key:
+            return
+        with self.lock:
+            self.in_flight_by_key[token.key] = max(0, int(self.in_flight_by_key.get(token.key, 0)) - 1)
+            self.last_seen_by_key[token.key] = time.monotonic()
+
+    def should_cancel(self, token: ConversationRequestToken | None) -> tuple[bool, str]:
+        if token is None or not token.key:
+            return False, ""
+        with self.lock:
+            generation = int(self.generation_by_key.get(token.key, 0))
+            active_model = self.active_model_by_key.get(token.key, "")
+            if generation != token.generation:
+                return True, "conversation_generation_changed"
+            if active_model and active_model != token.model:
+                return True, "conversation_model_changed"
+            return False, ""
+
+    def snapshot(self, key: str) -> dict[str, object]:
+        with self.lock:
+            return {
+                "key": key,
+                "generation": self.generation_by_key.get(key, 0),
+                "active_model": self.active_model_by_key.get(key, ""),
+                "in_flight": self.in_flight_by_key.get(key, 0),
+            }
+
+
+CONVERSATION_SWITCH_STATE = ConversationSwitchState()
+
+
+_CACHE_TYPE_ALIASES = {
+    "q8": "q8_0",
+    "8bit": "q8_0",
+    "int8": "q8_0",
+    "q4": "q4_0",
+    "4bit": "q4_0",
+    "int4": "q4_0",
+    "fp16": "f16",
+    "float16": "f16",
+    "fp32": "f32",
+    "float32": "f32",
+}
+_VALID_CACHE_TYPES = {
+    "f32",
+    "f16",
+    "bf16",
+    "q8_0",
+    "q4_0",
+    "q4_1",
+    "iq4_nl",
+    "q5_0",
+    "q5_1",
+}
+
+
+def _normalize_cache_type_value(value: object) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    text = _CACHE_TYPE_ALIASES.get(text, text)
+    if text in _VALID_CACHE_TYPES:
+        return text
+    return None
+
+
+
+def _catalog_model_key_names() -> list[str]:
+    return sorted(f.name for f in fields(ManagedModel))
+
+
+def _catalog_known_top_level_key_aliases() -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for name in _catalog_model_key_names():
+        dashed = name.replace("_", "-")
+        if dashed != name:
+            aliases[dashed] = name
+    return aliases
+
+
+def catalog_key_warnings(path: Path) -> list[str]:
+    try:
+        payload = json.loads(path.read_text("utf-8"))
+    except Exception as exc:
+        return [f"Could not inspect catalog keys in {path}: {exc}"]
+    if not isinstance(payload, list):
+        return []
+    model_keys = set(_catalog_model_key_names())
+    aliases = _catalog_known_top_level_key_aliases()
+    warnings: list[str] = []
+    for idx, raw_item in enumerate(payload):
+        if not isinstance(raw_item, dict):
+            continue
+        model_id = str(raw_item.get("model_id") or f"entry#{idx}")
+        for raw_key in raw_item:
+            key = str(raw_key).strip()
+            normalized = key.lower()
+            if key in model_keys or key == "server_overrides":
+                continue
+            if normalized in aliases:
+                warnings.append(
+                    f"catalog.json model {model_id}: top-level key {key!r} is not a catalog model key. "
+                    f"Use {aliases[normalized]!r} for the managed model field, or put raw llama.cpp flag "
+                    f"{key!r} under server_overrides."
+                )
+            elif "-" in key and normalized.replace("-", "_") in model_keys:
+                canonical = normalized.replace("-", "_")
+                warnings.append(
+                    f"catalog.json model {model_id}: top-level key {key!r} looks like managed field {canonical!r}. "
+                    f"Use snake_case top-level keys; raw llama.cpp flags belong under server_overrides."
+                )
+    return warnings
+
+
+def print_config_keys(args) -> int:
+    catalog_keys = _catalog_model_key_names()
+    server_default_keys = sorted(set(_load_bundled_llama_server_default_values().keys()) | set(resolve_llama_server_defaults(args).keys()))
+    global_keys = sorted(k for k in normalize_server_config_payload({})[0].keys() if not k.startswith("_"))
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps({
+            "catalog_model_top_level_keys": catalog_keys,
+            "conf_json_top_level_keys": global_keys,
+            "llama_server_defaults_keys": server_default_keys,
+            "notes": [
+                "Catalog model top-level keys use snake_case.",
+                "Raw llama.cpp flags belong under server_overrides and may use dash or underscore spelling.",
+            ],
+        }, indent=2, ensure_ascii=False))
+        return 0
+    print("Catalog model top-level keys (snake_case):")
+    for key in catalog_keys:
+        print(f"  {key}")
+    print("\nconf.json top-level keys:")
+    for key in global_keys:
+        print(f"  {key}")
+    print("\nllama_server_defaults keys seen/defaulted:")
+    for key in server_default_keys:
+        print(f"  {key}")
+    print("\nRule:")
+    print("  - Use snake_case for managed catalog fields, e.g. tensor_split.")
+    print("  - Put raw llama.cpp flags in server_overrides, e.g. {'batch-size': 1024}.")
+    return 0
+
+def _server_config_validation_warnings(payload: object) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    defaults = payload.get("llama_server_defaults")
+    if not isinstance(defaults, dict):
+        return []
+    warnings: list[str] = []
+    for key in ("cache_type_k", "cache_type_v", "cache-type-k", "cache-type-v"):
+        if key not in defaults:
+            continue
+        raw = defaults.get(key)
+        raw_text = str(raw or "").strip()
+        normalized = _normalize_cache_type_value(raw)
+        if normalized is None:
+            warnings.append(
+                f"Invalid llama_server_defaults.{key}={raw_text!r}; omitting this KV cache flag. "
+                f"Use one of: {', '.join(sorted(_VALID_CACHE_TYPES))}."
+            )
+            continue
+        if raw_text and normalized != raw_text:
+            warnings.append(
+                f"Non-canonical llama_server_defaults.{key}={raw_text!r}; normalized to {normalized!r}."
+            )
+    return warnings
 
 
 def _headers_lower(headers) -> dict[str, str]:
@@ -3976,7 +4255,7 @@ def _agent_fingerprint_from_payload(payload: dict) -> str:
     return hashlib.sha256("\n".join(pieces).encode("utf-8", errors="ignore")).hexdigest()[:12]
 
 
-def resolve_request_affinity_key(model_name: str, payload: dict, headers) -> str:
+def _request_session_and_agent(payload: dict, headers) -> tuple[str, str]:
     h = _headers_lower(headers)
     session = _first_header(h, [
         "thread-id", "session-id", "x-conversation-id", "x-session-id", "x-thread-id",
@@ -3991,6 +4270,29 @@ def resolve_request_affinity_key(model_name: str, payload: dict, headers) -> str
         # routing. OpenCode agents/subagents are instead distinguished by stable
         # system/developer/tool prompt prefixes when no explicit agent id exists.
         agent = _agent_fingerprint_from_payload(payload)
+    return session, agent
+
+
+def resolve_request_conversation_key(payload: dict, headers) -> str:
+    """Return conversation/agent identity without model id for cancellation.
+
+    Unlike replica affinity, this key is intentionally model-agnostic so a
+    request that switches the same conversation from Gemma to Qwen can cancel
+    old Gemma repair rounds. Fallback fingerprints are not reliable enough for
+    cancellation because they change with prompt text.
+    """
+    session, agent = _request_session_and_agent(payload, headers)
+    if not session:
+        # Best-effort for clients that do not expose explicit conversation ids.
+        # This is weaker than session/agent, but still model-agnostic and stable
+        # enough for long-running same-conversation model switches because it
+        # hashes the early message prefix rather than the current model.
+        return f"fallback:{_message_text_fingerprint(payload)}:agent:{agent}"
+    return f"session:{session}:agent:{agent}"
+
+
+def resolve_request_affinity_key(model_name: str, payload: dict, headers) -> str:
+    session, agent = _request_session_and_agent(payload, headers)
     previous_response_id = str(payload.get("previous_response_id") or "").strip()
     if previous_response_id:
         mapped = REPLICA_ROUTER_STATE.response_replica(previous_response_id)
@@ -5525,7 +5827,7 @@ def ensure_model_available(args, progress_callback = None):
                     f"MTP drafter already configured for {existing.model_id}: {mtp_filename}.",
                     progress_callback,
                 )
-        elif _is_integrated_mtp_model_filename(selected_file):
+        elif _looks_like_integrated_mtp_model(repo_id, selected_file, existing.model_id, existing.local_path):
             updated_overrides, mtp_changed = _apply_mtp_server_overrides(existing.server_overrides, None, active_server_defaults)
             if mtp_changed or updated_overrides != normalize_server_overrides(existing.server_overrides):
                 existing.server_overrides = updated_overrides
@@ -5699,7 +6001,11 @@ def ensure_model_available(args, progress_callback = None):
             mtp_path = mtp_loc
 
     probe_config_replaced = False
-    desired_ctx = ctx_override if ctx_override is not None else (existing.ctx_size if existing and skip_ctx and existing.ctx_size else (existing.ctx_size if existing and existing.auto_ctx_failed else default_ctx))
+    desired_ctx = ctx_override if ctx_override is not None else (
+        existing.ctx_size
+        if existing and skip_ctx and existing.ctx_size
+        else (existing.ctx_size if existing and (existing.auto_ctx_failed or existing.auto_ctx_error) else default_ctx)
+    )
     if ctx_override is not None:
         auto_ctx_failed = False
         auto_ctx_error = ""
@@ -5725,12 +6031,12 @@ def ensure_model_available(args, progress_callback = None):
             _emit_message(f"Skipping automatic ctx tuning. Preserving existing ctx {desired_ctx} for {mid}.", progress_callback)
         else:
             _emit_message(f"Skipping automatic ctx tuning. Using default ctx {desired_ctx} for {mid}.", progress_callback)
-    elif existing and existing.auto_ctx_failed and not force_auto_ctx:
+    elif existing and (existing.auto_ctx_failed or existing.auto_ctx_error) and not force_auto_ctx:
         desired_ctx = existing.ctx_size or default_ctx
-        auto_ctx_failed = True
+        auto_ctx_failed = bool(existing.auto_ctx_failed)
         auto_ctx_error = existing.auto_ctx_error or "previous-auto-ctx-failure"
         _emit_message(
-            f"Previous auto ctx probe failed ({auto_ctx_error}). Using saved fallback ctx {desired_ctx} without re-probing.",
+            f"Previous auto ctx issue ({auto_ctx_error}). Using saved ctx {desired_ctx} without re-probing; use --force-auto-ctx to override.",
             progress_callback,
         )
     else:
@@ -5761,6 +6067,11 @@ def ensure_model_available(args, progress_callback = None):
                 "Process: start at 8192, try a few larger values, keep a practical stable ctx, and avoid exhaustive slow probing.",
                 progress_callback,
             )
+            probe_server_overrides = normalize_server_overrides(existing.server_overrides) if existing else {}
+            if mtp_filename and mtp_path:
+                probe_server_overrides, _ = _apply_mtp_server_overrides(probe_server_overrides, mtp_path, active_server_defaults)
+            elif _looks_like_integrated_mtp_model(repo_id, selected_file, mid, str(local_path)):
+                probe_server_overrides, _ = _apply_mtp_server_overrides(probe_server_overrides, None, active_server_defaults)
             probe_model = ManagedModel(
                 model_id=mid,
                 repo_id=repo_id,
@@ -5776,6 +6087,7 @@ def ensure_model_available(args, progress_callback = None):
                 jinja=not args.no_jinja,
                 ttl=resolve_idle_ttl(args),
                 description=args.description or f"{repo_id} / {selected_file}",
+                server_overrides=probe_server_overrides,
             )
             refresh_model_load_capabilities(probe_model)
             probe_config_replaced = True
@@ -5984,7 +6296,7 @@ def ensure_model_available(args, progress_callback = None):
                 f"Detected MTP drafter for {new_m.model_id}: {mtp_filename}; enabling draft-mtp.",
                 progress_callback,
             )
-    elif _is_integrated_mtp_model_filename(selected_file) and not is_speculative_request:
+    elif _looks_like_integrated_mtp_model(repo_id, selected_file, mid, local_path) and not is_speculative_request:
         new_m.server_overrides, mtp_changed = _apply_mtp_server_overrides(new_m.server_overrides, None, active_server_defaults)
         if mtp_changed:
             _emit_message(
@@ -7215,20 +7527,42 @@ def build_openai_model_list_payload(model: ManagedModel) -> dict:
     ctx_status = ctx_evaluation_status(model)
     context_length = cfg_ctx if cfg_ctx > 0 and ctx_status != "ERROR" else None
     api_context_length = api_ctx if api_ctx > 0 and ctx_status != "ERROR" else None
+    # OpenAI's public Model object does not standardize context metadata, but
+    # OpenAI-compatible agent clients commonly need it. Keep these aliases
+    # deliberately flat and non-ambiguous:
+    #   - Hermes reads context_length/max_model_len/max_input_tokens.
+    #   - vLLM-style clients understand max_model_len.
+    #   - Some clients recursively parse nested keys named `input`/`output` as
+    #     pricing, and `max_tokens` is commonly treated as an output limit, so
+    #     avoid OpenCode-style `limit.output` and top-level `max_tokens` here.
     return {
         "id": model.model_id,
         "object": "model",
         "created": 0,
         "owned_by": "llama-swap",
         "context_length": context_length,
+        "context_window": context_length,
+        "context_size": context_length,
+        "max_context_length": context_length,
+        "max_model_len": context_length,
+        "max_input_tokens": context_length,
+        "max_output_tokens": api_context_length,
+        "max_completion_tokens": api_context_length,
         "metadata": {
             "vision": _has_vision_runtime(model),
             "load_capabilities": load_capabilities,
             "context_length": context_length,
+            "context_window": context_length,
+            "context_size": context_length,
+            "max_context_length": context_length,
+            "max_model_len": context_length,
+            "max_input_tokens": context_length,
             "configured_context_length": context_length,
             "api_context_length": api_context_length,
+            "max_output_tokens": api_context_length,
+            "max_completion_tokens": api_context_length,
             "api_context_status": ctx_status,
-        },
+            },
     }
 
 def build_openai_model_payload(model: ManagedModel) -> dict:
@@ -9499,6 +9833,57 @@ def _sanitize_chat_tool_repair_notices_in_messages(messages: object) -> list[dic
         sanitized.append(copied)
     return sanitized
 
+
+def _merge_chat_message_content(left: object, right: object) -> object:
+    if left in (None, ""):
+        return right if right is not None else ""
+    if right in (None, ""):
+        return left
+    if isinstance(left, list) or isinstance(right, list):
+        merged: list[object] = []
+        if isinstance(left, list):
+            merged.extend(left)
+        else:
+            merged.append({"type": "text", "text": str(left)})
+        if isinstance(right, list):
+            merged.extend(right)
+        else:
+            merged.append({"type": "text", "text": str(right)})
+        return merged
+    return f"{left}\n{right}"
+
+
+def _normalize_trailing_assistant_messages_for_llamacpp(messages: object) -> list[dict]:
+    """Merge a final run of plain assistant messages into one assistant message.
+
+    llama.cpp rejects prompts ending in two or more assistant messages. Some
+    clients use trailing assistant prefills after thinking-only continuations.
+    Preserve the information but send a single final assistant message. Do not
+    merge assistant messages that contain tool calls because those have protocol
+    semantics and should fail loudly rather than be rewritten.
+    """
+    if not isinstance(messages, list):
+        return []
+    normalized = [dict(item) for item in messages if isinstance(item, dict)]
+    tail_start = len(normalized)
+    while tail_start > 0 and str(normalized[tail_start - 1].get("role") or "") == "assistant":
+        tail_start -= 1
+    if len(normalized) - tail_start < 2:
+        return normalized
+    tail = normalized[tail_start:]
+    if any(item.get("tool_calls") for item in tail):
+        return normalized
+    merged = dict(tail[0])
+    for item in tail[1:]:
+        merged["content"] = _merge_chat_message_content(merged.get("content"), item.get("content"))
+        for key, value in item.items():
+            if key in {"role", "content"}:
+                continue
+            if key not in merged or merged.get(key) in (None, "", []):
+                merged[key] = value
+    return normalized[:tail_start] + [merged]
+
+
 def resolve_chat_tool_continue_repair_config(args = None) -> dict[str, object]:
     raw = _load_server_config_payload(args).get("experimental")
     cfg = _normalize_experimental_config(raw).get("chat_tool_continue_repair", {})
@@ -9527,6 +9912,170 @@ def _chat_tool_names_from_payload(tools: object, limit: int = 50) -> list[str]:
     return names
 
 
+def _valid_chat_tool_names_from_payload(tools: object) -> set[str]:
+    return set(_chat_tool_names_from_payload(tools, limit=500))
+
+
+def _normalize_tool_call_arguments_for_example(value: object, max_chars: int = 2000) -> str:
+    if isinstance(value, str):
+        text = value.strip()
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+        text = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        # Keep original string for diagnostics, but invalid JSON cannot be used
+        # as a formatting example for a future tool repair.
+        return ""
+    if len(text) > max_chars:
+        return text[:max_chars] + "…"
+    return text
+
+
+def _extract_chat_tool_call_examples_from_messages(
+    messages: object,
+    tools: object,
+    *,
+    limit: int = 3,
+) -> list[dict[str, str]]:
+    """Return recent valid assistant tool-call examples from request history.
+
+    The examples are used only as text inside the repair prompt, never as
+    protocol-level assistant/tool messages, so they cannot mutate conversation
+    state or create invalid trailing assistant sequences.
+    """
+    if not isinstance(messages, list):
+        return []
+    valid_names = _valid_chat_tool_names_from_payload(tools)
+    examples: list[dict[str, str]] = []
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls") or []
+        if not isinstance(tool_calls, list):
+            continue
+        for tool_call in reversed(tool_calls):
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function") or {}
+            if not isinstance(function, dict):
+                continue
+            name = str(function.get("name") or "").strip()
+            if not name or (valid_names and name not in valid_names):
+                continue
+            arguments = _normalize_tool_call_arguments_for_example(function.get("arguments") or "")
+            if not arguments:
+                continue
+            example = {"tool_name": name, "arguments": arguments}
+            if example not in examples:
+                examples.append(example)
+            if len(examples) >= limit:
+                return examples
+    return examples
+
+
+class ChatToolCallExampleStore:
+    def __init__(self, max_per_key: int = 4, ttl_s: float = 3600.0):
+        self.lock = threading.RLock()
+        self.max_per_key = max(1, int(max_per_key))
+        self.ttl_s = max(60.0, float(ttl_s))
+        self.examples_by_key: dict[str, list[dict[str, object]]] = {}
+
+    def _prune_locked(self, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        stale_keys = []
+        for key, examples in self.examples_by_key.items():
+            fresh = [item for item in examples if now - float(item.get("seen_monotonic") or 0.0) <= self.ttl_s]
+            if fresh:
+                self.examples_by_key[key] = fresh[: self.max_per_key]
+            else:
+                stale_keys.append(key)
+        for key in stale_keys:
+            self.examples_by_key.pop(key, None)
+
+    def remember(self, key: str, tool_calls: object, tools: object, *, request_id: str = "") -> None:
+        if not key or not isinstance(tool_calls, list) or not tool_calls:
+            return
+        valid_names = _valid_chat_tool_names_from_payload(tools)
+        now = time.monotonic()
+        new_examples: list[dict[str, object]] = []
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function") or {}
+            if not isinstance(function, dict):
+                continue
+            name = str(function.get("name") or "").strip()
+            if not name or (valid_names and name not in valid_names):
+                continue
+            arguments = _normalize_tool_call_arguments_for_example(function.get("arguments") or "")
+            if not arguments:
+                continue
+            new_examples.append(
+                {
+                    "tool_name": name,
+                    "arguments": arguments,
+                    "request_id": request_id,
+                    "seen_monotonic": now,
+                }
+            )
+        if not new_examples:
+            return
+        with self.lock:
+            self._prune_locked(now)
+            existing = self.examples_by_key.setdefault(key, [])
+            for example in new_examples:
+                existing = [
+                    old for old in existing
+                    if not (
+                        old.get("tool_name") == example.get("tool_name")
+                        and old.get("arguments") == example.get("arguments")
+                    )
+                ]
+                existing.insert(0, example)
+            self.examples_by_key[key] = existing[: self.max_per_key]
+
+    def get(self, keys: list[str], tools: object) -> dict[str, str] | None:
+        valid_names = _valid_chat_tool_names_from_payload(tools)
+        with self.lock:
+            self._prune_locked()
+            for key in keys:
+                if not key:
+                    continue
+                for example in self.examples_by_key.get(key, []):
+                    name = str(example.get("tool_name") or "").strip()
+                    args = str(example.get("arguments") or "").strip()
+                    if not name or not args:
+                        continue
+                    if valid_names and name not in valid_names:
+                        continue
+                    return {"tool_name": name, "arguments": args}
+        return None
+
+
+CHAT_TOOL_CALL_EXAMPLES = ChatToolCallExampleStore()
+
+
+def _chat_tool_example_keys(model: str, upstream_model: str = "", conversation_key: str = "") -> list[str]:
+    model_key = str(model or "").strip()
+    upstream_key = str(upstream_model or "").strip()
+    conversation = str(conversation_key or "").strip()
+    keys: list[str] = []
+    for base in (upstream_key, model_key):
+        if not base:
+            continue
+        if conversation:
+            keys.append(f"conversation:{base}:{conversation}")
+        keys.append(f"model:{base}")
+    return list(dict.fromkeys(keys))
+
+
 def _chat_tool_continue_trigger_reason(
     content: object,
     tool_calls: object,
@@ -9548,6 +10097,12 @@ def _chat_tool_continue_trigger_reason(
     visible_lines = [line.lstrip() for line in visible.splitlines()]
     visible_line_starts = [line.casefold() for line in visible_lines]
     visible_start = visible.lstrip().casefold()
+    visible_folded = visible.casefold()
+    # Hermes/OpenCode sometimes receives a model-imagined inline terminal tag
+    # as visible text instead of a real tool_call. Treat this as a strong
+    # syntactic failure signal even if the closing tag appears mid-line.
+    if "[terminal_inline" in visible_folded or "<terminal_inline" in visible_folded or "</terminal_inline>" in visible_folded:
+        return "visible_content_terminal_inline_markup"
     for prefix in _normalize_chat_tool_continue_trigger_prefixes(trigger_prefixes):
         folded_prefix = prefix.casefold()
         if visible_start.startswith(folded_prefix):
@@ -9555,6 +10110,24 @@ def _chat_tool_continue_trigger_reason(
         if any(line.startswith(folded_prefix) for line in visible_line_starts if line):
             return "visible_content_configured_prefix_line"
     tool_names = {name.casefold() for name in _chat_tool_names_from_payload(tools, limit=200)}
+    if re.search(r"```[\s\S]*?```", visible):
+        shell_like = re.search(
+            r"```(?:bash|sh|shell|zsh|python|python3)?\s*[\r\n]+"
+            r"(?=[\s\S]*(?:\b(?:cd|python3?|bash|sh|zsh|sudo|docker|grep|find|cat|ls|curl|wget|git|sed|awk)\b|[/~.]|&&|\|\|))",
+            visible,
+            re.IGNORECASE,
+        )
+        action_like = re.search(
+            r"\b(voy a|déjame|dejame|let me|i will|i'll|verificar|ejecut|buscar|leer|escribir|inspect|run|search|read|write)\b",
+            visible,
+            re.IGNORECASE,
+        )
+        if shell_like or action_like:
+            return "visible_content_fenced_tool_like_block"
+    for tool_name in tool_names:
+        escaped = re.escape(tool_name)
+        if re.search(rf"(^|[^\w.-]){escaped}\s*\(", visible_folded):
+            return "visible_content_pseudo_tool_call"
     for line in visible_lines:
         if not line.startswith("["):
             continue
@@ -9565,25 +10138,74 @@ def _chat_tool_continue_trigger_reason(
 
 
 
+def _format_chat_tool_repair_prompt(prompt_template: object, tools: object, fallback: str) -> str:
+    template = str(prompt_template or "").strip() or fallback
+    tool_names = _chat_tool_names_from_payload(tools)
+    tool_names_text = ", ".join(tool_names) if tool_names else "(tool names unavailable)"
+    try:
+        return template.format(tool_names=tool_names_text, tools=tool_names_text)
+    except Exception:
+        # Do not let a malformed user-configured template break live requests.
+        return f"{template}\nAvailable tool names: {tool_names_text}."
+
+
+def _format_chat_tool_call_example_for_prompt(example: object) -> str:
+    if not isinstance(example, dict):
+        return "No prior valid tool_call example is available. Use the provided tool schemas."
+    name = str(example.get("tool_name") or "").strip()
+    arguments = str(example.get("arguments") or "").strip()
+    if not name or not arguments:
+        return "No prior valid tool_call example is available. Use the provided tool schemas."
+    return (
+        "Recent valid tool_call example from this same environment, for formatting only:\n"
+        f"Tool name: {name}\n"
+        "Arguments JSON:\n"
+        f"{arguments}\n\n"
+        "Do not copy this exact example unless it matches the current intended action."
+    )
+
+
+def _format_failed_visible_response_for_prompt(assistant_message: object, max_chars: int = 4000) -> str:
+    if not isinstance(assistant_message, dict):
+        return "(unavailable)"
+    content = _strip_chat_tool_repair_notice_text(assistant_message.get("content") or "")
+    if not content:
+        return "(empty visible response)"
+    if len(content) > max_chars:
+        return content[:max_chars] + "…"
+    return content
+
+
 def _chat_tool_continue_repair_messages(
     messages: list[dict],
     assistant_message: dict,
     tools: object,
+    prompt_template: object = None,
+    include_failed_assistant_message: bool = False,
+    tool_call_example: object = None,
 ) -> list[dict]:
     repaired = _sanitize_chat_tool_repair_notices_in_messages(messages)
-    content = _strip_chat_tool_repair_notice_text(assistant_message.get("content") or "")
-    repaired.append({"role": "assistant", "content": content})
-    tool_names = _chat_tool_names_from_payload(tools)
-    tool_names_text = ", ".join(tool_names) if tool_names else "(no se pudieron resumir nombres)"
+    if include_failed_assistant_message:
+        content = _strip_chat_tool_repair_notice_text(assistant_message.get("content") or "")
+        repaired.append({"role": "assistant", "content": content})
+    default_prompt = _default_experimental_config()["chat_tool_continue_repair"]["prompt"]
+    base_prompt = _format_chat_tool_repair_prompt(prompt_template, tools, default_prompt)
+    failed_visible = _format_failed_visible_response_for_prompt(assistant_message)
+    example_text = _format_chat_tool_call_example_for_prompt(tool_call_example)
+    combined_prompt = (
+        f"{base_prompt}\n\n"
+        "Previous visible response that failed to produce a valid tool_call:\n"
+        "-----\n"
+        f"{failed_visible}\n"
+        "-----\n\n"
+        f"{example_text}\n\n"
+        "Repair rule: infer the intended tool use from the failed visible response and emit exactly one real tool_call now. "
+        "Do not write Markdown, pseudo tool syntax, XML tags, shell/code blocks, or explanatory prose."
+    )
     repaired.append(
         {
             "role": "user",
-            "content": (
-                "Your previous assistant message ended without any tool_calls.\n"
-                "You are in a tool-capable agent environment. If the next step requires reading files, editing files, running commands, searching, inspecting state, or using any external capability, you must call one of the available tools instead of describing the action in text.\n"
-                "Do not answer with empty visible content. Do not answer with a sentence that only sets up an action and ends with a colon.\n"
-                f"Available tool names: {tool_names_text}."
-            ),
+            "content": combined_prompt,
         }
     )
     return repaired
@@ -9604,19 +10226,13 @@ def _chat_tool_truncated_trigger_reason(stream_state: dict[str, object]) -> str:
     return ""
 
 
-def _chat_tool_truncated_repair_messages(messages: list[dict], tools: object) -> list[dict]:
+def _chat_tool_truncated_repair_messages(messages: list[dict], tools: object, prompt_template: object = None) -> list[dict]:
     repaired = [dict(item) for item in messages if isinstance(item, dict)]
-    tool_names = _chat_tool_names_from_payload(tools)
-    tool_names_text = ", ".join(tool_names) if tool_names else "(tool names unavailable)"
+    default_prompt = _default_experimental_config()["chat_tool_continue_repair"]["truncated_tool_call_prompt"]
     repaired.append(
         {
             "role": "user",
-            "content": (
-                "Your previous assistant message started a tool_call but it was truncated before the JSON arguments were complete.\n"
-                "Retry now with exactly one complete, valid tool_call. Keep the arguments minimal and valid JSON. "
-                "Do not stream or repeat partial arguments. Do not include explanatory text before the tool_call.\n"
-                f"Available tool names: {tool_names_text}."
-            ),
+            "content": _format_chat_tool_repair_prompt(prompt_template, tools, default_prompt),
         }
     )
     return repaired
@@ -9662,6 +10278,7 @@ def _chat_completion_state_from_sse_lines(lines: list[bytes]) -> dict[str, objec
     reasoning_len = 0
     tool_call_chunks = 0
     finish_reason = ""
+    tool_calls_by_index: dict[str, dict[str, object]] = {}
     for line in lines:
         if not line or not line.startswith(b"data: ") or line == b"data: [DONE]":
             continue
@@ -9680,12 +10297,42 @@ def _chat_completion_state_from_sse_lines(lines: list[bytes]) -> dict[str, objec
             reasoning_len += len(str(reasoning))
         if tool_calls:
             tool_call_chunks += len(tool_calls) if isinstance(tool_calls, list) else 1
+            for tool_call in tool_calls if isinstance(tool_calls, list) else [tool_calls]:
+                if not isinstance(tool_call, dict):
+                    continue
+                index_key = str(tool_call.get("index") if tool_call.get("index") is not None else tool_call.get("id") or "0")
+                existing = tool_calls_by_index.setdefault(
+                    index_key,
+                    {
+                        "id": tool_call.get("id") or f"call_{index_key}",
+                        "type": tool_call.get("type") or "function",
+                        "function": {"name": "", "arguments": ""},
+                    },
+                )
+                if tool_call.get("id"):
+                    existing["id"] = tool_call.get("id")
+                if tool_call.get("type"):
+                    existing["type"] = tool_call.get("type")
+                function = tool_call.get("function") or {}
+                if isinstance(function, dict):
+                    existing_function = existing.setdefault("function", {"name": "", "arguments": ""})
+                    if not isinstance(existing_function, dict):
+                        existing_function = {"name": "", "arguments": ""}
+                        existing["function"] = existing_function
+                    if function.get("name"):
+                        existing_function["name"] = str(function.get("name") or "")
+                    if function.get("arguments"):
+                        existing_function["arguments"] = str(existing_function.get("arguments") or "") + str(function.get("arguments") or "")
         if choice0.get("finish_reason"):
             finish_reason = str(choice0.get("finish_reason") or "")
     content = "".join(content_parts)
-    tool_calls_out: list[dict] = [{}] * tool_call_chunks if tool_call_chunks > 0 else []
+    tool_calls_out: list[dict] = []
+    for key in sorted(tool_calls_by_index.keys(), key=lambda x: int(x) if x.isdigit() else x):
+        tool_calls_out.append(tool_calls_by_index[key])
+    if tool_call_chunks > 0 and not tool_calls_out:
+        tool_calls_out = [{}] * tool_call_chunks
     return {
-        "message": {"role": "assistant", "content": content},
+        "message": {"role": "assistant", "content": content, "tool_calls": tool_calls_out},
         "content": content,
         "reasoning": "",
         "reasoning_len": reasoning_len,
@@ -9715,26 +10362,31 @@ def _force_tool_choice_for_chat_repair(payload: dict[str, object]) -> dict[str, 
         repaired["tool_choice"] = "required"
     return repaired
 
-def _apply_chat_tool_continue_repair_token_cap(payload: dict, max_tokens: object) -> dict:
+def _apply_chat_tool_continue_repair_token_cap(payload: dict, fallback_max_tokens: object) -> dict:
     capped = dict(payload)
-    try:
-        cap = int(max_tokens)
-    except Exception:
-        cap = 0
-    if cap <= 0:
-        return capped
-    current = capped.get("max_tokens")
-    try:
-        current_int = int(current)
-    except Exception:
-        current_int = 0
-    capped["max_tokens"] = min(current_int, cap) if current_int > 0 else cap
-    if "n_predict" in capped:
+
+    def _positive_int(value: object) -> int:
         try:
-            n_predict = int(capped.get("n_predict"))
+            parsed = int(value)
         except Exception:
-            n_predict = 0
-        capped["n_predict"] = min(n_predict, cap) if n_predict > 0 else cap
+            return 0
+        return parsed if parsed > 0 else 0
+
+    # Repair rounds should honor the caller's requested output budget when it
+    # exists.  The configured value is only a fallback for clients that omit an
+    # explicit max_tokens/n_predict.  Capping a large external request to the
+    # repair default can truncate long but valid tool-call JSON arguments.
+    effective_cap = _positive_int(capped.get("max_tokens"))
+    if effective_cap <= 0:
+        effective_cap = _positive_int(capped.get("n_predict"))
+    if effective_cap <= 0:
+        effective_cap = _positive_int(fallback_max_tokens)
+    if effective_cap <= 0:
+        return capped
+
+    capped["max_tokens"] = effective_cap
+    if "n_predict" in capped:
+        capped["n_predict"] = effective_cap
     return capped
 
 
@@ -9820,6 +10472,7 @@ def _buffer_openai_chat_sse_with_keepalive(
     passthrough_visible_chars: int = 0,
     passthrough_tool_calls: bool = False,
     loop_guard: dict[str, object] | None = None,
+    cancel_check=None,
 ) -> tuple[list[bytes], bool, dict[str, object]]:
     buffered_lines: list[bytes] = []
     stop_heartbeat = threading.Event()
@@ -9943,6 +10596,18 @@ def _buffer_openai_chat_sse_with_keepalive(
     def write_sse_line(line: bytes) -> None:
         handler.wfile.write(line + b"\n" if line else b"\n")
 
+    def cancelled_reason() -> str:
+        if cancel_check is None:
+            return ""
+        try:
+            value = cancel_check()
+        except Exception as exc:
+            log_api_event("openai_chat_stream_cancel_check_error", {"request_id": request_id, "error": str(exc)})
+            return ""
+        if isinstance(value, tuple):
+            return str(value[1] or "") if value[0] else ""
+        return "cancelled" if value else ""
+
     def send_visible_notice() -> None:
         if not visible_status:
             return
@@ -9951,6 +10616,15 @@ def _buffer_openai_chat_sse_with_keepalive(
         except Exception:
             delay = 0
         if stop_heartbeat.wait(delay):
+            return
+        cancel_reason = cancelled_reason()
+        if cancel_reason:
+            state["buffer_abort_reason"] = cancel_reason
+            stop_heartbeat.set()
+            try:
+                response.close()
+            except Exception:
+                pass
             return
         if suppress_visible_notice.is_set() or int(state.get("tool_call_chunks") or 0) > 0:
             tool_chunks = int(state.get("tool_call_chunks") or 0)
@@ -10008,6 +10682,15 @@ def _buffer_openai_chat_sse_with_keepalive(
             if stop_heartbeat.wait(max(1, keepalive_seconds)):
                 break
             try:
+                cancel_reason = cancelled_reason()
+                if cancel_reason:
+                    state["buffer_abort_reason"] = cancel_reason
+                    stop_heartbeat.set()
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                    break
                 with write_lock:
                     log_api_event(
                         "openai_chat_stream_repair_buffer_pulse",
@@ -10039,7 +10722,17 @@ def _buffer_openai_chat_sse_with_keepalive(
     passthrough = False
     try:
         for line in response.iter_lines():
+            cancel_reason = cancelled_reason()
+            if cancel_reason:
+                state["buffer_abort_reason"] = cancel_reason
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                break
             if stop_heartbeat.is_set():
+                if state.get("buffer_abort_reason"):
+                    break
                 raise BrokenPipeError("client disconnected while buffering chat repair stream")
             buffered_lines.append(line)
             observe_line(line)
@@ -10080,7 +10773,17 @@ def _buffer_openai_chat_sse_with_keepalive(
                 break
         if passthrough:
             for line in response.iter_lines():
+                cancel_reason = cancelled_reason()
+                if cancel_reason:
+                    state["buffer_abort_reason"] = cancel_reason
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                    break
                 if stop_heartbeat.is_set():
+                    if state.get("buffer_abort_reason"):
+                        break
                     raise BrokenPipeError("client disconnected while passthrough streaming chat repair")
                 observe_line(line)
                 with write_lock:
@@ -10913,6 +11616,22 @@ def start_ctx_metadata_server(args):
             if parsed.path in {"/v1/models", "/models"}:
                 self._send_json({"object": "list", "data": [build_openai_model_list_payload(model) for model in catalog]})
                 return
+            model_lookup_id = None
+            for prefix in ("/v1/models/", "/models/"):
+                if parsed.path.startswith(prefix):
+                    model_lookup_id = unquote(parsed.path[len(prefix):]).strip()
+                    break
+            if model_lookup_id:
+                wanted = model_lookup_id.casefold()
+                wanted_bare = wanted.rsplit("/", 1)[-1]
+                for model in catalog:
+                    mid = str(getattr(model, "model_id", "") or "")
+                    folded = mid.casefold()
+                    if folded == wanted or folded.rsplit("/", 1)[-1] == wanted_bare:
+                        self._send_json(build_openai_model_list_payload(model))
+                        return
+                self._send_json({"error": {"message": f"model not found: {model_lookup_id}", "type": "not_found_error"}}, status=404)
+                return
             if parsed.path == "/api/tags":
                 published_models = get_published_model_ids(client_host, int(args.public_port))
                 processes = get_llama_server_processes()
@@ -11465,7 +12184,20 @@ def start_ctx_metadata_server(args):
                     public_host=client_host,
                     public_port=int(args.public_port),
                 )
+            conversation_key = resolve_request_conversation_key(payload, self.headers)
+            conversation_token, conversation_start_reason = CONVERSATION_SWITCH_STATE.start(conversation_key, model_name)
+            if conversation_start_reason == "model_changed":
+                log_api_event(
+                    "openai_chat_conversation_model_switch",
+                    {
+                        "request_id": request_id,
+                        "model": model_name,
+                        "conversation_key_hash": hashlib.sha256(conversation_key.encode("utf-8", errors="ignore")).hexdigest()[:16] if conversation_key else "",
+                        "conversation_state": CONVERSATION_SWITCH_STATE.snapshot(conversation_key) if conversation_key else {},
+                    },
+                )
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="openai", payload=payload):
+                CONVERSATION_SWITCH_STATE.finish(conversation_token)
                 return
             log_api_event(
                 "openai_chat_route_decision",
@@ -11475,6 +12207,8 @@ def start_ctx_metadata_server(args):
                     "upstream_model": upstream_model_name,
                     "is_replica": is_replica_request,
                     "affinity_key": affinity_key,
+                    "conversation_key_hash": hashlib.sha256(conversation_key.encode("utf-8", errors="ignore")).hexdigest()[:16] if conversation_key else "",
+                    "conversation_generation": conversation_token.generation if conversation_token else 0,
                     "router_state": replica_trace_state_for_base(model_name),
                 },
             )
@@ -11497,15 +12231,30 @@ def start_ctx_metadata_server(args):
             if not isinstance(raw_messages, list) or not raw_messages:
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                CONVERSATION_SWITCH_STATE.finish(conversation_token)
                 self._send_json({"error": {"message": "messages is required", "type": "invalid_request_error"}}, status=400)
                 return
             messages = _sanitize_chat_tool_repair_notices_in_messages([_normalize_openai_message(item) for item in raw_messages if isinstance(item, dict)])
+            normalized_messages = _normalize_trailing_assistant_messages_for_llamacpp(messages)
+            if len(normalized_messages) != len(messages):
+                log_api_event(
+                    "openai_chat_trailing_assistant_messages_merged",
+                    {
+                        "request_id": request_id,
+                        "model": model_name,
+                        "before_count": len(messages),
+                        "after_count": len(normalized_messages),
+                        "tail_roles_before": [str(item.get("role") or "") for item in messages[-8:] if isinstance(item, dict)],
+                    },
+                )
+            messages = normalized_messages
             tool_diag = _summarize_chat_tool_message_diagnostics(messages)
             if tool_diag.get("matches"):
                 log_api_event("openai_chat_tool_message_diagnostics", {"request_id": request_id, "model": model_name, "matches": tool_diag.get("matches"), "tool_message_count": tool_diag.get("tool_message_count")})
             if not messages:
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                CONVERSATION_SWITCH_STATE.finish(conversation_token)
                 self._send_json({"error": {"message": "messages is required", "type": "invalid_request_error"}}, status=400)
                 return
             if _messages_include_images(messages) and (model_entry is None or not _has_configured_mmproj_runtime(model_entry)):
@@ -11534,6 +12283,7 @@ def start_ctx_metadata_server(args):
                 )
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                CONVERSATION_SWITCH_STATE.finish(conversation_token)
                 return
             upstream_payload = dict(payload)
             upstream_payload["model"] = upstream_model_name
@@ -11575,7 +12325,54 @@ def start_ctx_metadata_server(args):
             except Exception:
                 repair_visible_notice_after_seconds = 4
             repair_trigger_prefixes = _normalize_chat_tool_continue_trigger_prefixes(repair_cfg.get("trigger_prefixes"))
+            repair_prompt_template = repair_cfg.get("prompt")
+            repair_truncated_prompt_template = repair_cfg.get("truncated_tool_call_prompt")
+            repair_include_failed_assistant_message = bool(repair_cfg.get("include_failed_assistant_message"))
             repair_loop_guard = repair_cfg.get("loop_guard") if isinstance(repair_cfg.get("loop_guard"), dict) else {}
+
+            def _select_chat_tool_call_example_for_repair(current_messages_for_example: object) -> dict[str, str] | None:
+                examples = _extract_chat_tool_call_examples_from_messages(
+                    current_messages_for_example,
+                    upstream_payload.get("tools"),
+                    limit=1,
+                )
+                if examples:
+                    return examples[0]
+                return CHAT_TOOL_CALL_EXAMPLES.get(
+                    _chat_tool_example_keys(model_name, upstream_model_name, conversation_key),
+                    upstream_payload.get("tools"),
+                )
+
+            def _remember_successful_chat_tool_calls(tool_calls: object) -> None:
+                keys = _chat_tool_example_keys(model_name, upstream_model_name, conversation_key)
+                for key in keys:
+                    CHAT_TOOL_CALL_EXAMPLES.remember(
+                        key,
+                        tool_calls,
+                        upstream_payload.get("tools"),
+                        request_id=request_id,
+                    )
+
+            def _conversation_cancel_reason() -> tuple[bool, str]:
+                cancelled, reason = CONVERSATION_SWITCH_STATE.should_cancel(conversation_token)
+                if cancelled:
+                    log_api_event(
+                        "openai_chat_conversation_request_cancelled",
+                        {
+                            "request_id": request_id,
+                            "model": model_name,
+                            "upstream_model": upstream_model_name,
+                            "reason": reason,
+                            "conversation_key_hash": hashlib.sha256(conversation_key.encode("utf-8", errors="ignore")).hexdigest()[:16] if conversation_key else "",
+                            "conversation_generation": conversation_token.generation if conversation_token else 0,
+                            "conversation_state": CONVERSATION_SWITCH_STATE.snapshot(conversation_key) if conversation_key else {},
+                        },
+                    )
+                return cancelled, reason
+
+            def _finish_openai_chat_request() -> None:
+                CONVERSATION_SWITCH_STATE.finish(conversation_token)
+
             try:
                 response = requests.post(
                     f"http://{client_host}:{int(args.public_port)}/v1/chat/completions",
@@ -11589,6 +12386,7 @@ def start_ctx_metadata_server(args):
                 log_api_event("openai_chat_upstream_network_error", {"request_id": request_id, "error": str(exc), "payload": _summarize_api_payload_for_log(upstream_payload), "router_state": replica_trace_state_for_base(model_name)})
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                CONVERSATION_SWITCH_STATE.finish(conversation_token)
                 self._send_json({"error": {"message": f"upstream unavailable: {exc}", "type": "server_error"}}, status=502)
                 return
             if response.status_code >= 400:
@@ -11596,6 +12394,7 @@ def start_ctx_metadata_server(args):
                 log_api_event("openai_chat_upstream_error", {"request_id": request_id, "status": response.status_code, "body": body_text, "payload": _summarize_api_payload_for_log(upstream_payload), "router_state": replica_trace_state_for_base(model_name)})
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                CONVERSATION_SWITCH_STATE.finish(conversation_token)
                 self._send_json(
                     {"error": {"message": f"upstream unavailable: HTTP {response.status_code}: {body_text[:1000]}", "type": "server_error"}},
                     status=502,
@@ -11626,17 +12425,20 @@ def start_ctx_metadata_server(args):
                                 visible_status=pending_visible_status,
                                 visible_notice_after_seconds=repair_visible_notice_after_seconds,
                                 loop_guard=repair_loop_guard,
+                                cancel_check=_conversation_cancel_reason,
                             )
                             pending_visible_status = None
                             if passthrough_state.get("buffer_abort_reason"):
+                                abort_reason = str(passthrough_state.get("buffer_abort_reason") or "")
+                                is_conversation_cancel = abort_reason.startswith("conversation_")
                                 log_api_event(
-                                    "openai_chat_tool_continue_repair_loop_detected",
+                                    "openai_chat_conversation_repair_cancelled" if is_conversation_cancel else "openai_chat_tool_continue_repair_loop_detected",
                                     {
                                         "request_id": request_id,
                                         "model": model_name,
                                         "upstream_model": upstream_model_name,
                                         "repair_round": stream_repair_round_used,
-                                        "reason": passthrough_state.get("buffer_abort_reason") or "",
+                                        "reason": abort_reason,
                                         "visible_content_len": int(passthrough_state.get("visible_content_len") or 0),
                                         "reasoning_len": int(passthrough_state.get("reasoning_len") or 0),
                                         "tool_call_chunks": int(passthrough_state.get("tool_call_chunks") or 0),
@@ -11646,21 +12448,23 @@ def start_ctx_metadata_server(args):
                                     },
                                 )
                                 with repair_write_lock:
-                                    _send_openai_chat_sse_status(
-                                        self,
-                                        request_id=request_id,
-                                        model=model_name,
-                                        content=(
-                                            "\n<think>\n"
-                                            "Tool-call repair loop detected; stopping this response instead of consuming more tokens.\n"
-                                            "</think>\n"
-                                        ),
-                                    )
+                                    if not is_conversation_cancel:
+                                        _send_openai_chat_sse_status(
+                                            self,
+                                            request_id=request_id,
+                                            model=model_name,
+                                            content=(
+                                                "\n<think>\n"
+                                                "Tool-call repair loop detected; stopping this response instead of consuming more tokens.\n"
+                                                "</think>\n"
+                                            ),
+                                        )
                                     self.wfile.write(b"data: [DONE]\n\n")
                                     self.wfile.flush()
-                                mark_model_activity(model_name, "openai_chat", "stream_repair_loop_detected")
+                                mark_model_activity(model_name, "openai_chat", "stream_conversation_cancelled" if is_conversation_cancel else "stream_repair_loop_detected")
                                 if upstream_model_name:
                                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                                _finish_openai_chat_request()
                                 _write_chat_last_response_log(
                                     args,
                                     request_id=request_id,
@@ -11679,12 +12483,14 @@ def start_ctx_metadata_server(args):
                                 mark_model_activity(model_name, "openai_chat", "stream_passthrough_closed")
                                 if upstream_model_name:
                                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
+                                _finish_openai_chat_request()
                                 log_api_event("openai_chat_total", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": True, "visible_content_len": int(passthrough_state.get("visible_content_len") or 0), "reasoning_len": int(passthrough_state.get("reasoning_len") or 0), "tool_call_chunks": int(passthrough_state.get("tool_call_chunks") or 0), "tool_argument_chars": int(passthrough_state.get("tool_argument_chars") or 0), "tool_names": passthrough_state.get("tool_names") or [], "finish_reason": passthrough_state.get("finish_reason") or "passthrough", "finish_reasons_seen": passthrough_state.get("finish_reasons_seen") or [], "passthrough_reason": passthrough_state.get("passthrough_reason") or "", "tool_call_indices": passthrough_state.get("tool_call_indices") or [], "tool_argument_lengths_by_index": passthrough_state.get("tool_argument_lengths_by_index") or {}, "tool_argument_json_valid_by_index": passthrough_state.get("tool_argument_json_valid_by_index") or {}, "tool_argument_tail_by_index": passthrough_state.get("tool_argument_tail_by_index") or {}, "reasoning_only_final": False, "repair_rounds": stream_repair_round_used, "router_state": replica_trace_state_for_base(model_name)})
                                 return
                         except (requests.RequestException, Exception) as exc:
                             log_api_event("openai_chat_stream_interrupted", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "error": str(exc), "router_state": replica_trace_state_for_base(model_name), "repair_round": stream_repair_round_used})
                             if upstream_model_name:
                                 REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                            _finish_openai_chat_request()
                             _send_openai_chat_sse_error(self, f"upstream stream failed before repair decision: {exc}")
                             return
                         finally:
@@ -11707,6 +12513,7 @@ def start_ctx_metadata_server(args):
                             if truncated_trigger_reason:
                                 if upstream_model_name:
                                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                                _finish_openai_chat_request()
                                 _send_openai_chat_sse_truncated_tool_error(self, request_id=request_id, model=model_name, rounds=stream_repair_round_used)
                                 return
                             break
@@ -11715,12 +12522,15 @@ def start_ctx_metadata_server(args):
                         repair_payload = _force_tool_choice_for_chat_repair(_apply_chat_tool_continue_repair_token_cap(upstream_payload, repair_max_tokens))
                         repair_payload["stream"] = True
                         if truncated_trigger_reason:
-                            current_messages = _chat_tool_truncated_repair_messages(current_messages, upstream_payload.get("tools"))
+                            current_messages = _chat_tool_truncated_repair_messages(current_messages, upstream_payload.get("tools"), repair_truncated_prompt_template)
                         else:
                             current_messages = _chat_tool_continue_repair_messages(
                                 current_messages,
                                 stream_state.get("message") if isinstance(stream_state.get("message"), dict) else {"role": "assistant", "content": ""},
                                 upstream_payload.get("tools"),
+                                repair_prompt_template,
+                                repair_include_failed_assistant_message,
+                                _select_chat_tool_call_example_for_repair(current_messages),
                             )
                         repair_payload["messages"] = current_messages
                         pending_visible_status = {
@@ -11736,6 +12546,15 @@ def start_ctx_metadata_server(args):
                             ),
                         }
                         log_api_event("openai_chat_tool_continue_repair_round", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "round": stream_repair_round_used, "stream": True, "trigger_reason": active_trigger_reason, "visible_notice_after_seconds": repair_visible_notice_after_seconds})
+                        cancelled, cancel_reason = _conversation_cancel_reason()
+                        if cancelled:
+                            if upstream_model_name:
+                                REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                            _finish_openai_chat_request()
+                            with repair_write_lock:
+                                self.wfile.write(b"data: [DONE]\n\n")
+                                self.wfile.flush()
+                            return
                         try:
                             current_response = requests.post(
                                 f"http://{client_host}:{int(args.public_port)}/v1/chat/completions",
@@ -11750,6 +12569,7 @@ def start_ctx_metadata_server(args):
                             log_api_event("openai_chat_upstream_network_error", {"request_id": request_id, "error": str(exc), "payload": _summarize_api_payload_for_log(repair_payload), "router_state": replica_trace_state_for_base(model_name), "repair_round": stream_repair_round_used})
                             if upstream_model_name:
                                 REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                            _finish_openai_chat_request()
                             _send_openai_chat_sse_error(self, f"upstream unavailable during repair: {exc}")
                             return
                         if current_response.status_code >= 400:
@@ -11757,11 +12577,13 @@ def start_ctx_metadata_server(args):
                             log_api_event("openai_chat_upstream_error", {"request_id": request_id, "status": current_response.status_code, "body": body_text, "payload": _summarize_api_payload_for_log(repair_payload), "router_state": replica_trace_state_for_base(model_name), "repair_round": stream_repair_round_used})
                             if upstream_model_name:
                                 REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                            _finish_openai_chat_request()
                             _send_openai_chat_sse_error(self, f"upstream unavailable during repair: HTTP {current_response.status_code}: {body_text[:1000]}")
                             return
                     mark_model_activity(model_name, "openai_chat", "stream_closed")
                     if upstream_model_name:
                         REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
+                    _finish_openai_chat_request()
                     try:
                         with repair_write_lock:
                             for line in final_buffered_lines:
@@ -11775,6 +12597,8 @@ def start_ctx_metadata_server(args):
                     final_content = str(final_stream_state.get("content") or "")
                     final_reasoning_len = int(final_stream_state.get("reasoning_len") or 0)
                     final_tool_call_chunks = int(final_stream_state.get("tool_call_chunks") or 0)
+                    if final_tool_call_chunks > 0:
+                        _remember_successful_chat_tool_calls(final_stream_state.get("tool_calls") or [])
                     reasoning_only_final = bool(final_reasoning_len) and not final_content and not final_stream_state.get("tool_calls")
                     log_api_event("openai_chat_total", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": True, "visible_content_len": len(final_content), "reasoning_len": final_reasoning_len, "tool_call_chunks": final_tool_call_chunks, "finish_reason": final_stream_state.get("finish_reason") or "", "reasoning_only_final": reasoning_only_final, "repair_rounds": stream_repair_round_used, "router_state": replica_trace_state_for_base(model_name)})
                     _write_chat_last_response_log(args, request_id=request_id, model=model_name, upstream_model=upstream_model_name, stream=True, content=final_content, reasoning_len=final_reasoning_len, tool_calls=final_stream_state.get("tool_calls"), tool_call_chunks=final_tool_call_chunks, finish_reason=final_stream_state.get("finish_reason") or "", repair_rounds=stream_repair_round_used)
@@ -11869,6 +12693,7 @@ def start_ctx_metadata_server(args):
                     mark_model_activity(model_name, "openai_chat", "stream_closed")
                     if upstream_model_name:
                         REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
+                    _finish_openai_chat_request()
                     reasoning_only_final = stream_reasoning_len > 0 and stream_visible_content_len == 0 and stream_tool_call_chunks == 0
                     log_api_event("openai_chat_total", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": True, "visible_content_len": stream_visible_content_len, "reasoning_len": stream_reasoning_len, "tool_call_chunks": stream_tool_call_chunks, "finish_reason": stream_finish_reason, "reasoning_only_final": reasoning_only_final, "router_state": replica_trace_state_for_base(model_name)})
                     _write_chat_last_response_log(args, request_id=request_id, model=model_name, upstream_model=upstream_model_name, stream=True, content="".join(stream_visible_content_parts), reasoning_len=stream_reasoning_len, tool_calls=[{}] * stream_tool_call_chunks if stream_tool_call_chunks > 0 else [], tool_call_chunks=stream_tool_call_chunks, finish_reason=stream_finish_reason, repair_rounds=stream_repair_round_used)
@@ -11887,6 +12712,7 @@ def start_ctx_metadata_server(args):
                 log_api_event("openai_chat_upstream_invalid_json", {"request_id": request_id, "error": str(exc), "payload": _summarize_api_payload_for_log(upstream_payload), "body": response.text[:4000], "router_state": replica_trace_state_for_base(model_name)})
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                _finish_openai_chat_request()
                 self._send_json({"error": {"message": f"upstream invalid response: {exc}", "type": "server_error"}}, status=502)
                 return
             repair_rounds_used = 0
@@ -11909,8 +12735,18 @@ def start_ctx_metadata_server(args):
                         messages,
                         state.get("message") if isinstance(state.get("message"), dict) else {"role": "assistant", "content": ""},
                         upstream_payload.get("tools"),
+                        repair_prompt_template,
+                        repair_include_failed_assistant_message,
+                        _select_chat_tool_call_example_for_repair(messages),
                     )
                     log_api_event("openai_chat_tool_continue_repair_round", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "round": repair_rounds_used, "stream": False, "trigger_reason": trigger_reason})
+                    cancelled, cancel_reason = _conversation_cancel_reason()
+                    if cancelled:
+                        if upstream_model_name:
+                            REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                        _finish_openai_chat_request()
+                        self._send_json({"error": {"message": f"request cancelled because conversation changed model: {cancel_reason}", "type": "server_error"}}, status=499)
+                        return
                     try:
                         repair_response = requests.post(
                             f"http://{client_host}:{int(args.public_port)}/v1/chat/completions",
@@ -11924,6 +12760,7 @@ def start_ctx_metadata_server(args):
                         log_api_event("openai_chat_upstream_network_error", {"request_id": request_id, "error": str(exc), "payload": _summarize_api_payload_for_log(repair_payload), "router_state": replica_trace_state_for_base(model_name), "repair_round": repair_rounds_used})
                         if upstream_model_name:
                             REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                        _finish_openai_chat_request()
                         self._send_json({"error": {"message": f"upstream unavailable during repair: {exc}", "type": "server_error"}}, status=502)
                         return
                     if repair_response.status_code >= 400:
@@ -11931,6 +12768,7 @@ def start_ctx_metadata_server(args):
                         log_api_event("openai_chat_upstream_error", {"request_id": request_id, "status": repair_response.status_code, "body": body_text, "payload": _summarize_api_payload_for_log(repair_payload), "router_state": replica_trace_state_for_base(model_name), "repair_round": repair_rounds_used})
                         if upstream_model_name:
                             REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                        _finish_openai_chat_request()
                         self._send_json({"error": {"message": f"upstream unavailable during repair: HTTP {repair_response.status_code}: {body_text[:1000]}", "type": "server_error"}}, status=502)
                         return
                     try:
@@ -11939,6 +12777,7 @@ def start_ctx_metadata_server(args):
                         log_api_event("openai_chat_upstream_invalid_json", {"request_id": request_id, "error": str(exc), "payload": _summarize_api_payload_for_log(repair_payload), "body": repair_response.text[:4000], "router_state": replica_trace_state_for_base(model_name), "repair_round": repair_rounds_used})
                         if upstream_model_name:
                             REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                        _finish_openai_chat_request()
                         self._send_json({"error": {"message": f"upstream invalid response during repair: {exc}", "type": "server_error"}}, status=502)
                         return
                 final_state = _chat_completion_state_from_payload(data)
@@ -11956,8 +12795,11 @@ def start_ctx_metadata_server(args):
             nonstream_reasoning = str(message.get("reasoning_content") or message.get("reasoning") or "")
             nonstream_tool_calls = message.get("tool_calls") or []
             nonstream_reasoning_only = bool(nonstream_reasoning) and not nonstream_content and not nonstream_tool_calls
+            if nonstream_tool_calls:
+                _remember_successful_chat_tool_calls(nonstream_tool_calls)
             if upstream_model_name:
                 REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
+            _finish_openai_chat_request()
             log_api_event("openai_chat_total", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": False, "visible_content_len": len(nonstream_content), "reasoning_len": len(nonstream_reasoning), "tool_calls_count": len(nonstream_tool_calls) if isinstance(nonstream_tool_calls, list) else (1 if nonstream_tool_calls else 0), "finish_reason": choice.get("finish_reason") or "", "reasoning_only_final": nonstream_reasoning_only, "router_state": replica_trace_state_for_base(model_name)})
             _write_chat_last_response_log(args, request_id=request_id, model=model_name, upstream_model=upstream_model_name, stream=False, content=nonstream_content, reasoning=nonstream_reasoning, tool_calls=nonstream_tool_calls, tool_call_chunks=len(nonstream_tool_calls) if isinstance(nonstream_tool_calls, list) else (1 if nonstream_tool_calls else 0), finish_reason=choice.get("finish_reason") or "", repair_rounds=repair_rounds_used)
             if not nonstream_tool_calls:
@@ -12154,6 +12996,20 @@ def start_ctx_metadata_server(args):
                 },
             )
             messages = upstream_payload.get("messages") or []
+            normalized_messages = _normalize_trailing_assistant_messages_for_llamacpp(messages)
+            if len(normalized_messages) != len(messages):
+                log_api_event(
+                    "openai_responses_trailing_assistant_messages_merged",
+                    {
+                        "request_id": request_id,
+                        "model": model_name,
+                        "before_count": len(messages),
+                        "after_count": len(normalized_messages),
+                        "tail_roles_before": [str(item.get("role") or "") for item in messages[-8:] if isinstance(item, dict)],
+                    },
+                )
+                upstream_payload["messages"] = normalized_messages
+                messages = normalized_messages
             if not messages:
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
@@ -12247,6 +13103,8 @@ def start_ctx_metadata_server(args):
             except Exception:
                 chat_continue_repair_max_rounds = 1
             chat_continue_repair_trigger_prefixes = _normalize_chat_tool_continue_trigger_prefixes(chat_continue_repair_cfg.get("trigger_prefixes"))
+            chat_continue_repair_prompt_template = chat_continue_repair_cfg.get("prompt")
+            chat_continue_repair_include_failed_assistant_message = bool(chat_continue_repair_cfg.get("include_failed_assistant_message"))
             if tool_registry is not None and tool_registry.has_deferred_tools:
                 extra_messages: list[dict] = []
                 accumulated_usage: dict | None = None
@@ -12846,6 +13704,8 @@ def start_ctx_metadata_server(args):
                                 upstream_payload.get("messages") if isinstance(upstream_payload.get("messages"), list) else [],
                                 {"role": "assistant", "content": full_content},
                                 upstream_payload.get("tools"),
+                                chat_continue_repair_prompt_template,
+                                chat_continue_repair_include_failed_assistant_message,
                             )
                             log_api_event(
                                 "openai_chat_tool_continue_repair_round",
@@ -15675,22 +16535,21 @@ def ensure_catalog_mtp_drafters(
                 model.server_overrides = updated
                 changed += 1
             continue
-        if _is_integrated_mtp_model_filename(filename):
-            updated, mtp_changed = _apply_mtp_server_overrides(overrides, None, server_defaults)
-            if mtp_changed or updated != overrides:
-                model.server_overrides = updated
-                changed += 1
-                _emit_message(
-                    f"Detected integrated MTP model for {model.model_id}: {filename}; enabling draft-mtp.",
-                    progress_callback,
-                )
-            continue
         try:
             mtp_filename = _detect_mtp_drafter_file(api, repo_id, token, filename)
         except Exception as exc:
             log_api_event("mtp_drafter_detect_failed", {"model": model.model_id, "repo_id": repo_id, "error": str(exc)})
-            continue
+            mtp_filename = None
         if not mtp_filename:
+            if _looks_like_integrated_mtp_model(repo_id, filename, str(getattr(model, "model_id", "") or ""), getattr(model, "local_path", "")):
+                updated, mtp_changed = _apply_mtp_server_overrides(overrides, None, server_defaults)
+                if mtp_changed or updated != overrides:
+                    model.server_overrides = updated
+                    changed += 1
+                    _emit_message(
+                        f"Detected integrated MTP model for {model.model_id}: {filename}; enabling draft-mtp.",
+                        progress_callback,
+                    )
             continue
         target_dir = Path(model.local_path).parent if model.local_path else Path(getattr(args, "models_dir", DEFAULT_MODELS_DIR)) / repo_id
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -15747,6 +16606,8 @@ def update_config(args, progress_callback = None):
     catalog, catalog_diag = load_catalog_with_diagnostics(args.catalog, _args_server_config_path(args))
     if catalog_diag:
         raise RuntimeError(f"Refusing to update from an invalid catalog: {catalog_diag}")
+    for warning in catalog_key_warnings(args.catalog):
+        _emit_message(f"WARNING: {warning}", progress_callback)
     target = getattr(args, "repo", None)
     repo_ref = getattr(args, "hf", None)
     model_id = getattr(args, "model_id", None)
@@ -16101,6 +16962,36 @@ def update_config(args, progress_callback = None):
         )
     return "updated"
 
+
+def sync_config_from_server_config_for_startup(args) -> str:
+    """Render llama-swap config from current conf/catalog during service startup.
+
+    This intentionally avoids the full `update` command behavior that waits for
+    the public llama-swap API. On systemd restart the router may not be up yet,
+    but conf.json changes still need to materialize into config.yaml before the
+    router starts watching it.
+    """
+    raw_server_config = _load_server_config_payload(args)
+    warnings = _server_config_validation_warnings(raw_server_config)
+    for warning in warnings:
+        print(f"[!] Heimdall Gateway config warning: {warning}", flush=True)
+        log_api_event("server_config_validation_warning", {"warning": warning, "server_config": str(_args_server_config_path(args))})
+    persist_server_config(args)
+    catalog, catalog_diag = load_catalog_with_diagnostics(args.catalog, _args_server_config_path(args))
+    if catalog_diag:
+        raise RuntimeError(f"Refusing startup sync from an invalid catalog: {catalog_diag}")
+    replica_defaults = resolve_global_replica_config(args)
+    render_llamaswap_config(
+        catalog,
+        args.config,
+        args.llama_server,
+        args.start_port,
+        resolve_idle_ttl(args),
+        server_defaults=resolve_llama_server_defaults(args),
+        replica_defaults=replica_defaults,
+    )
+    return "synced"
+
 def _http_error_snippet(exc: requests.HTTPError) -> str:
     response = getattr(exc, "response", None)
     if response is None:
@@ -16345,12 +17236,17 @@ def start_catalog_auto_update_watch(args, *, poll_s: float = 2.0, debounce_s: fl
 
 def daemon_mode(args):
     """Background manager listening on Unix socket."""
-    # Ensure llama-swap configuration is up-to-date with any manual edits to catalog.json or conf.json
+    # Ensure llama-swap configuration is up-to-date with manual edits to
+    # catalog.json or conf.json. This is render-only and does not wait for
+    # llama-swap/API because the router service may still be starting.
     try:
-        print("[*] Performing automatic configuration update on startup...")
-        update_config(args)
+        print(f"[*] Using Heimdall Gateway server config: {_args_server_config_path(args)}", flush=True)
+        print("[*] Syncing Heimdall Gateway config on startup...", flush=True)
+        sync_config_from_server_config_for_startup(args)
+        log_api_event("startup_config_sync_done", {"config": str(args.config), "catalog": str(args.catalog)})
     except Exception as exc:
-        print(f"[!] Warning: Automatic configuration update failed: {exc}")
+        log_api_event("startup_config_sync_failed", {"config": str(getattr(args, "config", "")), "catalog": str(getattr(args, "catalog", "")), "error": str(exc)})
+        print(f"[!] Warning: Startup configuration sync failed: {exc}", flush=True)
 
     _prepare_manager_socket_path(SOCKET_PATH)
     try:
@@ -16591,6 +17487,24 @@ def build_info_text(args = None) -> str:
     else:
         templates_dir = Path(server_config_path).expanduser().parent / "templates"
 
+    llama_defaults = resolve_llama_server_defaults(args)
+    default_keep = llama_defaults.get("keep", 20000)
+    default_cache_k = llama_defaults.get("cache_type_k", llama_defaults.get("cache-type-k", ""))
+    default_cache_v = llama_defaults.get("cache_type_v", llama_defaults.get("cache-type-v", ""))
+    default_parallel = llama_defaults.get("parallel", 1)
+    default_batch = llama_defaults.get("batch_size", llama_defaults.get("batch-size", 4096))
+    default_ubatch = llama_defaults.get("ubatch_size", llama_defaults.get("ubatch-size", 2048))
+    default_swa_full = _as_bool(llama_defaults.get("swa_full", llama_defaults.get("swa-full")), False)
+    default_flags_line = f"    --keep {default_keep}"
+    if default_cache_k not in (None, ""):
+        default_flags_line += f", --cache-type-k {default_cache_k}"
+    if default_cache_v not in (None, ""):
+        default_flags_line += f", --cache-type-v {default_cache_v}"
+    default_flags_line += f", --parallel {default_parallel}"
+    default_perf_line = f"    --batch-size {default_batch}, --ubatch-size {default_ubatch}"
+    if default_swa_full:
+        default_perf_line += ", --swa-full"
+
     return (
         "Default endpoints:\n"
         f"  llama-swap UI/backend: {ui_url}\n"
@@ -16622,8 +17536,8 @@ def build_info_text(args = None) -> str:
         f"  Per-model overrides:          {catalog_path} -> server_overrides\n"
         f"  API_CTX factor:               {server_config_path} -> api_ctx_factor (default {DEFAULT_API_CTX_FACTOR})\n"
         "  Default llama-server flags:\n"
-        "    --keep 20000, --cache-type-k q8_0, --cache-type-v q8_0, --parallel 1\n"
-        "    --batch-size 4096, --ubatch-size 2048, --swa-full\n"
+        f"{default_flags_line}\n"
+        f"{default_perf_line}\n"
         f"    use_fitc=false uses --ctx-size directly; use_fitc=true uses -fitc.\n"
         f"    (Change these in {server_config_path}['llama_server_defaults'])\n"
         "  Main folders: install root, models dir, state/config paths above.\n"
@@ -16844,6 +17758,15 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     )
     subparsers["config-migrate"] = p_config_migrate
     p_config_migrate.set_defaults(func=migrate_server_config)
+
+    p_config_keys = sub.add_parser(
+        "config-keys",
+        help="List valid configuration/catalog keys",
+        description="Print valid Heimdall Gateway catalog/conf keys and explain where raw llama.cpp flags belong.",
+    )
+    subparsers["config-keys"] = p_config_keys
+    p_config_keys.set_defaults(func=print_config_keys)
+    p_config_keys.add_argument("--format", choices=("text", "json"), default="text")
 
     p_refresh = sub.add_parser(
         "refresh-templates",
