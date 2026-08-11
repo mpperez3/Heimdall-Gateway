@@ -740,6 +740,10 @@ def normalize_server_config_payload(payload: dict[str, object]) -> tuple[dict[st
     if result.get("llama_server_family_defaults") != family_defaults:
         result["llama_server_family_defaults"] = family_defaults
         changed = True
+    vllm_config = _normalize_vllm_config(result.get("vllm"))
+    if result.get("vllm") != vllm_config:
+        result["vllm"] = vllm_config
+        changed = True
     raw_replicas = result.get("replicas")
     if not isinstance(raw_replicas, dict):
         result["replicas"] = _default_global_replicas_config()
@@ -837,6 +841,31 @@ def _normalize_llama_server_family_defaults_config(value: object) -> dict[str, d
         if normalized_defaults:
             normalized[pattern] = normalized_defaults
     return normalized
+
+
+def _normalize_vllm_mapping(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, object] = {}
+    for raw_key, raw_value in value.items():
+        key = str(raw_key).strip().lower().replace("-", "_")
+        if not key:
+            continue
+        if isinstance(raw_value, dict):
+            normalized[key] = _normalize_vllm_mapping(raw_value)
+        else:
+            normalized[key] = raw_value
+    return normalized
+
+
+def _normalize_vllm_config(value: object) -> dict[str, object]:
+    raw = _normalize_vllm_mapping(value)
+    defaults = raw.get("defaults")
+    family_defaults = raw.get("family_defaults")
+    return {
+        "defaults": defaults if isinstance(defaults, dict) else {},
+        "family_defaults": family_defaults if isinstance(family_defaults, dict) else {},
+    }
 
 
 def _migrate_llama_server_family_defaults(defaults: dict[str, dict[str, object]]) -> bool:
@@ -1098,6 +1127,7 @@ class ManagedModel:
     quant: str | None
     filename: str
     local_path: str
+    backend: str = "llama.cpp"
     mmproj_filename: str | None = None
     mmproj_path: str | None = None
     load_capabilities: list[str] = field(default_factory=list)
@@ -1209,6 +1239,28 @@ def _normalize_bool_flag(value: object) -> bool | None:
 
 def _is_vllm_backend() -> bool:
     return _env_value("HEIMDALL_GATEWAY_BACKEND", "LLAMACPP_BACKEND", "") == "vllm-beta"
+
+
+def _normalize_model_backend(value: object, filename: object = "", local_path: object = "") -> str:
+    normalized = str(value or "").strip().lower().replace("_", "-")
+    if str(filename or "").strip().lower() == "hf-native":
+        return "vllm"
+    local = Path(str(local_path or ""))
+    if local.is_dir() and not str(filename or "").lower().endswith(".gguf"):
+        return "vllm"
+    if normalized in {"vllm", "vllm-beta"}:
+        return "vllm"
+    if normalized in {"llama.cpp", "llama-cpp", "llamacpp"}:
+        return "llama.cpp"
+    return "llama.cpp"
+
+
+def _model_backend(model: ManagedModel) -> str:
+    return _normalize_model_backend(
+        getattr(model, "backend", None),
+        getattr(model, "filename", None),
+        getattr(model, "local_path", None),
+    )
 
 
 # Cache of parsed help flags per server binary path
@@ -1405,7 +1457,7 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
                 if bool_val is not None:
                     normalized[key] = bool_val
             continue
-        if key in {"kv_offload", "cont_batching", "op_offload", "cpu_moe", "kv_unified", "cache_idle_slots", "direct_io", "swa_full"}:
+        if key in {"kv_offload", "cont_batching", "op_offload", "cpu_moe", "kv_unified", "cache_idle_slots", "direct_io", "swa_full", "cache_prompt"}:
             bool_val = _normalize_bool_flag(raw_val)
             if bool_val is not None:
                 normalized[key] = bool_val
@@ -1660,7 +1712,7 @@ def load_catalog_with_diagnostics(path: Path, server_config_path: Path | None = 
         _clear_catalog_cache(path)
         return [], f"Catalog {path} has invalid entries: {exc}"
     changed = False
-    # Load global llama-server defaults for normalization context.
+    # Load global defaults for normalization context.
     try:
         args = argparse.Namespace(server_config=server_config_path) if server_config_path is not None else None
         server_defaults = resolve_llama_server_defaults(args)
@@ -1668,6 +1720,10 @@ def load_catalog_with_diagnostics(path: Path, server_config_path: Path | None = 
         server_defaults = {}
 
     for item in items:
+        normalized_backend = _normalize_model_backend(item.backend, item.filename, item.local_path)
+        if normalized_backend != item.backend:
+            item.backend = normalized_backend
+            changed = True
         normalized_load_capabilities = _normalize_load_capabilities(item.load_capabilities)
         if normalized_load_capabilities != item.load_capabilities:
             item.load_capabilities = normalized_load_capabilities
@@ -1849,11 +1905,9 @@ def choose_gguf_file(api, repo_id, quant, explicit_file, token):
     info = api.model_info(repo_id=repo_id, token=token)
     all_files = sorted(s.rfilename for s in info.siblings if s.rfilename and s.rfilename.lower().endswith(".gguf"))
     if not all_files:
-        if _is_vllm_backend():
-            if _env_value("HEIMDALL_GATEWAY_DEBUG", "DEBUG_LLAMACPP", ""):
-                print(f"DEBUG: No GGUF files found in {repo_id}, but vLLM backend is active. Returning None.", file=sys.stderr)
-            return None
-        raise RuntimeError(f"No GGUF in {repo_id}. If you want to use a native HuggingFace model, set HEIMDALL_GATEWAY_BACKEND=vllm-beta")
+        if _env_value("HEIMDALL_GATEWAY_DEBUG", "DEBUG_LLAMACPP", ""):
+            print(f"DEBUG: No GGUF files found in {repo_id}; treating it as a native HuggingFace model.", file=sys.stderr)
+        return None
     
     # Exclude mmproj files from main model search (they're selected separately)
     files = [f for f in all_files if "mmproj" not in f.lower()]
@@ -2261,9 +2315,16 @@ def summarize_configured_replicas(catalog: list[ManagedModel], global_replica_co
 
 
 def _get_model_size_mib(m: ManagedModel) -> float:
-    """Estimate model size in MiB using the GGUF file size."""
+    """Estimate model size in MiB for GGUF files and HF snapshots."""
     try:
-        return float(Path(m.local_path).stat().st_size) / (1024 * 1024)
+        path = Path(m.local_path)
+        if path.is_dir():
+            return sum(
+                file_path.stat().st_size
+                for file_path in path.rglob("*")
+                if file_path.is_file()
+            ) / (1024 * 1024)
+        return float(path.stat().st_size) / (1024 * 1024)
     except Exception:
         return 0.0
 
@@ -2400,6 +2461,7 @@ def render_llamaswap_config(
         "models": {},
     }
     resolved_defaults = normalize_server_overrides(server_defaults or resolve_llama_server_defaults())
+    resolved_vllm_defaults = resolve_vllm_defaults()
 
     # Count how many catalog entries reference the same local_path so that
     # we can create on-disk variant files at render time if necessary
@@ -2425,7 +2487,13 @@ def render_llamaswap_config(
         # intentionally reference the same GGUF but publish distinct model ids.
         use_model = m
 
-        cmd = build_llama_server_command(use_model, server_path, port="${PORT}", server_defaults=resolved_defaults)
+        cmd = build_llama_server_command(
+            use_model,
+            server_path,
+            port="${PORT}",
+            server_defaults=resolved_defaults,
+            vllm_defaults=resolved_vllm_defaults,
+        )
         if public_base_model_id is not None:
             cmd = _command_with_cuda_visible_devices(cmd, replica_gpu_set)
             replica_group_members.append(m.model_id)
@@ -2550,7 +2618,13 @@ def ensure_replica_route_in_llamaswap_config(
     if rid not in models:
         replica = build_replica_model(base_model, replica_index, gpu_set)
         resolved_defaults = normalize_server_overrides(server_defaults or resolve_llama_server_defaults())
-        cmd = build_llama_server_command(replica, Path(server_path), port="${PORT}", server_defaults=resolved_defaults)
+        cmd = build_llama_server_command(
+            replica,
+            Path(server_path),
+            port="${PORT}",
+            server_defaults=resolved_defaults,
+            vllm_defaults=resolve_vllm_defaults(),
+        )
         cmd = _command_with_cuda_visible_devices(cmd, gpu_set)
         models[rid] = {
             "cmd": " ".join(shell_quote(part) for part in cmd),
@@ -2806,6 +2880,31 @@ def resolve_llama_server_defaults(args = None) -> dict[str, object]:
     return defaults
 
 
+def resolve_vllm_defaults(args = None) -> dict[str, object]:
+    payload = _load_server_config_payload(args)
+    config = _normalize_vllm_config(payload.get("vllm"))
+    bundled_path = Path(__file__).resolve().parent / "bundle" / "llama_server_defaults.yaml"
+    bundled_vllm: dict[str, object] = {}
+    try:
+        bundled = yaml.safe_load(bundled_path.read_text(encoding="utf-8")) or {}
+        bundled_vllm = _normalize_vllm_config(bundled.get("vllm")) if isinstance(bundled, dict) else {}
+    except Exception:
+        bundled_vllm = {}
+    defaults = dict(bundled_vllm.get("defaults") or {})
+    defaults.update(config.get("defaults") or {})
+    family_defaults = {
+        str(pattern): dict(values)
+        for pattern, values in (bundled_vllm.get("family_defaults") or {}).items()
+        if isinstance(values, dict)
+    }
+    for pattern, values in (config.get("family_defaults") or {}).items():
+        if isinstance(values, dict):
+            family_defaults.setdefault(str(pattern), {}).update(values)
+    if isinstance(family_defaults, dict) and family_defaults:
+        defaults["__family_defaults"] = family_defaults
+    return defaults
+
+
 def _args_server_config_path(args) -> Path | None:
     value = getattr(args, "server_config", None)
     if value is None:
@@ -2855,6 +2954,46 @@ def _family_defaults_for_model(model: ManagedModel, family_defaults: object) -> 
             continue
         matched.update(normalize_server_overrides(raw_defaults))
     return matched
+
+
+def _vllm_family_defaults_for_model(model: ManagedModel, family_defaults: object) -> dict[str, object]:
+    if not isinstance(family_defaults, dict):
+        return {}
+    haystack = _model_family_match_text(model)
+    matched: dict[str, object] = {}
+    for raw_pattern, raw_defaults in family_defaults.items():
+        pattern = str(raw_pattern or "").strip().lower()
+        if pattern and pattern in haystack and isinstance(raw_defaults, dict):
+            matched.update(_normalize_vllm_mapping(raw_defaults))
+    return matched
+
+
+def resolve_vllm_options(
+    model: ManagedModel,
+    vllm_defaults: dict[str, object] | None = None,
+) -> dict[str, object]:
+    raw_defaults = _normalize_vllm_mapping(vllm_defaults or resolve_vllm_defaults())
+    family_defaults = raw_defaults.pop("__family_defaults", None)
+    options = dict(raw_defaults)
+    options.update(_vllm_family_defaults_for_model(model, family_defaults))
+    overrides = model.server_overrides if isinstance(model.server_overrides, dict) else {}
+    model_vllm = overrides.get("vllm")
+    if isinstance(model_vllm, dict):
+        options.update(_normalize_vllm_mapping(model_vllm))
+
+    if "max_model_len" not in options:
+        options["max_model_len"] = int(getattr(model, "ctx_size", DEFAULT_CTX_SIZE) or DEFAULT_CTX_SIZE)
+    if "tensor_parallel_size" not in options:
+        parts = [part for part in str(getattr(model, "tensor_split", "1") or "1").split(",") if part.strip()]
+        options["tensor_parallel_size"] = max(1, len(parts))
+    if "dtype" not in options:
+        legacy_dtype = next(
+            (key for key in ("float16", "bfloat16", "float32") if overrides.get(key)),
+            None,
+        )
+        if legacy_dtype:
+            options["dtype"] = legacy_dtype
+    return options
 
 
 def _is_gemma4_model(model: ManagedModel) -> bool:
@@ -3278,6 +3417,50 @@ def _device_list_for_tensor_split(tensor_split: str, total_devices: int | None =
     # 3-way tensor_split launch while still touching 7 physical GPUs.
     return ",".join(f"CUDA{idx}" for idx in range(len(parts)))
 
+def _vllm_flag_value(value: object) -> str:
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return str(value)
+
+
+def build_vllm_server_command(
+    model: ManagedModel,
+    *,
+    port: str,
+    host: str | None = None,
+    vllm_defaults: dict[str, object] | None = None,
+) -> list[str]:
+    options = resolve_vllm_options(model, vllm_defaults)
+    command = [
+        os.environ.get("VLLM_SERVER_BIN", "vllm-server"),
+        "--model",
+        str(model.local_path),
+        "--port",
+        str(port),
+        "--served-model-name",
+        str(model.model_id),
+    ]
+    resolved_host = str(options.pop("host", host or model.host) or "127.0.0.1")
+    if resolved_host:
+        command.extend(["--host", resolved_host])
+
+    reserved = {"model", "port", "served_model_name", "host"}
+    for raw_key, value in options.items():
+        key = str(raw_key).strip().lower().replace("-", "_")
+        if not key or key in reserved or value is None:
+            continue
+        flag = f"--{key.replace('_', '-')}"
+        if isinstance(value, bool):
+            # vLLM exposes both positive and negative argparse switches for
+            # most boolean engine arguments. Emitting the explicit negative
+            # form keeps a configured false value distinguishable from an
+            # omitted default.
+            command.append(flag if value else f"--no-{key.replace('_', '-')}")
+            continue
+        command.extend([flag, _vllm_flag_value(value)])
+    return command
+
+
 def build_llama_server_command(
     model: ManagedModel,
     server_path: Path,
@@ -3288,8 +3471,16 @@ def build_llama_server_command(
     include_mmproj: bool = True,
     include_jinja: bool = True,
     server_defaults: dict[str, object] | None = None,
+    vllm_defaults: dict[str, object] | None = None,
     extra_flags: list[str] | None = None,
 ) -> list[str]:
+    if _model_backend(model) == "vllm":
+        return build_vllm_server_command(
+            model,
+            port=port,
+            host=host,
+            vllm_defaults=vllm_defaults,
+        )
     effective = dict(normalize_server_overrides(server_defaults or {}))
     family_defaults = effective.pop("__family_defaults", None)
     effective.update(_family_defaults_for_model(model, family_defaults))
@@ -3332,6 +3523,7 @@ def build_llama_server_command(
     # flags and must not leak into the command line.
     for _sk in ("enabled", "id_prefix", "allow_multiple_variants"):
         effective.pop(_sk, None)
+
     # Internal escape hatch for generated replicas: tensor_split must be relative
     # to CUDA_VISIBLE_DEVICES, not normalized against all host GPUs.
     replica_tensor_split = effective.pop("__replica_tensor_split", None)
@@ -3538,6 +3730,7 @@ def build_llama_server_command(
         "parallel",
         "ctx_checkpoints",
         "cache_ram",
+        "cache_prompt",
         "kv_offload",
         "cont_batching",
         "op_offload",
@@ -3898,6 +4091,11 @@ class ReplicaRouterState:
         self.affinity: dict[str, tuple[str, float]] = {}
         self.response_to_replica: dict[str, tuple[str, float]] = {}
         self.gpu_snapshot: tuple[float, dict[int, dict[str, float]]] = (0.0, {})
+        # A model load is triggered by the first request that targets an
+        # unloaded process.  Keep an atomic claim so concurrent requests do
+        # not all reach llama-swap and make it start/restart the same model.
+        self.loading_claims: dict[str, float] = {}
+        self.loading_claim_aliases: dict[str, str] = {}
 
 
     def prune(self, now: float | None = None) -> None:
@@ -3939,6 +4137,10 @@ class ReplicaRouterState:
 
     def request_finished(self, replica_id: str, *, ok: bool = True) -> None:
         with self.lock:
+            self.loading_claims.pop(replica_id, None)
+            claim_key = self.loading_claim_aliases.pop(replica_id, None)
+            if claim_key:
+                self.loading_claims.pop(claim_key, None)
             rec = self.records.get(replica_id)
             if rec:
                 rec.in_flight = max(0, rec.in_flight - 1)
@@ -3953,6 +4155,42 @@ class ReplicaRouterState:
     def base_load(self, model_id: str) -> int:
         with self.lock:
             return int(self.base_in_flight.get(model_id, 0))
+
+    def claim_loading(self, model_id: str, catalog: list[ManagedModel], *, is_replica: bool = False, claim_key: str | None = None) -> bool:
+        """Claim the first request that may cause *model_id* to load.
+
+        The claim is only needed while no llama-server process exists.  It is
+        deliberately separate from ``in_flight``: a loaded server may serve
+        concurrent requests, while an unloaded server must receive exactly
+        one loader request.
+        """
+        now = time.monotonic()
+        claim_key = claim_key or model_id
+        rec = self.records.get(model_id) if is_replica else None
+        process_loaded = (rec is not None and rec.status == "ready") or (
+            not is_replica and get_catalog_model_process(model_id, catalog) is not None
+        )
+        with self.lock:
+            self.loading_claims = {
+                key: deadline for key, deadline in self.loading_claims.items()
+                if deadline > now
+            }
+            if process_loaded:
+                self.loading_claims.pop(claim_key, None)
+                return True
+            deadline = self.loading_claims.get(claim_key)
+            if deadline is not None and deadline > now:
+                return False
+            self.loading_claims[claim_key] = now + 900.0
+            self.loading_claim_aliases[model_id] = claim_key
+            return True
+
+    def release_loading_claim(self, model_id: str) -> None:
+        """Release a claim when preflight rejects the request before loading."""
+        with self.lock:
+            claim_key = self.loading_claim_aliases.pop(model_id, None) or model_id
+            self.loading_claims.pop(model_id, None)
+            self.loading_claims.pop(claim_key, None)
 
 
 REPLICA_ROUTER_STATE = ReplicaRouterState()
@@ -4133,11 +4371,20 @@ def print_config_keys(args) -> int:
     catalog_keys = _catalog_model_key_names()
     server_default_keys = sorted(set(_load_bundled_llama_server_default_values().keys()) | set(resolve_llama_server_defaults(args).keys()))
     global_keys = sorted(k for k in normalize_server_config_payload({})[0].keys() if not k.startswith("_"))
+    resolved_vllm = resolve_vllm_defaults(args)
+    vllm_keys = sorted(key for key in resolved_vllm if key != "__family_defaults")
+    family_vllm = resolved_vllm.get("__family_defaults")
+    if isinstance(family_vllm, dict):
+        for pattern, pattern_values in family_vllm.items():
+            if isinstance(pattern_values, dict):
+                vllm_keys.extend(f"family_defaults.{pattern}.{key}" for key in pattern_values)
+    vllm_keys = sorted(set(vllm_keys))
     if getattr(args, "format", "text") == "json":
         print(json.dumps({
             "catalog_model_top_level_keys": catalog_keys,
             "conf_json_top_level_keys": global_keys,
             "llama_server_defaults_keys": server_default_keys,
+            "vllm_keys": vllm_keys,
             "notes": [
                 "Catalog model top-level keys use snake_case.",
                 "Raw llama.cpp flags belong under server_overrides and may use dash or underscore spelling.",
@@ -4153,9 +4400,13 @@ def print_config_keys(args) -> int:
     print("\nllama_server_defaults keys seen/defaulted:")
     for key in server_default_keys:
         print(f"  {key}")
+    print("\nvLLM configuration keys:")
+    for key in vllm_keys:
+        print(f"  {key}")
     print("\nRule:")
     print("  - Use snake_case for managed catalog fields, e.g. tensor_split.")
     print("  - Put raw llama.cpp flags in server_overrides, e.g. {'batch-size': 1024}.")
+    print("  - Put vLLM-specific flags in server_overrides.vllm.")
     return 0
 
 def _server_config_validation_warnings(payload: object) -> list[str]:
@@ -5650,6 +5901,7 @@ def ensure_model_available(args, progress_callback = None):
     token = args.hf_token or os.environ.get("HF_TOKEN")
     selected_file = None
     to_download = []
+    backend = "llama.cpp"
 
     if requested_model is not None:
         explicit_ref = _explicit_hf_ref_quant(args)
@@ -5671,6 +5923,7 @@ def ensure_model_available(args, progress_callback = None):
             repo_id = existing.repo_id
             quant = existing.quant
             selected_file = existing.filename
+            backend = _model_backend(existing)
             to_download = infer_shard_filenames(selected_file)
             if len(to_download) > 1:
                 _emit_message(f"Using catalog model {existing.model_id} with {len(to_download)} shards.", progress_callback)
@@ -5683,15 +5936,17 @@ def ensure_model_available(args, progress_callback = None):
         repo_id, quant = parse_hf_input(ref)
         selected_file = choose_gguf_file(api, repo_id, quant, args.file, token)
 
-        if selected_file is None and _is_vllm_backend():
-            # For vLLM, if no GGUF is found, we assume it's a native HF model
-            # We'll use a virtual filename to represent the HF repo
+        if selected_file is None:
+            # A repository without GGUF is a native HuggingFace model. Keep a
+            # virtual filename in the catalog while storing the complete
+            # snapshot below models_dir.
+            backend = "vllm"
             selected_file = "hf-native"
-            to_download = [s.rfilename for s in api.model_info(repo_id=repo_id, token=token).siblings if s.rfilename]
-            # Exclude large blobs if they are not needed? No, vLLM needs them.
+            # snapshot_download owns the complete native repository transfer;
+            # do not download individual siblings first.
+            to_download = []
         else:
-            if selected_file is None:
-                raise RuntimeError(f"No GGUF found in {repo_id} and backend is not vLLM.")
+            backend = "llama.cpp"
             to_download = [selected_file]
         if "-00001-of-" in selected_file:
             _emit_message("Detected sharded model. Resolving all parts...", progress_callback)
@@ -5705,11 +5960,20 @@ def ensure_model_available(args, progress_callback = None):
 
     expected_sizes = _repo_sibling_sizes(api, repo_id, token)
 
+    native_snapshot_ready = bool(
+        backend == "vllm"
+        and selected_file == "hf-native"
+        and existing
+        and Path(existing.local_path).is_dir()
+    )
+    if native_snapshot_ready:
+        to_download = []
+
     target_dir = args.models_dir / repo_id
     target_dir.mkdir(parents=True, exist_ok=True)
     mmproj_filename = existing.mmproj_filename if existing else None
     mmproj_path = existing.mmproj_path if existing else None
-    if _looks_like_vision_model(existing if existing else ManagedModel(model_id=mid if 'mid' in locals() else "", repo_id=repo_id, quant=quant, filename=selected_file, local_path="", description=args.description or f"{repo_id} / {selected_file}")):
+    if backend == "llama.cpp" and _looks_like_vision_model(existing if existing else ManagedModel(model_id=mid if 'mid' in locals() else "", repo_id=repo_id, quant=quant, filename=selected_file, local_path="", description=args.description or f"{repo_id} / {selected_file}")):
         try:
             mmproj_filename = choose_mmproj_file(api, repo_id, token)
         except Exception:
@@ -5905,7 +6169,7 @@ def ensure_model_available(args, progress_callback = None):
         (not files_ready)
         or (bool(mmproj_filename) and not mmproj_ready)
         or (bool(mtp_filename) and not mtp_ready)
-        or selected_file == "hf-native"
+        or (selected_file == "hf-native" and not native_snapshot_ready)
     )
     has_force = bool(getattr(args, "force", False))
     if needs_download:
@@ -5914,7 +6178,7 @@ def ensure_model_available(args, progress_callback = None):
     if needs_download and not has_force:
         download_activity_guard = lambda: _raise_if_download_unsafe_while_active(catalog, force=has_force, progress_callback=progress_callback)
     
-    local_path = ""
+    local_path = str(existing.local_path) if native_snapshot_ready and existing else ""
     total_files = len(to_download)
     for idx, f in enumerate(to_download, start=1):
         if f == "hf-native":
@@ -5936,7 +6200,7 @@ def ensure_model_available(args, progress_callback = None):
         )
         if f == selected_file:
             local_path = loc
-    if selected_file == "hf-native":
+    if selected_file == "hf-native" and not native_snapshot_ready:
         _emit_message(f"Populating native HF repo {repo_id}...", progress_callback)
         local_path = snapshot_download(
             repo_id=repo_id,
@@ -6006,6 +6270,31 @@ def ensure_model_available(args, progress_callback = None):
         if existing and skip_ctx and existing.ctx_size
         else (existing.ctx_size if existing and (existing.auto_ctx_failed or existing.auto_ctx_error) else default_ctx)
     )
+    if backend == "vllm" and ctx_override is None and not (existing and existing.ctx_size and skip_ctx):
+        vllm_options = resolve_vllm_options(
+            ManagedModel(
+                model_id=mid,
+                repo_id=repo_id,
+                quant=quant,
+                filename=selected_file,
+                local_path=str(local_path),
+                backend="vllm",
+                ctx_size=default_ctx,
+                tensor_split=args.tensor_split or default_tensor_split(),
+                server_overrides=(existing.server_overrides if existing else {}),
+            )
+        )
+        desired_ctx = int(vllm_options.get("max_model_len") or default_ctx)
+        auto_ctx_failed = False
+        auto_ctx_error = ""
+        ctx_probe_read_s = None
+        ctx_probe_tokens_s = None
+        ctx_probe_totals_s = None
+        ctx_probe_latency_ms = None
+        ctx_probe_speed_tps = None
+        ctx_probe_kv_gb = None
+        ctx_probe_prompt_tokens = None
+        _emit_message(f"Native HF model detected; using vLLM max_model_len {desired_ctx} without llama.cpp auto-ctx.", progress_callback)
     if ctx_override is not None:
         auto_ctx_failed = False
         auto_ctx_error = ""
@@ -6017,6 +6306,8 @@ def ensure_model_available(args, progress_callback = None):
         ctx_probe_kv_gb = None
         ctx_probe_prompt_tokens = None
         _emit_message(f"Using explicit ctx override {desired_ctx} for {mid}.", progress_callback)
+    elif backend == "vllm":
+        pass
     elif skip_ctx:
         auto_ctx_failed = False
         auto_ctx_error = ""
@@ -6078,6 +6369,7 @@ def ensure_model_available(args, progress_callback = None):
                 quant=quant,
                 filename=selected_file,
                 local_path=str(local_path),
+                backend=backend,
                 mmproj_filename=mmproj_filename,
                 mmproj_path=mmproj_path,
                 ctx_size=default_ctx,
@@ -6265,6 +6557,7 @@ def ensure_model_available(args, progress_callback = None):
         quant=quant,
         filename=selected_file,
         local_path=str(local_path),
+        backend=backend,
         mmproj_filename=mmproj_filename,
         mmproj_path=mmproj_path,
         ctx_size=desired_ctx,
@@ -6562,12 +6855,135 @@ def _model_candidate_files(model: ManagedModel) -> list[Path]:
 
 def _catalog_referenced_paths(catalog: list[ManagedModel]) -> set[str]:
     refs: set[str] = set()
+
+    def add_path(raw_path: str) -> None:
+        path = Path(raw_path).expanduser()
+        if path.is_dir():
+            for nested in path.rglob("*"):
+                if nested.is_file() and nested.name.lower().endswith(_MODEL_ARTIFACT_SUFFIXES):
+                    refs.add(_safe_realpath(str(nested)))
+            return
+        refs.add(_safe_realpath(str(path)))
+
     for item in catalog:
-        for raw in (getattr(item, "local_path", ""), getattr(item, "mmproj_path", "")):
-            value = str(raw or "").strip()
+        for candidate in _model_candidate_files(item):
+            add_path(str(candidate))
+        # Draft and projector paths can be supplied as per-model overrides and
+        # are not necessarily duplicated in local_path/mmproj_path.
+        overrides = getattr(item, "server_overrides", {}) or {}
+        for key in ("model_draft", "mmproj", "mmproj_path"):
+            value = str(overrides.get(key, "") or "").strip()
             if value:
-                refs.add(_safe_realpath(value))
+                add_path(value)
     return refs
+
+
+_MODEL_ARTIFACT_SUFFIXES = (
+    ".gguf",
+    ".gguf.part",
+    ".safetensors",
+    ".safetensors.part",
+    ".bin",
+    ".bin.part",
+)
+
+
+def _delete_path_with_permission_fallback(path: Path, root: Path | None = None) -> bool:
+    """Delete a path, retrying with sudo only after a real permission failure.
+
+    The root check is mandatory for cleanup commands so a malformed catalog or
+    symlink cannot turn an orphan cleanup into an arbitrary file deletion.
+    ``sudo`` is deliberately a last resort: normal Heimdall installs should
+    have the model tree owned by the service account.
+    """
+    path = Path(path)
+    if root is not None:
+        try:
+            path.resolve(strict=False).relative_to(Path(root).resolve(strict=False))
+        except ValueError as exc:
+            raise RuntimeError(f"Refusing to delete path outside models directory: {path}") from exc
+
+    is_dir = path.is_dir() and not path.is_symlink()
+    try:
+        if is_dir:
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except PermissionError as local_exc:
+        sudo = shutil.which("sudo")
+        if not sudo:
+            raise RuntimeError(f"Could not delete {path}: permission denied and sudo is unavailable") from local_exc
+        command = [sudo, "rm", "-rf" if is_dir else "-f", "--", str(path)]
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as sudo_exc:
+            detail = (sudo_exc.stderr or sudo_exc.stdout or str(sudo_exc)).strip()
+            raise RuntimeError(f"Could not delete {path} with sudo: {detail}") from sudo_exc
+        return True
+
+
+def find_orphan_model_files(catalog: list[ManagedModel], models_dir: Path) -> list[Path]:
+    """Return model artifacts below ``models_dir`` absent from the catalog.
+
+    Only known model artifact suffixes are considered. Configuration,
+    tokenizer and documentation files are intentionally left untouched.
+    """
+    root = Path(models_dir).expanduser().resolve(strict=False)
+    if not root.exists():
+        return []
+    referenced = _catalog_referenced_paths(catalog)
+    orphans: list[Path] = []
+    for path in root.rglob("*"):
+        if not path.is_file() or not path.name.lower().endswith(_MODEL_ARTIFACT_SUFFIXES):
+            continue
+        if _safe_realpath(str(path)) not in referenced:
+            orphans.append(path)
+    return sorted(orphans, key=lambda item: str(item))
+
+
+def remove_orphan_models(args, progress_callback=None) -> int:
+    """List and optionally remove model artifacts not referenced by catalog."""
+    try:
+        is_owner = os.getuid() == 0 or os.getuid() == os.stat(args.catalog.parent).st_uid
+    except OSError:
+        is_owner = False
+    if not is_owner:
+        try:
+            return run_manager_command("remove-orphans", args)
+        except Exception as exc:
+            raise manager_unavailable_error(exc)
+
+    catalog = load_catalog(args.catalog, _args_server_config_path(args))
+    orphans = find_orphan_model_files(catalog, args.models_dir)
+    if not orphans:
+        _emit_message(f"No orphan model artifacts found under {args.models_dir}.", progress_callback)
+        return 0
+    _emit_message(
+        f"Found {len(orphans)} orphan model artifact(s) not referenced by catalog:",
+        progress_callback,
+    )
+    for path in orphans:
+        _emit_message(f"  {path}", progress_callback)
+
+    if getattr(args, "dry_run", False):
+        return 0
+    if not getattr(args, "yes", False) and not _ask_confirmation(
+        f"Delete these {len(orphans)} orphan artifact(s)?", progress_callback, default=False
+    ):
+        _emit_message("Orphan cleanup cancelled.", progress_callback)
+        return 0
+
+    deleted = 0
+    for path in orphans:
+        if _delete_path_with_permission_fallback(path, args.models_dir):
+            deleted += 1
+            _emit_message(f"Deleted orphan file {path}.", progress_callback)
+            _prune_empty_dirs_under_root(path.parent, args.models_dir, progress_callback)
+    _emit_message(f"Deleted {deleted} orphan model artifact(s).", progress_callback)
+    return 0
 
 
 def _prune_empty_dirs_under_root(path: Path, root: Path, progress_callback = None) -> None:
@@ -6612,7 +7028,7 @@ def _delete_model_files_from_disk(
         if not candidate.exists():
             continue
         try:
-            candidate.unlink()
+            _delete_path_with_permission_fallback(candidate, models_dir)
             deleted_any = True
             _emit_message(f"Deleted local file {candidate}.", progress_callback)
         except IsADirectoryError:
@@ -6630,7 +7046,7 @@ def _delete_model_files_from_disk(
         repo_dir = models_dir / model.repo_id
         if repo_dir.exists():
             try:
-                shutil.rmtree(repo_dir)
+                _delete_path_with_permission_fallback(repo_dir, models_dir)
                 deleted_any = True
                 _emit_message(f"Deleted local files under {repo_dir}.", progress_callback)
             except Exception as exc:
@@ -6665,7 +7081,7 @@ def _remove_orphan_files_by_reference(reference: str, models_dir: Path, progress
             if canonical_reference not in _orphan_file_aliases(file_path):
                 continue
             try:
-                file_path.unlink()
+                _delete_path_with_permission_fallback(file_path, models_dir)
                 deleted += 1
                 _emit_message(f"Deleted local file {file_path}.", progress_callback)
                 _prune_empty_dirs_under_root(file_path.parent, models_dir, progress_callback)
@@ -7023,7 +7439,11 @@ def get_published_model_ids(host=DEFAULT_PUBLIC_HOST, port=DEFAULT_PUBLIC_PORT) 
 def get_llama_server_processes() -> list[dict]:
     try:
         result = subprocess.run(
-            ["pgrep", "-af", "llama-server"],
+            [
+                "pgrep",
+                "-af",
+                "llama-server|vllm.entrypoints.openai.api_server|vllm serve|vllm-server",
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -7046,14 +7466,16 @@ def get_llama_server_processes() -> list[dict]:
             argv = shlex.split(cmdline)
         except Exception:
             argv = cmdline.split()
-        llama_arg_index = next(
+        server_arg_index = next(
             (
                 idx for idx, arg in enumerate(argv)
                 if Path(str(arg)).name == "llama-server"
+                or str(arg) in {"vllm-server", "vllm.entrypoints.openai.api_server"}
+                or str(arg).endswith("vllm.entrypoints.openai.api_server")
             ),
             None,
         )
-        if llama_arg_index is None or "--port" not in argv[llama_arg_index + 1:]:
+        if server_arg_index is None or "--port" not in argv[server_arg_index + 1:]:
             continue
         model_path = ""
         match = re.search(r"--model\s+(\S+)", cmdline)
@@ -9426,6 +9848,10 @@ def _responses_payload_to_chat_payload(
             allow_tool_output_images=allow_tool_output_images,
         ),
         "stream": stream_enabled,
+        # llama.cpp only reuses the slot KV/prompt prefix when this request
+        # option is enabled. OpenCode does not send it, so the proxy must
+        # preserve the cache by default while still honoring an explicit false.
+        "cache_prompt": payload.get("cache_prompt", True),
     }
     if tool_registry is not None and tool_registry.has_deferred_tools:
         directory = tool_registry.directory_text()
@@ -9853,6 +10279,40 @@ def _merge_chat_message_content(left: object, right: object) -> object:
     return f"{left}\n{right}"
 
 
+def _normalize_system_messages_for_llamacpp(messages: object) -> list[dict]:
+    """Collapse OpenAI/OpenCode system messages into the first system item.
+
+    Several clients, notably OpenCode, append system layers as separate
+    messages. llama.cpp chat templates are not uniform: Qwen3.5's template
+    accepts exactly one system message and raises if any later system item is
+    encountered. Keep the first system position and preserve every layer's
+    content in order, without changing user/assistant/tool messages.
+    """
+    if not isinstance(messages, list):
+        return []
+    normalized = [dict(item) for item in messages if isinstance(item, dict)]
+    system_indexes = [
+        index for index, item in enumerate(normalized)
+        if str(item.get("role") or "") == "system"
+    ]
+    if len(system_indexes) < 2:
+        return normalized
+    first_index = system_indexes[0]
+    first_system = dict(normalized[first_index])
+    for index in system_indexes[1:]:
+        left = first_system.get("content")
+        right = normalized[index].get("content")
+        if isinstance(left, str) and isinstance(right, str) and left and right:
+            first_system["content"] = f"{left}\n\n{right}"
+        else:
+            first_system["content"] = _merge_chat_message_content(left, right)
+    return [
+        first_system if index == first_index else item
+        for index, item in enumerate(normalized)
+        if index == first_index or index not in set(system_indexes[1:])
+    ]
+
+
 def _normalize_trailing_assistant_messages_for_llamacpp(messages: object) -> list[dict]:
     """Merge a final run of plain assistant messages into one assistant message.
 
@@ -10076,6 +10536,29 @@ def _chat_tool_example_keys(model: str, upstream_model: str = "", conversation_k
     return list(dict.fromkeys(keys))
 
 
+def _strip_markup_edges_for_tool_heuristics(content: object) -> str:
+    """Ignore XML/HTML-like wrappers appended or prepended by clients.
+
+    OpenCode may append metadata such as ``<dcp-message-id>...</dcp-message-id>``
+    after the model text. The UI can hide that metadata, making a response
+    that visually ends in ``:`` appear not to match the repair heuristic.
+    This only changes the copy used for detection; the original response is
+    still returned unchanged.
+    """
+    text = str(content or "")
+    paired_suffix = re.compile(r"\s*<([A-Za-z][A-Za-z0-9_.:-]*)\b[^<>]*>.*?</\1>\s*$", re.DOTALL)
+    edge_tag = re.compile(r"^\s*</?[A-Za-z][A-Za-z0-9_.:-]*\b[^<>]*>\s*")
+    trailing_tag = re.compile(r"\s*</?[A-Za-z][A-Za-z0-9_.:-]*\b[^<>]*>\s*$")
+    for _ in range(8):
+        updated = paired_suffix.sub("", text, count=1)
+        updated = edge_tag.sub("", updated, count=1)
+        updated = trailing_tag.sub("", updated, count=1)
+        if updated == text:
+            break
+        text = updated
+    return text.strip()
+
+
 def _chat_tool_continue_trigger_reason(
     content: object,
     tool_calls: object,
@@ -10092,11 +10575,12 @@ def _chat_tool_continue_trigger_reason(
     visible = _strip_chat_tool_repair_notice_text(content)
     if not visible:
         return "empty_visible_content"
-    if visible.endswith(":"):
+    heuristic_visible = _strip_markup_edges_for_tool_heuristics(visible)
+    if heuristic_visible.endswith(":"):
         return "visible_content_trailing_colon"
-    visible_lines = [line.lstrip() for line in visible.splitlines()]
+    visible_lines = [line.lstrip() for line in heuristic_visible.splitlines()]
     visible_line_starts = [line.casefold() for line in visible_lines]
-    visible_start = visible.lstrip().casefold()
+    visible_start = heuristic_visible.lstrip().casefold()
     visible_folded = visible.casefold()
     # Hermes/OpenCode sometimes receives a model-imagined inline terminal tag
     # as visible text instead of a real tool_call. Treat this as a strong
@@ -11930,6 +12414,7 @@ def start_ctx_metadata_server(args):
                             "api_style": api_style,
                         },
                     )
+                    REPLICA_ROUTER_STATE.release_loading_claim(model_name)
                     if api_style == "openai":
                         self._send_json({"error": {"message": message, "type": "server_error"}}, status=503)
                     else:
@@ -11939,10 +12424,42 @@ def start_ctx_metadata_server(args):
             if not gpu_conflict:
                 return False
             log_api_event("model_load_blocked_gpu_busy", {"model": model_name, "message": gpu_conflict, "api_style": api_style})
+            REPLICA_ROUTER_STATE.release_loading_claim(model_name)
             if api_style == "openai":
                 self._send_json({"error": {"message": gpu_conflict, "type": "server_error"}}, status=503)
             else:
                 self._send_json({"error": gpu_conflict}, status=503)
+            return True
+
+        def _reject_if_model_loading(self, upstream_model_name: str, catalog: list[ManagedModel], *, public_model_name: str, is_replica: bool, api_style: str) -> bool:
+            if not upstream_model_name:
+                return False
+            if REPLICA_ROUTER_STATE.claim_loading(
+                upstream_model_name,
+                catalog,
+                is_replica=is_replica,
+                claim_key=public_model_name,
+            ):
+                return False
+            message = (
+                f"Model '{upstream_model_name}' is loading; the first request owns the load. "
+                "Retry this request when that load completes."
+            )
+            log_api_event(
+                "model_request_blocked_while_loading",
+                {
+                    "model": upstream_model_name,
+                    "api_style": api_style,
+                    "reason": "load_in_progress",
+                },
+            )
+            if api_style == "openai":
+                self._send_json(
+                    {"error": {"message": message, "type": "model_loading", "code": "model_loading"}},
+                    status=503,
+                )
+            else:
+                self._send_json({"error": message, "code": "model_loading"}, status=503)
             return True
 
         def _handle_ollama_chat(self):
@@ -11976,6 +12493,8 @@ def start_ctx_metadata_server(args):
                     public_host=client_host,
                     public_port=int(args.public_port),
                 )
+            if self._reject_if_model_loading(upstream_model_name, catalog, public_model_name=model_name, is_replica=is_replica_request, api_style="ollama"):
+                return
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
                 return
             mark_model_activity(model_name, "ollama_chat", "request_start")
@@ -12196,6 +12715,9 @@ def start_ctx_metadata_server(args):
                         "conversation_state": CONVERSATION_SWITCH_STATE.snapshot(conversation_key) if conversation_key else {},
                     },
                 )
+            if self._reject_if_model_loading(upstream_model_name, catalog, public_model_name=model_name, is_replica=is_replica_request, api_style="openai"):
+                CONVERSATION_SWITCH_STATE.finish(conversation_token)
+                return
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="openai", payload=payload):
                 CONVERSATION_SWITCH_STATE.finish(conversation_token)
                 return
@@ -12235,6 +12757,19 @@ def start_ctx_metadata_server(args):
                 self._send_json({"error": {"message": "messages is required", "type": "invalid_request_error"}}, status=400)
                 return
             messages = _sanitize_chat_tool_repair_notices_in_messages([_normalize_openai_message(item) for item in raw_messages if isinstance(item, dict)])
+            normalized_system_messages = _normalize_system_messages_for_llamacpp(messages)
+            if len(normalized_system_messages) != len(messages):
+                log_api_event(
+                    "openai_chat_system_messages_merged",
+                    {
+                        "request_id": request_id,
+                        "model": model_name,
+                        "before_count": len(messages),
+                        "after_count": len(normalized_system_messages),
+                        "system_count": sum(1 for item in messages if item.get("role") == "system"),
+                    },
+                )
+            messages = normalized_system_messages
             normalized_messages = _normalize_trailing_assistant_messages_for_llamacpp(messages)
             if len(normalized_messages) != len(messages):
                 log_api_event(
@@ -12288,6 +12823,7 @@ def start_ctx_metadata_server(args):
             upstream_payload = dict(payload)
             upstream_payload["model"] = upstream_model_name
             upstream_payload["messages"] = messages
+            upstream_payload.setdefault("cache_prompt", True)
             
             # Use explicit CLI flag if provided, otherwise fall back to server config
             flatten_enabled = True
@@ -12866,6 +13402,8 @@ def start_ctx_metadata_server(args):
                     public_host=client_host,
                     public_port=int(args.public_port),
                 )
+            if self._reject_if_model_loading(upstream_model_name, catalog, public_model_name=model_name, is_replica=is_replica_request, api_style="openai"):
+                return
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="openai", payload=payload):
                 return
             mark_model_activity(model_name, f"openai_responses:{request_id}", "request_start")
@@ -12995,7 +13533,7 @@ def start_ctx_metadata_server(args):
                     "payload": _summarize_api_payload_for_log(upstream_payload)
                 },
             )
-            messages = upstream_payload.get("messages") or []
+            messages = _normalize_system_messages_for_llamacpp(upstream_payload.get("messages") or [])
             normalized_messages = _normalize_trailing_assistant_messages_for_llamacpp(messages)
             if len(normalized_messages) != len(messages):
                 log_api_event(
@@ -13110,9 +13648,11 @@ def start_ctx_metadata_server(args):
                 accumulated_usage: dict | None = None
                 rounds = 0
                 tool_repair_rounds = 0
+                empty_final_repair_rounds = 0
                 seen_tool_repair_signatures: set[str] = set()
                 max_internal_tool_search_rounds = 2
                 max_internal_tool_repair_rounds = 2
+                force_tool_choice_next_round = False
                 sse_started = False
 
                 def fail_internal_response(message: str, *, status: int = 502, error_type: str = "server_error", extra: dict | None = None) -> None:
@@ -13139,6 +13679,10 @@ def start_ctx_metadata_server(args):
                         extra_messages=extra_messages,
                         allow_tool_output_images=allow_tool_output_images,
                     )
+                    if force_tool_choice_next_round:
+                        internal_payload = _force_tool_choice_for_chat_repair(
+                            _apply_chat_tool_continue_repair_token_cap(internal_payload, chat_continue_repair_cfg.get("max_tokens"))
+                        )
                     # Keep tool discovery KV-stable and private.  For streaming
                     # clients we collect the final response and emit Responses SSE
                     # only after internal tool_search rounds have completed.
@@ -13288,7 +13832,63 @@ def start_ctx_metadata_server(args):
                     if accumulated_usage is not None:
                         data["usage"] = accumulated_usage
                     final_payload = _chat_response_to_responses_payload(data, model_name, payload)
-                    if tool_repair_rounds > 0 and not _responses_payload_has_output_items(final_payload):
+                    final_has_output = _responses_payload_has_output_items(final_payload)
+                    if (
+                        chat_continue_repair_enabled
+                        and not final_has_output
+                        and not translated_internal_call
+                        and empty_final_repair_rounds < chat_continue_repair_max_rounds
+                    ):
+                        state = _chat_completion_state_from_payload(data)
+                        trigger_reason = _chat_tool_continue_trigger_reason(
+                            state.get("content") or "",
+                            state.get("tool_calls") or [],
+                            internal_payload.get("tools") or [],
+                            chat_continue_repair_trigger_prefixes,
+                        ) or "responses_empty_final"
+                        current_messages = internal_payload.get("messages") if isinstance(internal_payload.get("messages"), list) else []
+                        examples = _extract_chat_tool_call_examples_from_messages(current_messages, internal_payload.get("tools"), limit=1)
+                        repair_messages = _chat_tool_continue_repair_messages(
+                            current_messages,
+                            state.get("message") if isinstance(state.get("message"), dict) else {"role": "assistant", "content": ""},
+                            internal_payload.get("tools") or [],
+                            chat_continue_repair_prompt_template,
+                            chat_continue_repair_include_failed_assistant_message,
+                            examples[0] if examples else None,
+                        )
+                        added_messages = repair_messages[len(current_messages):] if len(repair_messages) >= len(current_messages) else repair_messages
+                        extra_messages.extend(added_messages)
+                        force_tool_choice_next_round = True
+                        log_api_event(
+                            "openai_responses_tool_fix_triggered",
+                            {
+                                "model": model_name,
+                                "request_id": request_id,
+                                "round": rounds,
+                                "repair_round": empty_final_repair_rounds,
+                                "trigger_reason": trigger_reason,
+                                "translated_internal_call": translated_internal_call,
+                                "output_text_len": len(str(final_payload.get("output_text") or "")),
+                                "output_items": len(final_payload.get("output") or []) if isinstance(final_payload.get("output"), list) else 0,
+                                "usage": final_payload.get("usage"),
+                            },
+                        )
+                        if stream and sse_started:
+                            _write_sse_comment(self, f"internal empty tool response repair {empty_final_repair_rounds + 1}")
+                        empty_final_repair_rounds += 1
+                        continue
+                    if chat_continue_repair_enabled and not final_has_output and not translated_internal_call and empty_final_repair_rounds >= chat_continue_repair_max_rounds:
+                        log_api_event(
+                            "openai_responses_tool_fix_exhausted",
+                            {
+                                "model": model_name,
+                                "request_id": request_id,
+                                "rounds": rounds,
+                                "repair_rounds": empty_final_repair_rounds,
+                                "usage": final_payload.get("usage"),
+                            },
+                        )
+                    if (tool_repair_rounds > 0 or empty_final_repair_rounds > 0) and not final_has_output:
                         log_api_event(
                             "openai_responses_tool_repair_empty_final",
                             {
@@ -13296,6 +13896,7 @@ def start_ctx_metadata_server(args):
                                 "request_id": request_id,
                                 "rounds": rounds,
                                 "repair_rounds": tool_repair_rounds,
+                                "empty_final_repair_rounds": empty_final_repair_rounds,
                                 "usage": final_payload.get("usage"),
                             },
                         )
@@ -14185,6 +14786,8 @@ def start_ctx_metadata_server(args):
                     public_host=client_host,
                     public_port=int(args.public_port),
                 )
+            if self._reject_if_model_loading(upstream_model_name, catalog, public_model_name=model_name, is_replica=is_replica_request, api_style="ollama"):
+                return
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
                 return
             mark_model_activity(model_name, "ollama_generate", "request_start")
@@ -14314,6 +14917,8 @@ def start_ctx_metadata_server(args):
                     public_host=client_host,
                     public_port=int(args.public_port),
                 )
+            if self._reject_if_model_loading(upstream_model_name, catalog, public_model_name=model_name, is_replica=is_replica_request, api_style="ollama"):
+                return
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
                 return
             mark_model_activity(model_name, "ollama_embeddings", "request_start")
@@ -16491,11 +17096,8 @@ def delete_downloaded_files(target_dir: Path, filenames: list[str]):
         for path in [final_path, part_path]:
             if path.exists():
                 try:
-                    path.unlink()
-                    removed += 1
-                except IsADirectoryError:
-                    shutil.rmtree(path, ignore_errors=True)
-                    removed += 1
+                    if _delete_path_with_permission_fallback(path, target_dir):
+                        removed += 1
                 except FileNotFoundError:
                     pass
     return removed
@@ -17030,8 +17632,11 @@ def warmup_model(model_id, host, port, timeout=600):
                 r.raise_for_status()
                 return
             except requests.HTTPError as exc:
-                status_code = getattr(getattr(exc, "response", None), "status_code", None)
-                if status_code not in {502, 503, 504}:
+                response = getattr(exc, "response", None)
+                status_code = getattr(response, "status_code", None)
+                response_text = str(getattr(response, "text", "") or "").lower()
+                matrix_reloading = status_code == 500 and "matrix is shutting down" in response_text
+                if status_code not in {502, 503, 504} and not matrix_reloading:
                     raise
                 last_error = exc
             except Exception as exc:
@@ -17321,6 +17926,13 @@ def daemon_mode(args):
                     mock_args.server_config = Path(getattr(mock_args, "server_config", DEFAULT_SERVER_CONFIG_PATH))
                     model_id = remove_model(mock_args, progress_callback=send_event)
                     send_event({"type": "done", "model_id": model_id})
+                elif req["command"] == "remove-orphans":
+                    mock_args = argparse.Namespace(**req["args"])
+                    mock_args.catalog = Path(mock_args.catalog)
+                    mock_args.models_dir = Path(mock_args.models_dir)
+                    mock_args.server_config = Path(getattr(mock_args, "server_config", DEFAULT_SERVER_CONFIG_PATH))
+                    result = remove_orphan_models(mock_args, progress_callback=send_event)
+                    send_event({"type": "done", "result": result})
                 elif req["command"] == "unload":
                     mock_args = argparse.Namespace(**req["args"])
                     mock_args.catalog = Path(mock_args.catalog)
@@ -17716,6 +18328,21 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
         action="store_false",
         help="Keep local model files on disk.",
     )
+
+    p_orphans = sub.add_parser(
+        "remove-orphans",
+        aliases=["clean-orphans", "orphans"],
+        help="Remove model artifacts not referenced by the catalog",
+        description=(
+            "List model artifacts under the models directory that are not in the catalog. "
+            "The command asks for confirmation before deleting them; use --dry-run to only inspect."
+        ),
+    )
+    for alias in ("remove-orphans", "clean-orphans", "orphans"):
+        subparsers[alias] = p_orphans
+    p_orphans.set_defaults(func=remove_orphan_models)
+    p_orphans.add_argument("--dry-run", action="store_true", help="Only list orphan artifacts")
+    p_orphans.add_argument("--yes", action="store_true", help="Delete without an interactive confirmation")
 
     p_unload = sub.add_parser(
         "unload",

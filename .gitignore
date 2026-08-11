@@ -26,3 +26,8 @@ uv.lock
 
 # Compiled llama.cpp (source and build artifacts)
 /llama.cpp-source/
+
+# Local Serena notes and accidental debug exports
+.serena/memories/
+/subprocess
+/vllm

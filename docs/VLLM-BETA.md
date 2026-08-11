@@ -1,5 +1,5 @@
 # vLLM Beta Integration
-**Status: BETA** - vLLM is being tested as an alternative inference backend to llama.cpp
+vLLM is installed alongside llama.cpp and selected automatically for native HuggingFace repositories.
 
 ## Overview
 
@@ -33,21 +33,17 @@ docker-compose -f docker-compose-vllm.yaml logs -f vllm
 
 ### Option 2: System-wide Installation
 
-When running the installer, select "vllm-beta" when prompted, or pass it explicitly:
+The installer provisions both engines. Use automatic routing:
 
 ```bash
-heimdall-gateway install
-# When asked: "Which inference backend would you like to use?"
-# → Select "vllm-beta"
-
-heimdall-gateway install --backend vllm-beta
+heimdall-gateway install --backend auto
 ```
 
 The installer will:
 1. Create the runtime Python environment with `uv`
 2. Install vLLM and its torch backend with `uv pip install --torch-backend=auto`
-3. Set up vLLM in your heimdall-gateway installation
-4. Configure llama-swap to use vLLM's OpenAI API endpoint
+3. Install vLLM in the managed runtime alongside llama.cpp
+4. Route GGUF models to llama.cpp and native HuggingFace models to vLLM
 
 ### Option 3: Manual Setup
 
@@ -67,7 +63,7 @@ python -m vllm.entrypoints.openai.api_server \
 ### Running a Model with vLLM
 
 ```bash
-# Using the CLI
+# A repository without GGUF is routed to vLLM automatically
 heimdall-gateway run -hf meta-llama/Llama-2-7b-hf
 
 # Or with custom parameters

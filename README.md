@@ -1,6 +1,6 @@
 # heimdall-gateway
 
-Manager for a local llama.cpp / llama-swap stack with **optional vLLM beta support**.
+Manager for a local llama.cpp / llama-swap stack with automatic llama.cpp/vLLM routing.
 
 It provides:
 
@@ -8,7 +8,7 @@ It provides:
 - install/uninstall entry points for the full stack.
 - a bundled shell installer in `llamacpp_stack/bundle/`.
 - helpers for Hugging Face GGUF downloads, model cataloguing, runtime validation, llama-swap config rendering, and Ollama-compatible endpoints.
-- **[BETA] vLLM integration** — alternative inference backend for HuggingFace models.
+- vLLM integration for native HuggingFace models, installed alongside llama.cpp.
 
 ## Backends
 
@@ -17,7 +17,7 @@ It provides:
 - Excellent CPU and GPU support
 - Native Flash Attention
 
-### vLLM (Beta)
+### vLLM
 - OpenAI API compatible
 - Optimized for HuggingFace format models
 - High-throughput inference with batching
@@ -31,13 +31,13 @@ heimdall-gateway install
 heimdall-gateway run -hf meta-llama/Llama-2-7b-hf:Q4_K_M
 ```
 
-### With vLLM (beta)
+### With vLLM
 ```bash
 # Option 1: Docker (recommended for testing)
 ./test-vllm.sh
 
-# Option 2: System install
-heimdall-gateway install  # Select "vllm-beta" when prompted
+# Option 2: System install (installs both engines)
+heimdall-gateway install --backend auto
 heimdall-gateway run -hf meta-llama/Llama-2-7b-hf
 ```
 
@@ -133,4 +133,3 @@ Notas y buenas prácticas:
 - La imagen compila `llama.cpp` en el momento de construirla; una vez construida sirve para iterar rápidamente sin recompilar.
 - Si vas a desarrollar mucho tiempo, considera crear una imagen base y reutilizarla para acelerar iteraciones.
 - Asegúrate de que los archivos en `templates/` sean accesibles por el usuario que corre el servicio en producción (permisos/propiedad). Esta imagen sirve sólo para pruebas de desarrollo.
-

@@ -34,6 +34,7 @@ from llamacpp_stack.cli import (
     _prepare_manager_socket_path,
     _probe_runtime_env,
     build_llama_server_command,
+    build_vllm_server_command,
     catalog_key_warnings,
     build_help_epilog,
     build_cli_parser,
@@ -71,6 +72,7 @@ from llamacpp_stack.cli import (
     replica_model_id,
     REPLICA_ROUTER_STATE,
     resolve_llama_server_defaults,
+    resolve_vllm_options,
     resolve_idle_ttl,
     resolve_catalog_model_name,
     restart_service_to_free_vram,
@@ -78,6 +80,7 @@ from llamacpp_stack.cli import (
     save_catalog,
     sort_catalog_for_json,
     get_model_context_size,
+    get_llama_server_processes,
     is_gemma4_sliding_window_long_context_model,
     summarize_configured_replicas,
     start_catalog_auto_update_watch,
@@ -90,6 +93,7 @@ from llamacpp_stack.cli import (
     request_looks_like_model_probe,
     recent_activity_blocking_model_switch,
     should_reload_after_unexpected_unload,
+    warmup_model,
     stop_running_ollama_models,
     unload_models,
     update_models,
@@ -129,6 +133,8 @@ from llamacpp_stack.install import (
     maybe_install_cuda_toolkit_via_uv,
     desired_models_dir_owner,
     ensure_models_dir_ready,
+    ensure_models_tree_owned,
+    ensure_runtime_python,
     _models_dir_already_ready_for_owner,
     detect_cuda_toolkit,
     derive_models_dir,
@@ -165,6 +171,7 @@ from llamacpp_stack.install import (
     resolve_api_security_options,
     _api_cert_san_entries,
     _generate_self_signed_api_cert,
+    _args_to_cli,
     _cert_subject_alt_names,
 )
 
@@ -493,6 +500,76 @@ class InstallHelpersTest(unittest.TestCase):
             auth, https = resolve_api_security_options(args, layout)
             self.assertEqual(auth, {"enabled": True, "api_key": "lcsk_existing"})
             self.assertEqual(https, {"enabled": True, "cert_file": str(cert), "key_file": str(key)})
+
+    def test_update_preserves_disabled_https_without_prompt_or_certificate_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            layout = Namespace(config_dir=root / "config", public_host="0.0.0.0")
+            layout.config_dir.mkdir(parents=True, exist_ok=True)
+            (layout.config_dir / "conf.json").write_text(json.dumps({
+                "api_auth": {"enabled": False, "api_key": ""},
+                "api_https": {"enabled": False, "cert_file": "", "key_file": ""},
+            }), encoding="utf-8")
+            args = Namespace(
+                api_auth=None, api_key="", api_https=None, api_cert_file="",
+                api_key_file="", api_cert_sans="", regenerate_api_cert=False,
+                dry_run=False,
+            )
+
+            with mock.patch("llamacpp_stack.install.prompt_bool") as prompt_mock, \
+                 mock.patch("llamacpp_stack.install._generate_self_signed_api_cert") as cert_mock:
+                auth, https = resolve_api_security_options(args, layout, is_update=True)
+
+            self.assertEqual(auth, {"enabled": False, "api_key": ""})
+            self.assertEqual(https, {"enabled": False, "cert_file": "", "key_file": ""})
+            prompt_mock.assert_not_called()
+            cert_mock.assert_not_called()
+
+    def test_update_keeps_existing_certificate_even_if_detected_sans_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            layout = Namespace(config_dir=root / "config", public_host="0.0.0.0")
+            layout.config_dir.mkdir(parents=True, exist_ok=True)
+            cert = root / "existing.crt"
+            key = root / "existing.key"
+            (layout.config_dir / "conf.json").write_text(json.dumps({
+                "api_https": {"enabled": True, "cert_file": str(cert), "key_file": str(key)},
+            }), encoding="utf-8")
+            args = Namespace(
+                api_auth=None, api_key="", api_https=None, api_cert_file="",
+                api_key_file="", api_cert_sans="new.example", regenerate_api_cert=False,
+                dry_run=False,
+            )
+
+            with mock.patch("llamacpp_stack.install.prompt_bool") as prompt_mock, \
+                 mock.patch("llamacpp_stack.install._generate_self_signed_api_cert") as cert_mock:
+                _auth, https = resolve_api_security_options(args, layout, is_update=True)
+
+            self.assertEqual(https, {"enabled": True, "cert_file": str(cert), "key_file": str(key)})
+            prompt_mock.assert_not_called()
+            cert_mock.assert_not_called()
+
+    def test_update_regenerates_certificate_only_when_explicitly_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            layout = Namespace(config_dir=root / "config", public_host="0.0.0.0")
+            layout.config_dir.mkdir(parents=True, exist_ok=True)
+            (layout.config_dir / "conf.json").write_text(json.dumps({
+                "api_https": {"enabled": True, "cert_file": "/old/cert", "key_file": "/old/key"},
+            }), encoding="utf-8")
+            args = Namespace(
+                api_auth=None, api_key="", api_https=None, api_cert_file="",
+                api_key_file="", api_cert_sans="", regenerate_api_cert=True,
+                dry_run=False,
+            )
+            generated = (str(root / "new.crt"), str(root / "new.key"))
+
+            with mock.patch("llamacpp_stack.install._generate_self_signed_api_cert", return_value=generated) as cert_mock:
+                _auth, https = resolve_api_security_options(args, layout, is_update=True)
+
+            self.assertEqual(https["cert_file"], generated[0])
+            self.assertEqual(https["key_file"], generated[1])
+            self.assertTrue(cert_mock.call_args.kwargs["force"])
 
     def test_api_cert_sans_include_lan_public_and_extra_addresses(self) -> None:
         with (
@@ -1079,6 +1156,7 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertIn(f"-DNCCL_INCLUDE_DIR={nccl_root / 'include'}", cmake_cmd)
             self.assertIn(f"-DNCCL_LIBRARY={nccl_root / 'lib' / 'libnccl.so.2'}", cmake_cmd)
             self.assertIn(f"-DCMAKE_BUILD_RPATH={cuda_root / 'lib64'};{nccl_root / 'lib'}", cmake_cmd)
+            self.assertIn("-DCMAKE_CUDA_FLAGS=-Xcompiler=-Wno-stringop-overflow", cmake_cmd)
 
     def test_install_prompt_package_only_triggers_package_only_update(self) -> None:
         args = Namespace(
@@ -1188,6 +1266,105 @@ class InstallHelpersTest(unittest.TestCase):
         install_units_mock.assert_called_once_with(dummy_layout, True)
         restart_units_mock.assert_not_called()
 
+    def test_system_install_migrates_legacy_files_only_in_sudo_reexec(self) -> None:
+        args = Namespace(
+            mode=None,
+            public_host=None,
+            public_port=None,
+            models_dir=None,
+            install_services=False,
+            update_binaries=False,
+            package_only_update=True,
+            llama_cpp_mode=None,
+            llama_cpp_ref=None,
+            backend=None,
+            prefer_source_cuda=False,
+            prefer_binary=False,
+            dry_run=False,
+            enable_tls=False,
+            idle_ttl=300,
+            skip_venv_install=False,
+            api_auth=None,
+            api_key="",
+            api_https=False,
+            api_cert_file="",
+            api_key_file="",
+        )
+        dummy_layout = Namespace(
+            install_root=Path("/opt/heimdall-gateway"),
+            state_dir=Path("/var/lib/heimdall-gateway"),
+            models_dir=Path("/workvols/data3/LLAMACPP_MODELS"),
+            public_host="0.0.0.0",
+            public_port=11436,
+            mode="system",
+            config_dir=Path("/etc/heimdall-gateway"),
+            bin_dir=Path("/usr/local/bin"),
+            run_dir=Path("/run/heimdall-gateway"),
+            runtime_venv=Path("/opt/heimdall-gateway/venv"),
+        )
+        with (
+            mock.patch("llamacpp_stack.install.resolve_install_mode", return_value="system"),
+            mock.patch("llamacpp_stack.install.resolve_public_host", return_value="0.0.0.0"),
+            mock.patch("llamacpp_stack.install.prompt_path", return_value=dummy_layout.models_dir),
+            mock.patch("llamacpp_stack.install.maybe_migrate_existing_install"),
+            mock.patch("llamacpp_stack.install.choose_layout", return_value=dummy_layout),
+            mock.patch("llamacpp_stack.install.is_existing_install", return_value=True),
+            mock.patch("llamacpp_stack.install.detect_existing_llama_cpp_mode", return_value="source"),
+            mock.patch("llamacpp_stack.install.migrate_legacy_installation") as migrate_mock,
+            mock.patch("llamacpp_stack.install.maybe_reexec_system_install", return_value=0) as reexec_mock,
+            mock.patch("llamacpp_stack.install.maybe_refresh_runtime_package_only") as refresh_mock,
+            mock.patch("llamacpp_stack.install.write_api_security_config"),
+        ):
+            result = install_stack(args)
+
+            self.assertEqual(result, 0)
+            migrate_mock.assert_not_called()
+
+            migration_order: list[str] = []
+            reexec_mock.return_value = None
+            migrate_mock.side_effect = lambda *_args: migration_order.append("migrate")
+            refresh_mock.side_effect = lambda *_args: migration_order.append("refresh")
+
+            elevated_result = install_stack(args)
+
+            self.assertEqual(elevated_result, 0)
+            migrate_mock.assert_called_once_with(dummy_layout, False)
+            self.assertEqual(migration_order, ["migrate", "refresh"])
+
+    def test_existing_system_update_reuses_models_and_resolves_security_only_after_reexec(self) -> None:
+        args = Namespace(
+            mode=None, public_host=None, public_port=None, models_dir=None,
+            install_services=False, update_binaries=False, package_only_update=True,
+            llama_cpp_mode=None, llama_cpp_ref=None, backend=None,
+            prefer_source_cuda=False, prefer_binary=False, dry_run=False,
+            enable_tls=False, idle_ttl=300, skip_venv_install=False,
+            api_auth=None, api_key="", api_https=None, api_cert_file="",
+            api_key_file="", api_cert_sans="", regenerate_api_cert=False,
+        )
+        models_dir = Path("/workvols/models")
+        layout = Namespace(
+            install_root=Path("/opt/heimdall-gateway"),
+            state_dir=Path("/var/lib/heimdall-gateway"), models_dir=models_dir,
+            public_host="0.0.0.0", public_port=11436, mode="system",
+            config_dir=Path("/etc/heimdall-gateway"), bin_dir=Path("/usr/local/bin"),
+            run_dir=Path("/run/heimdall-gateway"), runtime_venv=Path("/opt/heimdall-gateway/venv"),
+        )
+        with mock.patch("llamacpp_stack.install.resolve_install_mode", return_value="system"), \
+             mock.patch("llamacpp_stack.install.existing_public_host", return_value="0.0.0.0"), \
+             mock.patch("llamacpp_stack.install.existing_models_dir", return_value=models_dir), \
+             mock.patch("llamacpp_stack.install.prompt_path") as prompt_path_mock, \
+             mock.patch("llamacpp_stack.install.maybe_migrate_existing_install"), \
+             mock.patch("llamacpp_stack.install.choose_layout", return_value=layout), \
+             mock.patch("llamacpp_stack.install.is_existing_install", return_value=True), \
+             mock.patch("llamacpp_stack.install.detect_existing_llama_cpp_mode", return_value="source"), \
+             mock.patch("llamacpp_stack.install.maybe_reexec_system_install", return_value=0), \
+             mock.patch("llamacpp_stack.install.resolve_api_security_options") as security_mock:
+            result = install_stack(args)
+
+        self.assertEqual(result, 0)
+        prompt_path_mock.assert_not_called()
+        security_mock.assert_not_called()
+
     def test_render_llamaswap_wrapper_exports_llama_server_lib_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1239,11 +1416,225 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertIn("--max-model-len", wrapper)
             self.assertIn("--no-enable-log-requests", wrapper)
             self.assertIn("VLLM_WORKER_MULTIPROC_METHOD", wrapper)
+            self.assertIn('export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"', wrapper)
+            self.assertIn('export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"', wrapper)
+            self.assertIn('export PATH="$(dirname "$PYTHON_BIN"):', wrapper)
             self.assertIn("--n-gpu-layers", wrapper)
+
+    def test_vllm_model_command_keeps_special_options_and_public_model_id(self) -> None:
+        model = ManagedModel(
+            model_id="unsloth-qwen3.6-27b-nvfp4",
+            repo_id="unsloth/Qwen3.6-27B-NVFP4",
+            quant=None,
+            filename="hf-native",
+            local_path="/models/unsloth/Qwen3.6-27B-NVFP4",
+            backend="vllm",
+            tensor_split="1",
+            server_overrides={
+                "vllm": {
+                    "reasoning_parser": "qwen3",
+                    "speculative_config": {"method": "mtp", "num_speculative_tokens": 2},
+                }
+            },
+        )
+        cmd = build_vllm_server_command(
+            model,
+            port="${PORT}",
+            vllm_defaults={
+                "__family_defaults": {
+                    "qwen3.6": {
+                        "max_model_len": 262144,
+                        "dtype": "bfloat16",
+                        "trust_remote_code": True,
+                        "max_num_batched_tokens": 1024,
+                        "max_num_seqs": 1,
+                        "reasoning_parser": "qwen3",
+                    }
+                }
+            },
+        )
+        self.assertEqual(cmd[0], "vllm-server")
+        self.assertIn("--served-model-name", cmd)
+        self.assertEqual(cmd[cmd.index("--served-model-name") + 1], model.model_id)
+        self.assertEqual(cmd[cmd.index("--max-model-len") + 1], "262144")
+        self.assertEqual(cmd[cmd.index("--dtype") + 1], "bfloat16")
+        self.assertEqual(cmd[cmd.index("--max-num-batched-tokens") + 1], "1024")
+        self.assertEqual(cmd[cmd.index("--max-num-seqs") + 1], "1")
+        self.assertIn("--speculative-config", cmd)
+        self.assertEqual(
+            json.loads(cmd[cmd.index("--speculative-config") + 1]),
+            {"method": "mtp", "num_speculative_tokens": 2},
+        )
+
+    def test_native_hf_legacy_catalog_entry_is_inferred_as_vllm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "catalog.json"
+            path.write_text(
+                json.dumps([{
+                    "model_id": "native",
+                    "repo_id": "org/native",
+                    "quant": None,
+                    "filename": "hf-native",
+                    "local_path": str(Path(tmp) / "native"),
+                }]),
+                encoding="utf-8",
+            )
+            models = load_catalog(path)
+        self.assertEqual(models[0].backend, "vllm")
+
+    def test_native_hf_model_size_sums_snapshot_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_bytes(b"{}")
+            (root / "model.safetensors").write_bytes(b"x" * 1024)
+            model = ManagedModel("native", "org/native", None, "hf-native", str(root), backend="vllm")
+            self.assertGreater(cli._get_model_size_mib(model), 0)
+
+    def test_render_config_routes_gguf_and_native_hf_models_independently(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.yaml"
+            gguf = root / "model.gguf"
+            gguf.write_bytes(b"gguf")
+            hf_dir = root / "hf-model"
+            hf_dir.mkdir()
+            models = [
+                ManagedModel("gguf", "org/gguf", "Q4", "model.gguf", str(gguf)),
+                ManagedModel("native", "org/native", None, "hf-native", str(hf_dir), backend="vllm"),
+            ]
+            render_llamaswap_config(models, config_path, root / "llama-server", 18080, idle_ttl=10)
+            rendered = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            self.assertIn("llama-server", rendered["models"]["gguf"]["cmd"])
+            self.assertIn("vllm-server", rendered["models"]["native"]["cmd"])
+            self.assertIn("--served-model-name native", rendered["models"]["native"]["cmd"])
 
     def test_determine_build_jobs_uses_all_available_cpus(self) -> None:
         with mock.patch("llamacpp_stack.install.os.cpu_count", return_value=32):
             self.assertEqual(determine_build_jobs(), 32)
+
+    def test_runtime_refresh_replaces_venv_symlink_and_installs_vllm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "old-venv"
+            (target / "bin").mkdir(parents=True)
+            runtime_link = root / "venv"
+            runtime_link.symlink_to(target, target_is_directory=True)
+            layout = InstallLayout(
+                mode="system",
+                state_dir=root / "state",
+                bin_dir=root / "bin",
+                install_root=root,
+                models_dir=root / "models",
+                config_dir=root / "config",
+                run_dir=root / "run",
+                service_user="llamaswap",
+                service_group="llamaswap",
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=runtime_link,
+                cuda_root=root / "cuda",
+            )
+            invocations = []
+
+            def record_runtime_command(cmd, **kwargs):
+                invocations.append((cmd, kwargs))
+                if cmd[:2] == ["uv", "venv"]:
+                    (runtime_link / "bin").mkdir(parents=True)
+
+            with (
+                mock.patch("llamacpp_stack.install.resolve_uv_executable", return_value="uv"),
+                mock.patch(
+                    "llamacpp_stack.install._run",
+                    side_effect=record_runtime_command,
+                ),
+            ):
+                ensure_runtime_python(layout, dry_run=False)
+            commands = [cmd for cmd, _kwargs in invocations]
+            venv_cmd, venv_kwargs = invocations[0]
+            self.assertFalse(runtime_link.is_symlink())
+            self.assertEqual(venv_cmd[:4], ["uv", "venv", "--python", "3.12"])
+            self.assertIn("--managed-python", venv_cmd)
+            self.assertEqual(
+                venv_kwargs["env"]["UV_PYTHON_INSTALL_DIR"],
+                str(layout.install_root / "managed-python"),
+            )
+            self.assertIn(
+                [
+                    "chgrp",
+                    "-R",
+                    "llamaswap",
+                    "--",
+                    str(layout.install_root / "managed-python"),
+                    str(layout.runtime_venv),
+                    str(layout.python_root),
+                ],
+                commands,
+            )
+            self.assertIn(
+                [
+                    "chmod",
+                    "-R",
+                    "g=rX",
+                    "--",
+                    str(layout.install_root / "managed-python"),
+                    str(layout.runtime_venv),
+                    str(layout.python_root),
+                ],
+                commands,
+            )
+            self.assertTrue(any("vllm" in command for command in commands))
+
+    def test_system_runtime_skip_recreates_venv_when_service_cannot_execute_python(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_venv = root / "venv"
+            (runtime_venv / "bin").mkdir(parents=True)
+            (runtime_venv / "bin" / "python").write_text("#!/bin/sh\n", encoding="utf-8")
+            layout = InstallLayout(
+                mode="system",
+                state_dir=root / "state",
+                bin_dir=root / "bin",
+                install_root=root,
+                models_dir=root / "models",
+                config_dir=root / "config",
+                run_dir=root / "run",
+                service_user="llamaswap",
+                service_group="llamaswap",
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=root / "run" / "manager.sock",
+                python_root=root / "python",
+                runtime_venv=runtime_venv,
+                cuda_root=root / "cuda",
+            )
+            commands = []
+            with (
+                mock.patch("llamacpp_stack.install.resolve_uv_executable", return_value="uv"),
+                mock.patch("llamacpp_stack.install.service_can_execute_path", return_value=False),
+                mock.patch(
+                    "llamacpp_stack.install._run",
+                    side_effect=lambda cmd, **_kwargs: commands.append(cmd),
+                ),
+            ):
+                ensure_runtime_python(layout, dry_run=False, skip_pip_install=True)
+
+            self.assertTrue(any(command[:2] == ["uv", "venv"] for command in commands))
+
+            (runtime_venv / "bin").mkdir(parents=True)
+            commands.clear()
+            with (
+                mock.patch("llamacpp_stack.install.resolve_uv_executable", return_value="uv"),
+                mock.patch("llamacpp_stack.install.service_can_execute_path", return_value=True),
+                mock.patch(
+                    "llamacpp_stack.install._run",
+                    side_effect=lambda cmd, **_kwargs: commands.append(cmd),
+                ),
+            ):
+                ensure_runtime_python(layout, dry_run=False, skip_pip_install=True)
+
+            self.assertFalse(any(command[:2] == ["uv", "venv"] for command in commands))
 
     def test_locate_cuda_root_for_python_from_venv_nvcc_path(self) -> None:
         with mock.patch(
@@ -1364,9 +1755,9 @@ class InstallHelpersTest(unittest.TestCase):
             )
         self.assertEqual(value, "prebuilt")
 
-    def test_resolve_install_mode_prompts_even_when_existing_install_is_detected(self) -> None:
+    def test_resolve_install_mode_prompts_for_new_install(self) -> None:
         with (
-            mock.patch("llamacpp_stack.install.detect_existing_mode", return_value="user"),
+            mock.patch("llamacpp_stack.install.detect_existing_mode", return_value=None),
             mock.patch("sys.stdin.isatty", return_value=True),
             mock.patch("llamacpp_stack.install.prompt_bool", return_value=True),
         ):
@@ -1381,6 +1772,23 @@ class InstallHelpersTest(unittest.TestCase):
 
     def test_resolve_public_host_keeps_explicit_value(self) -> None:
         self.assertEqual(resolve_public_host("192.168.110.50"), "192.168.110.50")
+
+    def test_resolve_install_mode_reuses_existing_mode_without_prompt(self) -> None:
+        with mock.patch("llamacpp_stack.install.detect_existing_mode", return_value="system"), \
+             mock.patch("llamacpp_stack.install.sys.stdin.isatty", return_value=True), \
+             mock.patch("llamacpp_stack.install.prompt_bool") as prompt_mock:
+            self.assertEqual(resolve_install_mode(None), "system")
+        prompt_mock.assert_not_called()
+
+    def test_update_reuses_existing_port_without_migration_prompt(self) -> None:
+        args = Namespace(public_port=None)
+        with mock.patch("llamacpp_stack.install.existing_public_port", return_value=12000), \
+             mock.patch("llamacpp_stack.install.detect_ollama_port", return_value=11434), \
+             mock.patch("llamacpp_stack.install.sys.stdin.isatty", return_value=True), \
+             mock.patch("llamacpp_stack.install.prompt_bool") as prompt_mock:
+            port = choose_default_swap_port("0.0.0.0", "user", None, args=args)
+        self.assertEqual(port, 12000)
+        prompt_mock.assert_not_called()
 
     def test_maybe_migrate_existing_install_uninstalls_previous_mode_and_keeps_models(self) -> None:
         with (
@@ -1401,6 +1809,7 @@ class InstallHelpersTest(unittest.TestCase):
         uninstall_mock.assert_not_called()
 
     def test_maybe_reexec_system_install_uses_sudo_and_resolved_args(self) -> None:
+        fixture_api_key = "fixture" + "-value"
         args = Namespace(
             public_host="127.0.0.1",
             public_port=11436,
@@ -1413,6 +1822,13 @@ class InstallHelpersTest(unittest.TestCase):
             package_only_update=True,
             migrate_model_ids=True,
             dry_run=False,
+            api_auth=True,
+            api_key=fixture_api_key,
+            api_https=True,
+            api_cert_file="/etc/heimdall/cert.pem",
+            api_key_file="/etc/heimdall/key.pem",
+            api_cert_sans="gateway.example",
+            regenerate_api_cert=True,
         )
         with (
             mock.patch("llamacpp_stack.install.os.geteuid", return_value=1000),
@@ -1432,6 +1848,13 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertIn("--no-update-binaries", cmd)
         self.assertIn("--package-only-update", cmd)
         self.assertIn("--migrate-model-ids", cmd)
+        self.assertIn("--api-auth", cmd)
+        self.assertIn(fixture_api_key, cmd)
+        self.assertIn("--api-https", cmd)
+        self.assertIn("/etc/heimdall/cert.pem", cmd)
+        self.assertIn("/etc/heimdall/key.pem", cmd)
+        self.assertIn("gateway.example", cmd)
+        self.assertIn("--regenerate-api-cert", cmd)
         env = run_mock.call_args.kwargs["env"]
         self.assertEqual(env[ELEVATED_INSTALL_ENV], "1")
 
@@ -1459,6 +1882,9 @@ class InstallHelpersTest(unittest.TestCase):
             with mock.patch("llamacpp_stack.install.ensure_runtime_python") as runtime_mock:
                 maybe_refresh_runtime_package_only(layout, False, args)
             runtime_mock.assert_called_once_with(layout, False, skip_pip_install=False)
+            wrapper = layout.bin_dir / "vllm-server"
+            self.assertTrue(wrapper.is_file())
+            self.assertIn("VLLM_USE_FLASHINFER_SAMPLER", wrapper.read_text(encoding="utf-8"))
 
     def test_maybe_reexec_system_install_skips_when_already_root(self) -> None:
         args = Namespace(
@@ -3457,6 +3883,10 @@ class InstallHelpersTest(unittest.TestCase):
             with (
                 mock.patch("llamacpp_stack.install._sudo_prefix", return_value=[]),
                 mock.patch("llamacpp_stack.install._run") as run_mock,
+                mock.patch(
+                    "llamacpp_stack.install.subprocess.run",
+                    return_value=subprocess.CompletedProcess([], 0, stdout="loaded\n", stderr=""),
+                ),
             ):
                 self.assertTrue(stop_systemd_units(layout, dry_run=False))
             run_mock.assert_called_once_with(["systemctl", "stop", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME])
@@ -3591,6 +4021,25 @@ class InstallHelpersTest(unittest.TestCase):
             saved = json.loads(catalog_path.read_text(encoding="utf-8"))[0]
             self.assertEqual(saved["tensor_split"], "1,1,1")
             self.assertNotIn("tensor_split", saved["server_overrides"])
+
+    def test_server_default_cache_prompt_is_emitted_as_flag(self) -> None:
+        model = ManagedModel(
+            model_id="repo-q4",
+            repo_id="org/repo",
+            quant="Q4",
+            filename="model-q4.gguf",
+            local_path="/tmp/model-q4.gguf",
+            tensor_split="1",
+        )
+        rendered = " ".join(
+            build_llama_server_command(
+                model,
+                Path("/tmp/llama-server"),
+                port="18080",
+                server_defaults={"cache_prompt": True},
+            )
+        )
+        self.assertIn("--cache-prompt", rendered)
 
     def test_catalog_tensor_split_is_preserved_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4285,6 +4734,65 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertEqual(model.host, "0.0.0.0")
             self.assertFalse(model.jinja)
             self.assertEqual(model.description, "new")
+
+    def test_run_native_hf_repo_creates_vllm_catalog_entry_without_gguf_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models_dir = root / "models"
+            catalog_path = root / "catalog.json"
+            config_path = root / "config.yaml"
+            catalog_path.write_text("[]\n", encoding="utf-8")
+            args = Namespace(
+                repo=None,
+                hf="unsloth/Qwen3.6-27B-NVFP4",
+                model_id=None,
+                file=None,
+                catalog=catalog_path,
+                models_dir=models_dir,
+                force=True,
+                ctx_override=None,
+                auto_ctx=False,
+                skip_ctx=False,
+                ctx_size=8192,
+                config=config_path,
+                llama_server=root / "llama-server",
+                start_port=18080,
+                public_host="127.0.0.1",
+                public_port=11435,
+                n_gpu_layers=99,
+                tensor_split="1",
+                host="127.0.0.1",
+                idle_ttl=10,
+                no_jinja=False,
+                hf_token=None,
+                description="",
+                service="llamaswap",
+            )
+            api = mock.MagicMock()
+            config_sibling = mock.Mock(rfilename="config.json", size=2)
+            weight_sibling = mock.Mock(rfilename="model.safetensors", size=4)
+            api.model_info.return_value.siblings = [config_sibling, weight_sibling]
+
+            def fake_snapshot_download(**kwargs):
+                snapshot_dir = Path(kwargs["local_dir"])
+                snapshot_dir.mkdir(parents=True, exist_ok=True)
+                (snapshot_dir / "config.json").write_text('{"model_type":"qwen3_5"}\n', encoding="utf-8")
+                (snapshot_dir / "model.safetensors").write_bytes(b"weights")
+                return str(snapshot_dir)
+
+            with (
+                mock.patch("llamacpp_stack.cli.HfApi", return_value=api),
+                mock.patch("llamacpp_stack.cli.snapshot_download", side_effect=fake_snapshot_download),
+                mock.patch("llamacpp_stack.cli.apply_config_and_wait", return_value=True),
+            ):
+                result = ensure_model_available(args)
+
+            self.assertEqual(result, "qwen3.6-27b-nvfp4")
+            model = load_catalog(catalog_path)[0]
+            self.assertEqual(model.backend, "vllm")
+            self.assertEqual(model.filename, "hf-native")
+            self.assertEqual(model.ctx_size, 262144)
+            self.assertEqual(model.server_overrides, {})
 
     def test_existing_model_default_ctx_emits_update_hint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6188,6 +6696,43 @@ models:
             (False, 20.0),
         )
 
+    def test_runtime_process_detection_includes_vllm(self) -> None:
+        vllm_cmd = (
+            "1234 python -m vllm.entrypoints.openai.api_server "
+            "--model /models/qwen --port 18087 --served-model-name qwen"
+        )
+        with mock.patch(
+            "llamacpp_stack.cli.subprocess.run",
+            return_value=Namespace(stdout=vllm_cmd),
+        ):
+            processes = get_llama_server_processes()
+        self.assertEqual(
+            processes,
+            [{
+                "pid": 1234,
+                "cmdline": vllm_cmd.split(" ", 1)[1],
+                "model_path": str(Path("/models/qwen").resolve()),
+                "port": 18087,
+            }],
+        )
+
+    def test_warmup_retries_matrix_shutdown_500(self) -> None:
+        responses = [
+            mock.Mock(
+                status_code=500,
+                text='{"error":"unspecific error: matrix is shutting down"}',
+                raise_for_status=mock.Mock(side_effect=__import__("requests").HTTPError(response=mock.Mock(status_code=500, text='{"error":"unspecific error: matrix is shutting down"}'))),
+            ),
+            mock.Mock(status_code=200, raise_for_status=mock.Mock()),
+        ]
+        with (
+            mock.patch("llamacpp_stack.cli.requests.post", side_effect=responses) as post,
+            mock.patch("llamacpp_stack.cli.time.sleep"),
+            mock.patch("llamacpp_stack.cli.LoadingBar"),
+        ):
+            warmup_model("qwen", "127.0.0.1", 11436, timeout=5)
+        self.assertEqual(post.call_count, 2)
+
     def test_list_models_falls_back_to_local_catalog_when_manager_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -6905,6 +7450,24 @@ models:
             prompt_mock.assert_not_called()
             run_mock.assert_not_called()
 
+    def test_existing_model_files_trigger_recursive_owner_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            models_dir = Path(tmp) / "models"
+            models_dir.mkdir()
+            (models_dir / "orphan.gguf").write_bytes(b"")
+            layout = choose_layout("system", "127.0.0.1", 8080, models_dir)
+
+            with mock.patch("llamacpp_stack.install.pwd.getpwnam", return_value=Namespace(pw_uid=4242)), \
+                 mock.patch("llamacpp_stack.install.grp.getgrnam", return_value=Namespace(gr_gid=4343)), \
+                 mock.patch("llamacpp_stack.install.os.geteuid", return_value=1000), \
+                 mock.patch("llamacpp_stack.install.prompt_bool", return_value=True), \
+                 mock.patch("llamacpp_stack.install._run") as run_mock:
+                ensure_models_tree_owned(layout, dry_run=False)
+
+            run_mock.assert_called_once_with(
+                ["sudo", "chown", "-R", "llamaswap:llamaswap", "--", str(models_dir)]
+            )
+
     def test_heimdall_layout_uses_new_user_and_system_paths(self) -> None:
         with (
             mock.patch("llamacpp_stack.install.detect_existing_mode", return_value=None),
@@ -7043,6 +7606,16 @@ models:
                 if "llamacpp-superserver" in text and path not in allowed:
                     offenders.append(str(path))
         self.assertEqual(offenders, [])
+
+    def test_loading_claim_is_released_when_preflight_rejects(self) -> None:
+        REPLICA_ROUTER_STATE.loading_claims.clear()
+        REPLICA_ROUTER_STATE.loading_claim_aliases.clear()
+        with mock.patch("llamacpp_stack.cli.get_catalog_model_process", return_value=None):
+            self.assertTrue(REPLICA_ROUTER_STATE.claim_loading("qwen", [], claim_key="qwen"))
+            REPLICA_ROUTER_STATE.release_loading_claim("qwen")
+            self.assertTrue(REPLICA_ROUTER_STATE.claim_loading("qwen", [], claim_key="qwen"))
+        REPLICA_ROUTER_STATE.loading_claims.clear()
+        REPLICA_ROUTER_STATE.loading_claim_aliases.clear()
 
 if __name__ == "__main__":
     unittest.main()

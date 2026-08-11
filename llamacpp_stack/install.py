@@ -16,11 +16,13 @@ import tarfile
 import time
 import textwrap
 import urllib.request
-import yaml
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+
+import yaml
 
 
 def _json_loads_allow_comments(text: str, path_desc: str = "") -> object:
@@ -87,7 +89,7 @@ LEGACY_SERVER_CONFIG_BASENAME = "llamacpp-server.json"
 ENV_BASENAME = "heimdall-gateway.env"
 LEGACY_ENV_BASENAME = "llamacpp-stack.env"
 LLAMA_CPP_MODES = ("native", "prebuilt", "source")
-BACKEND_OPTIONS = ("llama.cpp", "vllm-beta")  # Beta: vLLM as alternative backend
+BACKEND_OPTIONS = ("auto", "llama.cpp", "vllm-beta")
 ELEVATED_INSTALL_ENV = "HEIMDALL_GATEWAY_INSTALL_ELEVATED"
 LEGACY_ELEVATED_INSTALL_ENV = "LLAMACPP_INSTALL_ELEVATED"
 DISABLE_AGGRESSIVE_CUDA_ENV = "HEIMDALL_GATEWAY_DISABLE_AGGRESSIVE_CUDA"
@@ -320,6 +322,13 @@ def _normalize_server_config_payload(payload: dict[str, object]) -> dict[str, ob
     result.pop("models", None)
     result["llama_server_defaults"] = _normalize_llama_server_defaults_payload(result.get("llama_server_defaults"))
     result["llama_server_family_defaults"] = _normalize_llama_server_family_defaults_payload(result.get("llama_server_family_defaults"))
+    raw_vllm = result.get("vllm")
+    if not isinstance(raw_vllm, dict):
+        raw_vllm = {}
+    result["vllm"] = {
+        "defaults": dict(raw_vllm.get("defaults") or {}) if isinstance(raw_vllm.get("defaults"), dict) else {},
+        "family_defaults": dict(raw_vllm.get("family_defaults") or {}) if isinstance(raw_vllm.get("family_defaults"), dict) else {},
+    }
     replicas = _default_global_replicas_config()
     raw_replicas = result.get("replicas")
     if isinstance(raw_replicas, dict):
@@ -599,6 +608,17 @@ def _build_cmake_args_from_config(
     # Add conditional CUDA flags
     if enable_cuda:
         cmake_args.append("-DGGML_CUDA=ON")
+        if sys.platform.startswith("linux"):
+            # CUDA 12.0 on Ubuntu selects its supported GCC 11 wrapper even
+            # when the normal C++ compiler is newer. GCC 11 emits a known
+            # false-positive -Wstringop-overflow in upstream ggml-cuda's
+            # std::vector<ggml_op> initializer-list insertion. Limit the
+            # suppression to CUDA translation units; regular C++ warnings stay
+            # enabled and build failures remain visible.
+            existing_cuda_flags = str(os.environ.get("CMAKE_CUDA_FLAGS", "") or "").strip()
+            warning_flag = "-Xcompiler=-Wno-stringop-overflow"
+            cuda_flags = " ".join(part for part in (existing_cuda_flags, warning_flag) if part)
+            cmake_args.append(f"-DCMAKE_CUDA_FLAGS={cuda_flags}")
         if arch:
             cmake_args.append(f"-DCMAKE_CUDA_ARCHITECTURES={arch}")
         if nvcc_compiler:
@@ -705,7 +725,7 @@ class InstallLayout:
     runtime_venv: Path
     cuda_root: Path
     nccl_root: Path = Path()
-    backend: str = "llama.cpp"
+    backend: str = "auto"
 
 
 def prompt_bool(message: str, default: bool = True) -> bool:
@@ -773,11 +793,12 @@ def resolve_install_mode(requested_mode: str | None) -> str:
     if requested_mode:
         return requested_mode
     existing = detect_existing_mode()
+    if existing:
+        print(f"Existing installation detected in {existing} mode; keeping that mode for the update.")
+        return existing
     default_mode = existing or ("system" if os.geteuid() == 0 else "user")
     if not sys.stdin.isatty():
         return default_mode
-    if existing:
-        print(f"Existing installation detected in {existing} mode.")
     if prompt_bool("Install for all users?", default=(default_mode == "system")):
         return "system"
     return "user"
@@ -848,19 +869,23 @@ def resolve_llama_cpp_ref(requested_ref: str | None, llama_cpp_mode: str) -> str
 
 
 def resolve_backend_choice(requested_backend: str | None) -> str:
-    """Allow user to choose between llama.cpp (stable) or vLLM (beta) backend."""
+    """Resolve the legacy default-backend option.
+
+    Both engines are installed now; ``auto`` controls per-model routing.
+    """
     if requested_backend:
         if requested_backend not in BACKEND_OPTIONS:
             raise ValueError(f"Unknown backend: {requested_backend}. Options: {', '.join(BACKEND_OPTIONS)}")
-        return requested_backend
+        return "auto"
     
     return prompt_choice(
         "Which inference backend would you like to use?",
         [
-            ("llama.cpp", "llama.cpp (stable, optimized for GGUF models)"),
-            ("vllm-beta", "vLLM beta (OpenAI API compatible, recommended for HuggingFace models)"),
+            ("auto", "Automatic per-model routing (GGUF -> llama.cpp, HF -> vLLM)"),
+            ("llama.cpp", "llama.cpp default for legacy installations"),
+            ("vllm-beta", "vLLM default for legacy installations"),
         ],
-        default="llama.cpp",
+        default="auto",
     )
 
 
@@ -929,26 +954,10 @@ def choose_default_swap_port(host: str, mode: str, explicit_public_port: int | N
 
     existing = existing_public_port(mode)
 
-    # If it matches our ideal logic, use it.
-    if existing == ideal_swap_port:
-        return existing
-
-    # If we have an existing port that differs from the ideal
+    # Updates preserve the configured port. Re-running an installer is not an
+    # implicit request to migrate network endpoints; --public-port is the
+    # explicit mechanism for that.
     if existing:
-        if not sys.stdin.isatty():
-            return existing
-
-        print(f"\nExisting installation uses port {existing} for llama-swap UI.")
-        print(f"Recommended ports based on Ollama ({ollama_port}) are:")
-        print(f"  UI:  {ideal_swap_port}")
-        print(f"  API: {ideal_api_port}")
-
-        # Don't check if ports are free here because they might be occupied by 
-        # the currently running services we are about to upgrade/replace.
-        if prompt_bool(f"Migrate to recommended ports ({ideal_swap_port}/{ideal_api_port})?", default=True):
-            if args:
-                args.public_port = ideal_swap_port
-            return ideal_swap_port
         if args:
             args.public_port = existing
         return existing
@@ -1120,7 +1129,7 @@ def _args_to_cli(argv: argparse.Namespace, chosen_mode: str, chosen_llama_cpp_mo
         "--mode",
         chosen_mode,
         "--backend",
-        str(getattr(argv, "backend", "llama.cpp")),
+        str(getattr(argv, "backend", "auto")),
         "--llama-cpp-mode",
         chosen_llama_cpp_mode,
         "--models-dir",
@@ -1149,6 +1158,25 @@ def _args_to_cli(argv: argparse.Namespace, chosen_mode: str, chosen_llama_cpp_mo
     migrate_model_ids = getattr(argv, "migrate_model_ids", None)
     if migrate_model_ids is not None:
         cmd.append("--migrate-model-ids" if migrate_model_ids else "--no-migrate-model-ids")
+    api_auth = getattr(argv, "api_auth", None)
+    if api_auth is not None:
+        cmd.append("--api-auth" if api_auth else "--no-api-auth")
+    api_key = str(getattr(argv, "api_key", "") or "").strip()
+    if api_key:
+        cmd.extend(["--api-key", api_key])
+    api_https = getattr(argv, "api_https", None)
+    if api_https is not None:
+        cmd.append("--api-https" if api_https else "--no-api-https")
+    for attr, option in (
+        ("api_cert_file", "--api-cert-file"),
+        ("api_key_file", "--api-key-file"),
+        ("api_cert_sans", "--api-cert-sans"),
+    ):
+        value = str(getattr(argv, attr, "") or "").strip()
+        if value:
+            cmd.extend([option, value])
+    if bool(getattr(argv, "regenerate_api_cert", False)):
+        cmd.append("--regenerate-api-cert")
     if argv.dry_run:
         cmd.append("--dry-run")
     return cmd
@@ -1590,7 +1618,7 @@ def choose_layout(
     public_port: int | None,
     models_dir: Path | None = None,
     args: argparse.Namespace | None = None,
-    backend: str = "llama.cpp",
+    backend: str = "auto",
 ) -> InstallLayout:
     resolved_mode = mode or detect_existing_mode() or ("system" if os.geteuid() == 0 else "user")
     resolved_port = choose_default_swap_port(public_host, resolved_mode, public_port, args=args)
@@ -1803,14 +1831,13 @@ def migrate_legacy_installation(layout: InstallLayout, dry_run: bool) -> int:
         *LEGACY_INSTALL_NAMES["router_services"],
     ]
     if shutil.which("systemctl") is not None and not dry_run:
-        try:
-            _run(_systemctl_cmd(layout.mode, "stop", *legacy_services))
-        except Exception:
-            pass
-        try:
-            _run(_systemctl_cmd(layout.mode, "disable", *legacy_services))
-        except Exception:
-            pass
+        loaded_legacy = [name for name in legacy_services if _systemd_unit_is_loaded(layout, name)]
+        if loaded_legacy:
+            try:
+                _run(_systemctl_cmd(layout.mode, "stop", *loaded_legacy))
+                _run(_systemctl_cmd(layout.mode, "disable", *loaded_legacy))
+            except Exception as exc:
+                print(f"Warning: could not retire loaded legacy services ({exc}).")
 
     systemd_dir = legacy["systemd_dir"]
     for service_name in legacy_services:
@@ -2139,7 +2166,7 @@ def _render_env(
         f"PYTHON_BIN={python_exec}",
         f"HEIMDALL_GATEWAY_PYTHONPATH={python_path}",
     ]
-    if layout.backend == "vllm-beta":
+    if layout.backend in {"auto", "vllm-beta"}:
         lines.append("VLLM_WORKER_MULTIPROC_METHOD=spawn")
     if cuda_root is not None:
         lines.append(f"HEIMDALL_GATEWAY_CUDA_ROOT={cuda_root}")
@@ -2281,93 +2308,45 @@ def render_llamaswap_wrapper(layout: InstallLayout) -> str:
 
 
 def render_vllm_server_wrapper(layout: InstallLayout) -> str:
-        env_file = layout.config_dir / ENV_BASENAME
-        return textwrap.dedent(
-                f"""\
-                #!/usr/bin/env bash
-                set -euo pipefail
-                set -a
-                source {env_file}
-                set +a
-                export VLLM_WORKER_MULTIPROC_METHOD="${{VLLM_WORKER_MULTIPROC_METHOD:-spawn}}"
+    env_file = layout.config_dir / ENV_BASENAME
+    return textwrap.dedent(
+        f"""\
+        #!/usr/bin/env bash
+        set -euo pipefail
+        set -a
+        source {env_file}
+        set +a
+        export VLLM_WORKER_MULTIPROC_METHOD="${{VLLM_WORKER_MULTIPROC_METHOD:-spawn}}"
+        export OMP_NUM_THREADS="${{OMP_NUM_THREADS:-1}}"
+        # FlashInfer 0.6.12's JIT sampler is incompatible with the local
+        # CUDA/CUB toolchain on Ada (sm_89): sampling.cu fails on
+        # BlockAdjacentDifference::FlagHeads. Keep other FlashInfer kernels
+        # available and use vLLM's native top-k/top-p sampler instead.
+        export VLLM_USE_FLASHINFER_SAMPLER="${{VLLM_USE_FLASHINFER_SAMPLER:-0}}"
+        # vLLM/FlashInfer may JIT-compile sampling kernels. The ninja
+        # executable is installed beside PYTHON_BIN, so make it visible to
+        # worker subprocesses even when systemd provides a minimal PATH.
+        export PATH="$(dirname "$PYTHON_BIN"):${{PATH:-}}"
 
-                port="8000"
-                host="0.0.0.0"
-                model_path=""
-                ctx_size=""
-                dtype="float16"
-                gpu_memory="0.9"
-
-                while [[ $# -gt 0 ]]; do
-                    case "$1" in
-                        --model)
-                            model_path="$2"
-                            shift 2
-                            ;;
-                        --port)
-                            port="$2"
-                            shift 2
-                            ;;
-                        --host)
-                            host="$2"
-                            shift 2
-                            ;;
-                        --ctx-size)
-                            ctx_size="$2"
-                            shift 2
-                            ;;
-                        --f16|--float16)
-                            dtype="float16"
-                            shift
-                            ;;
-                        --f32|--float32)
-                            dtype="float32"
-                            shift
-                            ;;
-                        --bf16|--bfloat16)
-                            dtype="bfloat16"
-                            shift
-                            ;;
-                        --fit|--fitc|--fitt|-fitc|-fitt|-fit)
-                            shift 2 2>/dev/null || shift
-                            ;;
-                        --threads|--threads-batch|--mirostat|--mirostat-ent|--mirostat-lr|--cache-type-k|--cache-type-v|--keep|--draft|--spec-draft-n-max)
-                            shift 2
-                            ;;
-                        --mmap|--mlock|--no-mmap|--no-mlock)
-                            shift
-                            ;;
-                        --n-gpu-layers|-ngl)
-                            shift 2
-                            ;;
-                        *)
-                            shift
-                            ;;
-                    esac
-                done
-
-                if [[ -z "$model_path" ]]; then
-                    echo "Error: --model is required" >&2
-                    exit 1
-                fi
-
-                cmd=(
-                    "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server
-                    --model "$model_path"
-                    --port "$port"
-                    --host "$host"
-                    --dtype "$dtype"
-                    --gpu-memory-utilization "$gpu_memory"
-                    --no-enable-log-requests
-                )
-
-                if [[ -n "$ctx_size" ]]; then
-                    cmd+=(--max-model-len "$ctx_size")
-                fi
-
-                exec "${{cmd[@]}}"
-                """
-        )
+        # The renderer emits native vLLM arguments. Keep this wrapper as the
+        # stable portable entrypoint and translate the small legacy llama.cpp
+        # surface used by older catalog entries.
+        translated=(--no-enable-log-requests)
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --ctx-size) translated+=(--max-model-len "$2"); shift 2 ;;
+                --f16|--float16) translated+=(--dtype float16); shift ;;
+                --f32|--float32) translated+=(--dtype float32); shift ;;
+                --bf16|--bfloat16) translated+=(--dtype bfloat16); shift ;;
+                --n-gpu-layers|-ngl|--fit|--fitc|--fitt|-fitc|-fitt|-fit|--threads|--threads-batch|--mirostat|--mirostat-ent|--mirostat-lr|--cache-type-k|--cache-type-v|--keep|--draft|--spec-draft-n-max)
+                    shift 2 ;;
+                --mmap|--mlock|--no-mmap|--no-mlock) shift ;;
+                *) translated+=("$1"); shift ;;
+            esac
+        done
+        exec "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server "${{translated[@]}}"
+        """
+    )
 
 
 def render_initial_config(config_path: Path, start_port: int = 18080) -> None:
@@ -2429,6 +2408,35 @@ def ensure_service_writable_dirs(layout: InstallLayout, dry_run: bool) -> None:
     for path in targets:
         path.mkdir(parents=True, exist_ok=True)
         chown_tree(path, layout.service_user, layout.service_group)
+
+
+def ensure_service_runtime_access(layout: InstallLayout, paths: Sequence[Path]) -> None:
+    """Make root-owned runtime files readable and executable by the service."""
+    if layout.mode != "system":
+        return
+    runtime_paths = [str(path) for path in paths if path.exists() or path.is_symlink()]
+    _run(["chgrp", layout.service_group, "--", str(layout.install_root)])
+    _run(["chmod", "g+rx", "--", str(layout.install_root)])
+    if not runtime_paths:
+        return
+    _run(["chgrp", "-R", layout.service_group, "--", *runtime_paths])
+    _run(["chmod", "-R", "g=rX", "--", *runtime_paths])
+
+
+def service_can_execute_path(layout: InstallLayout, path: Path) -> bool:
+    if layout.mode != "system":
+        return os.access(path, os.X_OK)
+    runuser = shutil.which("runuser")
+    test_bin = shutil.which("test")
+    if os.geteuid() != 0 or runuser is None or test_bin is None:
+        return False
+    result = subprocess.run(
+        [runuser, "--user", layout.service_user, "--", test_bin, "-x", str(path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
 
 
 def desired_models_dir_owner(layout: InstallLayout) -> tuple[str, str]:
@@ -2525,6 +2533,49 @@ def ensure_models_dir_ready(layout: InstallLayout, dry_run: bool) -> None:
         )
 
 
+def ensure_models_tree_owned(layout: InstallLayout, dry_run: bool) -> None:
+    """Repair ownership of existing model artifacts for the service account."""
+    if layout.mode != "system" or not layout.models_dir.exists():
+        return
+    owner_user, owner_group = desired_models_dir_owner(layout)
+    try:
+        expected_uid = pwd.getpwnam(owner_user).pw_uid
+        expected_gid = grp.getgrnam(owner_group).gr_gid
+    except KeyError as exc:
+        raise RuntimeError(f"Cannot resolve models directory owner {owner_user}:{owner_group}") from exc
+
+    needs_fix = False
+    for current, dirs, files in os.walk(layout.models_dir, followlinks=False):
+        for entry in [Path(current), *(Path(current) / name for name in dirs + files)]:
+            try:
+                stat_result = entry.lstat()
+            except FileNotFoundError:
+                continue
+            if stat_result.st_uid != expected_uid or stat_result.st_gid != expected_gid:
+                needs_fix = True
+                break
+        if needs_fix:
+            break
+    if not needs_fix:
+        return
+    if dry_run:
+        print(
+            f"[dry-run] would repair ownership recursively for {layout.models_dir} "
+            f"to {owner_user}:{owner_group}"
+        )
+        return
+    if os.geteuid() == 0:
+        chown_tree(layout.models_dir, owner_user, owner_group)
+        return
+    if not prompt_bool(
+        f"Existing model files under {layout.models_dir} have inconsistent ownership. "
+        f"Repair recursively with sudo for {owner_user}:{owner_group}?",
+        default=True,
+    ):
+        raise RuntimeError("Model ownership repair was declined; deletion may fail with permission denied.")
+    _run(_sudo_prefix() + ["chown", "-R", f"{owner_user}:{owner_group}", "--", str(layout.models_dir)])
+
+
 def determine_build_jobs() -> int:
     return max(1, os.cpu_count() or 1)
 
@@ -2546,8 +2597,7 @@ def ensure_runtime_python(layout: InstallLayout, dry_run: bool, skip_pip_install
     if dry_run:
         print(f"[dry-run] would create runtime venv at {layout.runtime_venv}")
         print(f"[dry-run] would copy Python package to {python_path / 'llamacpp_stack'}")
-        if layout.backend == "vllm-beta":
-            print("[dry-run] would install vLLM into the runtime venv with uv")
+        print("[dry-run] would install vLLM into the runtime venv with uv")
         return runtime_python, python_path
 
     if uv_bin is None:
@@ -2556,7 +2606,9 @@ def ensure_runtime_python(layout: InstallLayout, dry_run: bool, skip_pip_install
     source_pkg = Path(__file__).resolve().parent
     target_pkg = python_path / "llamacpp_stack"
     python_path.mkdir(parents=True, exist_ok=True)
-    if target_pkg.exists():
+    if target_pkg.is_symlink():
+        target_pkg.unlink()
+    elif target_pkg.exists():
         shutil.rmtree(target_pkg)
     shutil.copytree(
         source_pkg,
@@ -2570,16 +2622,36 @@ def ensure_runtime_python(layout: InstallLayout, dry_run: bool, skip_pip_install
         ),
     )
 
+    managed_python_root = layout.install_root / "managed-python"
     if skip_pip_install and layout.runtime_venv.exists():
-        print(f"Skipping venv recreation as requested: {layout.runtime_venv}")
-        return runtime_python, python_path
+        ensure_service_runtime_access(layout, [managed_python_root, layout.runtime_venv, python_path])
+        if service_can_execute_path(layout, runtime_python):
+            print(f"Skipping venv recreation as requested: {layout.runtime_venv}")
+            return runtime_python, python_path
+        print(
+            f"Existing runtime Python is not executable by {layout.service_user}: {runtime_python}. "
+            "Recreating the venv despite --skip-venv-install."
+        )
 
-    if layout.runtime_venv.exists():
+    if layout.runtime_venv.is_symlink():
+        layout.runtime_venv.unlink()
+    elif layout.runtime_venv.exists():
         shutil.rmtree(layout.runtime_venv)
-    if layout.backend == "vllm-beta":
-        _run([uv_bin, "venv", "--python", "3.12", "--seed", "--managed-python", str(layout.runtime_venv)])
-    else:
-        _run([uv_bin, "venv", "--python", sys.executable, str(layout.runtime_venv)])
+    managed_python_root.mkdir(parents=True, exist_ok=True)
+    venv_env = os.environ.copy()
+    venv_env["UV_PYTHON_INSTALL_DIR"] = str(managed_python_root)
+    _run(
+        [
+            uv_bin,
+            "venv",
+            "--python",
+            "3.12",
+            "--seed",
+            "--managed-python",
+            str(layout.runtime_venv),
+        ],
+        env=venv_env,
+    )
     _run(
         [
             uv_bin,
@@ -2592,23 +2664,26 @@ def ensure_runtime_python(layout: InstallLayout, dry_run: bool, skip_pip_install
             "huggingface_hub",
             "hf_transfer",
             "optuna",
+            # vLLM/FlashInfer JIT-compiles sampling kernels on first start.
+            # The runtime must provide the ninja executable for that build.
+            "ninja",
         ]
     )
-    if layout.backend == "vllm-beta":
-        vllm_env = os.environ.copy()
-        vllm_env["UV_TORCH_BACKEND"] = "auto"
-        _run(
-            [
-                uv_bin,
-                "pip",
-                "install",
-                "--python",
-                str(runtime_python),
-                "--torch-backend=auto",
-                "vllm",
-            ],
-            env=vllm_env,
-        )
+    vllm_env = os.environ.copy()
+    vllm_env["UV_TORCH_BACKEND"] = "auto"
+    _run(
+        [
+            uv_bin,
+            "pip",
+            "install",
+            "--python",
+            str(runtime_python),
+            "--torch-backend=auto",
+            "vllm",
+        ],
+        env=vllm_env,
+    )
+    ensure_service_runtime_access(layout, [managed_python_root, layout.runtime_venv, python_path])
     return runtime_python, python_path
 
 
@@ -2766,6 +2841,7 @@ def write_manifest(layout: InstallLayout, llama_cpp_tag: str, llamaswap_tag: str
         "llamaswap_tag": llamaswap_tag,
         "llama_cpp_strategy": strategy,
         "backend": backend,
+        "vllm_installed": True,
     }
     if dry_run:
         print(json.dumps(payload, indent=2))
@@ -2941,12 +3017,17 @@ def wait_for_manager_socket(layout: InstallLayout, dry_run: bool, timeout_second
 
 
 def stop_systemd_units(layout: InstallLayout, dry_run: bool) -> bool:
-    stop_cmd = _systemctl_cmd(layout.mode, "stop", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME)
+    service_names = [MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME]
+    if not dry_run:
+        service_names = [name for name in service_names if _systemd_unit_is_loaded(layout, name)]
+    stop_cmd = _systemctl_cmd(layout.mode, "stop", *service_names)
 
     if dry_run:
         print(f"[dry-run] would run: {' '.join(stop_cmd)}")
         return True
 
+    if not service_names:
+        return True
     try:
         _run(stop_cmd)
         return True
@@ -2956,6 +3037,20 @@ def stop_systemd_units(layout: InstallLayout, dry_run: bool) -> bool:
             f"({exc}). Install will continue and services will be restarted at the end."
         )
         return False
+
+
+def _systemd_unit_is_loaded(layout: InstallLayout, service_name: str) -> bool:
+    """Return whether systemd knows a unit without printing expected errors."""
+    try:
+        result = subprocess.run(
+            _systemctl_cmd(layout.mode, "show", service_name, "--property=LoadState", "--value"),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0 and result.stdout.strip() not in {"", "not-found"}
 
 
 def maybe_offer_ufw_ports(layout: InstallLayout, dry_run: bool) -> None:
@@ -3885,8 +3980,17 @@ def maybe_rerun_auto_ctx(layout: InstallLayout, install_services: bool, dry_run:
 def maybe_refresh_runtime_package_only(layout: InstallLayout, dry_run: bool, args: argparse.Namespace) -> None:
     if dry_run:
         print(f"[dry-run] would refresh the heimdall-gateway runtime package at {layout.install_root}")
+        print(f"[dry-run] would regenerate the vLLM wrapper at {layout.bin_dir / 'vllm-server'}")
         return
     ensure_runtime_python(layout, dry_run, skip_pip_install=args.skip_venv_install)
+    # Package-only updates used to refresh cli.py but leave the generated
+    # vLLM launcher stale. That makes fixes carried by the wrapper (PATH,
+    # ninja, FlashInfer workarounds, environment defaults) invisible until a
+    # full backend reinstall. Keep the launcher in sync here as well.
+    layout.bin_dir.mkdir(parents=True, exist_ok=True)
+    vllm_wrapper = layout.bin_dir / "vllm-server"
+    vllm_wrapper.write_text(render_vllm_server_wrapper(layout), encoding="utf-8")
+    vllm_wrapper.chmod(0o755)
     print("\n✓ Updated heimdall-gateway Python package with latest features and fixes.")
     print("  (Binaries, config, and auto-ctx settings were left untouched.)")
     print("  Run the full installer if you need to refresh llama.cpp binaries or reconfigure the system.\n")
@@ -4149,44 +4253,73 @@ def _existing_api_security_config(layout: InstallLayout) -> tuple[dict[str, obje
         _normalize_api_https_config(payload.get("api_https")),
     )
 
-def resolve_api_security_options(args: argparse.Namespace, layout: InstallLayout) -> tuple[dict[str, object], dict[str, object]]:
+def resolve_api_security_options(
+    args: argparse.Namespace,
+    layout: InstallLayout,
+    *,
+    is_update: bool = False,
+) -> tuple[dict[str, object], dict[str, object]]:
     existing_auth, existing_https = _existing_api_security_config(layout)
     auth_enabled = getattr(args, "api_auth", None)
     https_enabled = getattr(args, "api_https", None)
+
+    explicit_auth_change = auth_enabled is not None or bool(str(getattr(args, "api_key", "") or "").strip())
+    explicit_https_change = (
+        https_enabled is not None
+        or bool(str(getattr(args, "api_cert_file", "") or "").strip())
+        or bool(str(getattr(args, "api_key_file", "") or "").strip())
+        or bool(getattr(args, "regenerate_api_cert", False))
+    )
+
+    # An update is conservative: absent explicit security flags, preserve the
+    # complete existing values, including disabled states and certificate paths.
+    if is_update and not explicit_auth_change:
+        auth_config = dict(existing_auth)
+    else:
+        if auth_enabled is None:
+            if existing_auth.get("enabled"):
+                auth_enabled = True
+            else:
+                auth_enabled = layout.public_host not in {"127.0.0.1", "localhost", "::1"}
+        auth_enabled = bool(auth_enabled)
+        api_key = str(getattr(args, "api_key", "") or "").strip()
+        if auth_enabled and not api_key:
+            api_key = str(existing_auth.get("api_key") or "").strip()
+        if auth_enabled and not api_key:
+            api_key = _generate_api_key()
+        auth_config = {"enabled": auth_enabled, "api_key": api_key if auth_enabled else ""}
+
+    if is_update and not explicit_https_change:
+        return auth_config, dict(existing_https)
+
     if auth_enabled is None:
-        if existing_auth.get("enabled"):
-            auth_enabled = True
-        else:
-            # Secure by default when the API is exposed beyond loopback. Do not add
-            # another interactive prompt here: the installer already asks whether
-            # to bind 0.0.0.0, and package-only reinstalls must keep their prompt
-            # order stable. Local loopback clients are still trusted at request time.
-            auth_enabled = layout.public_host not in {"127.0.0.1", "localhost", "::1"}
-    auth_enabled = bool(auth_enabled)
-    api_key = str(getattr(args, "api_key", "") or "").strip()
-    if auth_enabled and not api_key:
-        api_key = str(existing_auth.get("api_key") or "").strip()
-    if auth_enabled and not api_key:
-        api_key = _generate_api_key()
+        auth_enabled = bool(auth_config.get("enabled"))
+
     if https_enabled is None:
         if existing_https.get("enabled"):
+            https_enabled = True
+        elif str(getattr(args, "api_cert_file", "") or "").strip() and str(getattr(args, "api_key_file", "") or "").strip():
             https_enabled = True
         elif sys.stdin.isatty():
             https_enabled = prompt_bool("Enable HTTPS on the Heimdall Gateway API (11435)?", default=False)
     https_enabled = bool(https_enabled)
     cert_file = str(getattr(args, "api_cert_file", "") or "").strip() or str(existing_https.get("cert_file") or "").strip()
     key_file = str(getattr(args, "api_key_file", "") or "").strip() or str(existing_https.get("key_file") or "").strip()
-    if https_enabled and (not cert_file or not key_file):
-        if sys.stdin.isatty():
-            if prompt_bool("Generate a self-signed HTTPS certificate now? Remote clients must trust it manually.", default=True):
-                cert_file, key_file = _generate_self_signed_api_cert(layout, layout.public_host, getattr(args, "dry_run", False), extra_sans=_parse_extra_api_cert_sans(getattr(args, "api_cert_sans", "") or os.environ.get("HEIMDALL_GATEWAY_API_CERT_SANS") or os.environ.get("LLAMACPP_API_CERT_SANS", "")), force=bool(getattr(args, "regenerate_api_cert", False)))
-            else:
-                print("HTTPS requested but no certificate/key configured; leaving HTTPS disabled.")
-                https_enabled = False
-        else:
-            cert_file, key_file = _generate_self_signed_api_cert(layout, layout.public_host, getattr(args, "dry_run", False), extra_sans=_parse_extra_api_cert_sans(getattr(args, "api_cert_sans", "") or os.environ.get("HEIMDALL_GATEWAY_API_CERT_SANS") or os.environ.get("LLAMACPP_API_CERT_SANS", "")), force=bool(getattr(args, "regenerate_api_cert", False)))
+    regenerate = bool(getattr(args, "regenerate_api_cert", False))
+    if https_enabled and (regenerate or not cert_file or not key_file):
+        cert_file, key_file = _generate_self_signed_api_cert(
+            layout,
+            layout.public_host,
+            getattr(args, "dry_run", False),
+            extra_sans=_parse_extra_api_cert_sans(
+                getattr(args, "api_cert_sans", "")
+                or os.environ.get("HEIMDALL_GATEWAY_API_CERT_SANS")
+                or os.environ.get("LLAMACPP_API_CERT_SANS", "")
+            ),
+            force=regenerate,
+        )
     return (
-        {"enabled": auth_enabled, "api_key": api_key if auth_enabled else ""},
+        auth_config,
         {"enabled": https_enabled, "cert_file": cert_file if https_enabled else "", "key_file": key_file if https_enabled else ""},
     )
 
@@ -4197,21 +4330,26 @@ def install_stack(args: argparse.Namespace) -> int:
     chosen_public_host = resolve_public_host(args.public_host, existing_host)
     previous_models_dir = existing_models_dir(pre_mode)
     suggested_models_dir = previous_models_dir or derive_models_dir(detect_ollama_models_dir(), pre_mode)
-    chosen_models_dir = Path(args.models_dir).expanduser() if args.models_dir else prompt_path("Models directory", suggested_models_dir)
-    models_dir_unchanged = _same_models_dir(chosen_models_dir, previous_models_dir)
+    if args.models_dir:
+        chosen_models_dir = Path(args.models_dir).expanduser()
+    elif previous_models_dir is not None:
+        chosen_models_dir = previous_models_dir
+        print(f"Keeping existing models directory: {chosen_models_dir}")
+    else:
+        chosen_models_dir = prompt_path("Models directory", suggested_models_dir)
     maybe_migrate_existing_install(pre_mode, chosen_public_host, args.public_port, args.dry_run)
     args.public_host = chosen_public_host
 
     # 1. First tentative layout to stop services if they exist
     layout = choose_layout(pre_mode, chosen_public_host, args.public_port, chosen_models_dir, args=args)
-    migrate_legacy_installation(layout, args.dry_run)
+    existing_install = is_existing_install(layout)
     if args.install_services:
         # Stop existing services early so ports they occupy can be re-assigned or migrated to.
         stop_systemd_units(layout, args.dry_run)
 
     # 2. Re-calculate layout (specifically ports) after services are stopped
     layout = choose_layout(pre_mode, chosen_public_host, args.public_port, chosen_models_dir, args=args)
-    backend = getattr(args, "backend", None) or detect_existing_backend(layout) or "llama.cpp"
+    backend = "auto"
     # Preserve backend for re-execution in system mode via sudo.
     args.backend = backend
 
@@ -4221,7 +4359,7 @@ def install_stack(args: argparse.Namespace) -> int:
         update_binaries = bool(args.update_binaries)
     else:
         update_binaries = True
-        if is_existing_install(layout):
+        if existing_install:
             if package_only_update is None:
                 # The interactive default is package-only; answering yes here
                 # runs the full installer (binaries/config/auto-ctx refresh).
@@ -4242,9 +4380,7 @@ def install_stack(args: argparse.Namespace) -> int:
         )
         update_binaries = True
         args.update_binaries = True
-    if backend == "vllm-beta":
-        llama_cpp_mode = "source"
-    elif update_binaries:
+    if update_binaries:
         if str(getattr(args, "llama_cpp_ref", "") or "").strip():
             llama_cpp_mode = "source"
             args.llama_cpp_mode = "source"
@@ -4260,14 +4396,24 @@ def install_stack(args: argparse.Namespace) -> int:
     else:
         llama_cpp_mode = detect_existing_llama_cpp_mode(layout)
         print(f"Keeping existing llama.cpp mode: {llama_cpp_mode}")
-    api_auth_config, api_https_config = resolve_api_security_options(args, layout)
+    reexec_status = maybe_reexec_system_install(args, pre_mode, llama_cpp_mode, chosen_models_dir)
+    if reexec_status is not None:
+        return reexec_status
+
+    # Resolve security only in the process that will perform the installation.
+    # This prevents duplicated prompts around the sudo re-exec boundary.
+    api_auth_config, api_https_config = resolve_api_security_options(
+        args,
+        layout,
+        is_update=existing_install,
+    )
     api_scheme = "https" if api_https_config.get("enabled") else "http"
     print(f"Heimdall Gateway API:     {api_scheme}://{layout.public_host}:{layout.public_port - 1}")
     print(f"Heimdall Gateway API key: {'enabled' if api_auth_config.get('enabled') else 'disabled'}")
 
-    reexec_status = maybe_reexec_system_install(args, pre_mode, llama_cpp_mode, chosen_models_dir)
-    if reexec_status is not None:
-        return reexec_status
+    # System-mode legacy paths live under protected directories such as /etc,
+    # /var/lib, and /usr/local/bin. Migrate only after the sudo re-exec boundary.
+    migrate_legacy_installation(layout, args.dry_run)
 
     if package_only_update:
         maybe_refresh_runtime_package_only(layout, args.dry_run, args)
@@ -4294,8 +4440,7 @@ def install_stack(args: argparse.Namespace) -> int:
                     print(f"Warning: update failed (exit code {exc.returncode}).")
         return 0
 
-    existing_backend = detect_existing_backend(layout)
-    backend = resolve_backend_choice(getattr(args, "backend", None) or existing_backend)
+    backend = resolve_backend_choice(getattr(args, "backend", None) or "auto")
     layout.backend = backend
     # Preserve the interactive selection when re-executing in system mode via sudo.
     args.backend = backend
@@ -4308,10 +4453,8 @@ def install_stack(args: argparse.Namespace) -> int:
     else:
         ensure_system_identity(layout, args.dry_run)
         ensure_dirs(layout)
-    if models_dir_unchanged and is_existing_install(layout):
-        print(f"Models directory unchanged and already configured: {layout.models_dir}; skipping sudo ownership check.")
-    else:
-        ensure_models_dir_ready(layout, args.dry_run)
+    ensure_models_dir_ready(layout, args.dry_run)
+    ensure_models_tree_owned(layout, args.dry_run)
     ensure_service_writable_dirs(layout, args.dry_run)
 
     llama_cpp_ref = str(getattr(args, "llama_cpp_ref", "") or "").strip()
@@ -4319,20 +4462,18 @@ def install_stack(args: argparse.Namespace) -> int:
         llama_cpp_release = {"tag_name": llama_cpp_ref, "source_kind": "ref", "assets": []} if llama_cpp_ref else dry_run_release_placeholder(DEFAULT_LLAMA_CPP_REPO)
         llamaswap_release = dry_run_release_placeholder(DEFAULT_LLAMASWAP_REPO)
     else:
-        if backend == "vllm-beta":
-            llama_cpp_release = dry_run_release_placeholder(DEFAULT_LLAMA_CPP_REPO)
-        elif llama_cpp_ref:
+        if llama_cpp_ref:
             llama_cpp_release = {"tag_name": llama_cpp_ref, "source_kind": "ref", "assets": []}
         else:
             llama_cpp_release = latest_release(DEFAULT_LLAMA_CPP_REPO)
         llamaswap_release = latest_release(DEFAULT_LLAMASWAP_REPO)
     llamaswap_asset = choose_llamaswap_asset(llamaswap_release)
-    llama_cpp_asset = choose_llamacpp_linux_asset(llama_cpp_release) if backend != "vllm-beta" and not llama_cpp_ref else None
+    llama_cpp_asset = choose_llamacpp_linux_asset(llama_cpp_release) if not llama_cpp_ref else None
 
     gpu_present = detect_nvidia_gpu()
     nvcc_path = locate_nvcc()
     cuda_toolkit_present = nvcc_path is not None
-    if backend != "vllm-beta" and llama_cpp_mode == "source" and update_binaries and gpu_present and not cuda_toolkit_present:
+    if llama_cpp_mode == "source" and update_binaries and gpu_present and not cuda_toolkit_present:
         cuda_toolkit_present = maybe_install_cuda_toolkit(
             gpu_present=gpu_present,
             dry_run=args.dry_run,
@@ -4340,15 +4481,15 @@ def install_stack(args: argparse.Namespace) -> int:
             python_exec=sys.executable,
         )
         nvcc_path = locate_nvcc()
-    if backend != "vllm-beta" and llama_cpp_mode == "source" and update_binaries and gpu_present:
+    if llama_cpp_mode == "source" and update_binaries and gpu_present:
         maybe_install_nccl_via_uv(sys.executable, args.dry_run)
-    if backend != "vllm-beta" and llama_cpp_mode == "source" and update_binaries:
+    if llama_cpp_mode == "source" and update_binaries:
         maybe_install_source_build_prereqs(args.dry_run)
 
     current_manifest = read_install_manifest(layout)
     current_llama_cpp_tag = str(current_manifest.get("llama_cpp_tag") or "not installed")
     current_llamaswap_tag = str(current_manifest.get("llamaswap_tag") or "not installed")
-    target_llama_cpp_tag = backend if backend == "vllm-beta" else (llama_cpp_release["tag_name"] if update_binaries else current_llama_cpp_tag)
+    target_llama_cpp_tag = llama_cpp_release["tag_name"] if update_binaries else current_llama_cpp_tag
     target_llamaswap_tag = llamaswap_release["tag_name"] if update_binaries else current_llamaswap_tag
     print(f"llama.cpp target: {target_llama_cpp_tag}")
     print(f"llama-swap target: {target_llamaswap_tag}")
@@ -4359,7 +4500,7 @@ def install_stack(args: argparse.Namespace) -> int:
     print(f"models directory: {layout.models_dir}")
     print(f"llama-swap UI/backend: http://{layout.public_host}:{layout.public_port}")
     print(f"llama.cpp mode: {llama_cpp_mode}")
-    if backend != "vllm-beta" and llama_cpp_mode == "source" and update_binaries and gpu_present and not cuda_toolkit_present:
+    if llama_cpp_mode == "source" and update_binaries and gpu_present and not cuda_toolkit_present:
         print("NVIDIA GPU detected but no nvcc/CUDA toolkit was found; falling back to prebuilt llama.cpp binary.")
 
     if update_binaries:
@@ -4404,13 +4545,10 @@ def install_stack(args: argparse.Namespace) -> int:
         else:
             llamaswap_bin = layout.install_root / "llama-swap"
 
-    prefer_cuda_build = backend != "vllm-beta" and llama_cpp_mode == "source" and sys.platform.startswith("linux") and gpu_present and cuda_toolkit_present and args.prefer_source_cuda
+    prefer_cuda_build = llama_cpp_mode == "source" and sys.platform.startswith("linux") and gpu_present and cuda_toolkit_present and args.prefer_source_cuda
 
     strategy = "binary"
-    if backend == "vllm-beta":
-        strategy = "vllm"
-        llama_server_bin = layout.install_root / "vllm-server"
-    elif llama_cpp_mode == "native":
+    if llama_cpp_mode == "native":
         strategy = "native"
         native_llama_server = detect_native_llama_server()
         if update_binaries and native_llama_server is None:
@@ -4508,7 +4646,7 @@ def install_stack(args: argparse.Namespace) -> int:
         )
 
     runtime_python, runtime_python_path = ensure_runtime_python(layout, args.dry_run, skip_pip_install=args.skip_venv_install)
-    cuda_probe_python = str(runtime_python) if backend == "vllm-beta" else sys.executable
+    cuda_probe_python = str(runtime_python)
     installed_cuda_root = sync_cuda_runtime(layout, cuda_probe_python, args.dry_run)
     env_text = _render_env(
         layout,
@@ -4572,6 +4710,7 @@ def install_stack(args: argparse.Namespace) -> int:
             family_defaults = {}
             server_config_data["llama_server_family_defaults"] = family_defaults
         _merge_missing_llama_server_family_defaults(family_defaults, layout.config_dir)
+        server_config_data.setdefault("vllm", {"defaults": {}, "family_defaults": {}})
         server_config_data = _normalize_server_config_payload(server_config_data)
         server_config_payload = json.dumps(server_config_data, indent=2) + "\n"
         server_config_path.write_text(
@@ -4596,10 +4735,9 @@ def install_stack(args: argparse.Namespace) -> int:
         swap_wrapper = layout.bin_dir / SWAP_WRAPPER_NAME
         swap_wrapper.write_text(render_llamaswap_wrapper(layout), encoding="utf-8")
         swap_wrapper.chmod(0o755)
-        if backend == "vllm-beta":
-            vllm_wrapper = layout.bin_dir / "vllm-server"
-            vllm_wrapper.write_text(render_vllm_server_wrapper(layout), encoding="utf-8")
-            vllm_wrapper.chmod(0o755)
+        vllm_wrapper = layout.bin_dir / "vllm-server"
+        vllm_wrapper.write_text(render_vllm_server_wrapper(layout), encoding="utf-8")
+        vllm_wrapper.chmod(0o755)
         target_wrapper = layout.bin_dir / CLI_COMMAND
         target_wrapper.write_text(
             "#!/usr/bin/env bash\n"
@@ -4643,7 +4781,7 @@ def install_stack(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Install Heimdall Gateway.")
     parser.add_argument("--mode", choices=("system", "user"))
-    parser.add_argument("--backend", choices=BACKEND_OPTIONS, help="Inference backend to install: llama.cpp or vLLM beta.")
+    parser.add_argument("--backend", choices=BACKEND_OPTIONS, default="auto", help="Legacy default backend selector; both llama.cpp and vLLM are installed, and auto routes per model.")
     parser.add_argument(
         "--llama-cpp-mode",
         choices=LLAMA_CPP_MODES,

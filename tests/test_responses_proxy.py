@@ -29,6 +29,7 @@ from llamacpp_stack.cli import (
     _summarize_chat_tool_message_diagnostics,
     _strip_chat_tool_repair_notice_text,
     _sanitize_chat_tool_repair_notices_in_messages,
+    _normalize_system_messages_for_llamacpp,
     _normalize_trailing_assistant_messages_for_llamacpp,
     _normalize_experimental_config,
 )
@@ -56,6 +57,38 @@ def test_chat_last_response_log_config_normalizes_defaults_and_overrides():
     assert cfg["max_chars"] == 123
     assert cfg["include_reasoning"] is True
     assert cfg["include_tool_calls"] is False
+
+
+def test_responses_chat_translation_enables_llama_prompt_cache_by_default():
+    assert _responses_payload_to_chat_payload({"input": "hello"}, "m")["cache_prompt"] is True
+    assert _responses_payload_to_chat_payload({"input": "hello", "cache_prompt": False}, "m")["cache_prompt"] is False
+
+
+def test_normalize_system_messages_for_llamacpp_merges_opencode_system_messages():
+    messages = [
+        {"role": "system", "content": "base instructions"},
+        {"role": "system", "content": "agent instructions"},
+        {"role": "user", "content": "hello"},
+    ]
+
+    normalized = _normalize_system_messages_for_llamacpp(messages)
+
+    assert [message["role"] for message in normalized] == ["system", "user"]
+    assert normalized[0]["content"] == "base instructions\n\nagent instructions"
+
+
+def test_normalize_system_messages_for_llamacpp_moves_late_system_without_losing_history():
+    messages = [
+        {"role": "system", "content": "first"},
+        {"role": "user", "content": "question"},
+        {"role": "system", "content": "late context"},
+    ]
+
+    normalized = _normalize_system_messages_for_llamacpp(messages)
+
+    assert [message["role"] for message in normalized] == ["system", "user"]
+    assert normalized[0]["content"] == "first\n\nlate context"
+    assert normalized[1]["content"] == "question"
 
 
 def test_chat_last_response_log_writes_bounded_snapshot(monkeypatch, tmp_path):
@@ -149,6 +182,17 @@ def test_chat_tool_continue_triggers_on_empty_trailing_colon_or_configured_prefi
     assert _chat_tool_continue_trigger_reason("echo hi</terminal_inline>", [], tools) == "visible_content_terminal_inline_markup"
     assert _chat_tool_continue_trigger_reason("voy a ejecutar el comando", [], tools, ["Voy a"]) == "visible_content_configured_prefix"
     assert _chat_tool_continue_trigger_reason("Te explico: voy a ejecutar el comando", [], tools, ["Voy a"]) == ""
+    assert _chat_tool_continue_trigger_reason(
+        "Voy a intentar un diagnóstico completo: <dcp-message-id>m0064</dcp-message-id>",
+        [],
+        tools,
+    ) == "visible_content_trailing_colon"
+    assert _chat_tool_continue_trigger_reason(
+        "<metadata>client</metadata> Voy a ejecutar:",
+        [],
+        tools,
+        ["Voy a"],
+    ) == "visible_content_trailing_colon"
     assert _chat_tool_continue_trigger_reason("Voy a revisar:\n[terminal command=\"sg docker -c 'docker compose ls'\" timeout=10]", [], tools, ["[terminal command"]) == "visible_content_configured_prefix_line"
     tools_with_search = tools + [{"type": "function", "function": {"name": "search_files"}}]
     assert _chat_tool_continue_trigger_reason("[search_files output_mode=\"files_only\" path=\"/tmp\"]", [], tools_with_search) == "visible_content_pseudo_tool_line"
@@ -2271,6 +2315,10 @@ def test_responses_handler_contains_kv_stable_tool_search_loop():
     assert "_chat_response_internal_tool_repair_followup_messages" in responses_source
     assert "openai_responses_tool_repair_feedback" in responses_source
     assert "openai_responses_tool_repair_empty_final" in responses_source
+    assert "openai_responses_tool_fix_triggered" in responses_source
+    assert "openai_responses_tool_fix_exhausted" in responses_source
+    assert "responses_empty_final" in responses_source
+    assert "force_tool_choice_next_round" in responses_source
     assert "openai_responses_internal_round_max_tokens_applied" in responses_source
     assert "_responses_internal_round_max_tokens()" in responses_source
     assert "_start_responses_sse_stream" in responses_source

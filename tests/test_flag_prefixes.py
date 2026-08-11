@@ -72,6 +72,58 @@ def test_build_command_emits_long_context_cache_flags(monkeypatch):
     assert '--chat-template-kwargs {"preserve_thinking":true}' in joined
 
 
+def test_qwen_mtp_vision_inherits_global_context_checkpoints(monkeypatch):
+    monkeypatch.setattr(cli, "_server_supports_or_unknown", lambda _path, _flag: True)
+    model = cli.ManagedModel(
+        model_id="qwen3.6-27b-ud-q5_k_xl",
+        repo_id="unsloth/Qwen3.6-27B-MTP-GGUF",
+        quant="UD-Q5_K_XL",
+        filename="Qwen3.6-27B-UD-Q5_K_XL.gguf",
+        local_path="/tmp/model.gguf",
+        mmproj_path="/tmp/mmproj-BF16.gguf",
+        load_capabilities=["image", "image-text-to-text"],
+        ctx_size=262144,
+        tensor_split="1,1",
+        server_overrides={"spec_type": "draft-mtp"},
+    )
+
+    cmd = cli.build_llama_server_command(
+        model, Path("/bin/llama-server"), port="12345",
+        server_defaults={"ctx_checkpoints": 32, "cache_ram": 32768},
+    )
+
+    assert cmd[cmd.index("--ctx-checkpoints") + 1] == "32"
+    assert cmd[cmd.index("--cache-ram") + 1] == "32768"
+
+
+def test_qwen_mtp_vision_respects_explicit_checkpoint_override(monkeypatch):
+    monkeypatch.setattr(cli, "_server_supports_or_unknown", lambda _path, _flag: True)
+    model = cli.ManagedModel(
+        model_id="qwen3.6-27b-ud-q5_k_xl",
+        repo_id="unsloth/Qwen3.6-27B-MTP-GGUF",
+        quant="UD-Q5_K_XL",
+        filename="Qwen3.6-27B-UD-Q5_K_XL.gguf",
+        local_path="/tmp/model.gguf",
+        mmproj_path="/tmp/mmproj-BF16.gguf",
+        load_capabilities=["image"],
+        ctx_size=262144,
+        tensor_split="1,1",
+        server_overrides={
+            "spec_type": "draft-mtp",
+            "ctx_checkpoints": 32,
+            "cache_ram": 32768,
+        },
+    )
+
+    cmd = cli.build_llama_server_command(
+        model, Path("/bin/llama-server"), port="12345",
+        server_defaults={"ctx_checkpoints": 32, "cache_ram": 32768},
+    )
+
+    assert cmd[cmd.index("--ctx-checkpoints") + 1] == "32"
+    assert cmd[cmd.index("--cache-ram") + 1] == "32768"
+
+
 def test_normalize_server_config_migrates_new_defaults_and_removes_legacy_mirostat(monkeypatch):
     monkeypatch.setattr(cli, "detect_cuda_device_count", lambda: 2)
 

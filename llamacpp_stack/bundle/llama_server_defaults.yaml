@@ -12,6 +12,9 @@ default:
   cache_ram: 32768
   cache_type_k: f16
   cache_type_v: f16
+  # Explicitly enable llama.cpp prompt/KV prefix reuse. OpenAI clients do not
+  # consistently send this request option, so it must be a server default.
+  cache_prompt: true
   ctx_checkpoints: 32
   checkpoint_min_step: 1024
   top_k: 20
@@ -79,3 +82,37 @@ mtp_defaults:
   spec_draft_n_max: 3
   spec_draft_n_min: 0
   spec_draft_p_min: 0.75
+
+# vLLM defaults are kept separate from llama.cpp flags. They are applied only
+# to catalog entries whose backend is `vllm`.
+vllm:
+  defaults: {}
+  family_defaults:
+    qwen3.6:
+      # Same serving intent as the Qwen3.6 GGUF profile below: one scheduled
+      # sequence, a 1024-token scheduler batch, BF16 compute, and the native
+      # Qwen thinking/template path. These are vLLM options, not llama.cpp
+      # flags; model-specific options remain inside this vllm object.
+      max_model_len: 262144
+      dtype: bfloat16
+      trust_remote_code: true
+      # vLLM reserves scheduler slots for the three-token MTP proposer.
+      # 1024 (the llama.cpp batch size) triggers a scheduler warning here;
+      # 8192 leaves scheduler headroom for the speculative slots while
+      # max_num_seqs keeps the latency-oriented single-sequence profile.
+      max_num_batched_tokens: 8192
+      max_num_seqs: 1
+      disable_custom_all_reduce: true
+      reasoning_parser: qwen3
+      default_chat_template_kwargs:
+        enable_thinking: true
+      generation_config: vllm
+      override_generation_config:
+        top_k: 20
+        top_p: 0.95
+        repetition_penalty: 1.0
+        presence_penalty: 0.0
+        max_new_tokens: 16384
+      speculative_config:
+        method: mtp
+        num_speculative_tokens: 3
