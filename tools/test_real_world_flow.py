@@ -133,7 +133,7 @@ chat_template: |
     print(f"  File size: {template_file.stat().st_size} bytes")
     
     # Step 3: User runs refresh-templates command
-    print("\n[STEP 3] User runs: llamacpp-superserver refresh-templates")
+    print("\n[STEP 3] User runs: heimdall-gateway refresh-templates")
     print("-" * 70)
     
     # Simulate refresh_templates by doing what the command does
@@ -216,8 +216,8 @@ chat_template: |
      - phi-3.5-mini+template: launches WITH --chat-template-file
      
 ✓ User can now:
-  - Run `llamacpp-superserver launch phi-3.5-mini` (no template)
-  - Run `llamacpp-superserver launch phi-3.5-mini+template` (with template)
+  - Run `heimdall-gateway launch phi-3.5-mini` (no template)
+  - Run `heimdall-gateway launch phi-3.5-mini+template` (with template)
   - Each variant behaves as a distinct model in the catalog
 """)
     print("="*70)

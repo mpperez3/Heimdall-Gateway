@@ -5,7 +5,7 @@
   "tensor_split": "1,1,1,1,1,1,1",
   "server_overrides": {
     "parallel": 1,
-    "model_draft": "/workvols/data3/LLAMACPP_MODELS/TeichAI/gemma-4-31B-it-Claude-Opus-Distill-v2-GGUF/gemma-4-31B-it-Claude-Opus-Distill.q3_k_s.gguf",
+    "model_draft": "/models/TeichAI/gemma-4-31B-it-Claude-Opus-Distill-v2-GGUF/gemma-4-31B-it-Claude-Opus-Distill.q3_k_s.gguf",
     "draft": 16,
     "ctx_size_draft": 131072,
     "n_gpu_layers": -1,

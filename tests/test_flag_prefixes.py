@@ -356,7 +356,7 @@ def test_build_llama_server_command_clamps_unsupported_ubatch_size():
 
 
 def test_emitted_flags_are_supported_by_local_llama_server():
-    server_bin = Path("/home/martin/Developments/PycharmProjects/OpenCodeAutoModelDiscover/projects/llamacpp-stack/llama.cpp-source/build/bin/llama-server")
+    server_bin = Path(__file__).resolve().parents[1] / "llama.cpp-source" / "build" / "bin" / "llama-server"
     if not server_bin.exists():
         pytest.skip("local llama-server binary not available")
 

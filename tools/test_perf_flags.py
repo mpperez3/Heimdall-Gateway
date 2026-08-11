@@ -14,8 +14,9 @@ sys.modules['huggingface_hub'] = types.SimpleNamespace(
     snapshot_download=lambda *a, **k: None,
 )
 
-# Add project to path
-sys.path.insert(0, '/home/martin/Developments/PycharmProjects/OpenCodeAutoModelDiscover/projects/llamacpp-stack')
+# Add the repository root to the path without depending on a developer's home directory.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
 
 # Skip dependency check
 os.environ['SKIP_DEPS_CHECK'] = '1'

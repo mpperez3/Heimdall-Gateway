@@ -573,15 +573,15 @@ class InstallHelpersTest(unittest.TestCase):
 
     def test_api_cert_sans_include_lan_public_and_extra_addresses(self) -> None:
         with (
-            mock.patch("llamacpp_stack.install._detect_lan_ip_addresses", return_value=["192.168.1.10", "10.0.0.5"]),
-            mock.patch("llamacpp_stack.install._detect_public_ip_addresses", return_value=["193.147.87.218"]),
+            mock.patch("llamacpp_stack.install._detect_lan_ip_addresses", return_value=["192.0.2.10", "198.51.100.7"]),
+            mock.patch("llamacpp_stack.install._detect_public_ip_addresses", return_value=["203.0.113.42"]),
         ):
             sans = _api_cert_san_entries("0.0.0.0", extra_sans=["myhost.local", "172.16.0.2"])
         self.assertIn("DNS:localhost", sans)
         self.assertIn("IP:127.0.0.1", sans)
-        self.assertIn("IP:192.168.1.10", sans)
-        self.assertIn("IP:10.0.0.5", sans)
-        self.assertIn("IP:193.147.87.218", sans)
+        self.assertIn("IP:192.0.2.10", sans)
+        self.assertIn("IP:198.51.100.7", sans)
+        self.assertIn("IP:203.0.113.42", sans)
         self.assertIn("DNS:myhost.local", sans)
         self.assertIn("IP:172.16.0.2", sans)
 
@@ -615,16 +615,16 @@ class InstallHelpersTest(unittest.TestCase):
                 cert, key = _generate_self_signed_api_cert(layout, "0.0.0.0", False)
             first_sans = _cert_subject_alt_names(Path(cert))
             self.assertIn("IP:127.0.0.1", first_sans)
-            self.assertNotIn("IP:193.147.87.218", first_sans)
+            self.assertNotIn("IP:203.0.113.42", first_sans)
             with (
                 mock.patch("llamacpp_stack.install._detect_lan_ip_addresses", return_value=[]),
-                mock.patch("llamacpp_stack.install._detect_public_ip_addresses", return_value=["193.147.87.218"]),
+                mock.patch("llamacpp_stack.install._detect_public_ip_addresses", return_value=["203.0.113.42"]),
             ):
                 cert2, key2 = _generate_self_signed_api_cert(layout, "0.0.0.0", False)
             self.assertEqual(cert, cert2)
             self.assertEqual(key, key2)
             second_sans = _cert_subject_alt_names(Path(cert2))
-            self.assertIn("IP:193.147.87.218", second_sans)
+            self.assertIn("IP:203.0.113.42", second_sans)
             self.assertTrue(list((Path(cert).parent).glob("*.bak-*")))
 
     def test_parse_ollama_models_from_systemctl(self) -> None:
@@ -1293,7 +1293,7 @@ class InstallHelpersTest(unittest.TestCase):
         dummy_layout = Namespace(
             install_root=Path("/opt/heimdall-gateway"),
             state_dir=Path("/var/lib/heimdall-gateway"),
-            models_dir=Path("/workvols/data3/LLAMACPP_MODELS"),
+            models_dir=Path("/models/llamacpp"),
             public_host="0.0.0.0",
             public_port=11436,
             mode="system",
@@ -1771,7 +1771,7 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertEqual(resolve_public_host("127.0.0.1"), "0.0.0.0")
 
     def test_resolve_public_host_keeps_explicit_value(self) -> None:
-        self.assertEqual(resolve_public_host("192.168.110.50"), "192.168.110.50")
+        self.assertEqual(resolve_public_host("198.51.100.42"), "198.51.100.42")
 
     def test_resolve_install_mode_reuses_existing_mode_without_prompt(self) -> None:
         with mock.patch("llamacpp_stack.install.detect_existing_mode", return_value="system"), \
@@ -1950,11 +1950,11 @@ class InstallHelpersTest(unittest.TestCase):
             public_host="0.0.0.0",
             public_port=11436,
             api_port=11435,
-            models_dir=Path("/workvols/data3/LLAMACPP_MODELS"),
-            config=Path("/var/lib/llamacpp-superserver/config.yaml"),
-            catalog=Path("/var/lib/llamacpp-superserver/catalog.json"),
-            server_config=Path("/etc/llamacpp-superserver/conf.json"),
-            llama_server=Path("/opt/llamacpp-superserver/llama-server"),
+            models_dir=Path("/models/llamacpp"),
+            config=Path("/var/lib/heimdall-gateway/config.yaml"),
+            catalog=Path("/var/lib/heimdall-gateway/catalog.json"),
+            server_config=Path("/etc/heimdall-gateway/conf.json"),
+            llama_server=Path("/opt/heimdall-gateway/llama-server"),
             idle_ttl=300,
         )
         with (
@@ -1963,9 +1963,9 @@ class InstallHelpersTest(unittest.TestCase):
             mock.patch(
                 "llamacpp_stack.cli.service_commands_for_mode",
                 return_value=(
-                    "sudo systemctl start llamacpp-superserver-manager llamacpp-superserver-swap",
-                    "sudo systemctl status llamacpp-superserver-manager llamacpp-superserver-swap",
-                    "sudo systemctl restart llamacpp-superserver-manager llamacpp-superserver-swap",
+                    "sudo systemctl start heimdall-gateway-manager heimdall-gateway-router",
+                    "sudo systemctl status heimdall-gateway-manager heimdall-gateway-router",
+                    "sudo systemctl restart heimdall-gateway-manager heimdall-gateway-router",
                 ),
             ),
             mock.patch(
@@ -1997,8 +1997,8 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertIn("llama.cpp:           b8808", info_text)
         self.assertIn("llama-swap:          v202", info_text)
         self.assertIn("Runtime info:", info_text)
-        self.assertIn("Install root:        /opt/llamacpp-superserver", info_text)
-        self.assertIn("Models dir:          /workvols/data3/LLAMACPP_MODELS", info_text)
+        self.assertIn("Install root:        /opt/heimdall-gateway", info_text)
+        self.assertIn("Models dir:          /models/llamacpp", info_text)
         self.assertIn("Service management:", info_text)
         self.assertIn("Install mode:        system", info_text)
         self.assertIn("Config knobs:", info_text)
@@ -4613,20 +4613,20 @@ class InstallHelpersTest(unittest.TestCase):
     def test_desired_models_dir_owner_uses_service_identity_for_system_mode(self) -> None:
         layout = InstallLayout(
             mode="system",
-            state_dir=Path("/var/lib/llamacpp-superserver"),
-            bin_dir=Path("/opt/llamacpp-superserver/bin"),
-            install_root=Path("/opt/llamacpp-superserver"),
-            cuda_root=Path("/opt/llamacpp-superserver/cuda"),
+            state_dir=Path("/var/lib/heimdall-gateway"),
+            bin_dir=Path("/opt/heimdall-gateway/bin"),
+            install_root=Path("/opt/heimdall-gateway"),
+            cuda_root=Path("/opt/heimdall-gateway/cuda"),
             models_dir=Path("/var/llamacpp_models"),
-            config_dir=Path("/etc/llamacpp-superserver"),
-            run_dir=Path("/run/llamacpp-superserver"),
+            config_dir=Path("/etc/heimdall-gateway"),
+            run_dir=Path("/run/heimdall-gateway"),
             service_user=DEFAULT_SERVICE_USER,
             service_group=DEFAULT_SERVICE_USER,
             public_host="127.0.0.1",
             public_port=11435,
-            manager_socket=Path("/run/llamacpp-superserver/manager.sock"),
-            python_root=Path("/opt/llamacpp-superserver/python"),
-            runtime_venv=Path("/opt/llamacpp-superserver/venv"),
+            manager_socket=Path("/run/heimdall-gateway/manager.sock"),
+            python_root=Path("/opt/heimdall-gateway/python"),
+            runtime_venv=Path("/opt/heimdall-gateway/venv"),
         )
         self.assertEqual(desired_models_dir_owner(layout), (DEFAULT_SERVICE_USER, DEFAULT_SERVICE_USER))
 
@@ -7242,7 +7242,7 @@ models:
             mock.patch("llamacpp_stack.cli.subprocess.run", side_effect=fake_run),
             mock.patch("llamacpp_stack.cli.time.sleep"),
         ):
-            self.assertTrue(restart_service_to_free_vram("llamacpp-superserver-swap.service"))
+            self.assertTrue(restart_service_to_free_vram("heimdall-gateway-router.service"))
 
         self.assertEqual(calls[0][:3], ["systemctl", "--user", "restart"])
 
@@ -7258,7 +7258,7 @@ models:
             mock.patch("llamacpp_stack.cli.subprocess.run", side_effect=fake_run),
             mock.patch("llamacpp_stack.cli.time.sleep"),
         ):
-            self.assertTrue(restart_service_to_free_vram("llamacpp-superserver-swap.service"))
+            self.assertTrue(restart_service_to_free_vram("heimdall-gateway-router.service"))
 
         self.assertEqual(calls[0][:2], ["systemctl", "restart"])
 

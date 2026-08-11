@@ -69,7 +69,7 @@
     "model": "test-model",
     "repo": "test-model",
     "quant": "q4_0",
-    "llama_cpp_version": "/home/martin/.local/opt/llamacpp-superserver/llama-server: error while loading shared libraries: libcudart.so.13: cannot open shared object file: No such file or directory",
+    "llama_cpp_version": "/opt/heimdall-gateway/llama-server: error while loading shared libraries: libcudart.so.13: cannot open shared object file: No such file or directory",
     "hardware": {
       "fingerprint": "Linux-x86_64-8192",
       "cpu": "x86_64"
@@ -211,7 +211,7 @@
     "model": "test-model",
     "repo": "test/repo",
     "quant": "q8_0",
-    "llama_cpp_version": "/home/martin/.local/opt/llamacpp-superserver/llama-server: error while loading shared libraries: libcudart.so.13: cannot open shared object file: No such file or directory",
+    "llama_cpp_version": "/opt/heimdall-gateway/llama-server: error while loading shared libraries: libcudart.so.13: cannot open shared object file: No such file or directory",
     "hardware": {
       "fingerprint": "Linux-x86_64-8192-49128",
       "cpu": "x86_64",
@@ -355,7 +355,7 @@
     "model": "test-model",
     "repo": "test-model",
     "quant": "q4_0",
-    "llama_cpp_version": "/home/martin/.local/opt/llamacpp-superserver/llama-server: error while loading shared libraries: libcudart.so.13: cannot open shared object file: No such file or directory",
+    "llama_cpp_version": "/opt/heimdall-gateway/llama-server: error while loading shared libraries: libcudart.so.13: cannot open shared object file: No such file or directory",
     "hardware": {
       "fingerprint": "Linux-x86_64-8192-49128",
       "cpu": "x86_64",
@@ -507,7 +507,7 @@
     "model": "SmolLM2-135M-Instruct-Q2_K",
     "repo": "unsloth/SmolLM2-135M-Instruct-GGUF",
     "quant": "Q2_K",
-    "llama_cpp_version": "/home/martin/.local/opt/llamacpp-superserver/llama-server: error while loading shared libraries: libcudart.so.13: cannot open shared object file: No such file or directory",
+    "llama_cpp_version": "/opt/heimdall-gateway/llama-server: error while loading shared libraries: libcudart.so.13: cannot open shared object file: No such file or directory",
     "hardware": {
       "fingerprint": "Linux-x86_64-8192-49128",
       "cpu": "x86_64",
@@ -665,7 +665,7 @@
     "model": "e2e-spec",
     "repo": "local/e2e",
     "quant": "Q4",
-    "llama_cpp_version": "/home/martin/.local/opt/llamacpp-superserver/llama-server: error while loading shared libraries: libcudart.so.13: cannot open shared object file: No such file or directory",
+    "llama_cpp_version": "/opt/heimdall-gateway/llama-server: error while loading shared libraries: libcudart.so.13: cannot open shared object file: No such file or directory",
     "hardware": {
       "fingerprint": "Linux-x86_64-4096-0",
       "cpu": "x86_64",
@@ -890,7 +890,7 @@
     "model": "speculative-qwen3.6-35b-a3b-ud-q4_k_m",
     "repo": "unsloth/Qwen3.6-35B-A3B-GGUF",
     "quant": "UD-Q4_K_M",
-    "llama_cpp_version": "/home/martin/.local/opt/llamacpp-superserver/llama-server: error while loading shared libraries: libcudart.so.13: cannot open shared object file: No such file or directory",
+    "llama_cpp_version": "/opt/heimdall-gateway/llama-server: error while loading shared libraries: libcudart.so.13: cannot open shared object file: No such file or directory",
     "hardware": {
       "fingerprint": "Linux-x86_64-262144-0",
       "cpu": "x86_64",
@@ -943,7 +943,7 @@
         "op_offload": false,
         "threads": 32,
         "threads_batch": 32,
-        "model_draft": "/var/llamacpp_models/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-IQ1_M.gguf",
+        "model_draft": "/models/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-IQ1_M.gguf",
         "draft": 16,
         "ctx_size_draft": 2048,
         "n_gpu_layers_draft": "all",

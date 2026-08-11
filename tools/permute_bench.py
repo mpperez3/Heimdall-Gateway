@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
+import os
 import requests
 import json
 import time
 import sys
 
-BASE_URL = "http://192.168.110.50:11435"
+BASE_URL = os.environ.get("HEIMDALL_GATEWAY_URL", "http://127.0.0.1:11435").rstrip("/")
 MODEL_ID = "speculative-gemma-4-31b-it-claude-opus-distill.q8_0"
 
 # USER'S REVISED BASELINE (Q8, 256k Context)
@@ -77,7 +78,7 @@ def load_and_bench(flags, name):
         # Test 1: Short prompt (Generation speed)
         print("  - Measuring generation speed...")
         bench_resp = requests.post(
-            f"http://192.168.110.50:{port}/v1/chat/completions",
+            f"http://127.0.0.1:{port}/v1/chat/completions",
             json={
                 "model": MODEL_ID,
                 "messages": [{"role": "user", "content": "Explain relativity."}],

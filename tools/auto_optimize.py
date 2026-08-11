@@ -1,10 +1,11 @@
+import os
 import requests
 import time
 import json
 import sys
 
 # Remote Debug Server
-MANAGER_URL = "http://192.168.110.50:11435"
+MANAGER_URL = os.environ.get("HEIMDALL_GATEWAY_URL", "http://127.0.0.1:11435").rstrip("/")
 MODEL_ID = "speculative-gemma-4-31b-it-claude-opus-distill.q8_0"
 
 # Exclude Device 6 entirely from tensor split as it was OOMing on compute buffers

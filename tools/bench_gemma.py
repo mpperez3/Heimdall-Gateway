@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
+import os
 import requests
 import json
 import time
 import sys
 
 # Target remote server
-BASE_URL = "http://192.168.110.50:11435"
+BASE_URL = os.environ.get("HEIMDALL_GATEWAY_URL", "http://127.0.0.1:11435").rstrip("/")
 MODEL_ID = "speculative-gemma-4-31b-it-claude-opus-distill.q8_0"
 
 def wait_for_operation(target_state="idle"):
