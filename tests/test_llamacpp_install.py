@@ -4139,7 +4139,7 @@ class InstallHelpersTest(unittest.TestCase):
             repair["loop_guard"],
             {
                 "enabled": True,
-                "no_tool_call_max_chars": 12000,
+                "no_tool_call_max_chars": 0,
                 "repeated_tail_min_chars": 3000,
                 "repeated_tail_repetitions": 4,
             },
@@ -6612,7 +6612,33 @@ models:
                 "reasoning": "on",
             },
         )
-        self.assertEqual(budget, 130048)
+        self.assertEqual(budget, 15360)
+        self.assertEqual(reason, "half_context_clamped_to_generation_limit")
+
+    def test_reasoning_effort_hint_does_not_disable_visible_room_reserve(self) -> None:
+        model = ManagedModel(
+            model_id="qwen-large",
+            repo_id="org/qwen",
+            quant="Q4",
+            filename="qwen.gguf",
+            local_path="/models/qwen.gguf",
+            ctx_size=262144,
+        )
+        budget, reason = resolve_request_reasoning_budget(
+            {
+                "model": model.model_id,
+                "messages": [{"role": "user", "content": "write"}],
+                "max_tokens": 131072,
+                "reasoning_effort": "high",
+            },
+            model,
+            server_defaults={
+                "reasoning_budget": "half_context",
+                "predict": 16384,
+                "reasoning": "on",
+            },
+        )
+        self.assertEqual(budget, 15360)
         self.assertEqual(reason, "half_context_clamped_to_generation_limit")
 
     def test_request_reasoning_budget_clamps_to_server_predict_cap(self) -> None:
@@ -6669,6 +6695,24 @@ models:
         )
         self.assertIsNone(budget)
         self.assertEqual(reason, "explicit_client_control")
+
+    def test_chat_tool_loop_guard_scales_char_cap_with_thinking_budget(self) -> None:
+        from llamacpp_stack.cli import _chat_tool_continue_loop_guard_reason
+
+        loop_guard = {"enabled": True, "no_tool_call_max_chars": 12000}
+        budgeted_state = {
+            "tool_call_chunks": 0,
+            "visible_content_len": 0,
+            "reasoning_len": 12001,
+            "thinking_budget_tokens": 64512,
+        }
+        self.assertEqual(_chat_tool_continue_loop_guard_reason(budgeted_state, loop_guard), "")
+
+        unbudgeted_state = dict(budgeted_state, thinking_budget_tokens=0)
+        self.assertEqual(
+            _chat_tool_continue_loop_guard_reason(unbudgeted_state, loop_guard),
+            "no_tool_call_generation_limit",
+        )
 
     def test_llamaswap_guard_blocks_upstream_static_assets_only(self) -> None:
         self.assertTrue(is_llamaswap_upstream_static_autoload_path("GET", "/upstream/gemma/sw.js"))

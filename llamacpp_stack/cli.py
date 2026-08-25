@@ -589,7 +589,7 @@ def _default_experimental_config() -> dict[str, object]:
             "include_failed_assistant_message": False,
             "loop_guard": {
                 "enabled": True,
-                "no_tool_call_max_chars": 12000,
+                "no_tool_call_max_chars": 0,
                 "repeated_tail_min_chars": 3000,
                 "repeated_tail_repetitions": 4,
             },
@@ -658,7 +658,7 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
                     loop_guard = merged_loop_guard
                 loop_guard["enabled"] = _as_bool(loop_guard.get("enabled"), True)
                 for lk, dv in (
-                    ("no_tool_call_max_chars", 12000),
+                    ("no_tool_call_max_chars", 0),
                     ("repeated_tail_min_chars", 3000),
                     ("repeated_tail_repetitions", 4),
                 ):
@@ -3027,14 +3027,13 @@ def resolve_request_reasoning_budget(
     """
     if not isinstance(payload, dict) or _model_backend(model) != "llama.cpp":
         return None, "unsupported_backend"
-    explicit_keys = {
+    # Numeric budgets are real client decisions; qualitative hints carry no
+    # token budget and must never disable this starvation safety net.
+    numeric_budget_keys = {
         "thinking_budget_tokens",
         "reasoning_budget_tokens",
-        "reasoning",
-        "reasoning_effort",
-        "thinking",
     }
-    if any(key in payload for key in explicit_keys):
+    if any(key in payload for key in numeric_budget_keys):
         return None, "explicit_client_control"
 
     effective = _effective_llama_server_options(model, server_defaults)
@@ -3048,7 +3047,8 @@ def resolve_request_reasoning_budget(
     if request_limit is None:
         request_limit = _positive_int(payload.get("max_completion_tokens"))
     configured_predict = _positive_int(effective.get("predict"))
-    generation_limit = request_limit or configured_predict
+    limits = [limit for limit in (request_limit, configured_predict) if limit]
+    generation_limit = min(limits) if limits else None
     context_size = displayed_configured_ctx(model)
     if context_size <= 0:
         return None, "unknown_context"
@@ -10990,9 +10990,17 @@ def _chat_tool_continue_loop_guard_reason(state: dict[str, object], loop_guard: 
     reasoning_len = int(state.get("reasoning_len") or 0)
     generated_chars = visible_len + reasoning_len
     try:
-        no_tool_limit = max(0, int(loop_guard.get("no_tool_call_max_chars", 12000)))
+        no_tool_limit = max(0, int(loop_guard.get("no_tool_call_max_chars", 0)))
     except Exception:
         no_tool_limit = 12000
+    try:
+        budget_tokens = max(0, int(state.get("thinking_budget_tokens") or 0))
+    except Exception:
+        budget_tokens = 0
+    if budget_tokens > 0:
+        # Deep thinking legitimately consumes the injected reasoning budget
+        # before the first tool call; state counts chars, the budget is tokens.
+        no_tool_limit = max(no_tool_limit, budget_tokens * 4 + 4096)
     if no_tool_limit > 0 and generated_chars >= no_tool_limit:
         return "no_tool_call_generation_limit"
     tail = str(state.get("_loop_text_tail") or "")
@@ -11064,6 +11072,7 @@ def _buffer_openai_chat_sse_with_keepalive(
     passthrough_tool_calls: bool = False,
     loop_guard: dict[str, object] | None = None,
     cancel_check=None,
+    thinking_budget_tokens: int | None = None,
 ) -> tuple[list[bytes], bool, dict[str, object]]:
     buffered_lines: list[bytes] = []
     stop_heartbeat = threading.Event()
@@ -11072,6 +11081,7 @@ def _buffer_openai_chat_sse_with_keepalive(
     state: dict[str, object] = {
         "visible_content_len": 0,
         "reasoning_len": 0,
+        "thinking_budget_tokens": max(0, int(thinking_budget_tokens or 0)),
         "tool_call_chunks": 0,
         "tool_argument_chars": 0,
         "tool_names": [],
@@ -13099,6 +13109,7 @@ def start_ctx_metadata_server(args):
                                 visible_notice_after_seconds=repair_visible_notice_after_seconds,
                                 loop_guard=repair_loop_guard,
                                 cancel_check=_conversation_cancel_reason,
+                                thinking_budget_tokens=current_payload.get("thinking_budget_tokens"),
                             )
                             pending_visible_status = None
                             if passthrough_state.get("buffer_abort_reason"):
