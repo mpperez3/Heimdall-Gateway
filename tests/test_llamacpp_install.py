@@ -72,6 +72,7 @@ from llamacpp_stack.cli import (
     replica_model_id,
     REPLICA_ROUTER_STATE,
     resolve_llama_server_defaults,
+    resolve_request_reasoning_budget,
     resolve_vllm_options,
     resolve_idle_ttl,
     resolve_catalog_model_name,
@@ -4157,6 +4158,8 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertEqual(defaults["n_gpu_layers"], -1)
         self.assertEqual(defaults["use_fitc"], False)
         self.assertEqual(defaults["swa_full"], True)
+        self.assertEqual(defaults["reasoning_budget"], "half_context")
+        self.assertNotIn("reasoning_budget", normalized["llama_server_family_defaults"].get("qwen", {}))
         self.assertIn("flash_attn", defaults)
         self.assertNotIn("batch-size", defaults)
         self.assertNotIn("threads-batch", defaults)
@@ -5958,6 +5961,24 @@ class InstallHelpersTest(unittest.TestCase):
         )
         self.assertEqual(cmd[cmd.index("--chat-template-kwargs") + 1], '{"preserve_thinking":false}')
 
+    def test_build_llama_server_command_delegates_half_context_to_requests(self) -> None:
+        model = ManagedModel(
+            model_id="qwen-large",
+            repo_id="org/qwen",
+            quant="Q4",
+            filename="qwen.gguf",
+            local_path="/models/qwen.gguf",
+            ctx_size=262144,
+        )
+        with mock.patch("llamacpp_stack.cli.server_supports_flag", return_value=True):
+            cmd = build_llama_server_command(
+                model,
+                Path("/tmp/llama-server"),
+                port="12345",
+                server_defaults={"reasoning_budget": "half_context", "reasoning": "on"},
+            )
+        self.assertEqual(cmd[cmd.index("--reasoning-budget") + 1], "-1")
+
 
     def test_build_llama_server_command_qwopus_uses_qwen_family_defaults(self) -> None:
         model = ManagedModel(
@@ -6566,6 +6587,88 @@ models:
             "tools": [{"type": "function", "name": "exec_command"}],
             "input": [{"type": "message"}, {"type": "message"}],
         }))
+
+    def test_reasoning_budget_marker_is_normalized_without_becoming_a_fixed_integer(self) -> None:
+        self.assertEqual(
+            normalize_server_overrides({"reasoning_budget": "half_ctx"}),
+            {"reasoning_budget": "half_context"},
+        )
+
+    def test_request_reasoning_budget_uses_half_context_and_leaves_visible_room(self) -> None:
+        model = ManagedModel(
+            model_id="qwen-large",
+            repo_id="org/qwen",
+            quant="Q4",
+            filename="qwen.gguf",
+            local_path="/models/qwen.gguf",
+            ctx_size=262144,
+        )
+        budget, reason = resolve_request_reasoning_budget(
+            {"model": model.model_id, "messages": [{"role": "user", "content": "write"}], "max_tokens": 131072},
+            model,
+            server_defaults={
+                "reasoning_budget": "half_context",
+                "predict": 16384,
+                "reasoning": "on",
+            },
+        )
+        self.assertEqual(budget, 130048)
+        self.assertEqual(reason, "half_context_clamped_to_generation_limit")
+
+    def test_request_reasoning_budget_clamps_to_server_predict_cap(self) -> None:
+        model = ManagedModel(
+            model_id="qwen-large",
+            repo_id="org/qwen",
+            quant="Q4",
+            filename="qwen.gguf",
+            local_path="/models/qwen.gguf",
+            ctx_size=262144,
+        )
+        budget, reason = resolve_request_reasoning_budget(
+            {"model": model.model_id, "messages": [{"role": "user", "content": "write"}]},
+            model,
+            server_defaults={"reasoning_budget": "half_context", "predict": 16384, "reasoning": "on"},
+        )
+        self.assertEqual(budget, 15360)
+        self.assertEqual(reason, "half_context_clamped_to_generation_limit")
+
+    def test_model_probe_gets_no_reasoning_budget(self) -> None:
+        model = ManagedModel(
+            model_id="qwen-large",
+            repo_id="org/qwen",
+            quant="Q4",
+            filename="qwen.gguf",
+            local_path="/models/qwen.gguf",
+            ctx_size=262144,
+        )
+        budget, reason = resolve_request_reasoning_budget(
+            {
+                "model": model.model_id,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 64,
+            },
+            model,
+            server_defaults={"reasoning_budget": "half_context", "predict": 16384, "reasoning": "on"},
+        )
+        self.assertEqual(budget, 0)
+        self.assertEqual(reason, "model_probe")
+
+    def test_explicit_reasoning_budget_is_not_overridden(self) -> None:
+        model = ManagedModel(
+            model_id="qwen-large",
+            repo_id="org/qwen",
+            quant="Q4",
+            filename="qwen.gguf",
+            local_path="/models/qwen.gguf",
+            ctx_size=262144,
+        )
+        budget, reason = resolve_request_reasoning_budget(
+            {"messages": [{"role": "user", "content": "ping"}], "thinking_budget_tokens": 32},
+            model,
+            server_defaults={"reasoning_budget": "half_context", "predict": 16384, "reasoning": "on"},
+        )
+        self.assertIsNone(budget)
+        self.assertEqual(reason, "explicit_client_control")
 
     def test_llamaswap_guard_blocks_upstream_static_assets_only(self) -> None:
         self.assertTrue(is_llamaswap_upstream_static_autoload_path("GET", "/upstream/gemma/sw.js"))

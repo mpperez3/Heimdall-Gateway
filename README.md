@@ -283,13 +283,26 @@ copying them into every model entry:
     "qwen": {
       "predict": 16384,
       "reasoning": "on",
-      "reasoning_budget": 2048,
       "reasoning_budget_message": "Okay, I have thought enough. I will now provide the final answer",
       "chat_template_kwargs": {"preserve_thinking": false}
     }
+  },
+  "llama_server_defaults": {
+    "reasoning_budget": "half_context"
   }
 }
 ```
+
+`reasoning_budget: "half_context"` is the safe default for reasoning models.
+Heimdall sends half of the model's configured context as a request-level
+`thinking_budget_tokens` value, then clamps it to the active `max_tokens` (or
+`predict`) while reserving room for visible output. Tiny one-message capability
+probes are sent with a zero thinking budget so they cannot consume their whole
+response on hidden reasoning. A numeric per-model or per-family value remains
+an explicit override. This is deliberately not the same as disabling
+reasoning globally: reasoning remains available for planning and tool calls.
+To disable it for a family or model, set `reasoning: "off"` in that family's
+defaults or in `server_overrides`; the request-level budget is then omitted.
 
 Raw per-model llama.cpp flags belong in the model's `server_overrides`:
 

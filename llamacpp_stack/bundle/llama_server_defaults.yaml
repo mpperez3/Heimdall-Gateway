@@ -8,6 +8,11 @@
 # not found, the `default` block is used.
 
 default:
+  # Dynamic policy: Heimdall computes half of the model context per request
+  # and clamps it to the request/server generation budget. llama-server is
+  # launched with --reasoning-budget -1 so thinking_budget_tokens can be sent
+  # through the OpenAI-compatible request without rebuilding the process.
+  reasoning_budget: half_context
   keep: 20000
   cache_ram: 32768
   cache_type_k: f16
@@ -37,7 +42,6 @@ family_defaults:
   qwen:
     predict: 16384
     reasoning: "on"
-    reasoning_budget: 2048
     reasoning_budget_message: "Okay, I have thought enough. I will now provide the final answer"
     chat_template_kwargs:
       preserve_thinking: false
