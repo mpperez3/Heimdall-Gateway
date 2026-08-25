@@ -1,9 +1,10 @@
-rpetr# Heimdall Gateway
+# Heimdall Gateway
 
 Heimdall Gateway is a local, OpenAI-compatible inference gateway for running
 and switching large language models on your own hardware. It manages model
-artifacts, generates the runtime configuration, routes requests to
-`llama.cpp`/`llama-swap` or vLLM, and exposes diagnostics for operators.
+artifacts, generates the runtime configuration, and routes requests through
+`llama-swap` to `llama.cpp` or the vLLM beta backend, exposing diagnostics
+for operators.
 
 It is designed for machines with one or more NVIDIA GPUs, but the gateway
 itself is ordinary Python and can also be used to manage a CPU-backed
@@ -30,17 +31,19 @@ alias.
 
 ```mermaid
 flowchart LR
-    C[OpenAI-compatible client] --> A[Heimdall API\n:11435]
-    A --> S[Heimdall router\n:11436]
-    S --> LS[llama-swap\nmanaged model processes]
-    LS --> CPP[llama-server / GGUF]
-    A --> V[vLLM beta backend\nHF-native models]
-    A --> D[(conf.json + catalog.json)]
+    C[OpenAI-compatible client] --> A["Heimdall API :11435"]
+    A --> S["llama-swap :11436 (router service)"]
+    S --> CPP["llama-server / GGUF"]
+    S --> V["vllm-server / HF-native"]
+    A --> D[("conf.json + catalog.json")]
 ```
 
-The API and router are separate from the model processes. A model is loaded
-on demand by the supervisor, so an idle installation does not have to keep
-every model in VRAM.
+The API service (`heimdall-gateway-manager`) and the router service
+(`heimdall-gateway-router`, which runs `llama-swap`) are separate from the
+model processes. Every model process is spawned by `llama-swap` on demand:
+GGUF models run on `llama-server`, while native Hugging Face repositories run
+on the vLLM beta backend. An idle installation does not have to keep every
+model in VRAM.
 
 ## Requirements
 
