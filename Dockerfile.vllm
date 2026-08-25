@@ -58,14 +58,14 @@ RUN touch /usr/bin/llama-server && chmod +x /usr/bin/llama-server
 RUN python3 -m llamacpp_stack.install --skip-venv-install --no-install-services --llama-cpp-mode native --backend vllm-beta
 
 # 7. Setup vLLM wrapper
-COPY vllm-server.sh /usr/local/bin/vllm-server
+COPY scripts/vllm/vllm-server.sh /usr/local/bin/vllm-server
 RUN chmod +x /usr/local/bin/vllm-server
-COPY vllm-server.sh /opt/heimdall-gateway/vllm-server
+COPY scripts/vllm/vllm-server.sh /opt/heimdall-gateway/vllm-server
 RUN chmod +x /opt/heimdall-gateway/vllm-server
 
 # 8. Setup test script
 ARG TEST_BUST=1
-COPY test_vllm_integration.sh /usr/local/bin/test-vllm
+COPY scripts/vllm/test_vllm_integration.sh /usr/local/bin/test-vllm
 RUN chmod +x /usr/local/bin/test-vllm
 
 EXPOSE 11435 11436 18080

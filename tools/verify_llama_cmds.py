@@ -21,9 +21,9 @@ from llamacpp_stack.cli import ManagedModel, build_llama_server_command
 
 
 def main():
-    catalog_path = Path('test_catalog.json')
+    catalog_path = Path('tests/fixtures/test_catalog.json')
     if not catalog_path.exists():
-        print('Missing test_catalog.json in workspace', file=sys.stderr)
+        print('Missing tests/fixtures/test_catalog.json (run from repo root)', file=sys.stderr)
         sys.exit(2)
     models = json.loads(catalog_path.read_text(encoding='utf-8'))
     for m in models:

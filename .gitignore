@@ -31,3 +31,7 @@ uv.lock
 .serena/memories/
 /subprocess
 /vllm
+
+# Debug output logs
+debug_log*.txt
+*.debug.log
