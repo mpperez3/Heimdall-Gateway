@@ -159,6 +159,9 @@ def _is_vllm_backend() -> bool:
     return backend == "vllm-beta"
 
 DEFAULT_CTX_SIZE = 8192
+REASONING_BUDGET_HALF_CONTEXT = "half_context"
+DEFAULT_REASONING_VISIBLE_RESERVE = 1024
+MODEL_PROBE_REASONING_MAX_TOKENS = 128
 try:
     DEFAULT_API_CTX_FACTOR = float(
         os.environ.get("HEIMDALL_GATEWAY_API_CTX_FACTOR", os.environ.get("LLAMACPP_API_CTX_FACTOR", os.environ.get("LLAMACPP_CTX_DISPLAY_RATIO", "0.5")))
@@ -873,6 +876,15 @@ def _migrate_llama_server_family_defaults(defaults: dict[str, dict[str, object]]
         return False
     changed = False
     bundled = _load_bundled_llama_server_family_default_values()
+    # The old bundled Qwen profile hard-coded 2048.  It was an installer
+    # default, not a user choice, and would override the new global dynamic
+    # policy.  Remove only that exact legacy value; other explicit budgets
+    # remain untouched.
+    for pattern, current in defaults.items():
+        if str(pattern).strip().casefold() == "qwen" and isinstance(current, dict):
+            if current.get("reasoning_budget") == 2048:
+                current.pop("reasoning_budget", None)
+                changed = True
     for pattern, pattern_defaults in bundled.items():
         if pattern not in defaults:
             defaults[pattern] = dict(pattern_defaults)
@@ -1434,9 +1446,21 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
             "n_cpu_moe",
             "top_k",
             "predict",
-            "reasoning_budget",
             "image_min_tokens",
         }:
+            try:
+                normalized[key] = int(raw_val)
+            except (TypeError, ValueError):
+                continue
+            continue
+        if key == "reasoning_budget":
+            if isinstance(raw_val, str) and raw_val.strip().casefold() in {
+                REASONING_BUDGET_HALF_CONTEXT,
+                "half_ctx",
+                "auto",
+            }:
+                normalized[key] = REASONING_BUDGET_HALF_CONTEXT
+                continue
             try:
                 normalized[key] = int(raw_val)
             except (TypeError, ValueError):
@@ -2968,6 +2992,82 @@ def _vllm_family_defaults_for_model(model: ManagedModel, family_defaults: object
     return matched
 
 
+def _positive_int(value: object) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _effective_llama_server_options(
+    model: ManagedModel,
+    server_defaults: dict[str, object] | None,
+) -> dict[str, object]:
+    """Merge global, family and model options using launch precedence."""
+    effective = dict(normalize_server_overrides(server_defaults or {}))
+    family_defaults = effective.pop("__family_defaults", None)
+    effective.update(_family_defaults_for_model(model, family_defaults))
+    effective.update(normalize_server_overrides(model.server_overrides))
+    return effective
+
+
+def resolve_request_reasoning_budget(
+    payload: dict[str, object],
+    model: ManagedModel,
+    *,
+    server_defaults: dict[str, object] | None = None,
+) -> tuple[int | None, str]:
+    """Return a safe request-level thinking budget for dynamic defaults.
+
+    A configured ``half_context`` is a policy, not a literal CLI integer.
+    llama.cpp counts reasoning and visible output against the same generation
+    limit, so the policy is clamped to leave output room and to the active
+    predict/request cap. Explicit client controls always win.
+    """
+    if not isinstance(payload, dict) or _model_backend(model) != "llama.cpp":
+        return None, "unsupported_backend"
+    explicit_keys = {
+        "thinking_budget_tokens",
+        "reasoning_budget_tokens",
+        "reasoning",
+        "reasoning_effort",
+        "thinking",
+    }
+    if any(key in payload for key in explicit_keys):
+        return None, "explicit_client_control"
+
+    effective = _effective_llama_server_options(model, server_defaults)
+    policy = effective.get("reasoning_budget")
+    if not (isinstance(policy, str) and policy.casefold() == REASONING_BUDGET_HALF_CONTEXT):
+        return None, "fixed_or_unconfigured"
+    if str(effective.get("reasoning") or "").strip().casefold() == "off":
+        return None, "reasoning_disabled"
+
+    request_limit = _positive_int(payload.get("max_tokens"))
+    if request_limit is None:
+        request_limit = _positive_int(payload.get("max_completion_tokens"))
+    configured_predict = _positive_int(effective.get("predict"))
+    generation_limit = request_limit or configured_predict
+    context_size = displayed_configured_ctx(model)
+    if context_size <= 0:
+        return None, "unknown_context"
+    half_context = max(0, context_size // 2)
+
+    # Tiny one-message requests are capability probes used by several
+    # clients. They have no room for hidden reasoning; neutralize thinking so
+    # the probe gets a visible response instead of finish_reason=length.
+    if request_looks_like_model_probe(payload) and request_limit is not None and request_limit <= MODEL_PROBE_REASONING_MAX_TOKENS:
+        return 0, "model_probe"
+
+    if generation_limit is None:
+        return half_context, "half_context"
+    reserve = min(DEFAULT_REASONING_VISIBLE_RESERVE, max(1, generation_limit // 8))
+    budget = max(0, min(half_context, generation_limit - reserve))
+    reason = "half_context_clamped_to_generation_limit" if budget < half_context else "half_context"
+    return budget, reason
+
+
 def resolve_vllm_options(
     model: ManagedModel,
     vllm_defaults: dict[str, object] | None = None,
@@ -3374,6 +3474,11 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
     elif key == "reasoning_budget":
         try:
             if _server_supports_or_unknown(server_path, "--reasoning-budget"):
+                # -1 delegates the actual budget to the request-level
+                # thinking_budget_tokens field. This is the launch-time
+                # representation of the half_context policy.
+                if isinstance(value, str) and value.strip().casefold() == REASONING_BUDGET_HALF_CONTEXT:
+                    value = -1
                 cmd.extend(["--reasoning-budget", str(int(value))])
         except (TypeError, ValueError):
             pass
@@ -4010,6 +4115,8 @@ def _summarize_api_payload_for_log(payload: dict) -> dict:
         "stream",
         "max_tokens",
         "max_output_tokens",
+        "max_completion_tokens",
+        "thinking_budget_tokens",
         "temperature",
         "tool_choice",
         "parallel_tool_calls",
@@ -12824,6 +12931,36 @@ def start_ctx_metadata_server(args):
             upstream_payload["model"] = upstream_model_name
             upstream_payload["messages"] = messages
             upstream_payload.setdefault("cache_prompt", True)
+            # OpenAI-compatible clients use both spellings. llama.cpp uses
+            # max_tokens for the generation cap; normalize before deriving a
+            # reasoning budget so max_completion_tokens cannot accidentally
+            # leave the model with an unbounded/fixed server cap.
+            if "max_tokens" not in upstream_payload and "max_completion_tokens" in upstream_payload:
+                upstream_payload["max_tokens"] = upstream_payload.get("max_completion_tokens")
+
+            if model_entry is not None and _model_backend(model_entry) == "llama.cpp":
+                active_server_defaults = resolve_llama_server_defaults(args)
+                reasoning_budget, reasoning_budget_reason = resolve_request_reasoning_budget(
+                    payload,
+                    model_entry,
+                    server_defaults=active_server_defaults,
+                )
+                if reasoning_budget is not None:
+                    upstream_payload["thinking_budget_tokens"] = reasoning_budget
+                    log_api_event(
+                        "openai_reasoning_budget_applied",
+                        {
+                            "request_id": request_id,
+                            "model": model_name,
+                            "upstream_model": upstream_model_name,
+                            "configured_context": displayed_configured_ctx(model_entry),
+                            "half_context": displayed_configured_ctx(model_entry) // 2,
+                            "applied_budget": reasoning_budget,
+                            "request_max_tokens": payload.get("max_tokens", payload.get("max_completion_tokens")),
+                            "configured_predict": _effective_llama_server_options(model_entry, active_server_defaults).get("predict"),
+                            "reason": reasoning_budget_reason,
+                        },
+                    )
             
             # Use explicit CLI flag if provided, otherwise fall back to server config
             flatten_enabled = True
