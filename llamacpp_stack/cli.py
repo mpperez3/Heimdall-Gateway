@@ -10768,6 +10768,31 @@ def _format_failed_visible_response_for_prompt(assistant_message: object, max_ch
     return content
 
 
+def _chat_tool_repair_diagnostics_text(stream_state: dict[str, object] | None) -> str:
+    if not isinstance(stream_state, dict):
+        return ""
+    parts: list[str] = []
+    valid = stream_state.get("tool_argument_json_valid_by_index") if isinstance(stream_state.get("tool_argument_json_valid_by_index"), dict) else {}
+    errors = stream_state.get("tool_argument_json_error_by_index") if isinstance(stream_state.get("tool_argument_json_error_by_index"), dict) else {}
+    tails = stream_state.get("tool_argument_tail_by_index") if isinstance(stream_state.get("tool_argument_tail_by_index"), dict) else {}
+    lengths = stream_state.get("tool_argument_lengths_by_index") if isinstance(stream_state.get("tool_argument_lengths_by_index"), dict) else {}
+    finish = str(stream_state.get("finish_reason") or "")
+    chunks = int(stream_state.get("tool_call_chunks") or 0)
+    if chunks > 0:
+        for idx in sorted(set(list(valid.keys()) + list(errors.keys()))):
+            if valid.get(idx):
+                continue
+            err = str(errors.get(idx) or "invalid JSON")[:200]
+            tail = str(tails.get(idx) or "")[-120:]
+            length = lengths.get(idx, "?")
+            parts.append(f"tool index {idx}: JSON error: {err} (arg chars: {length}, tail: {tail!r})")
+        if finish == "length":
+            parts.append("finish_reason was 'length': arguments were cut off by the output limit.")
+    elif finish == "length":
+        parts.append("finish_reason was 'length' with no tool_call emitted: output was truncated before a call could start.")
+    return " Diagnostics: " + " | ".join(parts) + "." if parts else ""
+
+
 def _chat_tool_continue_repair_messages(
     messages: list[dict],
     assistant_message: dict,
@@ -10775,6 +10800,7 @@ def _chat_tool_continue_repair_messages(
     prompt_template: object = None,
     include_failed_assistant_message: bool = False,
     tool_call_example: object = None,
+    diagnostics_text: str | None = None,
 ) -> list[dict]:
     repaired = _sanitize_chat_tool_repair_notices_in_messages(messages)
     if include_failed_assistant_message:
@@ -10784,13 +10810,18 @@ def _chat_tool_continue_repair_messages(
     base_prompt = _format_chat_tool_repair_prompt(prompt_template, tools, default_prompt)
     failed_visible = _format_failed_visible_response_for_prompt(assistant_message)
     example_text = _format_chat_tool_call_example_for_prompt(tool_call_example)
+    diag = (diagnostics_text or "").strip()
+    if diag:
+        diag_block = f"\n\n{diag}"
+    else:
+        diag_block = ""
     combined_prompt = (
         f"{base_prompt}\n\n"
         "Previous visible response that failed to produce a valid tool_call:\n"
         "-----\n"
         f"{failed_visible}\n"
         "-----\n\n"
-        f"{example_text}\n\n"
+        f"{example_text}{diag_block}\n\n"
         "Repair rule: infer the intended tool use from the failed visible response and emit exactly one real tool_call now. "
         "Do not write Markdown, pseudo tool syntax, XML tags, shell/code blocks, or explanatory prose."
     )
@@ -10818,13 +10849,16 @@ def _chat_tool_truncated_trigger_reason(stream_state: dict[str, object]) -> str:
     return ""
 
 
-def _chat_tool_truncated_repair_messages(messages: list[dict], tools: object, prompt_template: object = None) -> list[dict]:
+def _chat_tool_truncated_repair_messages(messages: list[dict], tools: object, prompt_template: object = None, diagnostics_text: str | None = None) -> list[dict]:
     repaired = [dict(item) for item in messages if isinstance(item, dict)]
     default_prompt = _default_experimental_config()["chat_tool_continue_repair"]["truncated_tool_call_prompt"]
+    content = _format_chat_tool_repair_prompt(prompt_template, tools, default_prompt)
+    if diagnostics_text and str(diagnostics_text).strip():
+        content = f"{content}\n\n{str(diagnostics_text).strip()}"
     repaired.append(
         {
             "role": "user",
-            "content": _format_chat_tool_repair_prompt(prompt_template, tools, default_prompt),
+            "content": content,
         }
     )
     return repaired
@@ -11116,12 +11150,18 @@ def _buffer_openai_chat_sse_with_keepalive(
         if not isinstance(tails, dict):
             tails = {}
             state["tool_argument_tail_by_index"] = tails
+        errors = state.get("tool_argument_json_error_by_index")
+        if not isinstance(errors, dict):
+            errors = {}
+            state["tool_argument_json_error_by_index"] = errors
         lengths[index_key] = len(joined)
         try:
             json.loads(joined)
             valid[index_key] = True
-        except Exception:
+            errors[index_key] = ""
+        except Exception as exc:
             valid[index_key] = False
+            errors[index_key] = str(exc)[:200]
         tails[index_key] = joined[-160:]
 
     def observe_line(line: bytes) -> None:
@@ -13231,8 +13271,11 @@ def start_ctx_metadata_server(args):
                         stream_repair_round_used += 1
                         repair_payload = _force_tool_choice_for_chat_repair(_apply_chat_tool_continue_repair_token_cap(upstream_payload, repair_max_tokens))
                         repair_payload["stream"] = True
+                        repair_diag = _chat_tool_repair_diagnostics_text(stream_state)
+                        if active_trigger_reason:
+                            repair_diag = (repair_diag + f" trigger: {active_trigger_reason}.").strip()
                         if truncated_trigger_reason:
-                            current_messages = _chat_tool_truncated_repair_messages(current_messages, upstream_payload.get("tools"), repair_truncated_prompt_template)
+                            current_messages = _chat_tool_truncated_repair_messages(current_messages, upstream_payload.get("tools"), repair_truncated_prompt_template, diagnostics_text=repair_diag)
                         else:
                             current_messages = _chat_tool_continue_repair_messages(
                                 current_messages,
@@ -13241,6 +13284,7 @@ def start_ctx_metadata_server(args):
                                 repair_prompt_template,
                                 repair_include_failed_assistant_message,
                                 _select_chat_tool_call_example_for_repair(current_messages),
+                                diagnostics_text=repair_diag,
                             )
                         repair_payload["messages"] = current_messages
                         pending_visible_status = {
@@ -13441,6 +13485,7 @@ def start_ctx_metadata_server(args):
                     log_api_event("openai_chat_tool_continue_repair_triggered", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "stream": False, "visible_content_len": len(str(state.get("content") or "")), "reasoning_len": len(str(state.get("reasoning") or "")), "finish_reason": state.get("finish_reason") or "", "trigger_reason": trigger_reason})
                     repair_payload = _force_tool_choice_for_chat_repair(_apply_chat_tool_continue_repair_token_cap(upstream_payload, repair_max_tokens))
                     repair_payload["stream"] = False
+                    repair_diag = _chat_tool_repair_diagnostics_text(state)
                     repair_payload["messages"] = _chat_tool_continue_repair_messages(
                         messages,
                         state.get("message") if isinstance(state.get("message"), dict) else {"role": "assistant", "content": ""},
@@ -13448,6 +13493,7 @@ def start_ctx_metadata_server(args):
                         repair_prompt_template,
                         repair_include_failed_assistant_message,
                         _select_chat_tool_call_example_for_repair(messages),
+                        diagnostics_text=repair_diag,
                     )
                     log_api_event("openai_chat_tool_continue_repair_round", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "round": repair_rounds_used, "stream": False, "trigger_reason": trigger_reason})
                     cancelled, cancel_reason = _conversation_cancel_reason()
@@ -14029,6 +14075,7 @@ def start_ctx_metadata_server(args):
                             chat_continue_repair_prompt_template,
                             chat_continue_repair_include_failed_assistant_message,
                             examples[0] if examples else None,
+                            diagnostics_text=_chat_tool_repair_diagnostics_text(state),
                         )
                         added_messages = repair_messages[len(current_messages):] if len(repair_messages) >= len(current_messages) else repair_messages
                         extra_messages.extend(added_messages)
@@ -14481,6 +14528,7 @@ def start_ctx_metadata_server(args):
                                 upstream_payload.get("tools"),
                                 chat_continue_repair_prompt_template,
                                 chat_continue_repair_include_failed_assistant_message,
+                                diagnostics_text=_chat_tool_repair_diagnostics_text({"finish_reason": "stop", "content": full_content, "reasoning": full_reasoning}),
                             )
                             log_api_event(
                                 "openai_chat_tool_continue_repair_round",

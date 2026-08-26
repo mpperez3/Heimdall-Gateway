@@ -6774,6 +6774,32 @@ models:
         client_choice = _force_tool_choice_for_chat_repair({"tool_choice": {"type": "function", "function": {"name": "f"}}})
         self.assertEqual(client_choice["tool_choice"], {"type": "function", "function": {"name": "f"}})
 
+    def test_chat_tool_repair_diagnostics_embeds_json_error(self) -> None:
+        from llamacpp_stack.cli import _chat_tool_repair_diagnostics_text
+        from llamacpp_stack.cli import _chat_tool_continue_repair_messages
+
+        state = {
+            "tool_call_chunks": 1,
+            "tool_argument_json_valid_by_index": {"0": False},
+            "tool_argument_json_error_by_index": {"0": "Expecting ',' delimiter: line 1 column 45"},
+            "tool_argument_tail_by_index": {"0": '{"url": "https://x.com"'},
+            "tool_argument_lengths_by_index": {"0": 42},
+            "finish_reason": "length",
+        }
+        diag = _chat_tool_repair_diagnostics_text(state)
+        self.assertIn("Expecting ',' delimiter", diag)
+        self.assertIn("tool index 0", diag)
+        self.assertIn("length", diag)
+
+        msgs = _chat_tool_continue_repair_messages(
+            [{"role": "user", "content": "hello"}],
+            {"role": "assistant", "content": "I will call the tool"},
+            [{"type": "function", "function": {"name": "browser_navigate"}}],
+            diagnostics_text=diag,
+        )
+        self.assertIn("Diagnostics:", msgs[-1]["content"])
+        self.assertIn("Expecting ',' delimiter", msgs[-1]["content"])
+
     def test_llamaswap_guard_blocks_upstream_static_assets_only(self) -> None:
         self.assertTrue(is_llamaswap_upstream_static_autoload_path("GET", "/upstream/gemma/sw.js"))
         self.assertTrue(is_llamaswap_upstream_static_autoload_path("HEAD", "/upstream/gemma/assets/app.js"))
