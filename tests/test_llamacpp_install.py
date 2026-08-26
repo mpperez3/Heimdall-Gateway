@@ -6714,6 +6714,66 @@ models:
             "no_tool_call_generation_limit",
         )
 
+    def test_repair_buffer_streams_reasoning_deltas_live_without_duplication(self) -> None:
+        import io
+        import threading as threading_mod
+
+        from llamacpp_stack.cli import _buffer_openai_chat_sse_with_keepalive
+
+        class FakeHandler:
+            def __init__(self):
+                self.wfile = io.BytesIO()
+
+        lines = [
+            b'data: {"choices":[{"delta":{"reasoning_content":"thinking..."}}]}',
+            b'data: {"choices":[{"delta":{"content":"Hello"}}]}',
+            b"data: [DONE]",
+        ]
+
+        class FakeResponse:
+            def __init__(self):
+                self._it = iter(lines)
+
+            def iter_lines(self):
+                return self._it
+
+            def close(self):
+                pass
+
+        handler = FakeHandler()
+        lock = threading_mod.Lock()
+        _, passthrough_done, state = _buffer_openai_chat_sse_with_keepalive(
+            handler,
+            FakeResponse(),
+            request_id="test_req",
+            keepalive_seconds=9999,
+            write_lock=lock,
+            passthrough_visible_chars=1,
+            loop_guard={"enabled": True, "no_tool_call_max_chars": 0},
+        )
+
+        output = handler.wfile.getvalue().decode("utf-8")
+        self.assertTrue(passthrough_done)
+        self.assertEqual(output.count("thinking..."), 1)
+        self.assertEqual(output.count("Hello"), 1)
+        self.assertGreater(int(state.get("reasoning_len") or 0), 0)
+        self.assertGreater(int(state.get("visible_content_len") or 0), 0)
+
+    def test_force_tool_choice_for_chat_repair_caps_thinking_budget(self) -> None:
+        from llamacpp_stack.cli import CHAT_TOOL_CONTINUE_REPAIR_THINKING_BUDGET_TOKENS
+        from llamacpp_stack.cli import _force_tool_choice_for_chat_repair
+
+        repaired = _force_tool_choice_for_chat_repair({"messages": [], "max_tokens": 4096})
+        self.assertEqual(repaired["tool_choice"], "required")
+        self.assertEqual(repaired["thinking_budget_tokens"], CHAT_TOOL_CONTINUE_REPAIR_THINKING_BUDGET_TOKENS)
+
+        explicit = _force_tool_choice_for_chat_repair({"thinking_budget_tokens": 2048})
+        self.assertEqual(explicit["tool_choice"], "required")
+        self.assertEqual(explicit["thinking_budget_tokens"], 2048)
+
+        client_choice = _force_tool_choice_for_chat_repair({"tool_choice": {"type": "function", "function": {"name": "f"}}})
+        self.assertEqual(client_choice["tool_choice"], {"type": "function", "function": {"name": "f"}})
+
     def test_llamaswap_guard_blocks_upstream_static_assets_only(self) -> None:
         self.assertTrue(is_llamaswap_upstream_static_autoload_path("GET", "/upstream/gemma/sw.js"))
         self.assertTrue(is_llamaswap_upstream_static_autoload_path("HEAD", "/upstream/gemma/assets/app.js"))

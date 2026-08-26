@@ -161,6 +161,7 @@ def _is_vllm_backend() -> bool:
 DEFAULT_CTX_SIZE = 8192
 REASONING_BUDGET_HALF_CONTEXT = "half_context"
 DEFAULT_REASONING_VISIBLE_RESERVE = 1024
+CHAT_TOOL_CONTINUE_REPAIR_THINKING_BUDGET_TOKENS = 512
 MODEL_PROBE_REASONING_MAX_TOKENS = 128
 try:
     DEFAULT_API_CTX_FACTOR = float(
@@ -10951,6 +10952,10 @@ def _force_tool_choice_for_chat_repair(payload: dict[str, object]) -> dict[str, 
     current = repaired.get("tool_choice")
     if current in (None, "", "none", "auto"):
         repaired["tool_choice"] = "required"
+    # The model already thought on the failed attempt; repair rounds only need
+    # to emit the corrected call, not re-enter a full reasoning phase.
+    if repaired.get("thinking_budget_tokens") is None and repaired.get("reasoning_budget_tokens") is None:
+        repaired["thinking_budget_tokens"] = CHAT_TOOL_CONTINUE_REPAIR_THINKING_BUDGET_TOKENS
     return repaired
 
 def _apply_chat_tool_continue_repair_token_cap(payload: dict, fallback_max_tokens: object) -> dict:
@@ -11183,6 +11188,26 @@ def _buffer_openai_chat_sse_with_keepalive(
                     tool_argument_parts_by_index.setdefault(index_key, []).append(arg_text)
                     _update_tool_argument_diagnostics(index_key)
 
+    def _forward_reasoning_line(line: bytes) -> bool:
+        # Streaming pure-reasoning deltas straight through keeps slow-thinking
+        # models from tripping client stale-timeouts before the first token.
+        if not line or not line.startswith(b"data: ") or line == b"data: [DONE]":
+            return False
+        try:
+            chunk_data = json.loads(line[6:].decode("utf-8", errors="ignore"))
+        except Exception:
+            return False
+        choice0 = (chunk_data.get("choices") or [{}])[0]
+        delta = choice0.get("delta", {}) or {}
+        reasoning = delta.get("reasoning_content") or delta.get("reasoning") or delta.get("thinking")
+        if not reasoning or delta.get("content") or delta.get("tool_calls") or choice0.get("finish_reason"):
+            return False
+        with write_lock:
+            write_sse_line(line)
+            handler.wfile.flush()
+        observe_line(line)
+        return True
+
     def should_passthrough() -> bool:
         if int(state.get("tool_call_chunks") or 0) > 0:
             if passthrough_tool_calls:
@@ -11195,7 +11220,7 @@ def _buffer_openai_chat_sse_with_keepalive(
         return False
 
     def write_sse_line(line: bytes) -> None:
-        handler.wfile.write(line + b"\n" if line else b"\n")
+        handler.wfile.write(line + b"\n\n" if line else b"\n")
 
     def cancelled_reason() -> str:
         if cancel_check is None:
@@ -11335,8 +11360,9 @@ def _buffer_openai_chat_sse_with_keepalive(
                 if state.get("buffer_abort_reason"):
                     break
                 raise BrokenPipeError("client disconnected while buffering chat repair stream")
-            buffered_lines.append(line)
-            observe_line(line)
+            if not _forward_reasoning_line(line):
+                buffered_lines.append(line)
+                observe_line(line)
             loop_reason = _chat_tool_continue_loop_guard_reason(state, loop_guard)
             if loop_reason:
                 state["buffer_abort_reason"] = loop_reason
