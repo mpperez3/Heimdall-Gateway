@@ -74,6 +74,13 @@ $ python -m pip install -e .
 $ heimdall-gateway install --mode user --backend auto
 ```
 
+For a checkout without a prior `pip install`, the bundled wrapper is equivalent
+(it creates a bootstrap venv automatically):
+
+```console
+$ ./llamacpp_stack/bundle/install_llamacpp_stack.sh --mode user --backend auto
+```
+
 ### New system installation
 
 ```console

@@ -2105,6 +2105,8 @@ def _link_stable_binary(target: Path, link_path: Path, dry_run: bool) -> Path:
     realpath_file = link_path.with_name(link_path.name + ".realpath")
     if link_path.exists() or link_path.is_symlink():
         link_path.unlink()
+    if realpath_file.is_symlink() or realpath_file.exists():
+        realpath_file.unlink()
     realpath_file.write_text(f"{target_abs}\n", encoding="utf-8")
     wrapper = f"""#!/usr/bin/env bash
 set -euo pipefail
@@ -2734,6 +2736,8 @@ def build_llama_cpp_from_source(
         source_url = f"https://github.com/{DEFAULT_LLAMA_CPP_REPO}/archive/refs/tags/{tag}.tar.gz"
     src_archive = install_root / f"{tag}.tar.gz"
     src_dir = install_root / f"llama.cpp-{tag}"
+    # GitHub strips leading 'v' for semver tags (v0.3.0 -> llama.cpp-0.3.0)
+    alt_src_dir = install_root / f"llama.cpp-{tag[1:]}" if tag.startswith("v") else None
     build_dir = src_dir / "build"
     if dry_run:
         print(f"[dry-run] would download source {source_url}")
@@ -2742,7 +2746,21 @@ def build_llama_cpp_from_source(
     _download(source_url, src_archive)
     if src_dir.exists():
         shutil.rmtree(src_dir)
+    if alt_src_dir is not None and alt_src_dir.exists():
+        shutil.rmtree(alt_src_dir)
     _extract_tarball(src_archive, install_root)
+    # Resolve actual extracted directory (GitHub archive naming varies)
+    if not src_dir.exists() and alt_src_dir is not None and alt_src_dir.exists():
+        src_dir = alt_src_dir
+        build_dir = src_dir / "build"
+    elif not src_dir.exists():
+        # Fallback: discover the directory that was actually created
+        for candidate in install_root.glob("llama.cpp-*"):
+            if candidate.is_dir() and (candidate / "CMakeLists.txt").exists():
+                # Prefer most recently modified if multiple
+                src_dir = candidate
+                build_dir = src_dir / "build"
+                break
     # Prepare auxiliary build parameters
     build_env = os.environ.copy()
     arch = detect_cuda_arch() if enable_cuda else None
