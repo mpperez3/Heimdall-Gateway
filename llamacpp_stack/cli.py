@@ -172,6 +172,7 @@ except ValueError:
 DEFAULT_N_GPU_LAYERS = 999
 DEFAULT_IDLE_TTL = int(_env_value("HEIMDALL_GATEWAY_IDLE_TTL", "LLAMACPP_IDLE_TTL", os.environ.get("LLAMACPP_DEFAULT_TTL", "300")))
 DEFAULT_MODEL_SWITCH_GRACE_S = int(_env_value("HEIMDALL_GATEWAY_MODEL_SWITCH_GRACE_S", "LLAMACPP_MODEL_SWITCH_GRACE_S", "30"))
+DEFAULT_MAX_CONCURRENT_PER_MODEL = int(_env_value("HEIMDALL_GATEWAY_MAX_CONCURRENT_PER_MODEL", "LLAMACPP_MAX_CONCURRENT_PER_MODEL", "2"))
 LLAMASWAP_UPSTREAM_STATIC_BLOCKED_BASENAMES = {
     "sw.js",
     "service-worker.js",
@@ -12645,6 +12646,54 @@ def start_ctx_metadata_server(args):
                 self._send_json({"error": message, "code": "model_loading"}, status=503)
             return True
 
+        def _reject_if_concurrent_limit_exceeded(self, model_name: str, *, api_style: str, upstream_model_name: str | None = None) -> bool:
+            limit = int(DEFAULT_MAX_CONCURRENT_PER_MODEL)
+            if limit <= 0:
+                return False
+            target = str(upstream_model_name or model_name or "")
+            if not target:
+                return False
+            with REPLICA_ROUTER_STATE.lock:
+                base_count = int(REPLICA_ROUTER_STATE.base_in_flight.get(target, 0))
+                replica_count = sum(
+                    int(rec.in_flight)
+                    for rec in REPLICA_ROUTER_STATE.records.values()
+                    if rec.replica_model_id == target or rec.base_model_id == target
+                )
+                current_total = base_count + replica_count
+                if current_total >= limit:
+                    overloaded_total = current_total
+                else:
+                    if target in REPLICA_ROUTER_STATE.records:
+                        REPLICA_ROUTER_STATE.records[target].in_flight += 1
+                        REPLICA_ROUTER_STATE.records[target].last_used = time.monotonic()
+                    else:
+                        REPLICA_ROUTER_STATE.base_in_flight[target] = base_count + 1
+                        REPLICA_ROUTER_STATE.base_last_used[target] = time.monotonic()
+                    return False
+            message = (
+                f"Model '{target}' is overloaded: {overloaded_total} concurrent requests (limit {limit}). "
+                "Server is busy processing other requests for the same model. Please retry shortly."
+            )
+            log_api_event(
+                "model_request_blocked_overloaded",
+                {
+                    "model": target,
+                    "public_model": model_name,
+                    "api_style": api_style,
+                    "concurrent": overloaded_total,
+                    "limit": limit,
+                },
+            )
+            if api_style == "openai":
+                self._send_json(
+                    {"error": {"message": message, "type": "server_error", "code": "model_overloaded"}},
+                    status=429,
+                )
+            else:
+                self._send_json({"error": message, "code": "model_overloaded"}, status=429)
+            return True
+
         def _handle_ollama_chat(self):
             payload = self._read_json_body()
             log_api_event("ollama_chat_request", payload)
@@ -12680,9 +12729,11 @@ def start_ctx_metadata_server(args):
                 return
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
                 return
-            mark_model_activity(model_name, "ollama_chat", "request_start")
-            if upstream_model_name:
+            if self._reject_if_concurrent_limit_exceeded(model_name, api_style="ollama", upstream_model_name=upstream_model_name):
+                return
+            if int(DEFAULT_MAX_CONCURRENT_PER_MODEL) <= 0 and upstream_model_name:
                 REPLICA_ROUTER_STATE.request_started(upstream_model_name)
+            mark_model_activity(model_name, "ollama_chat", "request_start")
             raw_messages = payload.get("messages") or []
             messages = [_ollama_message_to_openai(item) for item in raw_messages if isinstance(item, dict)]
             if not messages:
@@ -12904,6 +12955,9 @@ def start_ctx_metadata_server(args):
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="openai", payload=payload):
                 CONVERSATION_SWITCH_STATE.finish(conversation_token)
                 return
+            if self._reject_if_concurrent_limit_exceeded(model_name, api_style="openai", upstream_model_name=upstream_model_name):
+                CONVERSATION_SWITCH_STATE.finish(conversation_token)
+                return
             log_api_event(
                 "openai_chat_route_decision",
                 {
@@ -12930,7 +12984,7 @@ def start_ctx_metadata_server(args):
                 affinity_key=affinity_key,
             )
             mark_model_activity(model_name, "openai_chat", "request_start")
-            if upstream_model_name:
+            if int(DEFAULT_MAX_CONCURRENT_PER_MODEL) <= 0 and upstream_model_name:
                 REPLICA_ROUTER_STATE.request_started(upstream_model_name)
             raw_messages = payload.get("messages") or []
             if not isinstance(raw_messages, list) or not raw_messages:
@@ -13626,8 +13680,10 @@ def start_ctx_metadata_server(args):
                 return
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="openai", payload=payload):
                 return
+            if self._reject_if_concurrent_limit_exceeded(model_name, api_style="openai", upstream_model_name=upstream_model_name):
+                return
             mark_model_activity(model_name, f"openai_responses:{request_id}", "request_start")
-            if upstream_model_name:
+            if int(DEFAULT_MAX_CONCURRENT_PER_MODEL) <= 0 and upstream_model_name:
                 REPLICA_ROUTER_STATE.request_started(upstream_model_name)
             log_model_runtime_snapshot(
                 "openai_responses_runtime_before_upstream",
@@ -15012,9 +15068,11 @@ def start_ctx_metadata_server(args):
                 return
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
                 return
-            mark_model_activity(model_name, "ollama_generate", "request_start")
-            if upstream_model_name:
+            if self._reject_if_concurrent_limit_exceeded(model_name, api_style="ollama", upstream_model_name=upstream_model_name):
+                return
+            if int(DEFAULT_MAX_CONCURRENT_PER_MODEL) <= 0 and upstream_model_name:
                 REPLICA_ROUTER_STATE.request_started(upstream_model_name)
+            mark_model_activity(model_name, "ollama_generate", "request_start")
             prompt = str(payload.get("prompt") or "")
             images = payload.get("images") or []
             options = payload.get("options") or {}
@@ -15143,9 +15201,11 @@ def start_ctx_metadata_server(args):
                 return
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
                 return
-            mark_model_activity(model_name, "ollama_embeddings", "request_start")
-            if upstream_model_name:
+            if self._reject_if_concurrent_limit_exceeded(model_name, api_style="ollama", upstream_model_name=upstream_model_name):
+                return
+            if int(DEFAULT_MAX_CONCURRENT_PER_MODEL) <= 0 and upstream_model_name:
                 REPLICA_ROUTER_STATE.request_started(upstream_model_name)
+            mark_model_activity(model_name, "ollama_embeddings", "request_start")
             upstream_payload = {"model": upstream_model_name, "input": text_input}
             try:
                 response = _proxy_request_to_public_api(
@@ -15677,7 +15737,45 @@ def unload_models(args):
     raise RuntimeError("Unload request was sent, but the target model(s) are still visible in /v1/models.")
 
 
+def _is_dependency_update_request(args) -> bool:
+    if bool(getattr(args, "list_deps", False)):
+        return True
+    if bool(getattr(args, "check", False)):
+        return True
+    if getattr(args, "llama_cpp_ref", None):
+        return True
+    if bool(getattr(args, "dry_run", False)):
+        refs = _collect_model_references(args)
+        model_specific = bool(refs or getattr(args, "model_id", None) or getattr(args, "file", None) or getattr(args, "ctx_override", None) or getattr(args, "auto_ctx", False) or getattr(args, "preserve_ctx", False) or getattr(args, "sync_gguf_ctx", False))
+        if not model_specific:
+            return True
+        if getattr(args, "only", None) or bool(getattr(args, "deps", False)):
+            return True
+        return False
+    if getattr(args, "only", None):
+        return True
+    if bool(getattr(args, "deps", False)):
+        return True
+    if bool(getattr(args, "force", False)) and not _collect_model_references(args) and not getattr(args, "model_id", None):
+        return True
+    try:
+        refs = _collect_model_references(args)
+        model_specific = bool(refs or getattr(args, "model_id", None) or getattr(args, "file", None) or getattr(args, "ctx_override", None) or getattr(args, "auto_ctx", False) or getattr(args, "preserve_ctx", False) or getattr(args, "sync_gguf_ctx", False))
+        if not model_specific and not getattr(args, "only", None) and not getattr(args, "deps", False):
+            import sys as _sys
+
+            if _sys.stdin.isatty():
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def update_models(args):
+    if _is_dependency_update_request(args):
+        from llamacpp_stack.dependencies import handle_dependency_update
+
+        return handle_dependency_update(args)
     refs = _collect_model_references(args)
     if refs:
         if getattr(args, "model_id", None) or getattr(args, "file", None):
@@ -18406,6 +18504,11 @@ def build_help_epilog():
         "  update [repo ...|-hf HF ...] [--auto|--preserve-ctx|--sync-gguf-ctx]\n"
         "    Refresh config and optionally re-probe ctx.\n"
         f"    Example: {CLI_COMMAND} update qwen2.5-32b-instruct-q4_k_m --auto\n"
+        "  update [--check|--dry-run] [--only DEP ...] [--yes] [--force] [--list]\n"
+        "    Update registered dependencies (llama.cpp, llama-swap, vLLM, heimdall-gateway, ...).\n"
+        f"    Example: {CLI_COMMAND} update --check\n"
+        f"    Example: {CLI_COMMAND} update --only vllm --yes\n"
+        f"    Example: {CLI_COMMAND} update --list\n"
         "  validate [repo|-hf HF] [--auto]\n"
         "    Probe/validate a model and context settings before serving.\n"
         f"    Example: {CLI_COMMAND} validate -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M --auto\n"
@@ -18580,12 +18683,17 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
 
     p_update = sub.add_parser(
         "update",
-        help="Refresh model configuration",
-        description="Refresh model configuration and optionally re-probe context limits.",
+        help="Refresh model configuration or update dependencies",
+        description=(
+            "Refresh model configuration and optionally re-probe context limits.\n"
+            "When invoked with --check/--dry-run/--only/--list or --deps, updates registered "
+            "dependencies (llama.cpp, llama-swap, vLLM, heimdall-gateway, and any future tech "
+            "registered via llamacpp_stack.dependencies.register_dependency) instead of model configs."
+        ),
     )
     subparsers["update"] = p_update
     p_update.set_defaults(func=update_models)
-    p_update.add_argument("repo", nargs="*", help="Model id or HF repo[:QUANT] (accepts a list)")
+    p_update.add_argument("repo", nargs="*", help="Model id or HF repo[:QUANT] (accepts a list). When --deps/--only is used, repo values are treated as dependency names (llama.cpp, llama-swap, vllm, heimdall-gateway).")
     p_update.add_argument("-hf", "--hf", nargs="+", help="HF repo list")
     p_update.add_argument("--file")
     p_update.add_argument("--model-id")
@@ -18599,6 +18707,16 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
         action="store_true",
         help="Probe and set a practical ctx size per model automatically",
     )
+    dep_group = p_update.add_argument_group("dependency update options (extensible via dependencies.register_dependency)")
+    dep_group.add_argument("--check", action="store_true", help="Check for dependency updates without installing (implies --dry-run)")
+    dep_group.add_argument("--dry-run", action="store_true", help="Show what would be updated without changing the system")
+    dep_group.add_argument("--yes", "-y", action="store_true", help="Assume yes to confirmation prompts")
+    dep_group.add_argument("--force", action="store_true", help="Force re-install even if already at latest version")
+    dep_group.add_argument("--only", nargs="+", help="Only update the named dependencies (repeatable, comma-separated). Choices: llama.cpp, llama-swap, vllm, heimdall-gateway (aliases accepted)")
+    dep_group.add_argument("--list", dest="list_deps", action="store_true", help="List all registered updatable dependencies and exit")
+    dep_group.add_argument("--deps", action="store_true", help="Explicitly run in dependency-update mode (required when a dependency name collides with a model id)")
+    dep_group.add_argument("--verbose", "-v", action="store_true", help="Verbose output during dependency updates")
+    dep_group.add_argument("--llama-cpp-ref", dest="llama_cpp_ref", help="For llama.cpp updates: specific git commit/tag/ref to build (implies source build, same as install --llama-cpp-ref). If omitted in interactive TTY, you will be asked latest vs commit.")
 
     p_config_migrate = sub.add_parser(
         "config-migrate",
