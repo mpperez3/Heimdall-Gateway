@@ -1,4 +1,6 @@
-# Heimdall Gateway
+/# Heimdall Gateway
+
+> **Are you an LLM / coding agent?** Go to [`docs/LLM_INSTALL.md`](docs/LLM_INSTALL.md) for the full install checklist, pre-checks, mandatory user questions, and copy-paste commands. Human overview continues below.
 
 Heimdall Gateway is a local, OpenAI-compatible inference gateway for running
 and switching large language models on your own hardware. It manages model
@@ -511,6 +513,8 @@ $ heimdall-gateway hacks
 
 ## Related documentation
 
+- [`docs/LLM_INSTALL.md`](docs/LLM_INSTALL.md) — **LLM/agent install guide**
+  (checklist, mandatory user questions, decision matrix, verification).
 - [`docs/LOCAL_OLLAMA_SETUP.md`](docs/LOCAL_OLLAMA_SETUP.md) — local Ollama
   compatibility setup.
 - [`docs/VLLM-BETA.md`](docs/VLLM-BETA.md) — vLLM beta backend notes.

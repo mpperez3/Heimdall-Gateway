@@ -1257,10 +1257,16 @@ def _is_vllm_backend() -> bool:
 
 def _normalize_model_backend(value: object, filename: object = "", local_path: object = "") -> str:
     normalized = str(value or "").strip().lower().replace("_", "-")
+    if normalized in {"exllama", "exlama", "exllamav3", "exllama-v3", "exllama-v3", "exllama3"}:
+        return "exllama"
     if str(filename or "").strip().lower() == "hf-native":
         return "vllm"
     local = Path(str(local_path or ""))
     if local.is_dir() and not str(filename or "").lower().endswith(".gguf"):
+        # Do not hardcode model names like exl3 here; backend is determined by explicit backend field only
+        # See: keep model-specific names out of generic backend detection to avoid coupling
+        if normalized in {"exllama", "exlama", "exllamav3", "exllama-v3", "exllama-v3", "exllama3"}:
+            return "exllama"
         return "vllm"
     if normalized in {"vllm", "vllm-beta"}:
         return "vllm"
@@ -2258,7 +2264,7 @@ def _replica_gpu_sets(model: ManagedModel, cfg: ReplicaConfig, total_gpus: int |
         base_gpu_count = max(0, _infer_base_gpu_count(model))
         if total <= base_gpu_count:
             return []
-        for start in range(base_gpu_count, total, gpr):
+        for start in range(0, total, gpr):
             gpu_set = list(range(start, min(start + gpr, total)))
             if len(gpu_set) == gpr:
                 sets.append(gpu_set)
@@ -2443,6 +2449,27 @@ def _calculate_llama_swap_matrix(models_info: list[dict]) -> dict[str, object]:
             large_groups.append([l["id"]])
 
             
+    # Group 1-GPU replicas of same base together if GPUs disjoint (exllama)
+    base_to_replicas: dict[str, list[str]] = {}
+    for m in models_info:
+        mid = m["id"]
+        if is_replica_model_id(mid):
+            base_to_replicas.setdefault(replica_base_model_id(mid), []).append(mid)
+    for base, rids in base_to_replicas.items():
+        if len(rids) > 1:
+            gpu_sets = []
+            for rid in rids:
+                mi = next((x for x in models_info if x["id"] == rid), None)
+                gs = set(mi.get("_effective_gpu_set") or set(mi.get("gpu_set") or [])) if mi else set()
+                gpu_sets.append(gs)
+            if len(gpu_sets) == len(rids) and all(gpu_sets[i].isdisjoint(gpu_sets[j]) for i in range(len(gpu_sets)) for j in range(i + 1, len(gpu_sets))):
+                for group in large_groups:
+                    for rid in rids:
+                        if rid in group:
+                            group.remove(rid)
+                large_groups = [g for g in large_groups if g]
+                large_groups.append(list(rids))
+
     # Final sets: each large group + all packables
 
     matrix_sets = {}
@@ -2513,9 +2540,23 @@ def render_llamaswap_config(
         # intentionally reference the same GGUF but publish distinct model ids.
         use_model = m
 
+        engine = str((getattr(use_model, "server_overrides", {}) or {}).get("engine") or "").strip().lower().replace("_", "-")
+        if engine in {"exllamav3", "exllama-v3", "exllama3"}:
+            engine = "exllama"
+        effective_server_path = server_path
+        if engine == "beellama":
+            candidate = Path(server_path).parent / "beellama" / "bin" / "llama-server-beellama"
+            if candidate.exists():
+                effective_server_path = str(candidate)
+                print(f"[beellama] {use_model.model_id} -> {effective_server_path}", flush=True)
+        elif engine == "exllama":
+            candidate = Path(server_path).parent / "exllama" / "bin" / "llama-server-exllama"
+            if candidate.exists():
+                effective_server_path = str(candidate)
+                print(f"[exllama] {use_model.model_id} -> {effective_server_path}", flush=True)
         cmd = build_llama_server_command(
             use_model,
-            server_path,
+            effective_server_path,
             port="${PORT}",
             server_defaults=resolved_defaults,
             vllm_defaults=resolved_vllm_defaults,
@@ -2644,9 +2685,22 @@ def ensure_replica_route_in_llamaswap_config(
     if rid not in models:
         replica = build_replica_model(base_model, replica_index, gpu_set)
         resolved_defaults = normalize_server_overrides(server_defaults or resolve_llama_server_defaults())
+        replica_engine = str((getattr(replica, "server_overrides", {}) or {}).get("engine") or "").strip().lower().replace("_", "-")
+        if replica_engine in {"exllamav3", "exllama-v3", "exllama3"}:
+            replica_engine = "exllama"
+        effective_replica_server_path = Path(server_path)
+        if replica_engine == "beellama":
+            cand = Path(server_path).parent / "beellama" / "bin" / "llama-server-beellama"
+            if cand.exists():
+                effective_replica_server_path = cand
+        elif replica_engine == "exllama":
+            cand = Path(server_path).parent / "exllama" / "bin" / "llama-server-exllama"
+            if cand.exists():
+                effective_replica_server_path = cand
+                print(f"[exllama] {replica.model_id} -> {effective_replica_server_path}", flush=True)
         cmd = build_llama_server_command(
             replica,
-            Path(server_path),
+            Path(effective_replica_server_path),
             port="${PORT}",
             server_defaults=resolved_defaults,
             vllm_defaults=resolve_vllm_defaults(),
@@ -3612,9 +3666,9 @@ def build_llama_server_command(
         # >100 GiB on a single GPU and make llama-server exit during load.
         # Keep an explicit per-model override for advanced manual testing.
         effective.pop("swa_full", None)
-    # Replica orchestration config is consumed by the Heimdall Gateway proxy/config
-    # renderer and must never be forwarded as a llama-server CLI flag.
     effective.pop("replicas", None)
+    effective.pop("placement", None)
+    _engine = str(effective.pop("engine", None) or "").strip().lower().replace("_", "-")
     effective.pop("auto_performance", None)
     effective.pop("__family_defaults", None)
     # speculative_defaults is internal config for orchestration, not a
@@ -3630,6 +3684,11 @@ def build_llama_server_command(
     # flags and must not leak into the command line.
     for _sk in ("enabled", "id_prefix", "allow_multiple_variants"):
         effective.pop(_sk, None)
+    # cache_quant is exllama-specific (handled by exllama_server.py -cq flag),
+    # not a llama-server flag. Pop for llama-server builds; for exllama,
+    # emit it so the wrapper picks it up via parse_known_args.
+    if _engine not in {"exllama", "exllamav3", "exllama-v3", "exllama3"}:
+        effective.pop("cache_quant", None)
 
     # Internal escape hatch for generated replicas: tensor_split must be relative
     # to CUDA_VISIBLE_DEVICES, not normalized against all host GPUs.
@@ -4415,6 +4474,18 @@ _VALID_CACHE_TYPES = {
     "iq4_nl",
     "q5_0",
     "q5_1",
+    "kvarn2",
+    "kvarn3",
+    "kvarn4",
+    "kvarn5",
+    "kvarn6",
+    "kvarn8",
+    "karn2",
+    "karn3",
+    "karn4",
+    "karn5",
+    "karn6",
+    "karn8",
 }
 
 
@@ -4795,13 +4866,19 @@ def select_replica_for_request(
             REPLICA_ROUTER_STATE.affinity[affinity_key] = (mapped_response_replica, now + cfg.sticky_ttl_s)
             return mapped_response_replica, affinity_key, True
         if bound and bound[1] > now and bound[0] in replica_ids:
-            return bound[0], affinity_key, True
+            bound_rec = REPLICA_ROUTER_STATE.records.get(bound[0])
+            if not dynamic_routes_enabled or bound_rec is None or bound_rec.in_flight <= 0:
+                return bound[0], affinity_key, True
         if bound and bound[1] > now and bound[0] == base_model.model_id:
-            return base_model.model_id, affinity_key, False
+            if dynamic_routes_enabled:
+                pass
+            else:
+                return base_model.model_id, affinity_key, False
         if REPLICA_ROUTER_STATE.base_in_flight.get(base_model.model_id, 0) <= 0:
-            REPLICA_ROUTER_STATE.affinity[affinity_key] = (base_model.model_id, now + cfg.sticky_ttl_s)
-            log_api_event("replica_base_selected_idle", {"model": base_model.model_id, "affinity_key": affinity_key})
-            return base_model.model_id, affinity_key, False
+            if not dynamic_routes_enabled:
+                REPLICA_ROUTER_STATE.affinity[affinity_key] = (base_model.model_id, now + cfg.sticky_ttl_s)
+                log_api_event("replica_base_selected_idle", {"model": base_model.model_id, "affinity_key": affinity_key})
+                return base_model.model_id, affinity_key, False
         candidates = [
             REPLICA_ROUTER_STATE.records[rid]
             for rid in replica_ids
@@ -7578,9 +7655,10 @@ def get_llama_server_processes() -> list[dict]:
         server_arg_index = next(
             (
                 idx for idx, arg in enumerate(argv)
-                if Path(str(arg)).name == "llama-server"
+                if "llama-server" in Path(str(arg)).name
                 or str(arg) in {"vllm-server", "vllm.entrypoints.openai.api_server"}
                 or str(arg).endswith("vllm.entrypoints.openai.api_server")
+                or "llama-server" in str(arg)
             ),
             None,
         )

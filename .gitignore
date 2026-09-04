@@ -35,3 +35,6 @@ uv.lock
 # Debug output logs
 debug_log*.txt
 *.debug.log
+
+# No ignorar histórico curado de configs
+!configs/history/
