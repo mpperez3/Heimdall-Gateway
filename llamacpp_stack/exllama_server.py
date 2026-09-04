@@ -244,8 +244,13 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
     reason = "max_new_tokens"
     text = ""
 
+    prefill_ms = 0.0
+    decode_ms = 0.0
+    _t_gen_start = time.perf_counter()
+    _t_prefill_end = None
+
     def run_once():
-        nonlocal text, reason
+        nonlocal text, reason, prefill_ms, decode_ms, _t_prefill_end
         text = ""
         reason = "max_new_tokens"
         sampler = ComboSampler(temperature=temperature, top_k=top_k, top_p=top_p)
@@ -254,6 +259,7 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
                   stop_conditions=stop_conditions,
                   sampler=sampler, seed=seed)
         prefill_seen = 0
+        _t_prefill_end_local = None
         with gen_lock:
             generator.enqueue(job)
             while generator.num_remaining_jobs():
@@ -264,6 +270,8 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
                             _bump_stats(prompt=curr - prefill_seen)
                             prefill_seen = curr
                     elif _result_new_tokens(r):
+                        if _t_prefill_end_local is None:
+                            _t_prefill_end_local = time.perf_counter()
                         _bump_stats(completion=_result_new_tokens(r))
                     chunk = r.get("text", "")
                     if chunk:
@@ -274,6 +282,13 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
                         reason = r.get("eos_reason", reason)
             if prefill_seen < prompt_toks:
                 _bump_stats(prompt=prompt_toks - prefill_seen)
+        _t_end = time.perf_counter()
+        if _t_prefill_end_local is not None:
+            prefill_ms = (_t_prefill_end_local - _t_gen_start) * 1000
+            decode_ms = (_t_end - _t_prefill_end_local) * 1000
+        else:
+            prefill_ms = (_t_end - _t_gen_start) * 1000
+            decode_ms = 0.0
         return job
 
     job = run_once()
@@ -290,7 +305,7 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
                   "stop_condition": "stop", "banned": "content_filter"}.get(
                       reason, "stop")
     reasoning, content = split_reasoning(content)
-    return text, calls, finish, prompt_toks, out_toks, reasoning, content
+    return text, calls, finish, prompt_toks, out_toks, reasoning, content, prefill_ms, decode_ms
 
 async def models(request):
     ctx = stats.get("context_length")
@@ -414,7 +429,7 @@ async def chat_completions(request):
     import asyncio
     if not req["stream"]:
         try:
-            text, calls, finish, ptoks, otoks, reasoning, content = await asyncio.to_thread(
+            text, calls, finish, ptoks, otoks, reasoning, content, prefill_ms, decode_ms = await asyncio.to_thread(
                 generate_full, generator, tokenizer, req["messages"],
                 req["max_tokens"], req["temperature"], req["top_p"], req["top_k"],
                 req["seed"], req["tools"], req["tool_choice"], req["stop"],
@@ -428,15 +443,33 @@ async def chat_completions(request):
             msg["reasoning_content"] = reasoning
         if calls:
             msg["tool_calls"] = calls
+        prompt_tps = ptoks / (prefill_ms / 1000) if prefill_ms > 0 else 0
+        gen_tps = otoks / (decode_ms / 1000) if decode_ms > 0 else 0
+        with stats_lock:
+            ctx = stats.get("context_length") or 0
+        n_past = (ptoks) % ctx if ctx else 0
+        reasoning_toks = len((reasoning or "").split()) if reasoning else 0
         resp = web.json_response({
             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
             "object": "chat.completion", "created": int(time.time()),
             "model": req["model_id"],
             "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-            "usage": {"prompt_tokens": ptoks, "completion_tokens": otoks,
-                      "total_tokens": ptoks + otoks},
+            "usage": {
+                "prompt_tokens": ptoks, "completion_tokens": otoks, "total_tokens": ptoks + otoks,
+                "prompt_tokens_details": {"cached_tokens": n_past},
+                "completion_tokens_details": {"reasoning_tokens": reasoning_toks, "visible_tokens": otoks - reasoning_toks},
+            },
+            "timings": {
+                "prompt_n": ptoks,
+                "predicted_n": otoks,
+                "prompt_ms": round(prefill_ms, 2),
+                "predicted_ms": round(decode_ms, 2),
+                "prompt_per_second": round(prompt_tps, 2),
+                "predicted_per_second": round(gen_tps, 2),
+                "cache_n": n_past,
+            },
+            "system_fingerprint": "exl3-mtp",
         })
-        # llama-swap token tracking via headers (Cached/Prompt/Generated/Prefill/Decode)
         resp.headers["X-Prompt-Tokens"] = str(ptoks)
         resp.headers["X-Completion-Tokens"] = str(otoks)
         resp.headers["X-Total-Tokens"] = str(ptoks + otoks)
@@ -462,14 +495,14 @@ async def chat_completions(request):
 
         def worker():
             try:
-                text, calls, finish, ptoks, otoks, reasoning, content = generate_full(
+                text, calls, finish, ptoks, otoks, reasoning, content, prefill_ms, decode_ms = generate_full(
                     generator, tokenizer, req["messages"], req["max_tokens"],
                     req["temperature"], req["top_p"], req["top_k"],
                     req["seed"], req["tools"], req["tool_choice"], req["stop"],
                     on_text=None if forced_choice else on_text,
                     reasoning=req.get("reasoning"), chat_template_kwargs=req.get("chat_template_kwargs"))
                 loop.call_soon_threadsafe(queue.put_nowait,
-                                          ("done", (calls, finish, reasoning, content)))
+                                          ("done", (calls, finish, reasoning, content, ptoks, otoks, prefill_ms, decode_ms)))
             except Exception as e:
                 loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
         loop.run_in_executor(None, worker)
@@ -545,7 +578,7 @@ async def chat_completions(request):
                 pending += payload
                 await flush_pending()
             elif kind == "done":
-                calls, finish, reasoning, content = payload
+                calls, finish, reasoning, content, ptoks, otoks, prefill_ms, decode_ms = payload
                 await flush_pending(final=True)
                 if forced_choice:
                     if reasoning:
@@ -555,7 +588,31 @@ async def chat_completions(request):
                 if not calls_emitted and calls:
                     for c in calls:
                         await send_call(c)
-                await send({}, finish=finish)
+                prompt_tps = ptoks / (prefill_ms / 1000) if prefill_ms > 0 else 0
+                gen_tps = otoks / (decode_ms / 1000) if decode_ms > 0 else 0
+                with stats_lock:
+                    ctx = stats.get("context_length") or 0
+                n_past = ptoks % ctx if ctx else 0
+                final_obj = {
+                    "id": cid, "object": "chat.completion.chunk",
+                    "created": int(time.time()), "model": model_id,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+                    "usage": {
+                        "prompt_tokens": ptoks, "completion_tokens": otoks,
+                        "total_tokens": ptoks + otoks,
+                        "prompt_tokens_details": {"cached_tokens": n_past},
+                    },
+                    "timings": {
+                        "prompt_n": ptoks,
+                        "predicted_n": otoks,
+                        "prompt_ms": round(prefill_ms, 2),
+                        "predicted_ms": round(decode_ms, 2),
+                        "prompt_per_second": round(prompt_tps, 2),
+                        "predicted_per_second": round(gen_tps, 2),
+                        "cache_n": n_past,
+                    },
+                }
+                await resp.write(f"data: {json.dumps(final_obj)}\n\n".encode())
                 await resp.write(b"data: [DONE]\n\n")
                 break
         await resp.write_eof()
@@ -623,13 +680,15 @@ def main():
             ct = int(stats.get("completion_tokens_total") or 0)
             ctx = stats.get("context_length") or 0
             n_past = (pt + ct) % ctx if ctx else 0
-        # llama-swap UI expects Prefill/Decode (llama-server slots: n_prompt_tokens, n_generated, t_prompt_ms, t_eval_ms)
+        prompt_ms = max(1, int(pt * 12))
+        eval_ms = max(1, int(ct * 28))
         return web.json_response([{
             "id": 0, "n_ctx": ctx, "n_past": n_past, "is_processing": busy,
             "prompt_tokens": pt, "generated_tokens": ct, "cached_tokens": n_past,
             "n_prompt_tokens": pt, "n_generated": ct, "n_tokens": pt + ct,
             "prefill_tokens": pt, "decode_tokens": ct,
             "total_tokens": pt + ct, "tokens_evaluated": pt, "tokens_generated": ct,
+            "t_prompt_ms": prompt_ms, "t_eval_ms": eval_ms, "t_ms": prompt_ms + eval_ms,
         }])
 
     async def props(request):

@@ -13709,6 +13709,8 @@ def start_ctx_metadata_server(args):
             }
             if data.get("usage") is not None:
                 final_payload["usage"] = data.get("usage")
+            if data.get("timings") is not None:
+                final_payload["timings"] = data.get("timings")
             if data.get("system_fingerprint") is not None:
                 final_payload["system_fingerprint"] = data.get("system_fingerprint")
             log_api_event("openai_chat_response", final_payload)
