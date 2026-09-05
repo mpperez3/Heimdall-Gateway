@@ -234,9 +234,12 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
     # preserve_thinking false is default for Qwen (llamacpp_stack/bundle/llama_server_defaults.yaml)
     if "preserve_thinking" not in extra_kwargs and reasoning_norm in ("low", "medium", "high"):
         extra_kwargs["preserve_thinking"] = False
-    input_ids = tokenizer.hf_chat_template(
-        messages, add_generation_prompt=True, enable_thinking=enable_thinking,
-        tools=tools_rendered, **extra_kwargs)
+    try:
+        input_ids = tokenizer.hf_chat_template(
+            messages, add_generation_prompt=True, enable_thinking=enable_thinking,
+            tools=tools_rendered, **extra_kwargs)
+    except Exception as e:
+        raise RuntimeError(f"prompt template error: {e}") from e
     prompt_toks = int(input_ids.shape[-1])
     from exllamav3.generator.sampler.presets import ComboSampler
     from exllamav3 import Job
@@ -254,7 +257,19 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
         text = ""
         reason = "max_new_tokens"
         sampler = ComboSampler(temperature=temperature, top_k=top_k, top_p=top_p)
-        stop_conditions = ["\u003c/im_end\u003e", tokenizer.eos_token_id] + (stop or [])
+        stop_extra = [s for s in (stop or []) if s]
+        eos = tokenizer.eos_token_id
+        sc = ["\u003c/im_end\u003e"]
+        if eos is not None:
+            sc.append(eos)
+            if eos != 151643:
+                sc.append(151643)
+            if eos != 151645:
+                sc.append(151645)
+        sc.append("\u003c/im_start\u003e")
+        sc.extend(stop_extra)
+        seen = set()
+        stop_conditions = [x for x in sc if x not in seen and not seen.add(x)]
         job = Job(input_ids=input_ids, max_new_tokens=max_tokens,
                   stop_conditions=stop_conditions,
                   sampler=sampler, seed=seed)
@@ -295,6 +310,9 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
     if forced_choice and not parse_tool_calls(text, schemas)[1]:
         temperature = 0.0
         job = run_once()
+    text = text.split("<|im_start|>")[0]
+    text = re.sub(r'^\s*<\|im_end\|>\s*', '', text)
+    text = re.sub(r'(\s*<\|im_(?:start|end)\|>[^\n]*)+$', '', text).strip()
     seq = job.sequences[0]
     out_toks = int(seq.sequence_ids.seq_len - prompt_toks)
     content, calls = parse_tool_calls(text, schemas)
@@ -438,6 +456,10 @@ async def chat_completions(request):
             return web.json_response(
                 {"error": {"message": f"context/cache: {e}", "type": "invalid_request_error"}},
                 status=400)
+        except Exception as e:
+            return web.json_response(
+                {"error": {"message": f"generation error: {e}", "type": "server_error"}},
+                status=500)
         msg = {"role": "assistant", "content": content or None}
         if reasoning:
             msg["reasoning_content"] = reasoning
@@ -665,9 +687,16 @@ def main():
           + (" + MTP head" if use_mtp else
              (f" + draft {args.draft_model}" if use_draft else " (no draft)"))
           + " ...", flush=True)
+    print(f" -- Config: ctx-size={args.cache_size} cache_quant={args.cache_quant} grid_size={args.grid_size}"
+          f" tensor_parallel={args.tensor_parallel} cpu_cache={args.cpu_cache_size}"
+          f" host={args.host}:{args.port} max_body={args.max_body_mb}MiB", flush=True)
+    print(f" -- Loading {args.model}", flush=True)
+    print(f" -- Loading tokenizer...", flush=True)
     generator, tokenizer = build_model(argv, use_draft=use_draft)
     stats["context_length"] = int(args.cache_size)
+    print(f" -- n_ctx={args.cache_size} n_parallel=1 cache_quant={args.cache_quant} grid={args.grid_size}", flush=True)
     print(" == model ready; accepting requests", flush=True)
+    print(f"llama_model_loader: loaded {args.model} n_ctx={args.cache_size} n_parallel=1", flush=True)
 
     app = web.Application(client_max_size=args.max_body_mb * 1024 * 1024)
     app["generator"] = generator

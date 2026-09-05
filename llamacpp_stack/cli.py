@@ -4731,7 +4731,22 @@ def resolve_request_affinity_key(model_name: str, payload: dict, headers) -> str
             return f"{model_name}:response:{previous_response_id}"
     if session:
         return f"{model_name}:session:{session}:agent:{agent}"
-    return f"{model_name}:fallback:{_message_text_fingerprint(payload)}"
+    # Fallback uses stable system/agent fingerprint plus first user message only;
+    # hashing messages[:3] changes every turn and breaks KV cache affinity.
+    first_user = ""
+    for m in (payload.get("messages") or []):
+        if isinstance(m, dict) and str(m.get("role") or "").lower() == "user":
+            c = m.get("content")
+            if isinstance(c, str):
+                first_user = c[:500]
+            elif isinstance(c, list):
+                first_user = " ".join(str(p.get("text") or "") for p in c if isinstance(p, dict))[:500]
+            if first_user.strip():
+                break
+    if first_user.strip():
+        first_hash = hashlib.sha256(first_user.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        return f"{model_name}:fallback:{agent}:{first_hash}"
+    return f"{model_name}:fallback:{agent}"
 
 
 def is_fallback_affinity_key(affinity_key: str) -> bool:
@@ -4866,9 +4881,7 @@ def select_replica_for_request(
             REPLICA_ROUTER_STATE.affinity[affinity_key] = (mapped_response_replica, now + cfg.sticky_ttl_s)
             return mapped_response_replica, affinity_key, True
         if bound and bound[1] > now and bound[0] in replica_ids:
-            bound_rec = REPLICA_ROUTER_STATE.records.get(bound[0])
-            if not dynamic_routes_enabled or bound_rec is None or bound_rec.in_flight <= 0:
-                return bound[0], affinity_key, True
+            return bound[0], affinity_key, True
         if bound and bound[1] > now and bound[0] == base_model.model_id:
             if dynamic_routes_enabled:
                 pass
@@ -10984,12 +10997,17 @@ def _chat_completion_state_from_sse_lines(lines: list[bytes]) -> dict[str, objec
     tool_call_chunks = 0
     finish_reason = ""
     tool_calls_by_index: dict[str, dict[str, object]] = {}
+    upstream_error: str = ""
     for line in lines:
         if not line or not line.startswith(b"data: ") or line == b"data: [DONE]":
             continue
         try:
             chunk_data = json.loads(line[6:].decode("utf-8", errors="ignore"))
         except Exception:
+            continue
+        error_obj = chunk_data.get("error")
+        if isinstance(error_obj, dict) and error_obj.get("message"):
+            upstream_error = str(error_obj.get("message") or "")
             continue
         choice0 = (chunk_data.get("choices") or [{}])[0]
         delta = choice0.get("delta", {}) or {}
@@ -11044,6 +11062,7 @@ def _chat_completion_state_from_sse_lines(lines: list[bytes]) -> dict[str, objec
         "tool_calls": tool_calls_out,
         "tool_call_chunks": tool_call_chunks,
         "finish_reason": finish_reason,
+        "upstream_error": upstream_error,
     }
 
 
@@ -11212,6 +11231,7 @@ def _buffer_openai_chat_sse_with_keepalive(
         "tool_argument_tail_by_index": {},
         "buffer_abort_reason": "",
         "_loop_text_tail": "",
+        "upstream_error": "",
     }
     tool_argument_parts_by_index: dict[str, list[str]] = {}
 
@@ -11249,6 +11269,14 @@ def _buffer_openai_chat_sse_with_keepalive(
         try:
             chunk_data = json.loads(line[6:].decode("utf-8", errors="ignore"))
         except Exception:
+            return
+        error_obj = chunk_data.get("error")
+        if isinstance(error_obj, dict) and error_obj.get("message"):
+            state["upstream_error"] = str(error_obj.get("message") or "")
+            log_api_event("openai_chat_upstream_sse_error", {
+                "request_id": request_id,
+                "error": state["upstream_error"],
+            })
             return
         choice0 = (chunk_data.get("choices") or [{}])[0]
         delta = choice0.get("delta", {}) or {}
@@ -11328,6 +11356,8 @@ def _buffer_openai_chat_sse_with_keepalive(
         return True
 
     def should_passthrough() -> bool:
+        if state.get("upstream_error"):
+            return False
         if int(state.get("tool_call_chunks") or 0) > 0:
             if passthrough_tool_calls:
                 state["passthrough_reason"] = "tool_call_seen"
@@ -13378,6 +13408,20 @@ def start_ctx_metadata_server(args):
                         finally:
                             current_response.close()
                         stream_state = _chat_completion_state_from_sse_lines(buffered_lines)
+                        if stream_state.get("upstream_error"):
+                            err_msg = str(stream_state.get("upstream_error") or "upstream error")
+                            log_api_event("openai_chat_upstream_error_in_stream", {
+                                "request_id": request_id,
+                                "model": model_name,
+                                "upstream_model": upstream_model_name,
+                                "error": err_msg,
+                                "repair_round": stream_repair_round_used,
+                            })
+                            if upstream_model_name:
+                                REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
+                            _finish_openai_chat_request()
+                            _send_openai_chat_sse_error(self, f"upstream error: {err_msg}")
+                            return
                         trigger_reason = _chat_tool_continue_trigger_reason(
                             stream_state.get("content"),
                             stream_state.get("tool_calls"),
