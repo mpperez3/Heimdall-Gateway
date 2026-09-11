@@ -95,7 +95,20 @@ heimdall-gateway info 2>&1 | head -n 80 || echo "gateway no instalado"
 ```
 .
 ├── llamacpp_stack/          # Paquete principal (heimdall-gateway)
-│   ├── cli.py               # CLI y help epilog
+│   ├── cli.py               # Shim <400 líneas — solo re-exports desde cli/* (sin lógica duplicada)
+│   ├── cli/                 # Paquete modularizado (env, constants, models, parser, replica, server_commands, gateway, daemon)
+│   │   ├── __init__.py      # Re-exports lazy + _CliPackageModule compat (from cli import X y from cli.parser import X)
+│   │   ├── constants.py     # PRODUCT_NAME/SLUG, DEFAULT_*_PATH, puertos, tensor_split
+│   │   ├── env.py           # _load_installed_env, _env_path/value, _is_vllm_backend
+│   │   ├── models.py        # ManagedModel, ReplicaConfig/Record, ProbeTraceMetrics, Spinner
+│   │   ├── parser.py        # build_cli_parser, parse_cli_args, HelpFormatter
+│   │   ├── replica.py       # replica matrix, render_llamaswap_config
+│   │   ├── server_commands.py # build_llama/vllm_server_command, normalize_server_overrides
+│   │   ├── gateway.py       # dedup, Responses proxy, tool-repair, manager_hint
+│   │   ├── crash_bundle.py  # collector crash-bundle (502/unload/guard/socket) todos motores, caps journal 12k/nvidia 2k
+│   │   ├── raw_log.py       # raw ring api-raw-requests.log últimas 10 (1 MiB cap, fallback /tmp)
+│   │   └── daemon.py        # daemon_mode, auto-watch, build_info_text, show_info
+│   ├── _cli_impl.py         # Implementación legacy completa (20k líneas) — fallback para símbolos aún no extraídos
 │   ├── install.py           # Instalador user/system, prompts, resolve_* (fuente de verdad)
 │   ├── llamacpp_api_install.py  # Entry point `heimdall-gateway`
 │   ├── command_router.py    # Ruteo API -> llama-swap
@@ -132,7 +145,8 @@ Ficheros de **instalación real** (no editar `config.yaml` a mano):
 | Catálogo modelos | `~/.local/state/heimdall-gateway/catalog.json` | `/var/lib/heimdall-gateway/catalog.json` |
 | Runtime generado | `~/.local/state/heimdall-gateway/config.yaml` | `/var/lib/heimdall-gateway/config.yaml` |
 | Env wrappers | `~/.config/heimdall-gateway/heimdall-gateway.env` | `/etc/heimdall-gateway/heimdall-gateway.env` |
-| Request log | `~/.local/state/heimdall-gateway/api-requests.log` | `/var/lib/heimdall-gateway/api-requests.log` |
+| Request log (rotado diario, split, 3 días) | `~/.local/state/heimdall-gateway/api-requests.log.YYYY-MM-DD[.partN]` + symlink `api-requests.log` → día activo; prune 3 días; fallback `/tmp` | `/var/lib/heimdall-gateway/api-requests.log.YYYY-MM-DD[.partN]` |
+| Raw ring (últimas 10 sin procesar) | `~/.local/state/heimdall-gateway/api-raw-requests.log` (fallback `/tmp/heimdall-gateway-api-raw-requests.log`, 1 MiB cap) | `/var/lib/heimdall-gateway/api-raw-requests.log` |
 
 ---
 
@@ -272,8 +286,8 @@ docker compose -f docker-compose-vllm.yaml up --build
 
 ## 11. Troubleshooting (resumen)
 
-- **API 502 / Connection refused :11436**: `llama-server` crasheó en load (OOM, ctx excesivo, draft MTP incompatible). `uv run heimdall-gateway logs --lines 200 --journal` + `nvidia-smi`.
-- **Setting no visible**: confirmar `info` muestra el `mode` correcto, luego `config-migrate && update && restart`.
+- **API 502 / Connection refused :11436**: `llama-server` crasheó en load (OOM, ctx excesivo, draft MTP incompatible). Buscar `bundle_ref` en JSON 502 y `*_with_bundle` en log rotado `api-requests.log.YYYY-MM-DD[.partN]`; `uv run heimdall-gateway logs --lines 200 --journal` trae journal + hint `nvidia-smi`; raw body de últimas 10 sin procesar en `api-raw-requests.log` (ring 1 MiB cap, fallback `/tmp`).
+- **Setting no visible**: confirmar `info` muestra el `mode` correcto, luego `config-migrate && update && restart`. `config-migrate` añade `logging.requests_log` con defaults si falta, nunca sobrescribe valores existentes, segunda pasada idempotente.
 - **GPU equivocada**: inspeccionar `CUDA_VISIBLE_DEVICES`/`--device`/`--tensor-split` en `ps`/`logs`.
 - **Contexto pequeño en cliente**: `curl /v1/models | jq` tiene el real; el cliente puede tener metadata cacheada.
 

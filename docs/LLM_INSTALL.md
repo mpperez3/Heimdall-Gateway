@@ -170,11 +170,15 @@ curl -s http://127.0.0.1:11435/v1/models | jq '.data[] | {id, context_length}'
 curl -s http://127.0.0.1:11436/v1/models | jq '.data | length'
 curl -s http://127.0.0.1:11435/api/replicas | jq .
 
-# 5.4 Logs si algo falla
+# 5.4 Logs si algo falla (rotación 3 días + split + raw ring)
 heimdall-gateway logs --lines 200 --journal
 heimdall-gateway requests --lines 200
 journalctl --user -u heimdall-gateway-manager -n 100 --no-pager
 journalctl --user -u heimdall-gateway-router -n 100 --no-pager
+
+# Rotación: api-requests.log.YYYY-MM-DD[.partN] (split por max_bytes, prune >retain_days=3, symlink api-requests.log → día activo)
+# Env vars: HEIMDALL_GATEWAY_REQUESTS_LOG_PATH > conf.json logging.requests_log.path > DEFAULT; MAX_BYTES/RETAIN_DAYS vía env o conf.json (clamp 65536-1GiB / 1-30)
+# Raw ring: api-raw-requests.log guarda últimas 10 requests RAW sin procesar (1 MiB cap/request, misma resolución de path, fallback /tmp)
 ```
 
 Si `API status: not reachable`, comprueba `HEIMDALL_GATEWAY_PUBLIC_HOST`/`PORT` en `~/.config/heimdall-gateway/heimdall-gateway.env` y `conf.json`.
@@ -209,14 +213,16 @@ heimdall-gateway run -hf org/base-model:Q4_K_M --speculative -hf org/draft-model
 | Catalogo modelos | `~/.local/state/heimdall-gateway/catalog.json` | `/var/lib/heimdall-gateway/catalog.json` |
 | Runtime generado | `~/.local/state/heimdall-gateway/config.yaml` | `/var/lib/heimdall-gateway/config.yaml` |
 | Env wrappers | `~/.config/heimdall-gateway/heimdall-gateway.env` | `/etc/heimdall-gateway/heimdall-gateway.env` |
-| Request log | `~/.local/state/heimdall-gateway/api-requests.log` | `/var/lib/heimdall-gateway/api-requests.log` |
+| Request log (rotado diario, split, 3 días) | `~/.local/state/heimdall-gateway/api-requests.log.YYYY-MM-DD[.partN]` + symlink `api-requests.log` → día activo; prune 3 días; fallback `/tmp/heimdall-gateway-api-requests.log.YYYY-MM-DD` | `/var/lib/heimdall-gateway/api-requests.log.YYYY-MM-DD[.partN]` |
+| Raw ring (últimas 10 sin procesar) | `~/.local/state/heimdall-gateway/api-raw-requests.log` (fallback `/tmp/heimdall-gateway-api-raw-requests.log`, 1 MiB cap) | `/var/lib/heimdall-gateway/api-raw-requests.log` |
 | Defaults tunables | `llamacpp_stack/bundle/llama_server_defaults.yaml` | mismo |
 
-Editables: `conf.json: llama_server_defaults`, `llama_server_family_defaults`, `replicas`, `experimental`, `api_auth`, `api_https`. Tras editar: `heimdall-gateway config-migrate && heimdall-gateway update && systemctl --user restart ...`
+Editables: `conf.json: llama_server_defaults`, `llama_server_family_defaults`, `replicas`, `experimental`, `api_auth`, `api_https`, `logging.requests_log` (`path`, `max_bytes` 65536-1GiB default 10485760, `retain_days` 1-30 default 3, `compress` bool). Tras editar: `heimdall-gateway config-migrate && heimdall-gateway update && systemctl --user restart ...`
+`config-migrate` añade `logging.requests_log` con defaults si falta y nunca sobrescribe valores existentes; segunda pasada `changed==False` idempotente. `update_config` no reescribe logs. `config-keys` lista `logging`.
 
 ## 8. Errores comunes y que decir al usuario
 
-*   **`502 upstream` / `Connection refused :11436`**: `llama-server` del modelo crasheo en load (OOM, ctx 262k en GPU pequena, draft MTP incompatible). Mira `logs --journal` con el `cmd` completo y `nvidia-smi`. Prueba otro quant o reduce `ctx-size` en `server_overrides`.
+*   **`502 upstream` / `Connection refused :11436`**: `llama-server` del modelo crasheo en load (OOM, ctx 262k en GPU pequena, draft MTP incompatible). Buscar `bundle_ref` en JSON 502 y `*_with_bundle` en log rotado `api-requests.log.YYYY-MM-DD[.partN]` + `api-raw-requests.log` (últimas 10 RAW, 1 MiB cap, fallback `/tmp`). `uv run heimdall-gateway logs --lines 200 --journal` trae journal + `nvidia-smi`. Bundle caps: journal 12k/nvidia 2k/HTTP 4000.
 *   **`model provider failed after retries` (Hermes)**: wrapper generico; ver `requests --lines 200` para `openai_chat_upstream_network_error` / `llamaswap_guard_backend_error`. Casi siempre router caido o modelo no cargado.
 *   **`context shown too small`**: `curl /v1/models | jq` tiene el real; cliente cacheo metadata vieja -> refrescar cliente o `update --auto`.
 *   **`BrokenPipeError` en guard**: cliente cerro stream; no critico.

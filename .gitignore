@@ -36,8 +36,8 @@ uv.lock
 debug_log*.txt
 *.debug.log
 
-# No ignorar histórico curado de configs
-!configs/history/
+# Histórico de configs (snapshots locales, no commitear)
+configs/history/
 /.omo/plans/dedup-inflight-cache.md
 /.omo/run-continuation/ses_12656b7f8ffe5LBUF9ckyxDV8v.json
 /.omo/run-continuation/ses_f7b66ab62ffepsxStlmjaRP9Gk.json

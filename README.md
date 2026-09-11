@@ -238,7 +238,8 @@ them:
 | Model catalog | `~/.local/state/heimdall-gateway/catalog.json` | `/var/lib/heimdall-gateway/catalog.json` |
 | Generated llama-swap config | `~/.local/state/heimdall-gateway/config.yaml` | `/var/lib/heimdall-gateway/config.yaml` |
 | Templates | `~/.config/heimdall-gateway/templates` | `/etc/heimdall-gateway/templates` |
-| Request log | `~/.local/state/heimdall-gateway/api-requests.log` | `/var/lib/heimdall-gateway/api-requests.log` |
+| Request log (rotated daily, split, 3-day retention) | `~/.local/state/heimdall-gateway/api-requests.log.YYYY-MM-DD[.partN]` + symlink `api-requests.log` → active day; prune >3 days; fallback `/tmp` | `/var/lib/heimdall-gateway/api-requests.log.YYYY-MM-DD[.partN]` |
+| Raw ring (last 10 raw) | `~/.local/state/heimdall-gateway/api-raw-requests.log` (fallback `/tmp/heimdall-gateway-api-raw-requests.log`, 1 MiB cap) | `/var/lib/heimdall-gateway/api-raw-requests.log` |
 
 `conf.json` contains global service settings and llama-server defaults.
 `catalog.json` contains the model inventory and per-model overrides.
@@ -487,7 +488,7 @@ $ heimdall-gateway remove-templates
 
 ### API is unavailable or returns 502
 
-Check the two Heimdall services, then inspect the supervisor and request log:
+Check the two Heimdall services, then inspect the supervisor, rotated request log and crash bundle:
 
 ```console
 $ heimdall-gateway info
@@ -497,8 +498,7 @@ $ heimdall-gateway requests --lines 200
 ```
 
 An upstream 502 usually means that the selected model process exited during
-load or became unavailable. The journal contains the original llama-server
-command and stderr; do not diagnose this only from the client-side retry.
+load or became unavailable. Look for `bundle_ref` in the 502 JSON and `*_with_bundle` in the rotated log `api-requests.log.YYYY-MM-DD[.partN]`; `logs --journal` includes journal tail + `nvidia-smi` hint (caps 12k/2k); raw bodies of last 10 requests are in `api-raw-requests.log` (ring 1 MiB cap, fallback `/tmp`). Do not diagnose only from the client-side retry.
 
 ### A changed setting is not visible
 
@@ -510,6 +510,8 @@ $ heimdall-gateway config-migrate
 $ heimdall-gateway update
 $ heimdall-gateway info
 ```
+
+`config-migrate` adds `logging.requests_log` (`path`, `max_bytes` 65536-1GiB default 10485760, `retain_days` 1-30 default 3, `compress` bool) with defaults when missing and never overwrites existing values; second pass is idempotent (`changed==False`). `update` does not rewrite log files. Verify with `heimdall-gateway config-keys --format json | grep -q logging`.
 
 Do not edit the generated `config.yaml` as the long-term fix: the next update
 will regenerate it from `conf.json` and `catalog.json`.

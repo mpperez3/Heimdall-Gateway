@@ -376,6 +376,61 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
     return cfg
 
 
+def _default_requests_log_config() -> dict[str, object]:
+    return {"path": "", "max_bytes": 10485760, "retain_days": 3, "compress": False}
+
+
+def _normalize_requests_log_config(raw: object) -> dict[str, object]:
+    defaults = _default_requests_log_config()
+    if not isinstance(raw, dict):
+        return dict(defaults)
+    normalized: dict[str, object] = {}
+    raw_path = raw.get("path", "")
+    if not isinstance(raw_path, str):
+        raw_path = str(raw_path or "")
+    normalized["path"] = str(raw_path).strip()
+    def _clamp_int(key: str, default: int, min_v: int, max_v: int) -> None:
+        if key not in raw:
+            normalized[key] = default
+            return
+        raw_val = raw.get(key)
+        try:
+            if isinstance(raw_val, bool):
+                raise ValueError("bool not allowed")
+            if isinstance(raw_val, str):
+                iv = int(raw_val.strip())
+            else:
+                iv = int(raw_val)  # type: ignore[arg-type]
+        except Exception:
+            normalized[key] = default
+            return
+        normalized[key] = max(min_v, min(max_v, iv))
+    _clamp_int("max_bytes", 10485760, 65536, 1073741824)
+    _clamp_int("retain_days", 3, 1, 30)
+    if "compress" not in raw:
+        normalized["compress"] = False
+    else:
+        raw_c = raw.get("compress")
+        if isinstance(raw_c, bool):
+            normalized["compress"] = raw_c
+        elif isinstance(raw_c, str):
+            lowered = raw_c.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                normalized["compress"] = True
+            elif lowered in {"0", "false", "no", "off"}:
+                normalized["compress"] = False
+            else:
+                normalized["compress"] = False
+        elif isinstance(raw_c, int):
+            normalized["compress"] = bool(raw_c)
+        else:
+            normalized["compress"] = False
+    for k in defaults:
+        if k not in normalized:
+            normalized[k] = defaults[k]
+    return normalized
+
+
 def _default_api_auth_config() -> dict[str, object]:
     return {"enabled": False, "api_key": ""}
 
@@ -473,6 +528,14 @@ def _normalize_server_config_payload(payload: dict[str, object]) -> dict[str, ob
     result["experimental"] = _normalize_experimental_config(result.get("experimental"))
     result["api_auth"] = _normalize_api_auth_config(result.get("api_auth"))
     result["api_https"] = _normalize_api_https_config(result.get("api_https"))
+    raw_logging = result.get("logging") if isinstance(result.get("logging"), dict) else {}
+    raw_req = raw_logging.get("requests_log") if isinstance(raw_logging, dict) else None
+    norm_req = _normalize_requests_log_config(raw_req)
+    result["logging"] = {"requests_log": norm_req}
+    if isinstance(raw_logging, dict):
+        for k, v in raw_logging.items():
+            if k != "requests_log" and k not in result["logging"]:
+                result["logging"][k] = v
     result.setdefault("api_ctx_factor", 0.5)
     result.setdefault("idle_ttl", DEFAULT_IDLE_TTL)
     _ensure_server_config_metadata(result)
@@ -4055,9 +4118,26 @@ def wait_for_manager_socket(layout: InstallLayout, dry_run: bool, timeout_second
             except OSError:
                 pass
         time.sleep(0.25)
+    try:
+        from llamacpp_stack.cli.crash_bundle import collect_engine_crash_bundle as _collect_sock  # type: ignore
+
+        _bundle_sock = _collect_sock("manager", port=None, pid=None, cmdline=None, returncode=None, timeout_s=8.0)
+    except Exception as _be:
+        _bundle_sock = {"engine": "manager", "pid": None, "port": None, "cmdline": f"unavailable: {type(_be).__name__}", "returncode": None, "journal_router_tail": f"unavailable: {type(_be).__name__}", "journal_manager_tail": f"unavailable: {type(_be).__name__}", "nvidia_smi": f"unavailable: {type(_be).__name__}", "probed_model": ""}
+    try:
+        from llamacpp_stack._cli_impl import log_api_event as _log_sock  # type: ignore
+
+        _log_sock("manager_socket_timeout_with_bundle", {"socket": str(layout.manager_socket), "bundle": _bundle_sock})
+    except Exception:
+        try:
+            from llamacpp_stack.cli.gateway import log_api_event as _log_sock2  # type: ignore
+
+            _log_sock2("manager_socket_timeout_with_bundle", {"socket": str(layout.manager_socket), "bundle": _bundle_sock})
+        except Exception:
+            pass
     print(
         "Warning: manager socket did not become ready after service restart "
-        f"({layout.manager_socket}). Automatic auto-ctx may be skipped for now."
+        f"({layout.manager_socket}). Automatic auto-ctx may be skipped for now. Hint: uv run heimdall-gateway logs --lines 200 --journal"
     )
     return False
 

@@ -1,0 +1,156 @@
+usage: heimdall-gateway [-h] [--models-dir MODELS_DIR] [--config CONFIG]
+                        [--server-config SERVER_CONFIG] [--catalog CATALOG]
+                        [--llama-server LLAMA_SERVER] [--service SERVICE]
+                        [--start-port START_PORT] [--public-host PUBLIC_HOST]
+                        [--public-port PUBLIC_PORT] [--api-port API_PORT]
+                        [--idle-ttl IDLE_TTL]
+                        [--api-ctx-factor API_CTX_FACTOR]
+                        [--flatten | --no-flatten]
+                        {add,run,remove,rm,unload,update,config-migrate,refresh-templates,remove-templates,validate,daemon,debug,auto-performance,list,ps,requests,logs,hacks,info}
+                        ...
+
+Manage GGUF models for llama-swap + llama-server.
+
+positional arguments:
+  {add,run,remove,rm,unload,update,config-migrate,refresh-templates,remove-templates,validate,daemon,debug,auto-performance,list,ps,requests,logs,hacks,info}
+    add                 Register/download model(s)
+    run                 Run chat with a model
+    remove (rm)         Remove model(s) from catalog
+    remove-orphans (clean-orphans, orphans)
+                        Remove model artifacts not referenced by the catalog
+    unload              Unload model(s) from llama-swap
+    update              Refresh model configuration or update dependencies
+    config-migrate      Migrate/canonicalize the global conf.json
+    config-keys         List valid configuration/catalog keys
+    refresh-templates   Scan templates folder and add template-backed model
+                        entries to catalog
+    remove-templates    Remove all template-backed model entries from catalog
+    validate            Probe/validate model ctx
+    daemon              Start manager daemon
+    debug               Start debug mode
+    auto-performance    Run auto-tuner to find best performance config
+    list                List configured models
+    ps                  Alias of list
+    requests            Show recent request logs
+    logs                Show request logs and service journal hints
+    hacks               List llama.cpp source/build/runtime modifications
+    info                Show runtime/system information
+
+options:
+  -h, --help            show this help message and exit
+  --models-dir MODELS_DIR
+  --config CONFIG
+  --server-config SERVER_CONFIG
+  --catalog CATALOG
+  --llama-server LLAMA_SERVER
+  --service SERVICE
+  --start-port START_PORT
+  --public-host PUBLIC_HOST
+  --public-port PUBLIC_PORT
+  --api-port API_PORT
+  --idle-ttl IDLE_TTL
+  --api-ctx-factor API_CTX_FACTOR
+  --flatten, --no-flatten
+                        Flatten Responses-native tools (namespaces) to
+                        standard function tools. (default: None)
+
+Command guide:
+  add [repo ...] [-hf HF ...] [--auto|--skip-ctx]
+    Register/download one or more models into the catalog.
+    Example: heimdall-gateway add -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M
+  run [repo|-hf HF] [--auto] [--no-chat]
+    Ensure model exists and start chat (or only preload with --no-chat).
+    Example: heimdall-gateway run -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M --auto
+    Pair example: heimdall-gateway run -hf org/master:Q4 --speculative -hf org/draft:IQ1
+  remove [repo ...|-hf HF ...] [--keep-files]
+    Remove models from config/catalog and delete files by default.
+    Example: heimdall-gateway remove qwen2.5-32b-instruct-q4_k_m
+  rm [repo ...|-hf HF ...] [--keep-files]
+    Alias of remove (also deletes model files by default).
+    Example: heimdall-gateway rm qwen2.5-32b-instruct-q4_k_m
+  update [repo ...|-hf HF ...] [--auto|--preserve-ctx|--sync-gguf-ctx]
+    Refresh config and optionally re-probe ctx.
+    Example: heimdall-gateway update qwen2.5-32b-instruct-q4_k_m --auto
+  update [--check|--dry-run] [--only DEP ...] [--yes] [--force] [--list]
+    Update registered dependencies (llama.cpp, llama-swap, vLLM, heimdall-gateway, ...).
+    Example: heimdall-gateway update --check
+    Example: heimdall-gateway update --only vllm --yes
+    Example: heimdall-gateway update --list
+  validate [repo|-hf HF] [--auto]
+    Probe/validate a model and context settings before serving.
+    Example: heimdall-gateway validate -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M --auto
+  daemon
+    Start the manager daemon loop (socket/API lifecycle automation).
+    Example: heimdall-gateway daemon
+  list
+    Show configured models (ctx, memory estimate, speed hints).
+    Example: heimdall-gateway list
+  ps
+    Alias view for model table/state (same rendering as list).
+    Example: heimdall-gateway ps
+  requests [-n LINES]
+    Show recent API request log entries.
+    Example: heimdall-gateway requests -n 50 (or heimdall-gateway requests -n 1)
+  logs [-n LINES] [--journal]
+    Show request log and journalctl command/output for crash diagnostics.
+    Example: heimdall-gateway logs -n 200 --journal
+  hacks
+    List source patches, aggressive build flags and runtime safe-mode knobs.
+    Example: heimdall-gateway hacks
+  info
+    Show endpoints, runtime paths, versions, service commands and status.
+    Example: heimdall-gateway info
+  Help     Show options for any command.
+    Example: heimdall-gateway <command> -h
+For endpoints/runtime/service/config details run: heimdall-gateway info
+
+---EPILOG---
+Command guide:
+  add [repo ...] [-hf HF ...] [--auto|--skip-ctx]
+    Register/download one or more models into the catalog.
+    Example: heimdall-gateway add -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M
+  run [repo|-hf HF] [--auto] [--no-chat]
+    Ensure model exists and start chat (or only preload with --no-chat).
+    Example: heimdall-gateway run -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M --auto
+    Pair example: heimdall-gateway run -hf org/master:Q4 --speculative -hf org/draft:IQ1
+  remove [repo ...|-hf HF ...] [--keep-files]
+    Remove models from config/catalog and delete files by default.
+    Example: heimdall-gateway remove qwen2.5-32b-instruct-q4_k_m
+  rm [repo ...|-hf HF ...] [--keep-files]
+    Alias of remove (also deletes model files by default).
+    Example: heimdall-gateway rm qwen2.5-32b-instruct-q4_k_m
+  update [repo ...|-hf HF ...] [--auto|--preserve-ctx|--sync-gguf-ctx]
+    Refresh config and optionally re-probe ctx.
+    Example: heimdall-gateway update qwen2.5-32b-instruct-q4_k_m --auto
+  update [--check|--dry-run] [--only DEP ...] [--yes] [--force] [--list]
+    Update registered dependencies (llama.cpp, llama-swap, vLLM, heimdall-gateway, ...).
+    Example: heimdall-gateway update --check
+    Example: heimdall-gateway update --only vllm --yes
+    Example: heimdall-gateway update --list
+  validate [repo|-hf HF] [--auto]
+    Probe/validate a model and context settings before serving.
+    Example: heimdall-gateway validate -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M --auto
+  daemon
+    Start the manager daemon loop (socket/API lifecycle automation).
+    Example: heimdall-gateway daemon
+  list
+    Show configured models (ctx, memory estimate, speed hints).
+    Example: heimdall-gateway list
+  ps
+    Alias view for model table/state (same rendering as list).
+    Example: heimdall-gateway ps
+  requests [-n LINES]
+    Show recent API request log entries.
+    Example: heimdall-gateway requests -n 50 (or heimdall-gateway requests -n 1)
+  logs [-n LINES] [--journal]
+    Show request log and journalctl command/output for crash diagnostics.
+    Example: heimdall-gateway logs -n 200 --journal
+  hacks
+    List source patches, aggressive build flags and runtime safe-mode knobs.
+    Example: heimdall-gateway hacks
+  info
+    Show endpoints, runtime paths, versions, service commands and status.
+    Example: heimdall-gateway info
+  Help     Show options for any command.
+    Example: heimdall-gateway <command> -h
+For endpoints/runtime/service/config details run: heimdall-gateway info
