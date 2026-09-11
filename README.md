@@ -386,6 +386,57 @@ can be configured to keep its notice out of the visible transcript.
 Keep repair limits small and monitor the request log. The gateway never
 forwards incomplete tool-call JSON to the upstream tool executor.
 
+### Deduplicación de requests idénticas (experimental)
+
+Deduplicación per-process con singleflight y caché TTL de 600 s para
+requests POST idénticas en `:11435`, tanto streaming como no streaming.
+Desactivada por defecto mediante el flag `experimental.dedup_inflight`.
+
+```json
+{
+  "experimental": {
+    "dedup_inflight": {
+      "enabled": false,
+      "ttl_s": 600,
+      "max_wait_ms": 2000,
+      "max_entries": 2000,
+      "tee_buffer_lines": 1024,
+      "tee_buffer_bytes": 2097152
+    }
+  }
+}
+```
+
+**Qué entra en la huella.** La clave es `SHA256(METHOD + "\n" + PATH_sin_query + "\n" + principal_hash + "\n" + stream_flag + "\n" + sha256(json_canónico))`:
+
+* `METHOD` en mayúsculas y `PATH` sin query string.
+* `principal_hash` es `sha256(api_key)` del `Authorization: Bearer` o `X-Api-Key`, o `"anonymous"` si la autenticación está desactivada o el acceso es por loopback sin clave. Nunca se comparten resultados entre principales distintos.
+* `stream_flag` distingue `stream:true` de `stream:false`, con buckets separados aunque el resto coincida.
+* `sha256(json_canónico)` sobre el body filtrado a la allowlist y serializado con `json.dumps(..., sort_keys=True, separators=(",",":"), ensure_ascii=False)`, preservando el orden de las listas. Campos incluidos: `model`, `messages`, `prompt`, `input`, `temperature`, `top_p`, `top_k`, `seed`, `max_tokens`, `stop`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `response_format`, `tools`, `tool_choice`, `n`, `logprobs`, `stream`, `stream_options`, `encoding_format`, `dimensions`. Todo lo demás queda fuera, incluidos `Authorization`, `X-Request-ID`, `X-Correlation-ID`, `User-Agent`, `X-Forwarded-For`, `Date` o `Idempotency-Key`.
+
+**Semántica singleflight.** La segunda request idéntica no se descarta, espera al líder hasta `max_wait_ms` y recibe la misma respuesta, con copia profunda de `status + headers relevantes + body` por seguidor. Transparente salvo el header diagnóstico `X-Heimdall-Dedup: hit|miss|shared` y los eventos `log_api_event` con prefijos `dedup_hit`, `dedup_shared`, `dedup_miss`, `dedup_wait_timeout`, `dedup_bypass_overload` y similares.
+
+**Caché TTL 600 s.** Tras un éxito del líder se guarda el resultado durante `ttl_s` y las siguientes idénticas se sirven desde caché sin ir al upstream. Solo se cachean éxitos `2xx`, los errores `4xx/5xx`, excepciones o streams interrumpidos no se cachean, solo se propagan a los seguidores en vuelo y se olvidan. Un stream truncado por superar `tee_buffer_bytes` tampoco se cachea, solo se deduplica en vuelo. Cada seguidor recibe copia profunda para evitar interferencias.
+
+**Límites y notas:**
+
+* Con `temperature > 0` sin `seed` deduplica igual y las dos reciben la misma muestra.
+* Si el buffer de streaming se llena (`tee_buffer_lines` o `tee_buffer_bytes`), el seguidor lento puede perder el prefijo y recibir `drop` con cierre `data: [DONE]`, sin frenar al líder.
+* Es per-process, no distribuido.
+* El bypass directo a `:11436` queda fuera de alcance, no se deduplica.
+* No deduplica `GET`, solo `POST` en `:11435`.
+* No comparte resultados entre principales distintos.
+* Si se alcanza `max_entries` el comportamiento es fail-open, la request hace bypass sin deduplicar.
+
+**Activación y verificación:**
+
+```console
+$ heimdall-gateway config-migrate && heimdall-gateway update
+$ systemctl --user restart heimdall-gateway-manager heimdall-gateway-router
+# system: sudo systemctl restart heimdall-gateway-manager heimdall-gateway-router
+$ heimdall-gateway config-keys --format json | jq '.experimental.dedup_inflight'
+```
+
 ## Replicas, loading, and observability
 
 The first request that needs a cold model owns its load. Concurrent requests

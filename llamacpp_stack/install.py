@@ -135,6 +135,25 @@ ENV_FILE_HEADER = textwrap.dedent(
 )
 
 
+def _normalize_bool_flag(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def _as_bool(value: object, default: bool = False) -> bool:
+    parsed = _normalize_bool_flag(value)
+    return default if parsed is None else parsed
+
+
 def _default_global_replicas_config() -> dict[str, object]:
     return {
         "enabled": False,
@@ -144,8 +163,89 @@ def _default_global_replicas_config() -> dict[str, object]:
     }
 
 
+def _default_dedup_inflight_config() -> dict[str, object]:
+    return {
+        "enabled": False,
+        "ttl_s": 600,
+        "max_wait_ms": 2000,
+        "max_entries": 2000,
+        "tee_buffer_lines": 1024,
+        "tee_buffer_bytes": 2097152,
+    }
+
+
+def _normalize_dedup_inflight_config(raw: object) -> tuple[dict[str, object], bool]:
+    defaults = _default_dedup_inflight_config()
+    if not isinstance(raw, dict):
+        return dict(defaults), True
+    normalized: dict[str, object] = {}
+    changed = False
+    if "enabled" not in raw:
+        normalized["enabled"] = defaults["enabled"]
+        changed = True
+    else:
+        raw_enabled = raw.get("enabled")
+        parsed = _normalize_bool_flag(raw_enabled)
+        if parsed is None:
+            normalized["enabled"] = defaults["enabled"]
+            changed = True
+        else:
+            normalized["enabled"] = parsed
+            if isinstance(raw_enabled, bool):
+                if parsed != raw_enabled:
+                    changed = True
+            else:
+                changed = True
+
+    def _clamp_int(key: str, default: int, min_v: int, max_v: int) -> None:
+        nonlocal changed
+        if key not in raw:
+            normalized[key] = default
+            changed = True
+            return
+        raw_val = raw.get(key)
+        try:
+            if isinstance(raw_val, bool):
+                raise ValueError("bool not allowed for int field")
+            if isinstance(raw_val, str):
+                iv = int(raw_val.strip())
+            else:
+                iv = int(raw_val)  # type: ignore[arg-type]
+        except Exception:
+            normalized[key] = default
+            changed = True
+            return
+        clamped = max(min_v, min(max_v, iv))
+        normalized[key] = clamped
+        if clamped != iv:
+            changed = True
+        if not isinstance(raw_val, int) or isinstance(raw_val, bool):
+            changed = True
+        elif raw_val != clamped:
+            changed = True
+
+    _clamp_int("ttl_s", 600, 0, 86400)
+    _clamp_int("max_wait_ms", 2000, 0, 30000)
+    _clamp_int("max_entries", 2000, 1, 100000)
+    _clamp_int("tee_buffer_lines", 1024, 1, 100000)
+    _clamp_int("tee_buffer_bytes", 2097152, 1024, 104857600)
+    for k in defaults:
+        if k not in normalized:
+            normalized[k] = defaults[k]
+            changed = True
+    if set(raw.keys()) != set(normalized.keys()):
+        for k in defaults:
+            if k not in raw:
+                changed = True
+                break
+        if any(k not in defaults for k in raw):
+            pass
+    return normalized, changed
+
+
 def _default_experimental_config() -> dict[str, object]:
     return {
+        "dedup_inflight": _default_dedup_inflight_config(),
         "chat_tool_continue_repair": {
             "enabled": False,
             "max_rounds": 1,
@@ -171,6 +271,12 @@ def _default_experimental_config() -> dict[str, object]:
                 "Available tool names: {tool_names}."
             ),
             "include_failed_assistant_message": False,
+            "loop_guard": {
+                "enabled": True,
+                "no_tool_call_max_chars": 0,
+                "repeated_tail_min_chars": 3000,
+                "repeated_tail_repetitions": 4,
+            },
         },
         "chat_last_response_log": {
             "enabled": False,
@@ -197,10 +303,13 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
     cfg = _default_experimental_config()
     if isinstance(raw, dict):
         for key, value in raw.items():
-            if key == "chat_tool_continue_repair" and isinstance(value, dict):
+            if key == "dedup_inflight":
+                normalized, _ = _normalize_dedup_inflight_config(value)
+                cfg["dedup_inflight"] = normalized
+            elif key == "chat_tool_continue_repair" and isinstance(value, dict):
                 repair = dict(cfg["chat_tool_continue_repair"])
                 repair.update(value)
-                repair["enabled"] = bool(repair.get("enabled"))
+                repair["enabled"] = _as_bool(repair.get("enabled"), False)
                 try:
                     repair["max_rounds"] = max(0, int(repair.get("max_rounds", 1)))
                 except Exception:
@@ -225,22 +334,45 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
                         repair[prompt_key] = default_prompt
                     else:
                         repair[prompt_key] = prompt_value
-                repair["include_failed_assistant_message"] = bool(repair.get("include_failed_assistant_message"))
+                repair["include_failed_assistant_message"] = _as_bool(repair.get("include_failed_assistant_message"), False)
+                loop_guard = repair.get("loop_guard")
+                default_loop_guard = _default_experimental_config()["chat_tool_continue_repair"]["loop_guard"]
+                if not isinstance(loop_guard, dict):
+                    loop_guard = dict(default_loop_guard)
+                else:
+                    merged_loop_guard = dict(default_loop_guard)
+                    merged_loop_guard.update(loop_guard)
+                    loop_guard = merged_loop_guard
+                loop_guard["enabled"] = _as_bool(loop_guard.get("enabled"), True)
+                for lk, dv in (
+                    ("no_tool_call_max_chars", 0),
+                    ("repeated_tail_min_chars", 3000),
+                    ("repeated_tail_repetitions", 4),
+                ):
+                    try:
+                        loop_guard[lk] = max(0, int(loop_guard.get(lk, dv)))
+                    except Exception:
+                        loop_guard[lk] = dv
+                repair["loop_guard"] = loop_guard
                 cfg["chat_tool_continue_repair"] = repair
             elif key == "chat_last_response_log" and isinstance(value, dict):
                 response_log = dict(cfg["chat_last_response_log"])
                 response_log.update(value)
-                response_log["enabled"] = bool(response_log.get("enabled"))
+                response_log["enabled"] = _as_bool(response_log.get("enabled"), False)
                 response_log["path"] = str(response_log.get("path") or "").strip()
                 try:
                     response_log["max_chars"] = max(0, int(response_log.get("max_chars", 20000)))
                 except Exception:
                     response_log["max_chars"] = 20000
-                response_log["include_reasoning"] = bool(response_log.get("include_reasoning"))
-                response_log["include_tool_calls"] = bool(response_log.get("include_tool_calls", True))
+                response_log["include_reasoning"] = _as_bool(response_log.get("include_reasoning"), False)
+                response_log["include_tool_calls"] = _as_bool(response_log.get("include_tool_calls", True))
                 cfg["chat_last_response_log"] = response_log
             elif key not in cfg:
                 cfg[key] = value
+    if "dedup_inflight" not in cfg or not isinstance(cfg.get("dedup_inflight"), dict):
+        cfg["dedup_inflight"], _ = _normalize_dedup_inflight_config(None)
+    else:
+        cfg["dedup_inflight"], _ = _normalize_dedup_inflight_config(cfg.get("dedup_inflight"))
     return cfg
 
 

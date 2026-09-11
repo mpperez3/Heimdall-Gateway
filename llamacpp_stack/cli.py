@@ -58,6 +58,23 @@ try:
 except ImportError:
     readline = None
 
+# Dedup inflight (optional, stdlib only module)
+try:
+    from llamacpp_stack.dedup import DedupState, TeeBroadcast, canonical_body, fingerprint, principal_hash_for_api_key  # type: ignore
+except Exception:  # pragma: no cover
+    DedupState = None  # type: ignore
+    TeeBroadcast = None  # type: ignore
+    canonical_body = None  # type: ignore
+    fingerprint = None  # type: ignore
+    principal_hash_for_api_key = None  # type: ignore
+
+DEDUP_STATE = None  # lazy singleton, initialized on first normalize
+try:
+    if DedupState is not None:  # type: ignore[truthy-function]
+        DEDUP_STATE = DedupState(max_entries=2000)  # type: ignore[call-arg]
+except Exception:  # pragma: no cover
+    DEDUP_STATE = None
+
 # Paths & Constants
 def _load_installed_env() -> None:
     candidates = [
@@ -561,8 +578,290 @@ def _default_global_replicas_config() -> dict[str, object]:
     }
 
 
+def _default_dedup_inflight_config() -> dict[str, object]:
+    return {
+        "enabled": False,
+        "ttl_s": 600,
+        "max_wait_ms": 2000,
+        "max_entries": 2000,
+        "tee_buffer_lines": 1024,
+        "tee_buffer_bytes": 2097152,
+    }
+
+
+def _normalize_dedup_inflight_config(raw: object) -> tuple[dict[str, object], bool]:
+    global DEDUP_STATE
+    defaults = _default_dedup_inflight_config()
+    if not isinstance(raw, dict):
+        try:
+            if DedupState is not None:  # type: ignore[truthy-function]
+                max_e = int(defaults.get("max_entries", 2000))  # type: ignore[arg-type]
+                if DEDUP_STATE is None:
+                    DEDUP_STATE = DedupState(max_entries=max_e)  # type: ignore[call-arg]
+        except Exception:
+            pass
+        return dict(defaults), True
+    normalized: dict[str, object] = {}
+    changed = False
+    if "enabled" not in raw:
+        normalized["enabled"] = defaults["enabled"]
+        changed = True
+    else:
+        raw_enabled = raw.get("enabled")
+        parsed = _normalize_bool_flag(raw_enabled)
+        if parsed is None:
+            normalized["enabled"] = defaults["enabled"]
+            changed = True
+        else:
+            normalized["enabled"] = parsed
+            if isinstance(raw_enabled, bool):
+                if parsed != raw_enabled:
+                    changed = True
+            else:
+                changed = True
+    def _clamp_int(key: str, default: int, min_v: int, max_v: int) -> None:
+        nonlocal changed
+        if key not in raw:
+            normalized[key] = default
+            changed = True
+            return
+        raw_val = raw.get(key)
+        try:
+            if isinstance(raw_val, bool):
+                raise ValueError("bool not allowed for int field")
+            if isinstance(raw_val, str):
+                iv = int(raw_val.strip())
+            else:
+                iv = int(raw_val)  # type: ignore[arg-type]
+        except Exception:
+            normalized[key] = default
+            changed = True
+            return
+        clamped = max(min_v, min(max_v, iv))
+        normalized[key] = clamped
+        if clamped != iv:
+            changed = True
+        if not isinstance(raw_val, int) or isinstance(raw_val, bool):
+            changed = True
+        elif raw_val != clamped:
+            changed = True
+    _clamp_int("ttl_s", 600, 0, 86400)
+    _clamp_int("max_wait_ms", 2000, 0, 30000)
+    _clamp_int("max_entries", 2000, 1, 100000)
+    _clamp_int("tee_buffer_lines", 1024, 1, 100000)
+    _clamp_int("tee_buffer_bytes", 2097152, 1024, 104857600)
+    for k in defaults:
+        if k not in normalized:
+            normalized[k] = defaults[k]
+            changed = True
+    if set(raw.keys()) != set(normalized.keys()):
+        for k in defaults:
+            if k not in raw:
+                changed = True
+                break
+        if any(k not in defaults for k in raw):
+            pass
+    try:
+        if DedupState is not None:  # type: ignore[truthy-function]
+            max_e = int(normalized.get("max_entries", 2000))  # type: ignore[arg-type]
+            if DEDUP_STATE is None:
+                DEDUP_STATE = DedupState(max_entries=max_e)  # type: ignore[call-arg]
+            elif getattr(DEDUP_STATE, "max_entries", None) != max_e:
+                try:
+                    DEDUP_STATE.max_entries = max_e
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return normalized, changed
+
+
+def _dedup_should_bypass(args=None) -> str | None:
+    try:
+        cfg = _load_server_config_payload(args)
+        exp = cfg.get("experimental") if isinstance(cfg.get("experimental"), dict) else {}
+        dedup_cfg = exp.get("dedup_inflight") if isinstance(exp, dict) else None
+        if not isinstance(dedup_cfg, dict):
+            dedup_cfg = _default_dedup_inflight_config()
+        else:
+            dedup_cfg, _ = _normalize_dedup_inflight_config(dedup_cfg)
+        if not bool(dedup_cfg.get("enabled")):
+            return "dedup_bypass_disabled"
+        if DEDUP_STATE is None or DedupState is None:
+            return "dedup_bypass_no_state"
+        return None
+    except Exception:
+        return "dedup_bypass_error"
+
+
+def _dedup_extract_principal(handler_self) -> str:
+    try:
+        headers = getattr(handler_self, "headers", {}) or {}
+        api_key = None
+        try:
+            auth = str(headers.get("Authorization") or headers.get("authorization") or "").strip()
+            if auth.lower().startswith("bearer "):
+                api_key = auth[7:].strip()
+        except Exception:
+            pass
+        if not api_key:
+            try:
+                api_key = str(headers.get("X-Api-Key") or headers.get("X-API-Key") or headers.get("x-api-key") or "").strip()
+            except Exception:
+                pass
+        if not api_key:
+            try:
+                client_host = handler_self.client_address[0] if getattr(handler_self, "client_address", None) else ""
+                if _is_loopback_client(client_host):
+                    return "anonymous"
+            except Exception:
+                pass
+            return "anonymous" if not api_key else principal_hash_for_api_key(api_key)  # type: ignore
+        if principal_hash_for_api_key is not None:  # type: ignore
+            return principal_hash_for_api_key(api_key)  # type: ignore
+        return "anonymous"
+    except Exception:
+        return "anonymous"
+
+
+def _dedup_build_fingerprint(method: str, path: str, principal_hash: str, stream_flag: bool, body_dict: dict | None) -> str:
+    try:
+        if canonical_body is not None and fingerprint is not None:  # type: ignore
+            cbody = canonical_body(body_dict)  # type: ignore
+            return fingerprint(method, path, principal_hash, stream_flag, cbody)  # type: ignore
+    except Exception:
+        pass
+    import hashlib, json as _json
+    try:
+        cbody = _json.dumps(body_dict or {}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    except Exception:
+        cbody = b"{}"
+    m = (method or "POST").upper()
+    p = (path or "/").split("?", 1)[0]
+    inner = hashlib.sha256(cbody).hexdigest()
+    outer = f"{m}\n{p}\n{principal_hash}\n{str(bool(stream_flag))}\n{inner}"
+    return hashlib.sha256(outer.encode("utf-8")).hexdigest()
+
+
+def _dedup_send_cached_response(handler_self, cached_result: dict, hit_type: str) -> None:
+    import copy as _copy
+    result = _copy.deepcopy(cached_result)
+    status = int(result.get("status", 200))
+    headers = result.get("headers") or {}
+    body = result.get("body", b"")
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    if not isinstance(body, (bytes, bytearray)):
+        body = str(body).encode("utf-8")
+    ctype = "application/json"
+    try:
+        for k, v in (headers or {}).items():
+            if str(k).lower() == "content-type":
+                ctype = str(v)
+                break
+    except Exception:
+        pass
+    handler_self.send_response(status)
+    handler_self.send_header("Content-Type", ctype)
+    handler_self.send_header("Content-Length", str(len(body)))
+    hdr_val = "hit" if hit_type == "hit" else "shared"
+    try:
+        handler_self.send_header("X-Heimdall-Dedup", hdr_val)
+    except Exception:
+        pass
+    try:
+        for k, v in (headers or {}).items():
+            lk = str(k).lower()
+            if lk in {"content-type", "content-length", "connection", "transfer-encoding", "content-encoding", "x-heimdall-dedup"}:
+                continue
+            try:
+                handler_self.send_header(k, str(v))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    handler_self.end_headers()
+    try:
+        handler_self.wfile.write(body)
+        handler_self.wfile.flush()
+    except Exception:
+        pass
+
+
+_DEDUP_STREAM_TEES: dict[str, object] = {}
+
+
+def _dedup_send_json_with_header(handler_self, payload: dict, status: int = 200, dedup_header: str = "miss") -> None:
+    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    handler_self.send_response(status)
+    handler_self.send_header("Content-Type", "application/json; charset=utf-8")
+    handler_self.send_header("Content-Length", str(len(encoded)))
+    try:
+        handler_self.send_header("X-Heimdall-Dedup", dedup_header)
+    except Exception:
+        pass
+    handler_self.end_headers()
+    try:
+        handler_self.wfile.write(encoded)
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        try:
+            handler_self.connection.shutdown(2)
+        except Exception:
+            pass
+
+
+def _dedup_streaming_finalize(key: str, collected: list[bytes], dedup_cfg: dict, principal_hash: str, stream_flag: bool, truncated: bool, total_bytes: int, tee: object | None = None) -> None:
+    try:
+        if tee is not None and hasattr(tee, "close"):
+            tee.close()  # type: ignore
+    except Exception:
+        pass
+    if truncated:
+        try:
+            if DEDUP_STATE is not None:
+                DEDUP_STATE.complete_ok(key, {"status": 200, "headers": {}, "body": b""})
+                DEDUP_STATE.forget(key)
+        except Exception:
+            pass
+        log_api_event("dedup_stream_not_cached_truncated", {"key_prefix8": key[:8], "principal_hash8": principal_hash[:8], "stream": stream_flag, "bytes": total_bytes})
+        return
+    if not collected:
+        try:
+            if DEDUP_STATE is not None:
+                DEDUP_STATE.forget(key)
+        except Exception:
+            pass
+        return
+    try:
+        max_bytes = int(dedup_cfg.get("tee_buffer_bytes", 2097152) or 2097152)
+        body_bytes = b"\n".join(collected)
+        if len(body_bytes) <= max_bytes:
+            result = {"status": 200, "headers": {"Content-Type": "text/event-stream"}, "body": body_bytes}
+            if DEDUP_STATE is not None:
+                ttl_s = float(dedup_cfg.get("ttl_s", 600) or 600)
+                if ttl_s > 0:
+                    DEDUP_STATE.put_cached(key, result, ttl_s)
+                    DEDUP_STATE.complete_ok(key, result)
+                else:
+                    DEDUP_STATE.complete_ok(key, result)
+                    DEDUP_STATE.forget(key)
+            log_api_event("dedup_stream_cached", {"key_prefix8": key[:8], "principal_hash8": principal_hash[:8], "stream": stream_flag, "bytes": len(body_bytes)})
+        else:
+            if DEDUP_STATE is not None:
+                DEDUP_STATE.complete_ok(key, {"status": 200, "headers": {}, "body": b""})
+                DEDUP_STATE.forget(key)
+            log_api_event("dedup_stream_not_cached_truncated", {"key_prefix8": key[:8], "principal_hash8": principal_hash[:8], "stream": stream_flag, "bytes": len(body_bytes)})
+    except Exception:
+        try:
+            if DEDUP_STATE is not None:
+                DEDUP_STATE.forget(key)
+        except Exception:
+            pass
+
+
 def _default_experimental_config() -> dict[str, object]:
     return {
+        "dedup_inflight": _default_dedup_inflight_config(),
         "chat_tool_continue_repair": {
             "enabled": False,
             "max_rounds": 1,
@@ -621,7 +920,10 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
     cfg = _default_experimental_config()
     if isinstance(raw, dict):
         for key, value in raw.items():
-            if key == "chat_tool_continue_repair" and isinstance(value, dict):
+            if key == "dedup_inflight":
+                normalized, _ = _normalize_dedup_inflight_config(value)
+                cfg["dedup_inflight"] = normalized
+            elif key == "chat_tool_continue_repair" and isinstance(value, dict):
                 repair = dict(cfg["chat_tool_continue_repair"])
                 repair.update(value)
                 repair["enabled"] = _as_bool(repair.get("enabled"), False)
@@ -684,6 +986,10 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
                 cfg["chat_last_response_log"] = response_log
             elif key not in cfg:
                 cfg[key] = value
+    if "dedup_inflight" not in cfg or not isinstance(cfg.get("dedup_inflight"), dict):
+        cfg["dedup_inflight"], _ = _normalize_dedup_inflight_config(None)
+    else:
+        cfg["dedup_inflight"], _ = _normalize_dedup_inflight_config(cfg.get("dedup_inflight"))
     return cfg
 
 
@@ -4584,6 +4890,16 @@ def print_config_keys(args) -> int:
     catalog_keys = _catalog_model_key_names()
     server_default_keys = sorted(set(_load_bundled_llama_server_default_values().keys()) | set(resolve_llama_server_defaults(args).keys()))
     global_keys = sorted(k for k in normalize_server_config_payload({})[0].keys() if not k.startswith("_"))
+    try:
+        exp_keys = _default_experimental_config().keys()
+        for ek in sorted(exp_keys):
+            dotted = f"experimental.{ek}"
+            if dotted not in global_keys:
+                global_keys.append(dotted)
+        global_keys = sorted(global_keys)
+        experimental_keys = sorted(exp_keys)
+    except Exception:
+        experimental_keys = []
     resolved_vllm = resolve_vllm_defaults(args)
     vllm_keys = sorted(key for key in resolved_vllm if key != "__family_defaults")
     family_vllm = resolved_vllm.get("__family_defaults")
@@ -4596,6 +4912,7 @@ def print_config_keys(args) -> int:
         print(json.dumps({
             "catalog_model_top_level_keys": catalog_keys,
             "conf_json_top_level_keys": global_keys,
+            "experimental_keys": experimental_keys,
             "llama_server_defaults_keys": server_default_keys,
             "vllm_keys": vllm_keys,
             "notes": [
@@ -10303,6 +10620,10 @@ def _start_responses_sse_stream(handler: BaseHTTPRequestHandler) -> None:
     handler.send_response(200)
     handler.send_header("Content-Type", "text/event-stream")
     handler.send_header("Cache-Control", "no-cache")
+    try:
+        handler.send_header("X-Heimdall-Dedup", "miss")
+    except Exception:
+        pass
     handler.end_headers()
 
 
@@ -12689,6 +13010,65 @@ def start_ctx_metadata_server(args):
                                     REPLICA_ROUTER_STATE.request_started(upstream_model_name)
                 except Exception:
                     pass
+            _dedup_key_proxy = None
+            _dedup_principal_proxy = ""
+            _dedup_cfg_proxy = None
+            _dedup_is_leader_proxy = True
+            _dedup_event_proxy = None
+            if method == "POST":
+                _bypass_proxy = _dedup_should_bypass(args)
+                if _bypass_proxy is None:
+                    try:
+                        _dedup_cfg_proxy = _load_server_config_payload(args).get("experimental", {}).get("dedup_inflight", _default_dedup_inflight_config())  # type: ignore
+                        if not isinstance(_dedup_cfg_proxy, dict):
+                            _dedup_cfg_proxy = _default_dedup_inflight_config()
+                        _dedup_principal_proxy = _dedup_extract_principal(self)
+                        _stream_proxy_flag = bool(proxy_payload.get("stream") == True) if isinstance(proxy_payload, dict) else False
+                        if _stream_proxy_flag:
+                            _dedup_key_proxy = None
+                        else:
+                            _dedup_key_proxy = _dedup_build_fingerprint("POST", parsed.path, _dedup_principal_proxy, False, proxy_payload if isinstance(proxy_payload, dict) else None)
+                            _dedup_is_leader_proxy, _dedup_event_proxy, _dedup_cached_proxy = DEDUP_STATE.get_or_create_inflight(_dedup_key_proxy)  # type: ignore
+                            if _dedup_cached_proxy is not None:
+                                log_api_event("dedup_hit", {"key_prefix8": _dedup_key_proxy[:8], "principal_hash8": _dedup_principal_proxy[:8], "stream": False, "path": parsed.path})
+                                _dedup_send_cached_response(self, _dedup_cached_proxy, "hit")
+                                if upstream_model_name:
+                                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
+                                if activity_model:
+                                    mark_model_activity(activity_model, f"proxy:{parsed.path}", "response_done")
+                                return
+                            if not _dedup_is_leader_proxy and _dedup_event_proxy is not None:
+                                _max_wait_proxy = float(_dedup_cfg_proxy.get("max_wait_ms", 2000) or 2000) / 1000.0
+                                _waited_proxy = _dedup_event_proxy.wait(timeout=_max_wait_proxy)
+                                if _waited_proxy:
+                                    _cached2_proxy = DEDUP_STATE.get_cached(_dedup_key_proxy)  # type: ignore
+                                    if _cached2_proxy is not None:
+                                        log_api_event("dedup_shared", {"key_prefix8": _dedup_key_proxy[:8], "principal_hash8": _dedup_principal_proxy[:8], "stream": False, "wait_ms": int(_max_wait_proxy * 1000)})
+                                        _dedup_send_cached_response(self, _cached2_proxy, "shared")
+                                        if upstream_model_name:
+                                            REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
+                                        if activity_model:
+                                            mark_model_activity(activity_model, f"proxy:{parsed.path}", "response_done")
+                                        return
+                                    _entry_proxy = DEDUP_STATE._get_entry(_dedup_key_proxy)  # type: ignore
+                                    if _entry_proxy is not None and _entry_proxy.exception is not None:
+                                        DEDUP_STATE.forget(_dedup_key_proxy)  # type: ignore
+                                        _dedup_key_proxy = None
+                                    else:
+                                        log_api_event("dedup_wait_timeout", {"key_prefix8": _dedup_key_proxy[:8], "principal_hash8": _dedup_principal_proxy[:8], "stream": False, "wait_ms": int(_max_wait_proxy * 1000)})
+                                        DEDUP_STATE.forget(_dedup_key_proxy)  # type: ignore
+                                        _dedup_key_proxy = None
+                                else:
+                                    log_api_event("dedup_wait_timeout", {"key_prefix8": _dedup_key_proxy[:8], "principal_hash8": _dedup_principal_proxy[:8], "stream": False, "wait_ms": int(_max_wait_proxy * 1000)})
+                                    DEDUP_STATE.forget(_dedup_key_proxy)  # type: ignore
+                                    _dedup_key_proxy = None
+                            if _dedup_is_leader_proxy and _dedup_event_proxy is None:
+                                log_api_event("dedup_bypass_overload", {"key_prefix8": _dedup_key_proxy[:8] if _dedup_key_proxy else "", "principal_hash8": _dedup_principal_proxy[:8], "stream": False})
+                                _dedup_key_proxy = None
+                    except Exception:
+                        _dedup_key_proxy = None
+                else:
+                    log_api_event("dedup_bypass_disabled", {"reason": _bypass_proxy, "path": parsed.path})
             log_api_event("proxy_request", {"method": method, "path": parsed.path, "query": parsed.query, "body": body.decode("utf-8", errors="replace")[:4000] if body else ""})
             try:
                 response = _proxy_request_to_public_api(
@@ -12703,7 +13083,13 @@ def start_ctx_metadata_server(args):
                 log_api_event("proxy_error", {"method": method, "path": parsed.path, "error": str(exc)})
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
-                self._send_json({"error": f"upstream unavailable: {exc}"}, status=502)
+                if _dedup_key_proxy is not None:
+                    try:
+                        DEDUP_STATE.complete_err(_dedup_key_proxy, exc)  # type: ignore
+                        DEDUP_STATE.forget(_dedup_key_proxy)  # type: ignore
+                    except Exception:
+                        pass
+                _dedup_send_json_with_header(self, {"error": f"upstream unavailable: {exc}"}, status=502, dedup_header="miss")
                 return
 
             content = response.content
@@ -12712,7 +13098,31 @@ def start_ctx_metadata_server(args):
                 REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=response.status_code < 400)
             if activity_model:
                 mark_model_activity(activity_model, f"proxy:{parsed.path}", "response_done")
+            if _dedup_key_proxy is not None:
+                if 200 <= response.status_code < 400:
+                    try:
+                        ct = response.headers.get("Content-Type", "application/json")
+                        _result_proxy = {"status": response.status_code, "headers": {"Content-Type": ct}, "body": content}
+                        DEDUP_STATE.complete_ok(_dedup_key_proxy, _result_proxy)  # type: ignore
+                        ttl_s_proxy = float(_dedup_cfg_proxy.get("ttl_s", 600) or 600) if isinstance(_dedup_cfg_proxy, dict) else 600
+                        if ttl_s_proxy > 0:
+                            DEDUP_STATE.put_cached(_dedup_key_proxy, _result_proxy, ttl_s_proxy)  # type: ignore
+                        else:
+                            DEDUP_STATE.forget(_dedup_key_proxy)  # type: ignore
+                        log_api_event("dedup_miss", {"key_prefix8": _dedup_key_proxy[:8], "principal_hash8": _dedup_principal_proxy[:8], "stream": False, "path": parsed.path})
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        DEDUP_STATE.complete_err(_dedup_key_proxy, RuntimeError(f"upstream {response.status_code}"))  # type: ignore
+                        DEDUP_STATE.forget(_dedup_key_proxy)  # type: ignore
+                    except Exception:
+                        pass
             self.send_response(response.status_code)
+            try:
+                self.send_header("X-Heimdall-Dedup", "miss")
+            except Exception:
+                pass
             for key, value in response.headers.items():
                 lowered = key.lower()
                 if lowered in {"content-length", "connection", "transfer-encoding", "content-encoding"}:
@@ -12890,6 +13300,94 @@ def start_ctx_metadata_server(args):
             payload = self._read_json_body()
             log_api_event("ollama_chat_request", payload)
             started_at = time.monotonic()
+            _dedup_key_oc = None
+            _dedup_principal_oc = ""
+            _dedup_cfg_oc = None
+            _dedup_is_leader_oc = True
+            _dedup_event_oc = None
+            _dedup_stream_oc = bool(payload.get("stream"))
+            _dedup_bypass_oc = _dedup_should_bypass(args)
+            if _dedup_bypass_oc is None:
+                try:
+                    _dedup_cfg_oc = _load_server_config_payload(args).get("experimental", {}).get("dedup_inflight", _default_dedup_inflight_config())  # type: ignore
+                    if not isinstance(_dedup_cfg_oc, dict):
+                        _dedup_cfg_oc = _default_dedup_inflight_config()
+                    _dedup_principal_oc = _dedup_extract_principal(self)
+                    _dedup_key_oc = _dedup_build_fingerprint("POST", self.path, _dedup_principal_oc, _dedup_stream_oc, payload)
+                    _dedup_is_leader_oc, _dedup_event_oc, _dedup_cached_oc = DEDUP_STATE.get_or_create_inflight(_dedup_key_oc)  # type: ignore
+                    if _dedup_cached_oc is not None:
+                        log_api_event("dedup_hit", {"key_prefix8": _dedup_key_oc[:8], "principal_hash8": _dedup_principal_oc[:8], "stream": _dedup_stream_oc, "path": self.path.split("?", 1)[0]})
+                        _dedup_send_cached_response(self, _dedup_cached_oc, "hit")
+                        return
+                    if not _dedup_is_leader_oc and _dedup_event_oc is not None:
+                        if _dedup_stream_oc:
+                            _tee_oc = _DEDUP_STREAM_TEES.get(_dedup_key_oc)
+                            if _tee_oc is not None:
+                                self.send_response(200)
+                                self.send_header("Content-Type", "application/x-ndjson")
+                                self.send_header("X-Heimdall-Dedup", "shared")
+                                self.end_headers()
+                                for _line_oc in _tee_oc.subscribe_replay_then_live():  # type: ignore
+                                    if _line_oc is _DEDUP_STREAM_TEES.get("_SENTINEL", object()) or str(_line_oc) == "object":
+                                        break
+                                    try:
+                                        if _line_oc is not None and hasattr(_line_oc, "__class__") and str(type(_line_oc)) == "<class 'object'>":
+                                            break
+                                    except Exception:
+                                        pass
+                                    if _line_oc is None:
+                                        continue
+                                    # Tee stores raw bytes lines; convert for ollama
+                                    try:
+                                        if isinstance(_line_oc, bytes):
+                                            dec = _line_oc.decode("utf-8", errors="ignore").strip()
+                                        else:
+                                            dec = str(_line_oc).strip()
+                                        if dec == "[DONE]" or dec == "data: [DONE]":
+                                            done_payload = _ollama_done_payload(resolve_catalog_model_name(str(payload.get("model") or ""), load_catalog(catalog_path)))
+                                            self.wfile.write((json.dumps(done_payload, ensure_ascii=False) + "\n").encode("utf-8"))
+                                            self.wfile.flush()
+                                            break
+                                        if dec.startswith("data: "):
+                                            dec = dec[6:].strip()
+                                        chunk = json.loads(dec)
+                                        text = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                                        if text:
+                                            oc_model = resolve_catalog_model_name(str(payload.get("model") or ""), load_catalog(catalog_path))
+                                            oc = {"model": oc_model, "created_at": datetime.now(timezone.utc).isoformat(), "message": {"role": "assistant", "content": text}, "done": False}
+                                            self.wfile.write((json.dumps(oc, ensure_ascii=False) + "\n").encode("utf-8"))
+                                            self.wfile.flush()
+                                    except Exception:
+                                        continue
+                                log_api_event("dedup_shared", {"key_prefix8": _dedup_key_oc[:8], "principal_hash8": _dedup_principal_oc[:8], "stream": True, "path": self.path.split("?", 1)[0]})
+                                return
+                        _max_wait_oc = float(_dedup_cfg_oc.get("max_wait_ms", 2000) or 2000) / 1000.0
+                        _waited_oc = _dedup_event_oc.wait(timeout=_max_wait_oc)
+                        if _waited_oc:
+                            _cached2_oc = DEDUP_STATE.get_cached(_dedup_key_oc)  # type: ignore
+                            if _cached2_oc is not None:
+                                log_api_event("dedup_shared", {"key_prefix8": _dedup_key_oc[:8], "principal_hash8": _dedup_principal_oc[:8], "stream": _dedup_stream_oc, "wait_ms": int(_max_wait_oc * 1000)})
+                                _dedup_send_cached_response(self, _cached2_oc, "shared")
+                                return
+                            _entry_oc = DEDUP_STATE._get_entry(_dedup_key_oc)  # type: ignore
+                            if _entry_oc is not None and _entry_oc.exception is not None:
+                                DEDUP_STATE.forget(_dedup_key_oc)  # type: ignore
+                                _dedup_key_oc = None
+                            else:
+                                log_api_event("dedup_wait_timeout", {"key_prefix8": _dedup_key_oc[:8], "principal_hash8": _dedup_principal_oc[:8], "stream": _dedup_stream_oc, "wait_ms": int(_max_wait_oc * 1000)})
+                                DEDUP_STATE.forget(_dedup_key_oc)  # type: ignore
+                                _dedup_key_oc = None
+                        else:
+                            log_api_event("dedup_wait_timeout", {"key_prefix8": _dedup_key_oc[:8], "principal_hash8": _dedup_principal_oc[:8], "stream": _dedup_stream_oc, "wait_ms": int(_max_wait_oc * 1000)})
+                            DEDUP_STATE.forget(_dedup_key_oc)  # type: ignore
+                            _dedup_key_oc = None
+                    if _dedup_is_leader_oc and _dedup_event_oc is None:
+                        log_api_event("dedup_bypass_overload", {"key_prefix8": _dedup_key_oc[:8] if _dedup_key_oc else "", "principal_hash8": _dedup_principal_oc[:8], "stream": _dedup_stream_oc})
+                        _dedup_key_oc = None
+                except Exception:
+                    _dedup_key_oc = None
+            else:
+                log_api_event("dedup_bypass_disabled", {"reason": _dedup_bypass_oc, "path": self.path.split("?", 1)[0]})
             catalog = load_catalog(catalog_path)
             model_name = resolve_catalog_model_name(str(payload.get("model") or "").strip(), catalog)
             if not model_name:
@@ -12990,45 +13488,82 @@ def start_ctx_metadata_server(args):
                         REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                     self._send_json({"error": f"upstream unavailable: HTTP {response.status_code}: {body_text[:1000]}"}, status=502)
                     return
+                _ollama_stream_tee = None
+                _ollama_collected = []
+                _ollama_total = 0
+                _ollama_truncated = False
+                if _dedup_key_oc is not None and _dedup_stream_oc:
+                    try:
+                        if TeeBroadcast is not None and _dedup_cfg_oc is not None:  # type: ignore
+                            _ollama_stream_tee = TeeBroadcast(tee_buffer_lines=int(_dedup_cfg_oc.get("tee_buffer_lines", 1024) or 1024), tee_buffer_bytes=int(_dedup_cfg_oc.get("tee_buffer_bytes", 2097152) or 2097152))  # type: ignore
+                            _DEDUP_STREAM_TEES[_dedup_key_oc] = _ollama_stream_tee
+                    except Exception:
+                        _ollama_stream_tee = None
                 self.send_response(200)
                 self.send_header("Content-Type", "application/x-ndjson")
+                try:
+                    self.send_header("X-Heimdall-Dedup", "miss")
+                except Exception:
+                    pass
                 self.end_headers()
                 first_chunk_logged = False
-                for line in response.iter_lines(chunk_size=1, decode_unicode=False):
-                    if not line:
-                        continue
-                    decoded = line.decode("utf-8", errors="ignore").strip()
-                    if not decoded.startswith("data: "):
-                        continue
-                    chunk_payload = decoded[6:].strip()
-                    if chunk_payload == "[DONE]":
-                        done_payload = _ollama_done_payload(model_name)
-                        self.wfile.write((json.dumps(done_payload, ensure_ascii=False) + "\n").encode("utf-8"))
+                try:
+                    for line in response.iter_lines(chunk_size=1, decode_unicode=False):
+                        if _ollama_stream_tee is not None:
+                            try:
+                                _ollama_stream_tee.append(line if isinstance(line, bytes) else str(line).encode("utf-8"))  # type: ignore
+                            except Exception:
+                                pass
+                            try:
+                                _ollama_collected.append(line if isinstance(line, bytes) else str(line).encode("utf-8"))
+                                _ollama_total += len(line if isinstance(line, bytes) else str(line).encode("utf-8"))
+                                if _dedup_cfg_oc is not None and _ollama_total > int(_dedup_cfg_oc.get("tee_buffer_bytes", 2097152) or 2097152):
+                                    _ollama_truncated = True
+                            except Exception:
+                                pass
+                        if not line:
+                            continue
+                        decoded = line.decode("utf-8", errors="ignore").strip()
+                        if not decoded.startswith("data: "):
+                            continue
+                        chunk_payload = decoded[6:].strip()
+                        if chunk_payload == "[DONE]":
+                            done_payload = _ollama_done_payload(model_name)
+                            self.wfile.write((json.dumps(done_payload, ensure_ascii=False) + "\n").encode("utf-8"))
+                            self.wfile.flush()
+                            mark_model_activity(model_name, "ollama_chat", "stream_done")
+                            if upstream_model_name:
+                                REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
+                            log_api_event("ollama_chat_stream_done", done_payload)
+                            log_api_event("ollama_chat_total", {"model": model_name, "total_ms": _elapsed_ms(started_at), "stream": True})
+                            if _dedup_key_oc is not None:
+                                _dedup_streaming_finalize(_dedup_key_oc, _ollama_collected, _dedup_cfg_oc or {}, _dedup_principal_oc, True, _ollama_truncated, _ollama_total, _ollama_stream_tee)
+                                _DEDUP_STREAM_TEES.pop(_dedup_key_oc, None)
+                            return
+                        try:
+                            chunk = json.loads(chunk_payload)
+                        except Exception:
+                            continue
+                        text = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        if not text:
+                            continue
+                        if not first_chunk_logged:
+                            first_chunk_logged = True
+                            log_api_event("ollama_chat_first_chunk", {"model": model_name, "first_chunk_ms": _elapsed_ms(started_at)})
+                        ollama_chunk = {
+                            "model": model_name,
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                            "message": {"role": "assistant", "content": text},
+                            "done": False,
+                        }
+                        self.wfile.write((json.dumps(ollama_chunk, ensure_ascii=False) + "\n").encode("utf-8"))
                         self.wfile.flush()
-                        mark_model_activity(model_name, "ollama_chat", "stream_done")
-                        if upstream_model_name:
-                            REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
-                        log_api_event("ollama_chat_stream_done", done_payload)
-                        log_api_event("ollama_chat_total", {"model": model_name, "total_ms": _elapsed_ms(started_at), "stream": True})
-                        return
-                    try:
-                        chunk = json.loads(chunk_payload)
-                    except Exception:
-                        continue
-                    text = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                    if not text:
-                        continue
-                    if not first_chunk_logged:
-                        first_chunk_logged = True
-                        log_api_event("ollama_chat_first_chunk", {"model": model_name, "first_chunk_ms": _elapsed_ms(started_at)})
-                    ollama_chunk = {
-                        "model": model_name,
-                        "created_at": datetime.now(timezone.utc).isoformat(),
-                        "message": {"role": "assistant", "content": text},
-                        "done": False,
-                    }
-                    self.wfile.write((json.dumps(ollama_chunk, ensure_ascii=False) + "\n").encode("utf-8"))
-                    self.wfile.flush()
+                finally:
+                    if _ollama_stream_tee is not None:
+                        try:
+                            _ollama_stream_tee.close()  # type: ignore
+                        except Exception:
+                            pass
                 done_payload = _ollama_done_payload(model_name)
                 self.wfile.write((json.dumps(done_payload, ensure_ascii=False) + "\n").encode("utf-8"))
                 self.wfile.flush()
@@ -13037,6 +13572,9 @@ def start_ctx_metadata_server(args):
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
                 log_api_event("ollama_chat_stream_done", done_payload)
                 log_api_event("ollama_chat_total", {"model": model_name, "upstream_model": upstream_model_name, "total_ms": _elapsed_ms(started_at), "stream": True})
+                if _dedup_key_oc is not None:
+                    _dedup_streaming_finalize(_dedup_key_oc, _ollama_collected, _dedup_cfg_oc or {}, _dedup_principal_oc, True, _ollama_truncated, _ollama_total, None)
+                    _DEDUP_STREAM_TEES.pop(_dedup_key_oc, None)
                 return
 
             try:
@@ -13052,14 +13590,26 @@ def start_ctx_metadata_server(args):
                 log_api_event("ollama_chat_upstream_network_error", {"error": str(exc)})
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
-                self._send_json({"error": f"upstream unavailable: {exc}"}, status=502)
+                if _dedup_key_oc is not None:
+                    try:
+                        DEDUP_STATE.complete_err(_dedup_key_oc, exc)  # type: ignore
+                        DEDUP_STATE.forget(_dedup_key_oc)  # type: ignore
+                    except Exception:
+                        pass
+                _dedup_send_json_with_header(self, {"error": f"upstream unavailable: {exc}"}, status=502, dedup_header="miss")
                 return
             if response.status_code >= 400:
                 body_text = response.text[:4000]
                 log_api_event("ollama_chat_upstream_error", {"status": response.status_code, "body": body_text, "payload": upstream_payload})
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
-                self._send_json({"error": f"upstream unavailable: HTTP {response.status_code}: {body_text[:1000]}"}, status=502)
+                if _dedup_key_oc is not None:
+                    try:
+                        DEDUP_STATE.complete_err(_dedup_key_oc, RuntimeError(f"upstream {response.status_code}"))  # type: ignore
+                        DEDUP_STATE.forget(_dedup_key_oc)  # type: ignore
+                    except Exception:
+                        pass
+                _dedup_send_json_with_header(self, {"error": f"upstream unavailable: HTTP {response.status_code}: {body_text[:1000]}"}, status=502, dedup_header="miss")
                 return
             try:
                 data = response.json()
@@ -13067,7 +13617,13 @@ def start_ctx_metadata_server(args):
                 log_api_event("ollama_chat_upstream_invalid_json", {"status": response.status_code, "error": str(exc), "body": response.text[:4000]})
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
-                self._send_json({"error": f"upstream invalid response: {exc}"}, status=502)
+                if _dedup_key_oc is not None:
+                    try:
+                        DEDUP_STATE.complete_err(_dedup_key_oc, exc)  # type: ignore
+                        DEDUP_STATE.forget(_dedup_key_oc)  # type: ignore
+                    except Exception:
+                        pass
+                _dedup_send_json_with_header(self, {"error": f"upstream invalid response: {exc}"}, status=502, dedup_header="miss")
                 return
             if upstream_model_name:
                 REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
@@ -13095,7 +13651,21 @@ def start_ctx_metadata_server(args):
                 return
             log_api_event("ollama_chat_response", base)
             mark_model_activity(model_name, "ollama_chat", "response_done")
-            self._send_json(base)
+            if _dedup_key_oc is not None:
+                try:
+                    _result_oc = {"status": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(base, ensure_ascii=False).encode("utf-8")}
+                    DEDUP_STATE.complete_ok(_dedup_key_oc, _result_oc)  # type: ignore
+                    ttl_s_oc = float(_dedup_cfg_oc.get("ttl_s", 600) or 600) if isinstance(_dedup_cfg_oc, dict) else 600
+                    if ttl_s_oc > 0:
+                        DEDUP_STATE.put_cached(_dedup_key_oc, _result_oc, ttl_s_oc)  # type: ignore
+                    else:
+                        DEDUP_STATE.forget(_dedup_key_oc)  # type: ignore
+                    log_api_event("dedup_miss", {"key_prefix8": _dedup_key_oc[:8], "principal_hash8": _dedup_principal_oc[:8], "stream": False, "path": self.path.split("?", 1)[0]})
+                except Exception:
+                    pass
+                _dedup_send_json_with_header(self, base, status=200, dedup_header="miss")
+            else:
+                _dedup_send_json_with_header(self, base, status=200, dedup_header="miss")
 
         def _handle_openai_chat_completions(self):
             payload = self._read_json_body()
@@ -13176,6 +13746,88 @@ def start_ctx_metadata_server(args):
                 affinity_key=affinity_key,
             )
             mark_model_activity(model_name, "openai_chat", "request_start")
+            _dedup_key_chat = None
+            _dedup_principal_chat = ""
+            _dedup_cfg_chat = None
+            _dedup_is_leader_chat = True
+            _dedup_event_chat = None
+            _dedup_stream_chat = bool(payload.get("stream"))
+            _dedup_bypass_chat = _dedup_should_bypass(args)
+            if _dedup_bypass_chat is None:
+                try:
+                    _dedup_cfg_chat = _load_server_config_payload(args).get("experimental", {}).get("dedup_inflight", _default_dedup_inflight_config())  # type: ignore
+                    if not isinstance(_dedup_cfg_chat, dict):
+                        _dedup_cfg_chat = _default_dedup_inflight_config()
+                    _dedup_principal_chat = _dedup_extract_principal(self)
+                    _dedup_key_chat = _dedup_build_fingerprint("POST", self.path, _dedup_principal_chat, _dedup_stream_chat, payload)
+                    _dedup_is_leader_chat, _dedup_event_chat, _dedup_cached_chat = DEDUP_STATE.get_or_create_inflight(_dedup_key_chat)  # type: ignore
+                    if _dedup_cached_chat is not None:
+                        log_api_event("dedup_hit", {"key_prefix8": _dedup_key_chat[:8], "principal_hash8": _dedup_principal_chat[:8], "stream": _dedup_stream_chat, "path": self.path.split("?", 1)[0]})
+                        _dedup_send_cached_response(self, _dedup_cached_chat, "hit")
+                        CONVERSATION_SWITCH_STATE.finish(conversation_token)
+                        return
+                    if not _dedup_is_leader_chat and _dedup_event_chat is not None:
+                        if _dedup_stream_chat:
+                            _tee_chat = _DEDUP_STREAM_TEES.get(_dedup_key_chat)
+                            if _tee_chat is not None:
+                                self.send_response(200)
+                                self.send_header("Content-Type", "text/event-stream")
+                                self.send_header("X-Heimdall-Dedup", "shared")
+                                self.end_headers()
+                                for _line_chat in _tee_chat.subscribe_replay_then_live():  # type: ignore
+                                    if _line_chat is None:
+                                        continue
+                                    if isinstance(_line_chat, str) and _line_chat == str(object()):
+                                        break
+                                    try:
+                                        is_sentinel = False
+                                        try:
+                                            from llamacpp_stack.dedup import _DONE_SENTINEL as _DS  # type: ignore
+                                            if _line_chat is _DS:
+                                                is_sentinel = True
+                                        except Exception:
+                                            pass
+                                        if is_sentinel:
+                                            break
+                                    except Exception:
+                                        pass
+                                    try:
+                                        lb = _line_chat if isinstance(_line_chat, bytes) else str(_line_chat).encode("utf-8")
+                                        self.wfile.write(lb + b"\n" if not lb.endswith(b"\n") else lb)
+                                        self.wfile.flush()
+                                    except Exception:
+                                        break
+                                log_api_event("dedup_shared", {"key_prefix8": _dedup_key_chat[:8], "principal_hash8": _dedup_principal_chat[:8], "stream": True, "path": self.path.split("?", 1)[0]})
+                                CONVERSATION_SWITCH_STATE.finish(conversation_token)
+                                return
+                        _max_wait_chat = float(_dedup_cfg_chat.get("max_wait_ms", 2000) or 2000) / 1000.0
+                        _waited_chat = _dedup_event_chat.wait(timeout=_max_wait_chat)
+                        if _waited_chat:
+                            _cached2_chat = DEDUP_STATE.get_cached(_dedup_key_chat)  # type: ignore
+                            if _cached2_chat is not None:
+                                log_api_event("dedup_shared", {"key_prefix8": _dedup_key_chat[:8], "principal_hash8": _dedup_principal_chat[:8], "stream": _dedup_stream_chat, "wait_ms": int(_max_wait_chat * 1000)})
+                                _dedup_send_cached_response(self, _cached2_chat, "shared")
+                                CONVERSATION_SWITCH_STATE.finish(conversation_token)
+                                return
+                            _entry_chat = DEDUP_STATE._get_entry(_dedup_key_chat)  # type: ignore
+                            if _entry_chat is not None and _entry_chat.exception is not None:
+                                DEDUP_STATE.forget(_dedup_key_chat)  # type: ignore
+                                _dedup_key_chat = None
+                            else:
+                                log_api_event("dedup_wait_timeout", {"key_prefix8": _dedup_key_chat[:8], "principal_hash8": _dedup_principal_chat[:8], "stream": _dedup_stream_chat, "wait_ms": int(_max_wait_chat * 1000)})
+                                DEDUP_STATE.forget(_dedup_key_chat)  # type: ignore
+                                _dedup_key_chat = None
+                        else:
+                            log_api_event("dedup_wait_timeout", {"key_prefix8": _dedup_key_chat[:8], "principal_hash8": _dedup_principal_chat[:8], "stream": _dedup_stream_chat, "wait_ms": int(_max_wait_chat * 1000)})
+                            DEDUP_STATE.forget(_dedup_key_chat)  # type: ignore
+                            _dedup_key_chat = None
+                    if _dedup_is_leader_chat and _dedup_event_chat is None:
+                        log_api_event("dedup_bypass_overload", {"key_prefix8": _dedup_key_chat[:8] if _dedup_key_chat else "", "principal_hash8": _dedup_principal_chat[:8], "stream": _dedup_stream_chat})
+                        _dedup_key_chat = None
+                except Exception:
+                    _dedup_key_chat = None
+            else:
+                log_api_event("dedup_bypass_disabled", {"reason": _dedup_bypass_chat, "path": self.path.split("?", 1)[0]})
             if int(DEFAULT_MAX_CONCURRENT_PER_MODEL) <= 0 and upstream_model_name:
                 REPLICA_ROUTER_STATE.request_started(upstream_model_name)
             raw_messages = payload.get("messages") or []
@@ -13621,8 +14273,23 @@ def start_ctx_metadata_server(args):
                     if reasoning_only_final:
                         log_api_event("openai_chat_reasoning_only_final", {"request_id": request_id, "model": model_name, "upstream_model": upstream_model_name, "reasoning_len": final_reasoning_len, "finish_reason": final_stream_state.get("finish_reason") or ""})
                     return
+                _openai_stream_tee = None
+                _openai_collected = []
+                _openai_total = 0
+                _openai_truncated = False
+                if _dedup_key_chat is not None and _dedup_stream_chat:
+                    try:
+                        if TeeBroadcast is not None and _dedup_cfg_chat is not None:  # type: ignore
+                            _openai_stream_tee = TeeBroadcast(tee_buffer_lines=int(_dedup_cfg_chat.get("tee_buffer_lines", 1024) or 1024), tee_buffer_bytes=int(_dedup_cfg_chat.get("tee_buffer_bytes", 2097152) or 2097152))  # type: ignore
+                            _DEDUP_STREAM_TEES[_dedup_key_chat] = _openai_stream_tee
+                    except Exception:
+                        _openai_stream_tee = None
                 self.send_response(200)
                 self.send_header("Content-Type", response.headers.get("Content-Type", "text/event-stream"))
+                try:
+                    self.send_header("X-Heimdall-Dedup", "miss")
+                except Exception:
+                    pass
                 self.end_headers()
                 
                 write_lock = threading.Lock()
@@ -13657,6 +14324,18 @@ def start_ctx_metadata_server(args):
                 stream_visible_content_parts: list[str] = []
                 try:
                     for line in response.iter_lines():
+                        if _openai_stream_tee is not None:
+                            try:
+                                _openai_stream_tee.append(line if isinstance(line, bytes) else str(line).encode("utf-8"))  # type: ignore
+                            except Exception:
+                                pass
+                            try:
+                                _openai_collected.append(line if isinstance(line, bytes) else str(line).encode("utf-8"))
+                                _openai_total += len(line if isinstance(line, bytes) else str(line).encode("utf-8"))
+                                if _dedup_cfg_chat is not None and _openai_total > int(_dedup_cfg_chat.get("tee_buffer_bytes", 2097152) or 2097152):
+                                    _openai_truncated = True
+                            except Exception:
+                                pass
                         with write_lock:
                             if not first_chunk_logged and line and line.startswith(b"data: "):
                                 first_chunk_logged = True
@@ -13703,6 +14382,17 @@ def start_ctx_metadata_server(args):
                 finally:
                     stop_heartbeat.set()
                     heartbeat_thread.join(timeout=1.0)
+                    if _openai_stream_tee is not None:
+                        try:
+                            _openai_stream_tee.close()  # type: ignore
+                        except Exception:
+                            pass
+                    if _dedup_key_chat is not None:
+                        try:
+                            _dedup_streaming_finalize(_dedup_key_chat, _openai_collected, _dedup_cfg_chat or {}, _dedup_principal_chat, True, _openai_truncated, _openai_total, None)
+                        except Exception:
+                            pass
+                        _DEDUP_STREAM_TEES.pop(_dedup_key_chat, None)
                     response.close()
                     mark_model_activity(model_name, "openai_chat", "stream_closed")
                     if upstream_model_name:
@@ -13843,10 +14533,69 @@ def start_ctx_metadata_server(args):
                 final_payload["system_fingerprint"] = data.get("system_fingerprint")
             log_api_event("openai_chat_response", final_payload)
             mark_model_activity(model_name, "openai_chat", "response_done")
-            self._send_json(final_payload)
+            if _dedup_key_chat is not None:
+                try:
+                    _result_chat = {"status": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(final_payload, ensure_ascii=False).encode("utf-8")}
+                    DEDUP_STATE.complete_ok(_dedup_key_chat, _result_chat)  # type: ignore
+                    ttl_s_chat = float(_dedup_cfg_chat.get("ttl_s", 600) or 600) if isinstance(_dedup_cfg_chat, dict) else 600
+                    if ttl_s_chat > 0:
+                        DEDUP_STATE.put_cached(_dedup_key_chat, _result_chat, ttl_s_chat)  # type: ignore
+                    else:
+                        DEDUP_STATE.forget(_dedup_key_chat)  # type: ignore
+                    log_api_event("dedup_miss", {"key_prefix8": _dedup_key_chat[:8], "principal_hash8": _dedup_principal_chat[:8], "stream": False, "path": self.path.split("?", 1)[0]})
+                except Exception:
+                    pass
+                _dedup_send_json_with_header(self, final_payload, status=200, dedup_header="miss")
+            else:
+                _dedup_send_json_with_header(self, final_payload, status=200, dedup_header="miss")
 
         def _handle_openai_responses(self):
             payload = self._read_json_body()
+            _dedup_key_resp = None
+            _dedup_principal_resp = ""
+            _dedup_cfg_resp_dup = None
+            _dedup_stream_resp = bool(payload.get("stream"))
+            _dedup_bypass_resp = _dedup_should_bypass(args)
+            if _dedup_bypass_resp is None:
+                try:
+                    _dedup_cfg_resp_dup = _load_server_config_payload(args).get("experimental", {}).get("dedup_inflight", _default_dedup_inflight_config())  # type: ignore
+                    if not isinstance(_dedup_cfg_resp_dup, dict):
+                        _dedup_cfg_resp_dup = _default_dedup_inflight_config()
+                    _dedup_principal_resp = _dedup_extract_principal(self)
+                    _dedup_key_resp = _dedup_build_fingerprint("POST", self.path, _dedup_principal_resp, _dedup_stream_resp, payload)
+                    _is_leader_resp, _event_resp, _cached_resp = DEDUP_STATE.get_or_create_inflight(_dedup_key_resp)  # type: ignore
+                    if _cached_resp is not None:
+                        log_api_event("dedup_hit", {"key_prefix8": _dedup_key_resp[:8], "principal_hash8": _dedup_principal_resp[:8], "stream": _dedup_stream_resp, "path": self.path.split("?", 1)[0]})
+                        _dedup_send_cached_response(self, _cached_resp, "hit")
+                        return
+                    if not _is_leader_resp and _event_resp is not None:
+                        _max_wait_resp = float(_dedup_cfg_resp_dup.get("max_wait_ms", 2000) or 2000) / 1000.0
+                        _waited_resp = _event_resp.wait(timeout=_max_wait_resp)
+                        if _waited_resp:
+                            _cached2_resp = DEDUP_STATE.get_cached(_dedup_key_resp)  # type: ignore
+                            if _cached2_resp is not None:
+                                log_api_event("dedup_shared", {"key_prefix8": _dedup_key_resp[:8], "principal_hash8": _dedup_principal_resp[:8], "stream": _dedup_stream_resp, "wait_ms": int(_max_wait_resp * 1000)})
+                                _dedup_send_cached_response(self, _cached2_resp, "shared")
+                                return
+                            _entry_resp = DEDUP_STATE._get_entry(_dedup_key_resp)  # type: ignore
+                            if _entry_resp is not None and _entry_resp.exception is not None:
+                                DEDUP_STATE.forget(_dedup_key_resp)  # type: ignore
+                                _dedup_key_resp = None
+                            else:
+                                log_api_event("dedup_wait_timeout", {"key_prefix8": _dedup_key_resp[:8], "principal_hash8": _dedup_principal_resp[:8], "stream": _dedup_stream_resp, "wait_ms": int(_max_wait_resp * 1000)})
+                                DEDUP_STATE.forget(_dedup_key_resp)  # type: ignore
+                                _dedup_key_resp = None
+                        else:
+                            log_api_event("dedup_wait_timeout", {"key_prefix8": _dedup_key_resp[:8], "principal_hash8": _dedup_principal_resp[:8], "stream": _dedup_stream_resp, "wait_ms": int(_max_wait_resp * 1000)})
+                            DEDUP_STATE.forget(_dedup_key_resp)  # type: ignore
+                            _dedup_key_resp = None
+                    if _is_leader_resp and _event_resp is None:
+                        log_api_event("dedup_bypass_overload", {"key_prefix8": _dedup_key_resp[:8] if _dedup_key_resp else "", "principal_hash8": _dedup_principal_resp[:8], "stream": _dedup_stream_resp})
+                        _dedup_key_resp = None
+                except Exception:
+                    _dedup_key_resp = None
+            else:
+                log_api_event("dedup_bypass_disabled", {"reason": _dedup_bypass_resp, "path": self.path.split("?", 1)[0]})
             request_id = f"resp_req_{uuid.uuid4().hex}"
             _payload_summary = _summarize_api_payload_for_log(payload)
             _tool_item_summary = _summarize_responses_input_tool_items(payload)
@@ -15236,15 +15985,83 @@ def start_ctx_metadata_server(args):
                 },
             )
             mark_model_activity(model_name, f"openai_responses:{request_id}", "response_done")
-            if bool(payload.get("stream")):
+            if _dedup_key_resp is not None and not bool(payload.get("stream")):
+                try:
+                    _result_resp = {"status": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(final_payload, ensure_ascii=False).encode("utf-8")}
+                    DEDUP_STATE.complete_ok(_dedup_key_resp, _result_resp)  # type: ignore
+                    ttl_s_resp = float(_dedup_cfg_resp_dup.get("ttl_s", 600) or 600) if isinstance(_dedup_cfg_resp_dup, dict) else 600
+                    if ttl_s_resp > 0:
+                        DEDUP_STATE.put_cached(_dedup_key_resp, _result_resp, ttl_s_resp)  # type: ignore
+                    else:
+                        DEDUP_STATE.forget(_dedup_key_resp)  # type: ignore
+                    log_api_event("dedup_miss", {"key_prefix8": _dedup_key_resp[:8], "principal_hash8": _dedup_principal_resp[:8], "stream": False, "path": self.path.split("?", 1)[0]})
+                except Exception:
+                    pass
+                _dedup_send_json_with_header(self, final_payload, status=200, dedup_header="miss")
+            elif bool(payload.get("stream")):
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("X-Heimdall-Dedup", "miss")
+                    self.end_headers()
+                    body = json.dumps(final_payload, ensure_ascii=False).encode("utf-8")
+                    self.wfile.write(body)
+                    self.wfile.flush()
+                    return
+                except Exception:
+                    pass
                 _write_responses_sse(self, final_payload)
             else:
-                self._send_json(final_payload)
+                _dedup_send_json_with_header(self, final_payload, status=200, dedup_header="miss")
 
         def _handle_ollama_generate(self):
             payload = self._read_json_body()
             log_api_event("ollama_generate_request", payload)
             started_at = time.monotonic()
+            _dedup_key_og = None
+            _dedup_principal_og = ""
+            _dedup_cfg_og = None
+            _dedup_bypass_og = _dedup_should_bypass(args)
+            if _dedup_bypass_og is None:
+                try:
+                    _dedup_cfg_og = _load_server_config_payload(args).get("experimental", {}).get("dedup_inflight", _default_dedup_inflight_config())  # type: ignore
+                    if not isinstance(_dedup_cfg_og, dict):
+                        _dedup_cfg_og = _default_dedup_inflight_config()
+                    _dedup_principal_og = _dedup_extract_principal(self)
+                    _dedup_key_og = _dedup_build_fingerprint("POST", self.path, _dedup_principal_og, False, payload)
+                    _is_leader_og, _event_og, _cached_og = DEDUP_STATE.get_or_create_inflight(_dedup_key_og)  # type: ignore
+                    if _cached_og is not None:
+                        log_api_event("dedup_hit", {"key_prefix8": _dedup_key_og[:8], "principal_hash8": _dedup_principal_og[:8], "stream": False, "path": self.path.split("?", 1)[0]})
+                        _dedup_send_cached_response(self, _cached_og, "hit")
+                        return
+                    if not _is_leader_og and _event_og is not None:
+                        _max_wait_og = float(_dedup_cfg_og.get("max_wait_ms", 2000) or 2000) / 1000.0
+                        _waited_og = _event_og.wait(timeout=_max_wait_og)
+                        if _waited_og:
+                            _cached2_og = DEDUP_STATE.get_cached(_dedup_key_og)  # type: ignore
+                            if _cached2_og is not None:
+                                log_api_event("dedup_shared", {"key_prefix8": _dedup_key_og[:8], "principal_hash8": _dedup_principal_og[:8], "stream": False, "wait_ms": int(_max_wait_og * 1000)})
+                                _dedup_send_cached_response(self, _cached2_og, "shared")
+                                return
+                            _entry_og = DEDUP_STATE._get_entry(_dedup_key_og)  # type: ignore
+                            if _entry_og is not None and _entry_og.exception is not None:
+                                DEDUP_STATE.forget(_dedup_key_og)  # type: ignore
+                                _dedup_key_og = None
+                            else:
+                                log_api_event("dedup_wait_timeout", {"key_prefix8": _dedup_key_og[:8], "principal_hash8": _dedup_principal_og[:8], "stream": False, "wait_ms": int(_max_wait_og * 1000)})
+                                DEDUP_STATE.forget(_dedup_key_og)  # type: ignore
+                                _dedup_key_og = None
+                        else:
+                            log_api_event("dedup_wait_timeout", {"key_prefix8": _dedup_key_og[:8], "principal_hash8": _dedup_principal_og[:8], "stream": False, "wait_ms": int(_max_wait_og * 1000)})
+                            DEDUP_STATE.forget(_dedup_key_og)  # type: ignore
+                            _dedup_key_og = None
+                    if _is_leader_og and _event_og is None:
+                        log_api_event("dedup_bypass_overload", {"key_prefix8": _dedup_key_og[:8] if _dedup_key_og else "", "principal_hash8": _dedup_principal_og[:8], "stream": False})
+                        _dedup_key_og = None
+                except Exception:
+                    _dedup_key_og = None
+            else:
+                log_api_event("dedup_bypass_disabled", {"reason": _dedup_bypass_og, "path": self.path.split("?", 1)[0]})
             catalog = load_catalog(catalog_path)
             model_name = resolve_catalog_model_name(str(payload.get("model") or "").strip(), catalog)
             if not model_name:
@@ -15327,14 +16144,26 @@ def start_ctx_metadata_server(args):
                 log_api_event("ollama_generate_upstream_network_error", {"error": str(exc)})
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
-                self._send_json({"error": f"upstream unavailable: {exc}"}, status=502)
+                if _dedup_key_og is not None:
+                    try:
+                        DEDUP_STATE.complete_err(_dedup_key_og, exc)  # type: ignore
+                        DEDUP_STATE.forget(_dedup_key_og)  # type: ignore
+                    except Exception:
+                        pass
+                _dedup_send_json_with_header(self, {"error": f"upstream unavailable: {exc}"}, status=502, dedup_header="miss")
                 return
             if response.status_code >= 400:
                 body_text = response.text[:4000]
                 log_api_event("ollama_generate_upstream_error", {"status": response.status_code, "body": body_text, "payload": upstream_payload})
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
-                self._send_json({"error": f"upstream unavailable: HTTP {response.status_code}: {body_text[:1000]}"}, status=502)
+                if _dedup_key_og is not None:
+                    try:
+                        DEDUP_STATE.complete_err(_dedup_key_og, RuntimeError(f"upstream {response.status_code}"))  # type: ignore
+                        DEDUP_STATE.forget(_dedup_key_og)  # type: ignore
+                    except Exception:
+                        pass
+                _dedup_send_json_with_header(self, {"error": f"upstream unavailable: HTTP {response.status_code}: {body_text[:1000]}"}, status=502, dedup_header="miss")
                 return
             try:
                 data = _collect_openai_sse_response(response)
@@ -15342,7 +16171,13 @@ def start_ctx_metadata_server(args):
                 log_api_event("ollama_generate_upstream_invalid_json", {"status": response.status_code, "error": str(exc)})
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
-                self._send_json({"error": f"upstream invalid response: {exc}"}, status=502)
+                if _dedup_key_og is not None:
+                    try:
+                        DEDUP_STATE.complete_err(_dedup_key_og, exc)  # type: ignore
+                        DEDUP_STATE.forget(_dedup_key_og)  # type: ignore
+                    except Exception:
+                        pass
+                _dedup_send_json_with_header(self, {"error": f"upstream invalid response: {exc}"}, status=502, dedup_header="miss")
                 return
             if upstream_model_name:
                 REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
@@ -15367,13 +16202,74 @@ def start_ctx_metadata_server(args):
                 return
             log_api_event("ollama_generate_response", base)
             mark_model_activity(model_name, "ollama_generate", "response_done")
-            self._send_json(base)
+            if _dedup_key_og is not None:
+                try:
+                    _result_og = {"status": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(base, ensure_ascii=False).encode("utf-8")}
+                    DEDUP_STATE.complete_ok(_dedup_key_og, _result_og)  # type: ignore
+                    ttl_s_og = float(_dedup_cfg_og.get("ttl_s", 600) or 600) if isinstance(_dedup_cfg_og, dict) else 600
+                    if ttl_s_og > 0:
+                        DEDUP_STATE.put_cached(_dedup_key_og, _result_og, ttl_s_og)  # type: ignore
+                    else:
+                        DEDUP_STATE.forget(_dedup_key_og)  # type: ignore
+                    log_api_event("dedup_miss", {"key_prefix8": _dedup_key_og[:8], "principal_hash8": _dedup_principal_og[:8], "stream": False, "path": self.path.split("?", 1)[0]})
+                except Exception:
+                    pass
+                _dedup_send_json_with_header(self, base, status=200, dedup_header="miss")
+            else:
+                _dedup_send_json_with_header(self, base, status=200, dedup_header="miss")
 
 
         def _handle_ollama_embeddings(self):
             payload = self._read_json_body()
             log_api_event("ollama_embeddings_request", payload)
             started_at = time.monotonic()
+            _dedup_key_emb = None
+            _dedup_principal_emb = ""
+            _dedup_cfg_emb = None
+            _dedup_is_leader_emb = True
+            _dedup_event_emb = None
+            _dedup_bypass_reason_emb = _dedup_should_bypass(args)
+            if _dedup_bypass_reason_emb is None:
+                try:
+                    _dedup_cfg_emb = _load_server_config_payload(args).get("experimental", {}).get("dedup_inflight", _default_dedup_inflight_config())  # type: ignore
+                    if not isinstance(_dedup_cfg_emb, dict):
+                        _dedup_cfg_emb = _default_dedup_inflight_config()
+                    _dedup_principal_emb = _dedup_extract_principal(self)
+                    _dedup_key_emb = _dedup_build_fingerprint("POST", self.path, _dedup_principal_emb, False, payload)
+                    _dedup_is_leader_emb, _dedup_event_emb, _dedup_cached_emb = DEDUP_STATE.get_or_create_inflight(_dedup_key_emb)  # type: ignore
+                    if _dedup_cached_emb is not None:
+                        log_api_event("dedup_hit", {"key_prefix8": _dedup_key_emb[:8], "principal_hash8": _dedup_principal_emb[:8], "stream": False, "path": self.path.split("?", 1)[0]})
+                        _dedup_send_cached_response(self, _dedup_cached_emb, "hit")
+                        return
+                    if not _dedup_is_leader_emb and _dedup_event_emb is not None:
+                        _max_wait_emb = float(_dedup_cfg_emb.get("max_wait_ms", 2000) or 2000) / 1000.0
+                        _waited_emb = _dedup_event_emb.wait(timeout=_max_wait_emb)
+                        if _waited_emb:
+                            _cached2_emb = DEDUP_STATE.get_cached(_dedup_key_emb)  # type: ignore
+                            if _cached2_emb is not None:
+                                log_api_event("dedup_shared", {"key_prefix8": _dedup_key_emb[:8], "principal_hash8": _dedup_principal_emb[:8], "stream": False, "wait_ms": int(_max_wait_emb * 1000)})
+                                _dedup_send_cached_response(self, _cached2_emb, "shared")
+                                return
+                            _entry_emb = DEDUP_STATE._get_entry(_dedup_key_emb)  # type: ignore
+                            if _entry_emb is not None and _entry_emb.exception is not None:
+                                DEDUP_STATE.forget(_dedup_key_emb)  # type: ignore
+                                _dedup_bypass_reason_emb = None
+                                _dedup_key_emb = None
+                            else:
+                                log_api_event("dedup_wait_timeout", {"key_prefix8": _dedup_key_emb[:8], "principal_hash8": _dedup_principal_emb[:8], "stream": False, "wait_ms": int(_max_wait_emb * 1000)})
+                                DEDUP_STATE.forget(_dedup_key_emb)  # type: ignore
+                                _dedup_key_emb = None
+                        else:
+                            log_api_event("dedup_wait_timeout", {"key_prefix8": _dedup_key_emb[:8], "principal_hash8": _dedup_principal_emb[:8], "stream": False, "wait_ms": int(_max_wait_emb * 1000)})
+                            DEDUP_STATE.forget(_dedup_key_emb)  # type: ignore
+                            _dedup_key_emb = None
+                    if _dedup_is_leader_emb and _dedup_event_emb is None:
+                        log_api_event("dedup_bypass_overload", {"key_prefix8": _dedup_key_emb[:8] if _dedup_key_emb else "", "principal_hash8": _dedup_principal_emb[:8], "stream": False})
+                        _dedup_key_emb = None
+                except Exception:
+                    _dedup_key_emb = None
+            else:
+                log_api_event("dedup_bypass_disabled", {"reason": _dedup_bypass_reason_emb, "path": self.path.split("?", 1)[0]})
             model_name_raw = str(payload.get("model") or "").strip()
             catalog = load_catalog(catalog_path)
             model_name = resolve_catalog_model_name(model_name_raw, catalog)
@@ -15429,29 +16325,77 @@ def start_ctx_metadata_server(args):
                 log_api_event("ollama_embeddings_upstream_network_error", {"error": str(exc)})
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
-                self._send_json({"error": f"upstream unavailable: {exc}"}, status=502)
+                if _dedup_key_emb is not None:
+                    try:
+                        DEDUP_STATE.complete_err(_dedup_key_emb, exc)  # type: ignore
+                        DEDUP_STATE.forget(_dedup_key_emb)  # type: ignore
+                    except Exception:
+                        pass
+                _dedup_send_json_with_header(self, {"error": f"upstream unavailable: {exc}"}, status=502, dedup_header="miss")
                 return
             except ValueError as exc:
                 log_api_event("ollama_embeddings_upstream_invalid_json", {"status": response.status_code if 'response' in locals() else None, "error": str(exc)})
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
-                self._send_json({"error": f"upstream invalid response: {exc}"}, status=502)
+                if _dedup_key_emb is not None:
+                    try:
+                        DEDUP_STATE.complete_err(_dedup_key_emb, exc)  # type: ignore
+                        DEDUP_STATE.forget(_dedup_key_emb)  # type: ignore
+                    except Exception:
+                        pass
+                _dedup_send_json_with_header(self, {"error": f"upstream invalid response: {exc}"}, status=502, dedup_header="miss")
                 return
             if response.status_code >= 400:
                 log_api_event("ollama_embeddings_upstream_error", {"status": response.status_code, "body": response.text[:4000], "payload": upstream_payload})
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
-                self._send_json({"error": f"upstream unavailable: HTTP {response.status_code}: {response.text[:1000]}"}, status=502)
+                if _dedup_key_emb is not None:
+                    try:
+                        DEDUP_STATE.complete_err(_dedup_key_emb, RuntimeError(f"upstream {response.status_code}"))  # type: ignore
+                        DEDUP_STATE.forget(_dedup_key_emb)  # type: ignore
+                    except Exception:
+                        pass
+                _dedup_send_json_with_header(self, {"error": f"upstream unavailable: HTTP {response.status_code}: {response.text[:1000]}"}, status=502, dedup_header="miss")
                 return
             if upstream_model_name:
                 REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
             embeddings = data.get("data", [])
             if len(embeddings) == 1:
                 mark_model_activity(model_name, "ollama_embeddings", "response_done")
-                self._send_json({"embedding": embeddings[0].get("embedding", [])})
+                _emb_payload_single = {"embedding": embeddings[0].get("embedding", [])}
+                if _dedup_key_emb is not None:
+                    try:
+                        _result_emb_single = {"status": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(_emb_payload_single, ensure_ascii=False).encode("utf-8")}
+                        DEDUP_STATE.complete_ok(_dedup_key_emb, _result_emb_single)  # type: ignore
+                        ttl_s_emb = float(_dedup_cfg_emb.get("ttl_s", 600) or 600) if isinstance(_dedup_cfg_emb, dict) else 600
+                        if ttl_s_emb > 0:
+                            DEDUP_STATE.put_cached(_dedup_key_emb, _result_emb_single, ttl_s_emb)  # type: ignore
+                        else:
+                            DEDUP_STATE.forget(_dedup_key_emb)  # type: ignore
+                        log_api_event("dedup_miss", {"key_prefix8": _dedup_key_emb[:8], "principal_hash8": _dedup_principal_emb[:8], "stream": False, "path": self.path.split("?", 1)[0]})
+                    except Exception:
+                        pass
+                    _dedup_send_json_with_header(self, _emb_payload_single, status=200, dedup_header="miss")
+                else:
+                    _dedup_send_json_with_header(self, _emb_payload_single, status=200, dedup_header="miss")
                 return
             mark_model_activity(model_name, "ollama_embeddings", "response_done")
-            self._send_json({"embeddings": [item.get("embedding", []) for item in embeddings]})
+            _emb_payload_multi = {"embeddings": [item.get("embedding", []) for item in embeddings]}
+            if _dedup_key_emb is not None:
+                try:
+                    _result_emb_multi = {"status": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(_emb_payload_multi, ensure_ascii=False).encode("utf-8")}
+                    DEDUP_STATE.complete_ok(_dedup_key_emb, _result_emb_multi)  # type: ignore
+                    ttl_s_emb2 = float(_dedup_cfg_emb.get("ttl_s", 600) or 600) if isinstance(_dedup_cfg_emb, dict) else 600
+                    if ttl_s_emb2 > 0:
+                        DEDUP_STATE.put_cached(_dedup_key_emb, _result_emb_multi, ttl_s_emb2)  # type: ignore
+                    else:
+                        DEDUP_STATE.forget(_dedup_key_emb)  # type: ignore
+                    log_api_event("dedup_miss", {"key_prefix8": _dedup_key_emb[:8], "principal_hash8": _dedup_principal_emb[:8], "stream": False, "path": self.path.split("?", 1)[0]})
+                except Exception:
+                    pass
+                _dedup_send_json_with_header(self, _emb_payload_multi, status=200, dedup_header="miss")
+            else:
+                _dedup_send_json_with_header(self, _emb_payload_multi, status=200, dedup_header="miss")
 
 
     try:
