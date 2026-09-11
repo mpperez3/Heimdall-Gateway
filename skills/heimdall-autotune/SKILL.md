@@ -56,6 +56,27 @@ curl -sk http://127.0.0.1:11436/upstream/<model>/slots | jq '[.[].n_ctx]'
 - Prompt `50K` -> `prompt_tokens / elapsed` (`~8s` warm, `~68s` cold)
 - If `VRAM free >8GB` increase `batch 8192->12288` `ubatch 2048->4096` `checkpoints 32`
 - If `GPU1` overloaded, adjust `tensor_split` (`1.1,0.9` -> `0.65,0.35` normalized)
+- **DO NOT reduce context as first optimization step** — try batch/ubatch/checkpoints/tensor_split first
+
+### 5b. Real-time GPU Monitoring
+Monitor VRAM during model load to catch OOM before crash:
+```bash
+# Background monitor (2s interval)
+ssh user@host 'for i in $(seq 1 60); do
+  ts=$(date +%H:%M:%S)
+  gpus=$(nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader,nounits)
+  g0=$(echo "$gpus" | grep "^0," | cut -d"," -f2 | tr -d " ")
+  g1=$(echo "$gpus" | grep "^1," | cut -d"," -f2 | tr -d " ")
+  echo "$ts GPU0:${g0}MiB GPU1:${g1}MiB"
+  sleep 3
+done'
+
+# Or one-shot after load:
+nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader
+```
+- Watch for GPU hitting >95% during load — indicates OOM risk
+- If one GPU is much higher than the other, adjust `tensor_split`
+- Equal balance is NOT the goal — stability and headroom matter more
 
 ### 6. Snapshot
 ```bash

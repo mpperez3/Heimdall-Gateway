@@ -691,6 +691,31 @@ def _default_api_auth_config() -> dict[str, object]:
     return {"enabled": False, "api_key": ""}
 
 
+def _resolve_api_prefix() -> str:
+    """Read optional URL prefix from conf.json (e.g. '/llm')."""
+    try:
+        # conf.json lives next to the server config; try both user and system paths
+        for candidate in (
+            Path.home() / ".config" / "heimdall-gateway" / "conf.json",
+            Path("/etc/heimdall-gateway/conf.json"),
+        ):
+            if candidate.exists():
+                payload = json.loads(candidate.read_text("utf-8"))
+                prefix = str(payload.get("api_prefix") or "").strip()
+                if prefix:
+                    return prefix.rstrip("/")
+    except Exception:
+        pass
+    return ""
+
+
+def _strip_api_prefix(path: str, prefix: str) -> str:
+    if prefix and path.startswith(prefix):
+        stripped = path[len(prefix):]
+        return stripped if stripped else "/"
+    return path
+
+
 def _default_api_https_config() -> dict[str, object]:
     return {"enabled": False, "cert_file": "", "key_file": ""}
 
@@ -3252,6 +3277,14 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
         sval = str(value or "").strip()
         if sval and sval.lower() not in {"none", "null"}:
             cmd.extend(["--model-draft", sval])
+    elif key in {"spec_draft_model", "spec-draft-model"}:
+        sval = str(value or "").strip()
+        if sval and sval.lower() not in {"none", "null"}:
+            cmd.extend(["--spec-draft-model", sval])
+    elif key in {"spec_draft_ngl", "spec-draft-ngl"}:
+        sval = str(value or "").strip()
+        if sval:
+            cmd.extend(["--spec-draft-ngl", sval])
     elif key == "hf_repo_draft":
         cmd.extend(["--hf-repo-draft", str(value)])
     elif key == "spec_type":
@@ -11783,6 +11816,7 @@ def run_llamaswap_guard(args) -> int:
         threading.Thread(target=_request_server_shutdown, daemon=True).start()
         if child.poll() is None:
             child.terminate()
+        _try_drop_caches()
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
@@ -11824,6 +11858,34 @@ def _touch_model_via_llamaswap(model_id: str, host: str, port: int, *, timeout: 
         return False
 
 
+def _try_drop_caches() -> bool:
+    """Try to reclaim mmap'd model pages after a model is unloaded.
+
+    When beellama/llama-server exits, the kernel keeps mmap'd GGUF pages as
+    anonymous memory until under pressure.  On a gateway that switches between
+    large models, this means hundreds of GB of stale RAM.  Calling
+    ``drop_caches`` (requires root/sudo) forces immediate reclamation.
+
+    Returns True if the caches were successfully dropped.
+    """
+    try:
+        import subprocess
+        # sync first to flush dirty pages
+        subprocess.run(["sync"], check=False, timeout=10)
+        # drop_caches needs root; try with sudo first, fall back to plain
+        for cmd in (["sudo", "-n", "sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"],
+                     ["sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"]):
+            try:
+                result = subprocess.run(cmd, check=False, capture_output=True, timeout=10)
+                if result.returncode == 0:
+                    return True
+            except Exception:
+                continue
+        return False
+    except Exception:
+        return False
+
+
 def start_unexpected_unload_guard(args):
     host = args.public_host
     port = int(args.public_port)
@@ -11841,6 +11903,7 @@ def start_unexpected_unload_guard(args):
                 state["loaded"] = loaded
                 disappeared = previous - loaded
                 if disappeared:
+                    _try_drop_caches()
                     activity, last_activity_model_id = get_model_activity_snapshot()
                     now = time.monotonic()
                     for model_id in sorted(disappeared):
@@ -11870,6 +11933,21 @@ def start_unexpected_unload_guard(args):
                                 port,
                             )
                             continue
+                        reason = "idle_ttl" if age >= idle_ttl else "eviction_or_oom"
+                        if last_activity_model_id and last_activity_model_id != model_id:
+                            reason = "eviction_for_" + str(last_activity_model_id)
+                        log_api_event(
+                            "model_lifecycle_unload",
+                            {
+                                "model": model_id,
+                                "action": "unload",
+                                "reason": reason,
+                                "activity_age_seconds": age,
+                                "idle_ttl": idle_ttl,
+                                "last_activity": activity.get(model_id),
+                                "last_activity_model_id": last_activity_model_id,
+                            },
+                        )
                         log_api_event(
                             "model_unexpected_unload",
                             {
@@ -12382,6 +12460,9 @@ def start_ctx_metadata_server(args):
 
         def do_GET(self):
             parsed = urlparse(self.path)
+            api_prefix = _resolve_api_prefix()
+            if api_prefix:
+                parsed = parsed._replace(path=_strip_api_prefix(parsed.path, api_prefix))
             if self._redirect_plain_http_to_https():
                 return
             if not self._check_auth(parsed):
@@ -12464,6 +12545,9 @@ def start_ctx_metadata_server(args):
 
         def do_POST(self):
             parsed = urlparse(self.path)
+            api_prefix = _resolve_api_prefix()
+            if api_prefix:
+                parsed = parsed._replace(path=_strip_api_prefix(parsed.path, api_prefix))
             if self._redirect_plain_http_to_https():
                 return
             if not self._check_auth(parsed):
@@ -15856,6 +15940,7 @@ def unload_models(args):
         replica_defaults=resolve_global_replica_config(effective_args),
     )
     _emit_message("Unloaded all models." if unload_all else f"Unloaded model(s): {', '.join(target_ids)}.", None)
+    _try_drop_caches()
     if wait_for_models_absent(target_ids if not unload_all else [], effective_args.public_host, effective_args.public_port):
         return 0
     raise RuntimeError("Unload request was sent, but the target model(s) are still visible in /v1/models.")
@@ -15941,6 +16026,7 @@ def temporarily_unload_published_models(args, progress_callback = None, timeout 
             r = requests.get(url, timeout=2)
             if r.status_code == 200 and not r.json().get("data", []):
                 _emit_message("Published models unloaded for probing.", progress_callback)
+                _try_drop_caches()
                 return True
         except Exception:
             pass
@@ -17597,8 +17683,12 @@ def ensure_catalog_mtp_drafters(
                         progress_callback,
                     )
             continue
-        target_dir = Path(model.local_path).parent if model.local_path else Path(getattr(args, "models_dir", DEFAULT_MODELS_DIR)) / repo_id
-        target_dir.mkdir(parents=True, exist_ok=True)
+        target_dir = Path(model.local_path).parent if model.local_path and Path(model.local_path).parent.exists() else Path(getattr(args, "models_dir", DEFAULT_MODELS_DIR)) / repo_id
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+        except (PermissionError, OSError):
+            log_api_event("mtp_drafter_dir_skip", {"model": model.model_id, "dir": str(target_dir), "reason": "permission denied or path not found"})
+            continue
         local_path = target_dir / mtp_filename
         if not local_path.exists():
             try:
@@ -19079,6 +19169,14 @@ def main(argv: list[str] | None = None):
     args = parse_cli_args(parser, subparsers, argv=argv)
     if getattr(args, "func", None) is not migrate_server_config:
         persist_server_config(args)
+    if hasattr(args, "llama_server") and not Path(args.llama_server).exists():
+        for candidate in [
+            Path.home() / ".local/opt/heimdall-gateway/beellama/bin/llama-server-beellama",
+            Path("/opt/heimdall-gateway/beellama/bin/llama-server-beellama"),
+        ]:
+            if candidate.exists():
+                args.llama_server = candidate
+                break
     return args.func(args)
 
 if __name__ == "__main__":

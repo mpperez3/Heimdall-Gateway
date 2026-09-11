@@ -7826,6 +7826,7 @@ models:
             Path("llamacpp_stack/uninstall.py"),
             Path("llamacpp_stack/cli.py"),
             Path("tests/test_llamacpp_install.py"),
+            Path("tests/test_uninstall.py"),
             Path("tests/test_speculative_support.py"),
             Path("tests/test_autotuning_validation.py"),
         }

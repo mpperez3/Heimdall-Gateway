@@ -35,6 +35,62 @@ from llamacpp_stack.install import (
 DEFAULT_BEELLAMA_REPO = "Anbeeld/beellama.cpp"
 DEFAULT_BEELLAMA_REF = "main"
 
+_DRIVER_MAX_CUDA = {
+    525: 12.0, 535: 12.2, 545: 12.3, 550: 12.4, 555: 12.5, 560: 12.6,
+}
+
+
+def _detect_driver_max_cuda() -> float:
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            check=True, capture_output=True, text=True, timeout=5,
+        ).stdout.strip().splitlines()
+        if not out:
+            return 999.0
+        major_minor = out[0].split(".")
+        driver_major = int(major_minor[0])
+        for drv_ver in sorted(_DRIVER_MAX_CUDA.keys(), reverse=True):
+            if driver_major >= drv_ver:
+                return _DRIVER_MAX_CUDA[drv_ver]
+    except Exception:
+        pass
+    return 999.0
+
+
+def _nvcc_cuda_version(nvcc_path: str) -> float:
+    try:
+        out = subprocess.run(
+            [nvcc_path, "--version"], check=True, capture_output=True, text=True, timeout=5,
+        ).stdout
+        for line in out.splitlines():
+            if "release" in line.lower():
+                parts = line.split("release")[-1].strip().split(",")[0].strip().split(".")
+                return float(f"{parts[0]}.{parts[1]}")
+    except Exception:
+        pass
+    return 999.0
+
+
+def _pick_compatible_nvcc(system_nvcc, pip_nvcc, driver_max_cuda: float):
+    candidates = []
+    if system_nvcc:
+        v = _nvcc_cuda_version(str(system_nvcc))
+        candidates.append((system_nvcc, v, "system"))
+    if pip_nvcc:
+        v = _nvcc_cuda_version(str(pip_nvcc))
+        candidates.append((pip_nvcc, v, "pip"))
+    compatible = [(p, v, s) for p, v, s in candidates if v <= driver_max_cuda]
+    if compatible:
+        best = min(compatible, key=lambda x: x[1])
+        print(f"[*] Using {best[2]} nvcc CUDA {best[1]} (driver supports ≤{driver_max_cuda})")
+        return best[0]
+    if candidates:
+        print(f"[!] Warning: all nvcc versions ({', '.join(f'{s} CUDA {v}' for _, v, s in candidates)}) exceed driver max CUDA {driver_max_cuda}")
+        print(f"[!] Binaries may fail to run on this driver. Upgrade driver or use CUDA ≤{driver_max_cuda}.")
+        return candidates[0][0]
+    return None
+
 
 def _default_beellama_install_root(install_root: Path) -> Path:
     return install_root / "beellama"
@@ -62,10 +118,11 @@ def build_beellama(
     bin_path = beellama_root / "bin" / "llama-server-beellama"
 
     if not src_dir.exists():
-        print(f"[*] Cloning {repo}@{ref} -> {src_dir}")
-        subprocess.run(["git", "clone", f"https://github.com/{repo}.git", str(src_dir)], check=True)
+        print(f"[*] Cloning {repo}@{ref} (shallow) -> {src_dir}")
+        clone_args = ["git", "clone", "--depth", "1", f"https://github.com/{repo}.git", str(src_dir)]
         if ref != "main":
-            subprocess.run(["git", "-C", str(src_dir), "checkout", ref], check=True)
+            clone_args.extend(["--branch", ref])
+        subprocess.run(clone_args, check=True)
     else:
         print(f"[*] Updating {src_dir} to {ref}")
         subprocess.run(["git", "-C", str(src_dir), "fetch", "--depth", "1", "origin", ref], check=False)
@@ -73,8 +130,16 @@ def build_beellama(
 
     # Prepare CUDA env like install.py does
     python_exec = python_exec or sys.executable
-    nvcc = locate_nvcc_for_python(python_exec) or locate_nvcc()
+    # Detect driver CUDA compatibility and pick the right nvcc
+    driver_max_cuda = _detect_driver_max_cuda()
+    system_nvcc = locate_nvcc()
+    pip_nvcc = locate_nvcc_for_python(python_exec)
+    nvcc = _pick_compatible_nvcc(system_nvcc, pip_nvcc, driver_max_cuda)
     cuda_root = locate_cuda_root_for_python(python_exec)
+    if nvcc and system_nvcc and str(Path(nvcc).resolve()) == str(Path(system_nvcc).resolve()):
+        system_cuda = Path(nvcc).parent.parent
+        if system_cuda.exists():
+            cuda_root = system_cuda
     nccl_root = locate_nccl_root_for_python(python_exec)
     _export_nvcc_path(nvcc)
     _export_cuda_root(cuda_root)
@@ -83,8 +148,17 @@ def build_beellama(
     enable_cuda = detect_nvidia_gpu()
     arch = None
     if enable_cuda:
-        # detect arch 89 for 4090
-        arch = "89-real"
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip().splitlines()
+            if out:
+                arch = out[0].replace(".", "") + "-real"
+            else:
+                arch = "89-real"
+        except Exception:
+            arch = "89-real"
 
     build_dir.mkdir(parents=True, exist_ok=True)
     beellama_lib_dir = beellama_root / "lib"
@@ -120,6 +194,11 @@ def build_beellama(
         rpath_dirs=rpath_list,
     )
     cmake_args[0] = str(cmake_bin)
+    if shutil.which("ninja"):
+        cmake_args.extend(["-G", "Ninja"])
+    if shutil.which("ccache"):
+        cmake_args.extend(["-DCMAKE_C_COMPILER_LAUNCHER=ccache", "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
+                           "-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache"])
     for _flag, _val in (("GGML_NATIVE", "ON"), ("GGML_CUDA_FA", "ON"), ("GGML_CUDA_F16", "ON")):
         try:
             from llamacpp_stack.install import source_tree_supports_flag
@@ -131,8 +210,10 @@ def build_beellama(
             cmake_args.append(f"-D{_flag}={_val}")
     print(f"[*] Configuring beellama: {' '.join(cmake_args)}")
     subprocess.run(cmake_args, check=True)
-    print("[*] Building beellama (same as llama.cpp, may take 5-10m)...")
-    subprocess.run(["cmake", "--build", str(build_dir), "-j", str(os.cpu_count() or 4)], check=True)
+    build_jobs = max(1, os.cpu_count() or 4)
+    make_bin = shutil.which("make") or "make"
+    print(f"[*] Building beellama ({build_jobs} jobs, ~5-10min)...")
+    subprocess.run([make_bin, "-C", str(build_dir), "-j", str(build_jobs)], check=True)
     print("[*] Installing beellama libs and binary with rpath (like llama.cpp)...")
     subprocess.run(["cmake", "--install", str(build_dir), "--prefix", str(beellama_root)], check=False)
     # Ensure binary and libs have rpath and are in place

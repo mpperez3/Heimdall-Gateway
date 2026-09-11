@@ -88,7 +88,7 @@ TEMPLATES_BASENAME = "templates"
 LEGACY_SERVER_CONFIG_BASENAME = "llamacpp-server.json"
 ENV_BASENAME = "heimdall-gateway.env"
 LEGACY_ENV_BASENAME = "llamacpp-stack.env"
-LLAMA_CPP_MODES = ("native", "prebuilt", "source")
+LLAMA_CPP_MODES = ("native", "prebuilt", "source", "skip")
 BACKEND_OPTIONS = ("auto", "llama.cpp", "vllm-beta")
 ELEVATED_INSTALL_ENV = "HEIMDALL_GATEWAY_INSTALL_ELEVATED"
 LEGACY_ELEVATED_INSTALL_ENV = "LLAMACPP_INSTALL_ELEVATED"
@@ -772,6 +772,113 @@ def prompt_choice(message: str, options: list[tuple[str, str]], default: str) ->
         print(f"Choose one of: {', '.join(numeric_to_key)} or {', '.join(labels)}")
 
 
+OPTIONAL_ENGINE_ORDER: list[tuple[str, str]] = [
+    ("1", "beellama"),
+    ("2", "vllm"),
+    ("3", "exllama"),
+]
+OPTIONAL_ENGINE_LABELS: dict[str, str] = {
+    "beellama": "beellama (kvarn4/MTP)",
+    "vllm": "vLLM",
+    "exllama": "EXL3 (ExLlamaV2+DFlash2)",
+}
+OPTIONAL_TOKEN_MAP: dict[str, str] = {
+    "1": "beellama",
+    "2": "vllm",
+    "3": "exllama",
+    "beellama": "beellama",
+    "kvarn4": "beellama",
+    "mtp": "beellama",
+    "vllm": "vllm",
+    "vllm-beta": "vllm",
+    "exllama": "exllama",
+    "exl3": "exllama",
+    "exllamav3": "exllama",
+    "exllama-v3": "exllama",
+}
+
+
+def parse_optional_selection(raw: str | None) -> set[str]:
+    if raw is None:
+        return set()
+    text = str(raw).strip().lower()
+    if not text or text in {"none", "no", "n", "0", "-", "skip"}:
+        return set()
+    if text in {"all", "a", "1,2,3", "1 2 3", "1, 2, 3", "123"}:
+        return {"beellama", "vllm", "exllama"}
+    # Normalize separators: commas and whitespace
+    parts = re.split(r"[,\s]+", text)
+    selected: set[str] = set()
+    for part in parts:
+        token = part.strip().lower()
+        if not token:
+            continue
+        if token in {"all", "a"}:
+            return {"beellama", "vllm", "exllama"}
+        if token in {"none", "no", "n", "0"}:
+            continue
+        mapped = OPTIONAL_TOKEN_MAP.get(token)
+        if mapped:
+            selected.add(mapped)
+        else:
+            # Unknown token ignored to keep prompt forgiving; could also warn
+            print(f"[!] Ignoring unknown optional '{part}' (valid: 1,2,3, all, none)")
+    return selected
+
+
+def prompt_optionals(default_raw: str | None = None) -> set[str]:
+    if not sys.stdin.isatty():
+        return parse_optional_selection(default_raw) if default_raw is not None else set()
+    if default_raw is not None:
+        parsed = parse_optional_selection(default_raw)
+        # Non-empty explicit flag already parsed without prompting
+        if str(default_raw).strip() != "":
+            return parsed
+    prompt = "¿Qué opcionales instalar? [1] beellama (kvarn4/MTP) [2] vLLM [3] EXL3 (ExLlamaV2+DFlash2) [all/none or e.g. 1,2]: "
+    if default_raw is not None:
+        # Show pre-selected default in prompt when re-prompting
+        pass
+    while True:
+        try:
+            raw = input(prompt).strip()
+        except EOFError:
+            return parse_optional_selection(default_raw) if default_raw is not None else set()
+        if raw == "":
+            return set()
+        selected = parse_optional_selection(raw)
+        # Accept any parse result, including empty (none). Re-prompt only on ambiguous input that yielded empty but wasn't none/all
+        # If raw was not empty and parse gave empty, it was either "none" or unknown tokens
+        if raw.lower() in {"none", "no", "n", "0", ""}:
+            return set()
+        if selected or raw.lower() in {"all", "a"}:
+            return selected
+        # If parse failed (unknown tokens), show hint and re-prompt
+        # parse_optional_selection already printed warning
+        print("  Valid: 1, 2, 3, 1,2, 1 2, all, none")
+
+
+def resolve_optionals_selection(args: argparse.Namespace) -> set[str]:
+    raw = getattr(args, "optionals", None)
+    # Also support legacy per-engine flags if present
+    if raw is not None and str(raw).strip() != "":
+        selected = parse_optional_selection(str(raw))
+        # Persist normalized form for re-exec
+        args.optionals = ",".join(sorted(selected, key=lambda x: {"beellama": 0, "vllm": 1, "exllama": 2}.get(x, 99))) if selected else "none"
+        return selected
+    # Check env var for non-interactive callers
+    env_raw = os.environ.get("HEIMDALL_GATEWAY_OPTIONALS", "").strip()
+    if env_raw:
+        selected = parse_optional_selection(env_raw)
+        args.optionals = ",".join(sorted(selected)) if selected else "none"
+        return selected
+    if not sys.stdin.isatty():
+        args.optionals = "none"
+        return set()
+    selected = prompt_optionals(default_raw=raw)
+    args.optionals = ",".join(sorted(selected, key=lambda x: {"beellama": 0, "vllm": 1, "exllama": 2}.get(x, 99))) if selected else "none"
+    return selected
+
+
 def prompt_existing_install_action() -> str:
     return prompt_choice(
         "Existing installation detected. What do you want to do?",
@@ -806,16 +913,58 @@ def resolve_install_mode(requested_mode: str | None) -> str:
 
 def resolve_llama_cpp_mode(requested_mode: str | None) -> str:
     if requested_mode:
+        if str(requested_mode).strip().lower() == "skip":
+            return "skip"
         return requested_mode
+    existing = detect_existing_llama_server_binary()
+    if existing is not None and sys.stdin.isatty():
+        selected = prompt_choice(
+            "How should llama.cpp be installed?",
+            [
+                ("source", "build locally from source (best default, best GPU tuning)"),
+                ("prebuilt", "download a precompiled binary (fastest install)"),
+                ("native", "use a system-wide llama.cpp already installed on the machine"),
+                ("skip", f"skip - keep existing binary at {existing} (¿Saltar llama.cpp ya instalado?)"),
+            ],
+            default="skip",
+        )
+        if selected == "skip":
+            return "skip"
+        if (
+            selected == "source"
+            and sys.stdin.isatty()
+            and not (os.environ.get(LLAMA_CPP_REF_ENV) or os.environ.get(LEGACY_LLAMA_CPP_REF_ENV))
+            and not (os.environ.get(LLAMA_CPP_REF_PROMPTED_ENV) or os.environ.get(LEGACY_LLAMA_CPP_REF_PROMPTED_ENV))
+        ):
+            source_choice = prompt_choice(
+                "Which llama.cpp source version should be built?",
+                [
+                    ("latest", "use the latest llama.cpp release (default)"),
+                    ("commit", "build a specific git commit/tag/ref"),
+                ],
+                default="latest",
+            )
+            os.environ[LLAMA_CPP_REF_PROMPTED_ENV] = "1"
+            if source_choice == "commit":
+                while True:
+                    raw = input("llama.cpp commit/tag/ref: ").strip()
+                    if raw:
+                        os.environ[LLAMA_CPP_REF_ENV] = raw
+                        break
+                    print("Please enter a non-empty commit/tag/ref, or press Ctrl+C to cancel.")
+        return selected
     selected = prompt_choice(
         "How should llama.cpp be installed?",
         [
             ("source", "build locally from source (best default, best GPU tuning)"),
             ("prebuilt", "download a precompiled binary (fastest install)"),
             ("native", "use a system-wide llama.cpp already installed on the machine"),
+            ("skip", "skip - keep existing binary if present"),
         ],
         default="source",
     )
+    if selected == "skip":
+        return "skip"
     if (
         selected == "source"
         and sys.stdin.isatty()
@@ -1177,6 +1326,9 @@ def _args_to_cli(argv: argparse.Namespace, chosen_mode: str, chosen_llama_cpp_mo
             cmd.extend([option, value])
     if bool(getattr(argv, "regenerate_api_cert", False)):
         cmd.append("--regenerate-api-cert")
+    optionals = str(getattr(argv, "optionals", "") or "").strip()
+    if optionals:
+        cmd.extend(["--optionals", optionals])
     if argv.dry_run:
         cmd.append("--dry-run")
     return cmd
@@ -1235,6 +1387,26 @@ def resolve_uv_executable() -> str | None:
         return bootstrap_uv
     if uv_bin := shutil.which("uv"):
         return uv_bin
+    # Fallback for sudo -E where PATH may not contain user ~/.local/bin
+    for cand in [
+        Path.home() / ".local" / "bin" / "uv",
+        Path("/usr/local/bin/uv"),
+        Path("/opt/uv/bin/uv"),
+    ]:
+        if cand.exists():
+            return str(cand)
+    # Check original sudo user's home
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        try:
+            import pwd
+
+            pw = pwd.getpwnam(sudo_user)
+            cand = Path(pw.pw_dir) / ".local" / "bin" / "uv"
+            if cand.exists():
+                return str(cand)
+        except Exception:
+            pass
     sibling = Path(sys.executable).resolve().parent / "uv"
     if sibling.exists():
         return str(sibling)
@@ -1571,12 +1743,718 @@ def env_paths_for_mode(mode: str) -> list[Path]:
     return [env_path_for_mode(mode), *legacy_env_paths_for_mode(mode)]
 
 
+def _has_sudo_noninteractive() -> bool:
+    if os.geteuid() == 0:
+        return True
+    if shutil.which("sudo") is None:
+        return False
+    try:
+        r = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _path_exists_no_perm_error(p: Path) -> bool:
+    try:
+        return p.exists() or p.is_symlink()
+    except PermissionError:
+        # Treat permission denied as existing but not readable – still a trace
+        return True
+    except Exception:
+        return False
+
+
+def _is_mode_present(mode: str) -> bool:
+    # Check env files (may raise PermissionError – handled)
+    for ep in env_paths_for_mode(mode):
+        if _path_exists_no_perm_error(ep):
+            return True
+    # Check install roots for this mode
+    roots = _install_root_candidates_for_coexistence().get(mode, [])
+    for r in roots:
+        if _path_exists_no_perm_error(r):
+            return True
+        # Also check python subdir that may remain as 4.0KiB placeholder
+        py_sub = r / "python" / "llamacpp_stack"
+        if _path_exists_no_perm_error(py_sub):
+            return True
+    # Check state/config/run dirs via choose_layout semantics without needing existence of env
+    try:
+        if mode == "system":
+            for p in [Path("/var/lib/heimdall-gateway"), Path("/etc/heimdall-gateway"), Path("/run/heimdall-gateway"), Path("/opt/heimdall-gateway")]:
+                if _path_exists_no_perm_error(p):
+                    return True
+        else:
+            for p in [Path.home() / ".local/state/heimdall-gateway", Path.home() / ".config/heimdall-gateway", Path.home() / ".local/run/heimdall-gateway"]:
+                if _path_exists_no_perm_error(p):
+                    return True
+            # hardcoded user path
+            if _path_exists_no_perm_error(Path("/home/mpperez3/.local/state/heimdall-gateway")):
+                return True
+            if _path_exists_no_perm_error(Path("/home/mpperez3/.local/opt/heimdall-gateway")):
+                return True
+    except Exception:
+        pass
+    # Check llama-server binary for this mode
+    for cand in _llama_server_binary_candidates():
+        is_user = ".local/opt" in str(cand) or "mpperez3" in str(cand)
+        cand_mode = "user" if is_user else "system"
+        if cand_mode != mode:
+            continue
+        if _path_exists_no_perm_error(cand):
+            return True
+    return False
+
+
 def detect_existing_mode() -> str | None:
-    if any(path.exists() for path in env_paths_for_mode("system")):
+    has_system = _is_mode_present("system")
+    has_user = _is_mode_present("user")
+    if has_system and has_user:
+        # Both present – prefer system as existing (coexistence will be handled)
+        # but report system so caller can detect coexistence via opposite check
         return "system"
-    if any(path.exists() for path in env_paths_for_mode("user")):
+    if has_system:
+        return "system"
+    if has_user:
         return "user"
     return None
+
+
+def _remove_path_robust(path: Path, use_sudo: bool = False, dry_run: bool = False) -> bool:
+    if dry_run:
+        exists = _path_exists_no_perm_error(path)
+        prefix = "[dry-run] would remove"
+        if use_sudo:
+            prefix += " (with sudo)"
+        suffix = "" if exists else " (not present, would skip)"
+        print(f"{prefix} {path}{suffix}")
+        return not exists or True
+
+    if not _path_exists_no_perm_error(path):
+        return True
+
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+    except (PermissionError, OSError):
+        if use_sudo or str(path).startswith(("/opt/", "/etc/", "/var/", "/usr/local/bin/", "/run/")):
+            if shutil.which("sudo") is not None:
+                try:
+                    result = subprocess.run(["sudo", "rm", "-rf", str(path)], capture_output=True, timeout=30)
+                    if result.returncode != 0:
+                        print(f"[!] sudo rm failed for {path}: {result.stderr.decode('utf-8', errors='replace').strip()}", file=sys.stderr)
+                except Exception:
+                    pass
+        else:
+            print(f"[!] Could not remove {path} without sudo, skipping (need sudo for {path})", file=sys.stderr)
+
+    if _path_exists_no_perm_error(path):
+        if shutil.which("sudo") is not None:
+            try:
+                subprocess.run(["sudo", "rm", "-rf", str(path)], capture_output=True, check=False, timeout=30)
+                py_placeholder = path / "python" / "llamacpp_stack"
+                if _path_exists_no_perm_error(py_placeholder):
+                    subprocess.run(["sudo", "rm", "-rf", str(py_placeholder)], capture_output=True, check=False, timeout=30)
+                    if _path_exists_no_perm_error(path):
+                        subprocess.run(["sudo", "rm", "-rf", str(path)], capture_output=True, check=False, timeout=30)
+            except Exception:
+                pass
+
+    if _path_exists_no_perm_error(path):
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    still = _path_exists_no_perm_error(path)
+    if still:
+        print(f"[!] Warning: {path} still exists after removal attempts (possible permission issue).", file=sys.stderr)
+        return False
+    print(f"[*] Removed {path}" + (" via sudo" if use_sudo else ""))
+    return True
+
+
+def _llama_server_binary_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    candidates.append(Path.home() / ".local/opt/heimdall-gateway/llama-server")
+    candidates.append(Path.home() / ".local/opt/heimdall-gateway/beellama/bin/llama-server-beellama")
+    candidates.append(Path("/opt/heimdall-gateway/llama-server"))
+    candidates.append(Path("/opt/heimdall-gateway/beellama/bin/llama-server-beellama"))
+    hardcoded = Path("/home/mpperez3/.local/opt/heimdall-gateway/llama-server")
+    if hardcoded not in candidates:
+        candidates.append(hardcoded)
+    hardcoded_beellama = Path("/home/mpperez3/.local/opt/heimdall-gateway/beellama/bin/llama-server-beellama")
+    if hardcoded_beellama not in candidates:
+        candidates.append(hardcoded_beellama)
+    return candidates
+
+
+def detect_existing_llama_server_binary() -> Path | None:
+    for candidate in _llama_server_binary_candidates():
+        try:
+            if candidate.exists() or candidate.is_symlink():
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _install_root_candidates_for_coexistence() -> dict[str, list[Path]]:
+    user_roots = [Path.home() / ".local/opt/heimdall-gateway", Path("/home/mpperez3/.local/opt/heimdall-gateway")]
+    deduped: list[Path] = []
+    seen = set()
+    for p in user_roots:
+        key = str(p)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(p)
+    return {"user": deduped, "system": [Path("/opt/heimdall-gateway")]}
+
+
+def _opposite_mode(target_mode: str) -> str:
+    return "user" if target_mode == "system" else "system"
+
+
+def _resolve_opposite_models_dir(opposite_mode: str) -> Path | None:
+    try:
+        found = existing_models_dir(opposite_mode)
+    except Exception:
+        found = None
+    if found is not None:
+        return found
+    # Common paths to check as required by migration hardlink feature.
+    # Use os.path.exists / Path.exists to detect existing models dir.
+    candidates: list[Path] = []
+    home_share = Path.home() / ".local/share/heimdall-gateway/models"
+    hardcoded_user = Path("/home/mpperez3/.local/share/heimdall-gateway/models")
+    common_required = [
+        Path("/var/llamacpp_models"),
+        Path("/scratch/tesla8/mpperez3/llm_models"),
+        home_share,
+        Path("/opt/heimdall-gateway/models"),
+    ]
+    if opposite_mode == "system":
+        candidates = [
+            Path("/var/llamacpp_models"),
+            Path("/var/lib/heimdall-gateway/models"),
+            Path("/opt/heimdall-gateway/models"),
+            Path("/scratch/tesla8/mpperez3/llm_models"),
+            home_share,
+            hardcoded_user,
+        ]
+    else:
+        candidates = [
+            home_share,
+            hardcoded_user,
+            Path("/scratch/tesla8/mpperez3/llm_models"),
+            Path("/var/llamacpp_models"),
+            Path("/var/lib/heimdall-gateway/models"),
+            Path("/opt/heimdall-gateway/models"),
+        ]
+    # Deduplicate while preserving order, also ensure required paths are covered
+    seen: set[str] = set()
+    deduped: list[Path] = []
+    for cand in candidates + common_required:
+        key = str(cand)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(cand)
+    for cand in deduped:
+        try:
+            if cand.exists():
+                return cand
+        except Exception:
+            continue
+    return found
+
+
+def _resolve_opposite_state_dir(opposite_mode: str) -> Path:
+    if opposite_mode == "system":
+        return Path("/var/lib/heimdall-gateway")
+    # Check primary and hardcoded user state dirs
+    primary = Path.home() / ".local/state/heimdall-gateway"
+    if primary.exists():
+        return primary
+    hardcoded = Path("/home/mpperez3/.local/state/heimdall-gateway")
+    if hardcoded.exists():
+        return hardcoded
+    return primary
+
+
+def _prompt_migration_action(opposite_mode: str) -> str:
+    if not sys.stdin.isatty():
+        return "migrar"
+    return prompt_choice(
+        f"Detectada instalación {opposite_mode} existente. ¿Migrar (mantener binarios y modelos con symlink) o eliminar? [migrar/eliminar/cancelar]",
+        [
+            ("migrar", "Mantener binarios y modelos, crear symlink hacia la instalación existente (skip rebuild)"),
+            ("eliminar", f"Eliminar la instalación {opposite_mode} existente"),
+            ("cancelar", "Cancelar la instalación"),
+        ],
+        default="migrar",
+    )
+
+
+def _prompt_models_hardlink_choice(existing: Path, dry_run: bool = False) -> str:
+    if dry_run:
+        print(f"¿Usar hardlink a {existing} existente o crear aparte? [hardlink/aparte] (default: hardlink)")
+        print(f"[dry-run] would prompt: ¿Usar hardlink a {existing} existente o crear aparte? [hardlink/aparte] -> hardlink")
+        return "hardlink"
+    if not sys.stdin.isatty():
+        return "hardlink"
+    return prompt_choice(
+        f"¿Usar hardlink a {existing} existente o crear aparte? [hardlink/aparte] (default: hardlink)",
+        [
+            ("hardlink", f"Usar hardlink/symlink hacia {existing} existente (compartir modelos)"),
+            ("aparte", "Crear directorio separado para esta instalación"),
+        ],
+        default="hardlink",
+    )
+
+
+def _ensure_models_symlink(target_models: Path, source_models: Path, dry_run: bool) -> None:
+    if _same_models_dir(target_models, source_models):
+        print(f"[*] Directorio de modelos ya apunta a {source_models}, no es necesario crear symlink.")
+        return
+    if dry_run:
+        print(f"[dry-run] would symlink models dir {target_models} -> {source_models} (mantener modelos existentes)")
+        # Also note that symlink creation may need sudo when target is system path
+        if target_models.parent == Path("/var/lib/heimdall-gateway") or str(target_models).startswith("/var/") or str(target_models).startswith("/opt/"):
+            print(f"[dry-run] would use sudo if needed to create symlink at {target_models}")
+        return
+    # If target already exists and is a symlink to source, nothing to do
+    try:
+        if target_models.is_symlink() and target_models.resolve(strict=False) == source_models.resolve(strict=False):
+            print(f"[*] Models symlink already correct: {target_models} -> {source_models}")
+            return
+    except Exception:
+        pass
+    # If target is an empty directory, remove it to replace with symlink
+    try:
+        if target_models.exists() and not target_models.is_symlink():
+            if target_models.is_dir():
+                try:
+                    is_empty = not any(target_models.iterdir())
+                except Exception:
+                    is_empty = False
+                if is_empty:
+                    target_models.rmdir()
+                else:
+                    # Keep existing non-empty target but create symlink inside? Instead, keep target and symlink not needed
+                    print(f"[*] Target models dir {target_models} already exists and is non-empty; keeping it and skipping symlink (models kept in place).")
+                    return
+            else:
+                target_models.unlink()
+    except Exception as exc:
+        print(f"[!] Could not prepare target models dir for symlink: {exc} - trying with sudo")
+        try:
+            subprocess.run(_sudo_prefix() + ["rm", "-rf", str(target_models)], check=True)
+        except Exception as exc2:
+            print(f"[!] sudo removal failed for {target_models}: {exc2}")
+            return
+    try:
+        target_models.parent.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        try:
+            subprocess.run(_sudo_prefix() + ["mkdir", "-p", str(target_models.parent)], check=True)
+        except Exception as exc:
+            print(f"[!] Could not create parent dir {target_models.parent}: {exc} - skipping symlink")
+            return
+    except Exception as exc:
+        print(f"[!] Could not create parent dir {target_models.parent}: {exc} - trying with sudo")
+        try:
+            subprocess.run(_sudo_prefix() + ["mkdir", "-p", str(target_models.parent)], check=True)
+        except Exception as exc2:
+            print(f"[!] sudo mkdir also failed for {target_models.parent}: {exc2}")
+            return
+    try:
+        target_models.symlink_to(source_models)
+        print(f"[*] Created symlink {target_models} -> {source_models}")
+    except PermissionError as exc:
+        print(f"[!] Could not create symlink {target_models} -> {source_models}: {exc} - trying with sudo")
+        try:
+            subprocess.run(_sudo_prefix() + ["mkdir", "-p", str(target_models.parent)], check=True)
+            subprocess.run(_sudo_prefix() + ["ln", "-sfn", str(source_models), str(target_models)], check=True)
+            print(f"[*] Created symlink via sudo {target_models} -> {source_models}")
+        except Exception as exc2:
+            print(f"[!] sudo symlink also failed: {exc2}")
+    except Exception as exc:
+        print(f"[!] Could not create symlink {target_models} -> {source_models}: {exc} - trying with sudo")
+        try:
+            subprocess.run(_sudo_prefix() + ["mkdir", "-p", str(target_models.parent)], check=True)
+            subprocess.run(_sudo_prefix() + ["ln", "-sfn", str(source_models), str(target_models)], check=True)
+            print(f"[*] Created symlink via sudo {target_models} -> {source_models}")
+        except Exception as exc2:
+            print(f"[!] sudo symlink also failed: {exc2}")
+
+
+def _migrate_catalog_and_config(target_mode: str, opposite_mode: str, dry_run: bool) -> None:
+    opposite_state = _resolve_opposite_state_dir(opposite_mode)
+    target_state = Path("/var/lib/heimdall-gateway") if target_mode == "system" else Path.home() / ".local/state/heimdall-gateway"
+    opposite_config_dir = Path("/etc/heimdall-gateway") if opposite_mode == "system" else Path.home() / ".config/heimdall-gateway"
+    target_config_dir = Path("/etc/heimdall-gateway") if target_mode == "system" else Path.home() / ".config/heimdall-gateway"
+    for src, dst in (
+        (opposite_state / "catalog.json", target_state / "catalog.json"),
+        (opposite_state / "config.yaml", target_state / "config.yaml"),
+        (opposite_config_dir / SERVER_CONFIG_BASENAME, target_config_dir / SERVER_CONFIG_BASENAME),
+    ):
+        if not _path_exists_no_perm_error(src):
+            continue
+        try:
+            if src.is_symlink() and not src.exists():
+                continue
+        except Exception:
+            pass
+        if _path_exists_no_perm_error(dst):
+            continue
+        if dry_run:
+            print(f"[dry-run] would migrate {src} -> {dst} (mantener config/catalog)")
+            continue
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            print(f"[*] Migrated {src} -> {dst}")
+        except PermissionError as exc:
+            print(f"[!] Could not copy {src} -> {dst}: {exc} - trying with sudo")
+            try:
+                subprocess.run(_sudo_prefix() + ["mkdir", "-p", str(dst.parent)], check=True)
+                subprocess.run(_sudo_prefix() + ["cp", "-a", str(src), str(dst)], check=True)
+                print(f"[*] Migrated via sudo {src} -> {dst}")
+            except Exception as exc2:
+                print(f"[!] sudo copy also failed: {exc2}")
+        except Exception as exc:
+            print(f"[!] Could not copy {src} -> {dst}: {exc} - trying with sudo")
+            try:
+                subprocess.run(_sudo_prefix() + ["mkdir", "-p", str(dst.parent)], check=True)
+                subprocess.run(_sudo_prefix() + ["cp", "-a", str(src), str(dst)], check=True)
+                print(f"[*] Migrated via sudo {src} -> {dst}")
+            except Exception as exc2:
+                print(f"[!] sudo copy also failed: {exc2}")
+
+
+def _opposite_install_traces(opposite_mode: str) -> list[tuple[Path, bool]]:
+    traces: list[tuple[Path, bool]] = []
+    if opposite_mode == "system":
+        traces.append((Path("/opt/heimdall-gateway"), True))
+        traces.append((Path("/etc/heimdall-gateway"), True))
+        traces.append((Path("/var/lib/heimdall-gateway"), False))
+        traces.append((Path("/run/heimdall-gateway"), False))
+        traces.append((Path("/etc/systemd/system/heimdall-gateway-manager.service"), True))
+        traces.append((Path("/etc/systemd/system/heimdall-gateway-router.service"), True))
+        traces.append((Path("/usr/local/bin/heimdall-gateway"), True))
+        traces.append((Path("/usr/local/bin/heimdall-gateway-manager-start"), True))
+        traces.append((Path("/usr/local/bin/heimdall-gateway-router-start"), True))
+        traces.append((Path("/usr/local/bin/vllm-server"), True))
+    else:
+        home = Path.home()
+        traces.append((home / ".local/opt/heimdall-gateway", False))
+        traces.append((home / ".local/state/heimdall-gateway", False))
+        traces.append((home / ".config/heimdall-gateway", False))
+        traces.append((home / ".local/run/heimdall-gateway", False))
+        traces.append((home / ".config/systemd/user/heimdall-gateway-manager.service", False))
+        traces.append((home / ".config/systemd/user/heimdall-gateway-router.service", False))
+        for p in [Path("/home/mpperez3/.local/opt/heimdall-gateway"), Path("/home/mpperez3/.local/state/heimdall-gateway"), Path("/home/mpperez3/.config/heimdall-gateway")]:
+            traces.append((p, False))
+    return traces
+
+
+def _cleanup_opposite_after_migrar(target_mode: str, opposite_mode: str, dry_run: bool) -> None:
+    if target_mode == "system" and opposite_mode == "user":
+        return
+    traces = _opposite_install_traces(opposite_mode)
+    models_to_keep = _resolve_opposite_models_dir(opposite_mode) if opposite_mode == "system" else None
+    for path, need_sudo in traces:
+        if not _path_exists_no_perm_error(path):
+            continue
+        # Don't delete models dir itself when it contains actual GGUFs and we hardlinked to it
+        try:
+            if models_to_keep is not None:
+                try:
+                    if path.resolve(strict=False) == models_to_keep.resolve(strict=False):
+                        continue
+                    if models_to_keep.is_relative_to(path):
+                        continue
+                except Exception:
+                    if str(path) in str(models_to_keep):
+                        continue
+        except Exception:
+            pass
+        # For state dir that contains models subtree, clean contents except models
+        if path == Path("/var/lib/heimdall-gateway") and models_to_keep is not None and not dry_run:
+            try:
+                # Remove everything except models dir
+                for child in list(path.iterdir()):
+                    try:
+                        if child.resolve(strict=False) == models_to_keep.resolve(strict=False):
+                            continue
+                    except Exception:
+                        pass
+                    _remove_path_robust(child, use_sudo=need_sudo, dry_run=dry_run)
+                # If now empty except models, keep directory; otherwise remove
+                try:
+                    remaining = list(path.iterdir())
+                    if len(remaining) == 1 and remaining[0].resolve(strict=False) == models_to_keep.resolve(strict=False):
+                        print(f"[*] Kept models at {models_to_keep}, cleaned {path} contents")
+                        continue
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        if dry_run:
+            print(f"[dry-run] would clean opposite {opposite_mode} trace {path} (post-migrar)")
+            continue
+        if "heimdall-gateway-manager.service" in str(path) or "heimdall-gateway-router.service" in str(path):
+            try:
+                svc = path.name
+                if opposite_mode == "system":
+                    if shutil.which("sudo") is not None or os.geteuid() == 0:
+                        prefix = [] if os.geteuid() == 0 else ["sudo"]
+                        subprocess.run(prefix + ["systemctl", "stop", svc], check=False, timeout=10)
+                        subprocess.run(prefix + ["systemctl", "disable", svc], check=False, timeout=10)
+                    else:
+                        print(f"[!] Skipping systemctl stop/disable for {svc} (no sudo)", file=sys.stderr)
+                else:
+                    subprocess.run(["systemctl", "--user", "stop", svc], check=False, timeout=10)
+                    subprocess.run(["systemctl", "--user", "disable", svc], check=False, timeout=10)
+            except Exception:
+                pass
+        _remove_path_robust(path, use_sudo=need_sudo, dry_run=False)
+    # Always ensure /opt placeholder is fully gone when target is user
+    if target_mode == "user":
+        opt_root = Path("/opt/heimdall-gateway")
+        if _path_exists_no_perm_error(opt_root):
+            if dry_run:
+                print(f"[dry-run] would ensure {opt_root} fully removed (including python/llamacpp_stack placeholder)")
+            else:
+                _remove_path_robust(opt_root, use_sudo=True, dry_run=False)
+                # Verify and log
+                if not _path_exists_no_perm_error(opt_root):
+                    print(f"[*] Ensured {opt_root} fully removed after migrar to user mode")
+    if not dry_run:
+        try:
+            if opposite_mode == "user":
+                subprocess.run(["systemctl", "--user", "daemon-reload"], check=False, timeout=10)
+            else:
+                if shutil.which("sudo") is not None or os.geteuid() == 0:
+                    prefix = [] if os.geteuid() == 0 else ["sudo"]
+                    subprocess.run(prefix + ["systemctl", "daemon-reload"], check=False, timeout=10)
+        except Exception:
+            pass
+
+
+def _handle_migration_migrar(target_mode: str, opposite_mode: str, chosen_models_dir: Path, dry_run: bool, args: argparse.Namespace | None = None) -> None:
+    choice = getattr(args, "_models_hardlink_choice", None) if args is not None else None
+    stored_existing = getattr(args, "_existing_opposite_models", None) if args is not None else None
+    opposite_models = stored_existing if isinstance(stored_existing, Path) else _resolve_opposite_models_dir(opposite_mode)
+    if choice == "aparte":
+        if dry_run:
+            print(f"[dry-run] aparte selected: keeping separate models dir {chosen_models_dir} (no symlink to {opposite_models})")
+        else:
+            print(f"[*] Creando directorio separado en {chosen_models_dir} (sin hardlink a {opposite_models})")
+    elif opposite_models is not None:
+        _ensure_models_symlink(chosen_models_dir, opposite_models, dry_run)
+    else:
+        if dry_run:
+            print(f"[dry-run] would keep models at {chosen_models_dir} (no existing opposite models dir detected)")
+        else:
+            print(f"[*] No existing opposite models dir detected; keeping {chosen_models_dir}")
+    _migrate_catalog_and_config(target_mode, opposite_mode, dry_run)
+    if args is not None:
+        if getattr(args, "update_binaries", None) is None:
+            args.update_binaries = False
+            args.package_only_update = True
+        else:
+            if bool(getattr(args, "update_binaries", True)):
+                if dry_run:
+                    print(f"[dry-run] would keep binaries (skip rebuild) via --keep-binaries logic (migrar)")
+        if dry_run:
+            print(f"[dry-run] would keep binaries (skip rebuild) - migrar maintains existing llama-server")
+        else:
+            print(f"[*] Manteniendo binarios existentes (skip rebuild) para migrar - no se recompilará llama.cpp")
+    roots = _install_root_candidates_for_coexistence()
+    opposite_roots = [p for p in roots[opposite_mode] if _path_exists_no_perm_error(p)]
+    target_root = Path("/opt/heimdall-gateway") if target_mode == "system" else Path.home() / ".local/opt/heimdall-gateway"
+    if dry_run:
+        if opposite_roots:
+            print(f"[dry-run] would keep binaries from {opposite_roots[0]} linked to {target_root} if needed (skip rebuild)")
+            print(f"[dry-run] would cleanup opposite {opposite_mode} install traces after migrar (keeping models)")
+        return
+    if opposite_roots and not _path_exists_no_perm_error(target_root):
+        src_root = opposite_roots[0]
+        stamp = _migration_stamp()
+        _migrate_legacy_install_root_minimal(src_root, target_root, stamp, dry_run=False)
+        print(f"[*] Linked binaries from {src_root} to {target_root} for migrar")
+    _cleanup_opposite_after_migrar(target_mode, opposite_mode, dry_run=False)
+
+
+def handle_coexisting_installs(target_mode: str, dry_run: bool, args: argparse.Namespace | None = None, chosen_models_dir: Path | None = None) -> str | None:
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("HEIMDALL_GATEWAY_TEST_COEXIST"):
+        return None
+    opposite = _opposite_mode(target_mode)
+    opposite_exists = _is_mode_present(opposite)
+    if not opposite_exists:
+        return None
+    if dry_run:
+        print(f"Detectada instalación {opposite} existente. ¿Migrar (mantener binarios y modelos con symlink) o eliminar? [migrar/eliminar/cancelar] (default: migrar)")
+        print(f"[dry-run] would prompt: ¿Migrar la instalación existente (mantener binarios y modelos) o eliminar? [migrar/eliminar/cancelar] -> migrar (keeping {opposite} -> {target_mode})")
+        action = "migrar"
+        opp_models = _resolve_opposite_models_dir(opposite)
+        hardlink_choice = "hardlink"
+        if opp_models is not None:
+            try:
+                exists = opp_models.exists()
+            except PermissionError:
+                exists = True
+            except Exception:
+                exists = False
+            if exists:
+                hardlink_choice = _prompt_models_hardlink_choice(opp_models, dry_run=True)
+                if args is not None:
+                    args._models_hardlink_choice = hardlink_choice
+                    args._existing_opposite_models = opp_models
+            elif args is not None:
+                args._existing_opposite_models = opp_models
+        elif args is not None and opp_models is not None:
+            args._existing_opposite_models = opp_models
+        if chosen_models_dir is not None:
+            _handle_migration_migrar(target_mode, opposite, chosen_models_dir, dry_run=True, args=args)
+        else:
+            if opp_models is not None:
+                try:
+                    opp_exists = opp_models.exists()
+                except Exception:
+                    opp_exists = False
+                if opp_exists and hardlink_choice == "hardlink":
+                    print(f"[dry-run] would migrar: keep models via symlink from {opp_models} to new location, keep binaries (skip rebuild), update catalog/config paths")
+                elif opp_exists and hardlink_choice == "aparte":
+                    print(f"[dry-run] would migrar: create separate models dir (aparte) not linking {opp_models}, keep binaries (skip rebuild)")
+                else:
+                    print(f"[dry-run] would migrar: keep models via symlink from {opp_models} to new location, keep binaries (skip rebuild), update catalog/config paths")
+            else:
+                print(f"[dry-run] would migrar: keep models via symlink to new location, keep binaries (skip rebuild), update catalog/config paths")
+        # Preview elimination thoroughly
+        print(f"[dry-run] eliminar would remove all {opposite} traces: {', '.join(str(p) for p,_ in _opposite_install_traces(opposite))}")
+        return action
+    action = _prompt_migration_action(opposite)
+    if action == "cancelar":
+        print("Instalación cancelada por el usuario.")
+        raise SystemExit(1)
+    if action in ("migrar", "eliminar") and shutil.which("sudo") is not None and os.geteuid() != 0:
+        print("[*] Se necesita sudo para la migración/eliminación. Introduce tu password:")
+        try:
+            subprocess.run(["sudo", "-v"], timeout=30, check=True)
+        except Exception:
+            print("[!] No se pudo obtener sudo. Algunas operaciones pueden fallar.")
+    if action == "eliminar":
+        print(f"[*] Eliminando instalación {opposite} completa (modo elegido: {target_mode})")
+        traces = _opposite_install_traces(opposite)
+        for path, need_sudo in traces:
+            if not _path_exists_no_perm_error(path):
+                continue
+            print(f"[*] Eliminando {path} ({opposite})")
+            # Stop services first
+            if ".service" in str(path):
+                svc = path.name
+                try:
+                    if opposite == "system":
+                        if shutil.which("sudo") is not None or os.geteuid() == 0:
+                            prefix = [] if os.geteuid() == 0 else ["sudo"]
+                            subprocess.run(prefix + ["systemctl", "stop", svc], check=False, timeout=10)
+                            subprocess.run(prefix + ["systemctl", "disable", svc], check=False, timeout=10)
+                        else:
+                            print(f"[!] Skipping systemctl stop/disable for {svc} (no sudo)", file=sys.stderr)
+                    else:
+                        subprocess.run(["systemctl", "--user", "stop", svc], check=False, timeout=10)
+                        subprocess.run(["systemctl", "--user", "disable", svc], check=False, timeout=10)
+                except Exception:
+                    pass
+            if path == Path("/var/lib/heimdall-gateway"):
+                models_keep = _resolve_opposite_models_dir(opposite)
+                try:
+                    if models_keep is not None and _path_exists_no_perm_error(models_keep) and models_keep.is_relative_to(path):
+                        for child in list(path.iterdir()):
+                            try:
+                                if child.resolve(strict=False) == models_keep.resolve(strict=False):
+                                    continue
+                            except Exception:
+                                pass
+                            _remove_path_robust(child, use_sudo=need_sudo, dry_run=False)
+                        try:
+                            remaining = [c for c in path.iterdir() if c.resolve(strict=False) != models_keep.resolve(strict=False)]
+                            if not remaining:
+                                print(f"[*] Kept models at {models_keep}, cleaned {path}")
+                                continue
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            _remove_path_robust(path, use_sudo=need_sudo, dry_run=False)
+        if target_mode == "user":
+            opt_root = Path("/opt/heimdall-gateway")
+            if _path_exists_no_perm_error(opt_root):
+                _remove_path_robust(opt_root, use_sudo=True, dry_run=False)
+        try:
+            if opposite == "user":
+                subprocess.run(["systemctl", "--user", "daemon-reload"], check=False, timeout=10)
+            else:
+                if shutil.which("sudo") is not None or os.geteuid() == 0:
+                    prefix = [] if os.geteuid() == 0 else ["sudo"]
+                    subprocess.run(prefix + ["systemctl", "daemon-reload"], check=False, timeout=10)
+        except Exception:
+            pass
+        # Verify no leftover 4.0KiB placeholder
+        if target_mode == "user" and _path_exists_no_perm_error(Path("/opt/heimdall-gateway/python/llamacpp_stack")):
+            print("[!] Warning: /opt/heimdall-gateway/python/llamacpp_stack still exists, forcing removal")
+            _remove_path_robust(Path("/opt/heimdall-gateway"), use_sudo=True, dry_run=False)
+        print(f"[*] Eliminación completa de {opposite} finalizada")
+        return action
+    if action == "migrar":
+        opp_models = _resolve_opposite_models_dir(opposite)
+        hardlink_choice = None
+        try:
+            opp_exists = opp_models is not None and opp_models.exists()
+        except PermissionError:
+            opp_exists = opp_models is not None
+        except Exception:
+            opp_exists = False
+        if opp_exists:
+            hardlink_choice = _prompt_models_hardlink_choice(opp_models, dry_run=False)
+            if args is not None:
+                args._models_hardlink_choice = hardlink_choice
+                args._existing_opposite_models = opp_models
+        elif args is not None and opp_models is not None:
+            args._existing_opposite_models = opp_models
+        # Defer symlink until chosen_models_dir known if not provided
+        if chosen_models_dir is not None:
+            _handle_migration_migrar(target_mode, opposite, chosen_models_dir, dry_run=False, args=args)
+        else:
+            if args is not None:
+                args._migration_pending = (target_mode, opposite)
+                if getattr(args, "update_binaries", None) is None:
+                    args.update_binaries = False
+                    args.package_only_update = True
+            if hardlink_choice == "aparte":
+                print(f"[*] Migrar seleccionado: se creará directorio separado (aparte) sin hardlink a {opp_models}")
+            else:
+                print(f"[*] Migrar seleccionado: se mantendrán binarios y modelos vía symlink de {opposite} a {target_mode}")
+        return action
+    return action
+
+
+def prompt_skip_llama_cpp() -> bool:
+    existing = detect_existing_llama_server_binary()
+    if existing is None:
+        return False
+    if not sys.stdin.isatty():
+        return False
+    print(f"Detected existing llama.cpp binary at {existing}")
+    return prompt_bool("¿Saltar llama.cpp ya instalado?", default=False)
 
 
 
@@ -1592,9 +2470,15 @@ def _same_models_dir(selected: Path, existing: Path | None) -> bool:
 
 def existing_models_dir(mode: str) -> Path | None:
     for env_path in env_paths_for_mode(mode):
-        if not env_path.exists():
+        if not _path_exists_no_perm_error(env_path):
             continue
-        for line in env_path.read_text(encoding="utf-8").splitlines():
+        try:
+            text = env_path.read_text(encoding="utf-8")
+        except PermissionError:
+            continue
+        except Exception:
+            continue
+        for line in text.splitlines():
             clean = line.strip()
             for key in ("HEIMDALL_GATEWAY_MODELS", "LLAMACPP_MODELS"):
                 if clean.startswith(f"{key}="):
@@ -2988,8 +3872,20 @@ def install_systemd_units(layout: InstallLayout, dry_run: bool) -> None:
 
     systemd_dir.mkdir(parents=True, exist_ok=True)
     env_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(layout.config_dir / "systemd" / MANAGER_SERVICE_NAME, systemd_dir / MANAGER_SERVICE_NAME)
-    shutil.copy2(layout.config_dir / "systemd" / SWAP_SERVICE_NAME, systemd_dir / SWAP_SERVICE_NAME)
+    src_manager = layout.config_dir / "systemd" / MANAGER_SERVICE_NAME
+    src_swap = layout.config_dir / "systemd" / SWAP_SERVICE_NAME
+    if not src_manager.exists() or not src_swap.exists():
+        try:
+            manager_content = render_manager_service(layout)
+            swap_content = render_llamaswap_service(layout)
+            (layout.config_dir / "systemd").mkdir(parents=True, exist_ok=True)
+            src_manager.write_text(manager_content, encoding="utf-8")
+            src_swap.write_text(swap_content, encoding="utf-8")
+        except Exception:
+            print(f"[!] Warning: could not generate systemd templates at {layout.config_dir / 'systemd'}", file=sys.stderr)
+            return
+    shutil.copy2(src_manager, systemd_dir / MANAGER_SERVICE_NAME)
+    shutil.copy2(src_swap, systemd_dir / SWAP_SERVICE_NAME)
     _run(reload_cmd)
     _run(enable_cmd)
 
@@ -4342,19 +5238,215 @@ def resolve_api_security_options(
     )
 
 
+def _install_optional_engines(layout: InstallLayout, selected: set[str], runtime_python: Path, dry_run: bool) -> None:
+    if not selected:
+        print("[*] No optional engines selected (none).")
+        return
+    print(f"[*] Installing optional engines: {', '.join(sorted(selected))}")
+    env = os.environ.copy()
+    env["HEIMDALL_GATEWAY_PYTHONPATH"] = str(layout.python_root)
+    pythonpath_val = str(layout.python_root)
+    if pythonpath_val:
+        env["HEIMDALL_GATEWAY_PYTHONPATH"] = pythonpath_val
+    for engine in sorted(selected, key=lambda x: {"beellama": 0, "vllm": 1, "exllama": 2}.get(x, 99)):
+        if engine == "beellama":
+            if dry_run:
+                print(f"[dry-run] would install beellama via build_beellama(install_root={layout.install_root}, python_exec={runtime_python}) with HEIMDALL_GATEWAY_PYTHONPATH={pythonpath_val}")
+                continue
+            try:
+                from llamacpp_stack.beellama_install import build_beellama
+
+                print(f"[*] Installing beellama (kvarn4/MTP) into {layout.install_root} ...")
+                env_before = os.environ.get("HEIMDALL_GATEWAY_PYTHONPATH")
+                os.environ["HEIMDALL_GATEWAY_PYTHONPATH"] = pythonpath_val
+                try:
+                    build_beellama(install_root=layout.install_root, python_exec=str(runtime_python))
+                finally:
+                    if env_before is None:
+                        os.environ.pop("HEIMDALL_GATEWAY_PYTHONPATH", None)
+                    else:
+                        os.environ["HEIMDALL_GATEWAY_PYTHONPATH"] = env_before
+                print("[*] beellama installed successfully.")
+            except Exception as exc:
+                print(f"[!] beellama install failed: {exc}")
+        elif engine == "vllm":
+            uv_bin = resolve_uv_executable()
+            if dry_run:
+                print(f"[dry-run] would ensure vLLM via: {(uv_bin or 'uv')} pip install --python {runtime_python} vllm --torch-backend=auto (HEIMDALL_GATEWAY_PYTHONPATH={pythonpath_val})")
+                continue
+            if uv_bin is None:
+                print("[!] uv not found, cannot install vLLM via uv pip install")
+                continue
+            try:
+                print(f"[*] Installing vLLM via uv pip install --python {runtime_python} ...")
+                vllm_env = env.copy()
+                vllm_env["UV_TORCH_BACKEND"] = "auto"
+                subprocess.run([uv_bin, "pip", "install", "--python", str(runtime_python), "--torch-backend=auto", "vllm"], check=True, env=vllm_env)
+                print("[*] vLLM installed successfully.")
+            except Exception as exc:
+                print(f"[!] vLLM install failed: {exc}")
+        elif engine == "exllama":
+            if dry_run:
+                print(f"[dry-run] would install EXL3 via build_exllama(install_root={layout.install_root}, python_exec={runtime_python}, HEIMDALL_GATEWAY_PYTHONPATH={pythonpath_val})")
+                continue
+            try:
+                from llamacpp_stack.exllama_install import build_exllama
+
+                print(f"[*] Installing EXL3 (exllama) into {layout.install_root} ...")
+                env_before = os.environ.get("HEIMDALL_GATEWAY_PYTHONPATH")
+                os.environ["HEIMDALL_GATEWAY_PYTHONPATH"] = pythonpath_val
+                try:
+                    build_exllama(install_root=layout.install_root, python_exec=str(runtime_python), dry_run=False)
+                finally:
+                    if env_before is None:
+                        os.environ.pop("HEIMDALL_GATEWAY_PYTHONPATH", None)
+                    else:
+                        os.environ["HEIMDALL_GATEWAY_PYTHONPATH"] = env_before
+                print("[*] EXL3 (exllama) installed successfully.")
+            except Exception as exc:
+                print(f"[!] EXL3 install failed: {exc}")
+
+
+def _update_catalog_engines_for_optionals(layout: InstallLayout, selected: set[str], dry_run: bool) -> None:
+    if not selected:
+        return
+    catalog_path = layout.state_dir / "catalog.json"
+    if not catalog_path.exists():
+        return
+    try:
+        payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[!] Could not read catalog for engine update: {exc}")
+        return
+    if not isinstance(payload, list):
+        return
+    changed = 0
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("model_id") or "")
+        repo_id = str(item.get("repo_id") or "")
+        quant = str(item.get("quant") or "")
+        filename = str(item.get("filename") or "")
+        haystack = " ".join([model_id, repo_id, quant, filename]).lower()
+        server_overrides = item.get("server_overrides")
+        if not isinstance(server_overrides, dict):
+            server_overrides = {}
+            item["server_overrides"] = server_overrides
+        current_engine = str(server_overrides.get("engine") or "").strip().lower()
+        target_engine: str | None = None
+        cache_k = str(server_overrides.get("cache_type_k") or item.get("cache_type_k") or "").lower()
+        cache_v = str(server_overrides.get("cache_type_v") or item.get("cache_type_v") or "").lower()
+        is_kvarn = "kvarn" in cache_k or "kvarn" in cache_v or "kvarn" in haystack
+        is_qwen38 = "qwen3.8" in haystack or "qwen3-8" in haystack or "qwen38" in haystack or ("qwen" in haystack and "8b" in haystack) or "qwen3.8" in haystack
+        is_exl = "exl3" in haystack or "exl2" in haystack or "exllama" in haystack
+        if "beellama" in selected and (is_kvarn or is_qwen38):
+            if current_engine not in {"beellama"}:
+                target_engine = "beellama"
+        elif "exllama" in selected and is_exl:
+            if current_engine not in {"exllama"}:
+                target_engine = "exllama"
+        elif "vllm" in selected:
+            backend_hint = str(item.get("backend") or "").lower()
+            is_hf = backend_hint in {"vllm", "vllm-beta"} or "hf" in haystack
+            if is_hf and current_engine not in {"vllm"}:
+                target_engine = "vllm"
+        if target_engine and current_engine != target_engine:
+            server_overrides["engine"] = target_engine
+            changed += 1
+    # Fallback: if beellama selected and no specific kvarn match but qwen3.8 present, ensure engine set
+    if "beellama" in selected and changed == 0:
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            haystack = " ".join([str(item.get("model_id") or ""), str(item.get("repo_id") or "")]).lower()
+            if "qwen" in haystack and "3" in haystack:
+                server_overrides = item.get("server_overrides")
+                if not isinstance(server_overrides, dict):
+                    server_overrides = {}
+                    item["server_overrides"] = server_overrides
+                if str(server_overrides.get("engine") or "").strip().lower() != "beellama":
+                    server_overrides["engine"] = "beellama"
+                    changed += 1
+                    break
+    if changed:
+        if dry_run:
+            print(f"[dry-run] would update {changed} catalog entry(ies) with server_overrides.engine for {', '.join(sorted(selected))}")
+            for eng in sorted(selected):
+                print(f"[dry-run]   engine {eng}: {changed} model(s) would be updated where relevant")
+            return
+        catalog_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"[*] Updated {changed} catalog entry(ies) with server_overrides.engine for optionals: {', '.join(sorted(selected))}")
+
+
 def install_stack(args: argparse.Namespace) -> int:
+    if getattr(args, "mode", None) is None and sys.stdin.isatty():
+        existing = detect_existing_mode()
+        if existing is not None:
+            chosen = prompt_choice(
+                "¿Instalar en modo system (sudo) o user? [system/user] (default: keep existing mode)",
+                [
+                    ("system", "system-wide install (requires sudo)"),
+                    ("user", "user install (no sudo, current user only)"),
+                ],
+                default=existing,
+            )
+            args.mode = chosen
+        else:
+            default_mode = "system" if os.geteuid() == 0 else "user"
+            chosen = prompt_choice(
+                "¿Instalar en modo system (sudo) o user? [system/user]",
+                [
+                    ("system", "system-wide install (requires sudo)"),
+                    ("user", "user install (no sudo, current user only)"),
+                ],
+                default=default_mode,
+            )
+            args.mode = chosen
     pre_mode = resolve_install_mode(args.mode)
+    args.mode = pre_mode
+    handle_coexisting_installs(pre_mode, bool(getattr(args, "dry_run", False)), args=args)
     existing_host = existing_public_host(pre_mode)
     chosen_public_host = resolve_public_host(args.public_host, existing_host)
     previous_models_dir = existing_models_dir(pre_mode)
     suggested_models_dir = previous_models_dir or derive_models_dir(detect_ollama_models_dir(), pre_mode)
-    if args.models_dir:
-        chosen_models_dir = Path(args.models_dir).expanduser()
-    elif previous_models_dir is not None:
-        chosen_models_dir = previous_models_dir
-        print(f"Keeping existing models directory: {chosen_models_dir}")
+    hardlink_choice = getattr(args, "_models_hardlink_choice", None)
+    existing_opposite = getattr(args, "_existing_opposite_models", None)
+    if hardlink_choice == "hardlink" and existing_opposite is not None:
+        if args.models_dir:
+            chosen_models_dir = Path(args.models_dir).expanduser()
+        elif previous_models_dir is not None:
+            chosen_models_dir = previous_models_dir
+            print(f"Keeping existing models directory: {chosen_models_dir}")
+        else:
+            chosen_models_dir = suggested_models_dir
+            if getattr(args, "dry_run", False):
+                print(f"[dry-run] hardlink selected: would symlink {chosen_models_dir} -> {existing_opposite}")
+            else:
+                print(f"Usando hardlink: {chosen_models_dir} -> {existing_opposite} (compartir modelos)")
+    elif hardlink_choice == "aparte":
+        if args.models_dir:
+            chosen_models_dir = Path(args.models_dir).expanduser()
+        elif previous_models_dir is not None:
+            chosen_models_dir = previous_models_dir
+            print(f"Keeping existing models directory: {chosen_models_dir}")
+        else:
+            chosen_models_dir = prompt_path("Models directory", suggested_models_dir)
     else:
-        chosen_models_dir = prompt_path("Models directory", suggested_models_dir)
+        if args.models_dir:
+            chosen_models_dir = Path(args.models_dir).expanduser()
+        elif previous_models_dir is not None:
+            chosen_models_dir = previous_models_dir
+            print(f"Keeping existing models directory: {chosen_models_dir}")
+        else:
+            chosen_models_dir = prompt_path("Models directory", suggested_models_dir)
+    if getattr(args, "_migration_pending", None):
+        t_mode, o_mode = args._migration_pending
+        _handle_migration_migrar(t_mode, o_mode, chosen_models_dir, bool(getattr(args, "dry_run", False)), args=args)
+        try:
+            delattr(args, "_migration_pending")
+        except Exception:
+            pass
     maybe_migrate_existing_install(pre_mode, chosen_public_host, args.public_port, args.dry_run)
     args.public_host = chosen_public_host
 
@@ -4377,16 +5469,33 @@ def install_stack(args: argparse.Namespace) -> int:
         update_binaries = bool(args.update_binaries)
     else:
         update_binaries = True
-        if existing_install:
-            if package_only_update is None:
-                # The interactive default is package-only; answering yes here
-                # runs the full installer (binaries/config/auto-ctx refresh).
-                run_full_installer = prompt_bool(
-                    "Run the full installer? (y=refresh backends, config, auto-ctx; n=package-only)",
-                    default=False,
+    migration_pending = getattr(args, "_migration_pending", None)
+    if existing_install and not migration_pending:
+        if package_only_update is None:
+            if sys.stdin.isatty():
+                run_choice = prompt_choice(
+                    "What to do with existing install?",
+                    [
+                        ("refresh", "refresh backends, config, auto-ctx, and rebuild llama.cpp"),
+                        ("update", "update package only (keep binaries, refresh config)"),
+                        ("skip", "skip - keep everything as-is and exit"),
+                    ],
+                    default="update",
                 )
-                package_only_update = not run_full_installer
-            update_binaries = not package_only_update
+                if run_choice == "skip":
+                    print("Skipping. Existing install left untouched.")
+                    return 0
+                run_full_installer = run_choice == "refresh"
+            else:
+                run_full_installer = False
+            package_only_update = not run_full_installer
+        update_binaries = not package_only_update
+    else:
+        if migration_pending:
+            package_only_update = True
+            update_binaries = False
+            args.package_only_update = True
+            args.update_binaries = False
     # Preserve the interactive selection when re-executing in system mode via sudo.
     args.update_binaries = update_binaries
     args.package_only_update = package_only_update
@@ -4398,19 +5507,29 @@ def install_stack(args: argparse.Namespace) -> int:
         )
         update_binaries = True
         args.update_binaries = True
-    if update_binaries:
+    if update_binaries and not migration_pending:
         if str(getattr(args, "llama_cpp_ref", "") or "").strip():
             llama_cpp_mode = "source"
             args.llama_cpp_mode = "source"
             print(f"llama.cpp ref requested; forcing source build: {args.llama_cpp_ref}")
         else:
             llama_cpp_mode = resolve_llama_cpp_mode(args.llama_cpp_mode)
-        if llama_cpp_mode == "source":
+        if llama_cpp_mode == "skip":
+            print(f"Skipping llama.cpp (keeping existing binary at {detect_existing_llama_server_binary() or layout.install_root / 'llama-server'})")
+            args.llama_cpp_ref = ""
+        elif llama_cpp_mode == "source":
             args.llama_cpp_ref = resolve_llama_cpp_ref(getattr(args, "llama_cpp_ref", None), llama_cpp_mode)
             if args.llama_cpp_ref:
                 os.environ[LLAMA_CPP_REF_ENV] = args.llama_cpp_ref
         else:
             args.llama_cpp_ref = ""
+        if llama_cpp_mode != "skip" and detect_existing_llama_server_binary() is not None and llama_cpp_mode in ("source", "prebuilt", "native"):
+            if prompt_skip_llama_cpp():
+                llama_cpp_mode = "skip"
+                args.llama_cpp_mode = "skip"
+                args.llama_cpp_ref = ""
+                print(f"Skipping llama.cpp after prompt (keeping existing binary at {detect_existing_llama_server_binary()})")
+        args.llama_cpp_mode = llama_cpp_mode
     else:
         llama_cpp_mode = detect_existing_llama_cpp_mode(layout)
         print(f"Keeping existing llama.cpp mode: {llama_cpp_mode}")
@@ -4507,7 +5626,10 @@ def install_stack(args: argparse.Namespace) -> int:
     current_manifest = read_install_manifest(layout)
     current_llama_cpp_tag = str(current_manifest.get("llama_cpp_tag") or "not installed")
     current_llamaswap_tag = str(current_manifest.get("llamaswap_tag") or "not installed")
-    target_llama_cpp_tag = llama_cpp_release["tag_name"] if update_binaries else current_llama_cpp_tag
+    if llama_cpp_mode == "skip":
+        target_llama_cpp_tag = current_llama_cpp_tag
+    else:
+        target_llama_cpp_tag = llama_cpp_release["tag_name"] if update_binaries else current_llama_cpp_tag
     target_llamaswap_tag = llamaswap_release["tag_name"] if update_binaries else current_llamaswap_tag
     print(f"llama.cpp target: {target_llama_cpp_tag}")
     print(f"llama-swap target: {target_llamaswap_tag}")
@@ -4566,7 +5688,21 @@ def install_stack(args: argparse.Namespace) -> int:
     prefer_cuda_build = llama_cpp_mode == "source" and sys.platform.startswith("linux") and gpu_present and cuda_toolkit_present and args.prefer_source_cuda
 
     strategy = "binary"
-    if llama_cpp_mode == "native":
+    if llama_cpp_mode == "skip":
+        existing_bin = detect_existing_llama_server_binary()
+        if existing_bin is not None:
+            llama_server_bin = existing_bin
+            strategy = str(read_install_manifest(layout).get("llama_cpp_strategy") or "skip")
+            print(f"[*] Keeping existing llama.cpp binary at {llama_server_bin} (skip)")
+        else:
+            existing_target = _resolve_existing_stable_target(layout.install_root, layout.install_root / "llama-server", "llama-server")
+            llama_server_bin = existing_target or (layout.install_root / "llama-server")
+            strategy = str(read_install_manifest(layout).get("llama_cpp_strategy") or "skip")
+            if args.dry_run:
+                print(f"[dry-run] would keep existing llama-server at {llama_server_bin} (skip, no existing binary found at global candidates)")
+            else:
+                print(f"[*] Keeping existing llama-server at {llama_server_bin} (skip, no global binary found)")
+    elif llama_cpp_mode == "native":
         strategy = "native"
         native_llama_server = detect_native_llama_server()
         if update_binaries and native_llama_server is None:
@@ -4664,6 +5800,25 @@ def install_stack(args: argparse.Namespace) -> int:
         )
 
     runtime_python, runtime_python_path = ensure_runtime_python(layout, args.dry_run, skip_pip_install=args.skip_venv_install)
+    args.llama_server = llama_server_bin
+    try:
+        if args.dry_run:
+            raw_opt = getattr(args, "optionals", None)
+            if raw_opt is not None and str(raw_opt).strip() != "":
+                selected_optionals = parse_optional_selection(str(raw_opt))
+            else:
+                selected_optionals = set()
+                print("[dry-run] would prompt: ¿Qué opcionales instalar? [1] beellama (kvarn4/MTP) [2] vLLM [3] EXL3 (ExLlamaV2+DFlash2) -> none (use --optionals 1,2 or all to select)")
+            if selected_optionals:
+                _install_optional_engines(layout, selected_optionals, runtime_python, True)
+                _update_catalog_engines_for_optionals(layout, selected_optionals, True)
+        else:
+            selected_optionals = resolve_optionals_selection(args)
+            if selected_optionals:
+                _install_optional_engines(layout, selected_optionals, runtime_python, False)
+                _update_catalog_engines_for_optionals(layout, selected_optionals, False)
+    except Exception as exc:
+        print(f"[!] Optional engine handling failed: {exc}")
     cuda_probe_python = str(runtime_python)
     installed_cuda_root = sync_cuda_runtime(layout, cuda_probe_python, args.dry_run)
     env_text = _render_env(
@@ -4865,6 +6020,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-venv-install",
         action="store_true",
         help="Skip recreating and installing packages into the runtime Python virtual environment.",
+    )
+    parser.add_argument(
+        "--optionals",
+        default=None,
+        help="Optional engines to install after llama.cpp: comma/space separated '1,2' or '1 2' or 'all'/'none' or names beellama,vllm,exllama (e.g. --optionals 1,2 or --optionals beellama,exllama). Non-interactive defaults to none.",
     )
     parser.add_argument("--dry-run", action="store_true")
     return parser
