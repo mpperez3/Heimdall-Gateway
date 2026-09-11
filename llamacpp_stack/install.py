@@ -1582,6 +1582,11 @@ def resolve_uv_executable() -> str | None:
         return bootstrap_uv
     if uv_bin := shutil.which("uv"):
         return uv_bin
+    # Sibling next to the running python (venv bootstrap) takes precedence
+    # over global fallbacks, so tests and venv installs resolve locally first.
+    sibling = Path(sys.executable).resolve().parent / "uv"
+    if sibling.exists():
+        return str(sibling)
     # Fallback for sudo -E where PATH may not contain user ~/.local/bin
     for cand in [
         Path.home() / ".local" / "bin" / "uv",
@@ -1602,9 +1607,6 @@ def resolve_uv_executable() -> str | None:
                 return str(cand)
         except Exception:
             pass
-    sibling = Path(sys.executable).resolve().parent / "uv"
-    if sibling.exists():
-        return str(sibling)
     return None
 
 

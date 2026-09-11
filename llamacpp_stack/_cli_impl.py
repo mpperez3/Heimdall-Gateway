@@ -12036,8 +12036,6 @@ def _buffer_openai_chat_sse_with_keepalive(
                     _update_tool_argument_diagnostics(index_key)
 
     def _forward_reasoning_line(line: bytes) -> bool:
-        # Streaming pure-reasoning deltas straight through keeps slow-thinking
-        # models from tripping client stale-timeouts before the first token.
         if not line or not line.startswith(b"data: ") or line == b"data: [DONE]":
             return False
         try:
@@ -12048,6 +12046,18 @@ def _buffer_openai_chat_sse_with_keepalive(
         delta = choice0.get("delta", {}) or {}
         reasoning = delta.get("reasoning_content") or delta.get("reasoning") or delta.get("thinking")
         if not reasoning or delta.get("content") or delta.get("tool_calls") or choice0.get("finish_reason"):
+            return False
+        if isinstance(loop_guard, dict) and _as_bool(loop_guard.get("enabled"), True):
+            try:
+                no_tool_limit = max(0, int(loop_guard.get("no_tool_call_max_chars", 0)))
+            except Exception:
+                no_tool_limit = 0
+            if no_tool_limit > 0 and int(state.get("tool_call_chunks") or 0) == 0:
+                return False
+        tentative_state = dict(state)
+        tentative_state["reasoning_len"] = int(state.get("reasoning_len") or 0) + len(str(reasoning))
+        tentative_state["_loop_text_tail"] = (str(state.get("_loop_text_tail") or "") + str(reasoning))[-24000:]
+        if _chat_tool_continue_loop_guard_reason(tentative_state, loop_guard) == "no_tool_call_generation_limit":
             return False
         with write_lock:
             write_sse_line(line)

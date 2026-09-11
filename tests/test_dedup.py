@@ -666,15 +666,16 @@ class TestTTLExpiry:
 class TestKillSwitchOff:
     def test_bypass_when_disabled(self, monkeypatch):
         import llamacpp_stack.cli as cli
+        import llamacpp_stack.cli.gateway as gw
 
         # simulate config with enabled=False
         def fake_load(args=None):
             return {"experimental": {"dedup_inflight": {"enabled": False, "ttl_s": 600, "max_wait_ms": 2000, "max_entries": 2000, "tee_buffer_lines": 1024, "tee_buffer_bytes": 2097152}}}
 
-        monkeypatch.setattr(cli, "_load_server_config_payload", fake_load)
+        monkeypatch.setattr(gw, "_load_server_config_payload", fake_load)
         # ensure DEDUP_STATE exists
         fresh = DedupState(max_entries=10)
-        monkeypatch.setattr(cli, "DEDUP_STATE", fresh)
+        monkeypatch.setattr(gw, "DEDUP_STATE", fresh)
 
         bypass = cli._dedup_should_bypass()
         assert bypass == "dedup_bypass_disabled"
@@ -694,25 +695,25 @@ class TestKillSwitchOff:
         assert upstream["n"] == 2
 
     def test_bypass_disabled_no_header_and_two_upstreams(self, monkeypatch):
-        import llamacpp_stack.cli as cli
+        import llamacpp_stack.cli.gateway as gw
 
         # empty experimental -> defaults enabled False -> bypass
-        monkeypatch.setattr(cli, "_load_server_config_payload", lambda args=None: {})
+        monkeypatch.setattr(gw, "_load_server_config_payload", lambda args=None: {})
         fresh = DedupState(max_entries=10)
-        monkeypatch.setattr(cli, "DEDUP_STATE", fresh)
-        assert cli._dedup_should_bypass() == "dedup_bypass_disabled"
+        monkeypatch.setattr(gw, "DEDUP_STATE", fresh)
+        assert gw._dedup_should_bypass() == "dedup_bypass_disabled"
 
         # second case: enabled True -> no bypass
-        monkeypatch.setattr(cli, "_load_server_config_payload", lambda args=None: {"experimental": {"dedup_inflight": {"enabled": True, "ttl_s": 600, "max_wait_ms": 2000, "max_entries": 2000, "tee_buffer_lines": 1024, "tee_buffer_bytes": 2097152}}})
+        monkeypatch.setattr(gw, "_load_server_config_payload", lambda args=None: {"experimental": {"dedup_inflight": {"enabled": True, "ttl_s": 600, "max_wait_ms": 2000, "max_entries": 2000, "tee_buffer_lines": 1024, "tee_buffer_bytes": 2097152}}})
         # need to ensure DEDUP_STATE is set after normalize would update max_entries; we set fresh again
-        monkeypatch.setattr(cli, "DEDUP_STATE", fresh)
+        monkeypatch.setattr(gw, "DEDUP_STATE", fresh)
         # _normalize will be called inside _dedup_should_bypass, but we patch to bypass that and just check
         # Force direct check: enabled True should return None (no bypass) if DEDUP_STATE present
         # We need to patch _normalize_dedup_inflight_config to return enabled True
-        orig_norm = cli._normalize_dedup_inflight_config
-        monkeypatch.setattr(cli, "_normalize_dedup_inflight_config", lambda raw: ({"enabled": True, "ttl_s": 600, "max_wait_ms": 2000, "max_entries": 2000, "tee_buffer_lines": 1024, "tee_buffer_bytes": 2097152}, False))
-        assert cli._dedup_should_bypass() is None
-        monkeypatch.setattr(cli, "_normalize_dedup_inflight_config", orig_norm)
+        orig_norm_gw = gw._normalize_dedup_inflight_config
+        monkeypatch.setattr(gw, "_normalize_dedup_inflight_config", lambda raw: ({"enabled": True, "ttl_s": 600, "max_wait_ms": 2000, "max_entries": 2000, "tee_buffer_lines": 1024, "tee_buffer_bytes": 2097152}, False))
+        assert gw._dedup_should_bypass() is None
+        monkeypatch.setattr(gw, "_normalize_dedup_inflight_config", orig_norm_gw)
 
 
 # ---------------------------------------------------------------------------
