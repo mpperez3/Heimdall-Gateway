@@ -11180,22 +11180,27 @@ def _merge_chat_message_content(left: object, right: object) -> object:
 
 
 def _normalize_system_messages_for_llamacpp(messages: object) -> list[dict]:
-    """Collapse OpenAI/OpenCode system messages into the first system item.
+    """Collapse OpenAI/OpenCode system/developer messages into the first item.
 
-    Several clients, notably OpenCode, append system layers as separate
-    messages. llama.cpp chat templates are not uniform: Qwen3.5's template
-    accepts exactly one system message and raises if any later system item is
-    encountered. Keep the first system position and preserve every layer's
-    content in order, without changing user/assistant/tool messages.
+    Several clients, notably OpenCode/Codex, append system layers as separate
+    messages. llama.cpp chat templates are not uniform: Qwen3's template (with
+    --jinja) treats both ``system`` and ``developer`` as system and raises
+    ``System message must be at the beginning`` if any such message appears
+    after the first turn. Treat ``developer`` identically to ``system``:
+    collapse duplicates and move the merged entry to the front, preserving
+    relative order of non-system/developer messages.
     """
     if not isinstance(messages, list):
         return []
     normalized = [dict(item) for item in messages if isinstance(item, dict)]
+    privileged_roles = ("system", "developer")
     system_indexes = [
         index for index, item in enumerate(normalized)
-        if str(item.get("role") or "") == "system"
+        if str(item.get("role") or "") in privileged_roles
     ]
-    if len(system_indexes) < 2:
+    if not system_indexes:
+        return normalized
+    if len(system_indexes) == 1 and system_indexes[0] == 0:
         return normalized
     first_index = system_indexes[0]
     first_system = dict(normalized[first_index])
@@ -11206,11 +11211,9 @@ def _normalize_system_messages_for_llamacpp(messages: object) -> list[dict]:
             first_system["content"] = f"{left}\n\n{right}"
         else:
             first_system["content"] = _merge_chat_message_content(left, right)
-    return [
-        first_system if index == first_index else item
-        for index, item in enumerate(normalized)
-        if index == first_index or index not in set(system_indexes[1:])
-    ]
+    privileged_set = set(system_indexes)
+    rest = [item for idx, item in enumerate(normalized) if idx not in privileged_set]
+    return [first_system] + rest
 
 
 def _normalize_trailing_assistant_messages_for_llamacpp(messages: object) -> list[dict]:
@@ -15403,6 +15406,7 @@ def start_ctx_metadata_server(args):
                 },
             )
             messages = _normalize_system_messages_for_llamacpp(upstream_payload.get("messages") or [])
+            upstream_payload["messages"] = messages
             normalized_messages = _normalize_trailing_assistant_messages_for_llamacpp(messages)
             if len(normalized_messages) != len(messages):
                 log_api_event(
@@ -15556,6 +15560,12 @@ def start_ctx_metadata_server(args):
                     # clients we collect the final response and emit Responses SSE
                     # only after internal tool_search rounds have completed.
                     internal_payload["stream"] = False
+                    internal_payload["messages"] = _normalize_system_messages_for_llamacpp(
+                        internal_payload.get("messages") or []
+                    )
+                    internal_payload["messages"] = _normalize_trailing_assistant_messages_for_llamacpp(
+                        internal_payload["messages"]
+                    )
                     if extra_messages and "max_tokens" not in internal_payload:
                         internal_payload["max_tokens"] = _responses_internal_round_max_tokens()
                         log_api_event(

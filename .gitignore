@@ -32,6 +32,10 @@ uv.lock
 /subprocess
 /vllm
 
+# Gateway raw examples — casos reales con código privado (no commitear)
+tests/fixtures/gateway_raw_examples/
+**/gateway_raw_examples/
+
 # Debug output logs
 debug_log*.txt
 *.debug.log
