@@ -15,8 +15,35 @@ import json
 import queue
 import threading
 import time
+import uuid as _uuid
 from dataclasses import dataclass, field
 from typing import Any
+
+
+def _try_log_api_event(event: str, data: dict | None = None) -> None:
+    try:
+        from llamacpp_stack.cli.gateway import log_api_event as _lae  # type: ignore
+
+        _lae(event, data)  # type: ignore
+        return
+    except Exception:
+        pass
+    try:
+        import importlib.util
+        import sys
+        from pathlib import Path
+
+        path = Path(__file__).parent / "cli.py"
+        if path.exists():
+            spec = importlib.util.spec_from_file_location("_cli_log", path)
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)  # type: ignore
+                if hasattr(mod, "log_api_event"):
+                    mod.log_api_event(event, data)  # type: ignore
+                    return
+    except Exception:
+        pass
 
 _CANONICAL_FIELDS: tuple[str, ...] = (
     "model", "messages", "prompt", "input", "temperature", "top_p", "top_k",
@@ -77,7 +104,7 @@ def fingerprint(method: str, path: str, principal_hash_str: str, stream_flag: bo
 
 @dataclass
 class Entry:
-    """Dedup entry: event signalled on completion; result/exception; TTL."""
+    """Dedup entry: event signalled on completion; result/exception; TTL + grace."""
 
     event: threading.Event = field(default_factory=threading.Event)
     result: dict | None = None
@@ -85,6 +112,9 @@ class Entry:
     expires_at: float = 0.0
     stream: bool = False
     principal: str = ""
+    grace_until: float = 0.0
+    leader_id: str = ""
+    created_at: float = field(default_factory=time.monotonic)
 
 
 class DedupState:
@@ -104,6 +134,7 @@ class DedupState:
 
         Cache hit -> (False, event, deepcopy(result)).
         Inflight  -> (False, event, None) follower waits.
+        Graced inflight (client disconnect, grace_until>now) -> (False, event, None) similar waits.
         Full/bypass -> (True, None, None).
         New leader -> (True, new_event, None).
         """
@@ -111,22 +142,53 @@ class DedupState:
         with self._lock:
             entry = self._entries.get(key)
             if entry is not None:
-                if entry.result is not None and entry.expires_at > now:
+                if entry.grace_until > now and entry.result is None and entry.exception is None and not entry.event.is_set():
+                    try:
+                        grace_ms = int((entry.grace_until - now) * 1000)
+                        _try_log_api_event("dedup_graced_hit", {"leader_id": entry.leader_id or key[:8], "similar_id": _uuid.uuid4().hex[:8], "key_prefix8": key[:8], "grace_ms": grace_ms})
+                        _try_log_api_event("dedup_similar_wait", {"leader_id": entry.leader_id or key[:8], "similar_id": _uuid.uuid4().hex[:8], "key_prefix8": key[:8], "grace_ms": grace_ms})
+                    except Exception:
+                        pass
+                    return (False, entry.event, None)
+                if entry.grace_until > 0 and entry.grace_until <= now and entry.result is None:
+                    try:
+                        _try_log_api_event("dedup_grace_expired", {"key_prefix8": key[:8], "grace_s": int(entry.grace_until - entry.created_at) if entry.created_at else 30})
+                    except Exception:
+                        pass
+                    self._entries.pop(key, None)
+                    entry = None
+                elif entry.result is not None and entry.expires_at > now:
                     return (False, entry.event, copy.deepcopy(entry.result))
-                if entry.result is not None and entry.expires_at <= now:
+                elif entry.result is not None and entry.expires_at <= now:
+                    if entry.grace_until > now:
+                        return (False, entry.event, copy.deepcopy(entry.result))
+                    if entry.grace_until > 0 and entry.grace_until <= now:
+                        try:
+                            _try_log_api_event("dedup_grace_expired", {"key_prefix8": key[:8], "grace_s": 30})
+                        except Exception:
+                            pass
                     self._entries.pop(key, None)
                     entry = None
                 elif entry.exception is not None:
                     if entry.event.is_set():
+                        if entry.grace_until > now:
+                            return (False, entry.event, None)
                         self._entries.pop(key, None)
                         entry = None
                     else:
                         return (False, entry.event, None)
                 elif entry.result is None and entry.exception is None:
+                    try:
+                        if entry.grace_until > now:
+                            grace_ms = int((entry.grace_until - now) * 1000)
+                            _try_log_api_event("dedup_graced_hit", {"leader_id": entry.leader_id or key[:8], "similar_id": _uuid.uuid4().hex[:8], "key_prefix8": key[:8], "grace_ms": grace_ms})
+                            _try_log_api_event("dedup_similar_wait", {"leader_id": entry.leader_id or key[:8], "similar_id": _uuid.uuid4().hex[:8], "key_prefix8": key[:8], "grace_ms": grace_ms})
+                    except Exception:
+                        pass
                     return (False, entry.event, None)
             if len(self._entries) >= self.max_entries:
                 return (True, None, None)
-            new_entry = Entry(event=threading.Event(), result=None, exception=None, expires_at=0.0)
+            new_entry = Entry(event=threading.Event(), result=None, exception=None, expires_at=0.0, leader_id=key[:8])
             self._entries[key] = new_entry
             return (True, new_entry.event, None)
 
@@ -187,14 +249,36 @@ class DedupState:
         now = time.monotonic()
         evicted = 0
         with self._lock:
-            for k in [k for k, e in self._entries.items() if e.result is not None and e.expires_at <= now]:
+            for k in [k for k, e in list(self._entries.items()) if e.result is not None and e.expires_at <= now and e.grace_until <= now]:
+                self._entries.pop(k, None)
+                evicted += 1
+            for k in [k for k, e in list(self._entries.items()) if e.grace_until > 0 and e.grace_until <= now and e.result is None and e.exception is None and e.event.is_set()]:
                 self._entries.pop(k, None)
                 evicted += 1
         return evicted
 
-    def forget(self, key: str) -> None:
+    def forget(self, key: str, grace_s: float = 0) -> None:
+        now = time.monotonic()
         with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return
+            if grace_s and grace_s > 0:
+                entry.grace_until = now + float(grace_s)
+                return
             self._entries.pop(key, None)
+
+    def mark_disconnected(self, key: str, grace_s: float = 30) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return False
+            entry.grace_until = now + float(grace_s)
+            return True
+
+    def enter_grace(self, key: str, grace_s: float = 30) -> bool:
+        return self.mark_disconnected(key, grace_s)
 
     def __len__(self) -> int:  # pragma: no cover
         with self._lock:

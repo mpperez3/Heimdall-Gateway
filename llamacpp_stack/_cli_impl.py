@@ -862,6 +862,7 @@ def _default_dedup_inflight_config() -> dict[str, object]:
         "max_entries": 2000,
         "tee_buffer_lines": 1024,
         "tee_buffer_bytes": 2097152,
+        "grace_s": 30,
     }
 
 
@@ -926,6 +927,7 @@ def _normalize_dedup_inflight_config(raw: object) -> tuple[dict[str, object], bo
     _clamp_int("max_entries", 2000, 1, 100000)
     _clamp_int("tee_buffer_lines", 1024, 1, 100000)
     _clamp_int("tee_buffer_bytes", 2097152, 1024, 104857600)
+    _clamp_int("grace_s", 30, 0, 86400)
     for k in defaults:
         if k not in normalized:
             normalized[k] = defaults[k]
@@ -1086,17 +1088,36 @@ def _dedup_send_json_with_header(handler_self, payload: dict, status: int = 200,
             pass
 
 
+def _dedup_log_graced_hit(key: str, leader_id: str, similar_id: str, grace_ms: int) -> None:
+    try:
+        log_api_event("dedup_graced_hit", {"leader_id": leader_id, "similar_id": similar_id, "key_prefix8": key[:8], "grace_ms": grace_ms})
+    except Exception:
+        pass
+
+def _dedup_log_similar_wait(key: str, leader_id: str, similar_id: str) -> None:
+    try:
+        log_api_event("dedup_similar_wait", {"leader_id": leader_id, "similar_id": similar_id, "key_prefix8": key[:8]})
+    except Exception:
+        pass
+
+def _dedup_log_grace_expired(key: str, grace_s: int) -> None:
+    try:
+        log_api_event("dedup_grace_expired", {"key_prefix8": key[:8], "grace_s": grace_s})
+    except Exception:
+        pass
+
 def _dedup_streaming_finalize(key: str, collected: list[bytes], dedup_cfg: dict, principal_hash: str, stream_flag: bool, truncated: bool, total_bytes: int, tee: object | None = None) -> None:
     try:
         if tee is not None and hasattr(tee, "close"):
             tee.close()  # type: ignore
     except Exception:
         pass
+    grace_s = float(dedup_cfg.get("grace_s", 30) or 30) if isinstance(dedup_cfg, dict) else 30
     if truncated:
         try:
             if DEDUP_STATE is not None:
                 DEDUP_STATE.complete_ok(key, {"status": 200, "headers": {}, "body": b""})
-                DEDUP_STATE.forget(key)
+                DEDUP_STATE.forget(key, grace_s=grace_s)
         except Exception:
             pass
         log_api_event("dedup_stream_not_cached_truncated", {"key_prefix8": key[:8], "principal_hash8": principal_hash[:8], "stream": stream_flag, "bytes": total_bytes})
@@ -1104,7 +1125,7 @@ def _dedup_streaming_finalize(key: str, collected: list[bytes], dedup_cfg: dict,
     if not collected:
         try:
             if DEDUP_STATE is not None:
-                DEDUP_STATE.forget(key)
+                DEDUP_STATE.forget(key, grace_s=grace_s)
         except Exception:
             pass
         return
@@ -1120,17 +1141,17 @@ def _dedup_streaming_finalize(key: str, collected: list[bytes], dedup_cfg: dict,
                     DEDUP_STATE.complete_ok(key, result)
                 else:
                     DEDUP_STATE.complete_ok(key, result)
-                    DEDUP_STATE.forget(key)
+                    DEDUP_STATE.forget(key, grace_s=grace_s)
             log_api_event("dedup_stream_cached", {"key_prefix8": key[:8], "principal_hash8": principal_hash[:8], "stream": stream_flag, "bytes": len(body_bytes)})
         else:
             if DEDUP_STATE is not None:
                 DEDUP_STATE.complete_ok(key, {"status": 200, "headers": {}, "body": b""})
-                DEDUP_STATE.forget(key)
+                DEDUP_STATE.forget(key, grace_s=grace_s)
             log_api_event("dedup_stream_not_cached_truncated", {"key_prefix8": key[:8], "principal_hash8": principal_hash[:8], "stream": stream_flag, "bytes": len(body_bytes)})
     except Exception:
         try:
             if DEDUP_STATE is not None:
-                DEDUP_STATE.forget(key)
+                DEDUP_STATE.forget(key, grace_s=grace_s)
         except Exception:
             pass
 
@@ -13625,6 +13646,16 @@ def start_ctx_metadata_server(args):
                                     mark_model_activity(activity_model, f"proxy:{parsed.path}", "response_done")
                                 return
                             if not _dedup_is_leader_proxy and _dedup_event_proxy is not None:
+                                try:
+                                    _grace_entry_proxy = DEDUP_STATE._get_entry(_dedup_key_proxy)  # type: ignore
+                                    _grace_ms_proxy = int((_grace_entry_proxy.grace_until - time.monotonic()) * 1000) if _grace_entry_proxy and _grace_entry_proxy.grace_until > time.monotonic() else 0
+                                    _similar_id_proxy = __import__("uuid").uuid4().hex[:8]
+                                    _leader_id_proxy = (_grace_entry_proxy.leader_id if _grace_entry_proxy and _grace_entry_proxy.leader_id else _dedup_key_proxy[:8])
+                                    if _grace_ms_proxy > 0:
+                                        _dedup_log_graced_hit(_dedup_key_proxy, _leader_id_proxy, _similar_id_proxy, _grace_ms_proxy)
+                                    _dedup_log_similar_wait(_dedup_key_proxy, _leader_id_proxy, _similar_id_proxy)
+                                except Exception:
+                                    pass
                                 _max_wait_proxy = float(_dedup_cfg_proxy.get("max_wait_ms", 2000) or 2000) / 1000.0
                                 _waited_proxy = _dedup_event_proxy.wait(timeout=_max_wait_proxy)
                                 if _waited_proxy:
@@ -13959,6 +13990,16 @@ def start_ctx_metadata_server(args):
                         _dedup_send_cached_response(self, _dedup_cached_oc, "hit")
                         return
                     if not _dedup_is_leader_oc and _dedup_event_oc is not None:
+                        try:
+                            _grace_entry_oc = DEDUP_STATE._get_entry(_dedup_key_oc)  # type: ignore
+                            _grace_ms_oc = int((_grace_entry_oc.grace_until - time.monotonic()) * 1000) if _grace_entry_oc and _grace_entry_oc.grace_until > time.monotonic() else 0
+                            _similar_oc = __import__("uuid").uuid4().hex[:8]
+                            _leader_oc = (_grace_entry_oc.leader_id if _grace_entry_oc and _grace_entry_oc.leader_id else _dedup_key_oc[:8])
+                            if _grace_ms_oc > 0:
+                                _dedup_log_graced_hit(_dedup_key_oc, _leader_oc, _similar_oc, _grace_ms_oc)
+                            _dedup_log_similar_wait(_dedup_key_oc, _leader_oc, _similar_oc)
+                        except Exception:
+                            pass
                         if _dedup_stream_oc:
                             _tee_oc = _DEDUP_STREAM_TEES.get(_dedup_key_oc)
                             if _tee_oc is not None:
@@ -14406,6 +14447,16 @@ def start_ctx_metadata_server(args):
                         CONVERSATION_SWITCH_STATE.finish(conversation_token)
                         return
                     if not _dedup_is_leader_chat and _dedup_event_chat is not None:
+                        try:
+                            _grace_entry_chat = DEDUP_STATE._get_entry(_dedup_key_chat)  # type: ignore
+                            _grace_ms_chat = int((_grace_entry_chat.grace_until - time.monotonic()) * 1000) if _grace_entry_chat and _grace_entry_chat.grace_until > time.monotonic() else 0
+                            _similar_chat = __import__("uuid").uuid4().hex[:8]
+                            _leader_chat = (_grace_entry_chat.leader_id if _grace_entry_chat and _grace_entry_chat.leader_id else _dedup_key_chat[:8])
+                            if _grace_ms_chat > 0:
+                                _dedup_log_graced_hit(_dedup_key_chat, _leader_chat, _similar_chat, _grace_ms_chat)
+                            _dedup_log_similar_wait(_dedup_key_chat, _leader_chat, _similar_chat)
+                        except Exception:
+                            pass
                         if _dedup_stream_chat:
                             _tee_chat = _DEDUP_STREAM_TEES.get(_dedup_key_chat)
                             if _tee_chat is not None:

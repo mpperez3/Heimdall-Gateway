@@ -171,6 +171,7 @@ def _default_dedup_inflight_config() -> dict[str, object]:
         "max_entries": 2000,
         "tee_buffer_lines": 1024,
         "tee_buffer_bytes": 2097152,
+        "grace_s": 30,
     }
 
 
@@ -229,6 +230,7 @@ def _normalize_dedup_inflight_config(raw: object) -> tuple[dict[str, object], bo
     _clamp_int("max_entries", 2000, 1, 100000)
     _clamp_int("tee_buffer_lines", 1024, 1, 100000)
     _clamp_int("tee_buffer_bytes", 2097152, 1024, 104857600)
+    _clamp_int("grace_s", 30, 0, 86400)
     for k in defaults:
         if k not in normalized:
             normalized[k] = defaults[k]

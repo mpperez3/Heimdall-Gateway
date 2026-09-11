@@ -824,3 +824,69 @@ class TestDedupHeadersAndPrincipal:
         assert fresh.get_cached(key) is not None
         time.sleep(0.1)
         assert fresh.get_cached(key) is None
+
+
+class TestGracePeriod30s:
+    def test_grace_hit_within_30s_single_inference(self):
+        state = DedupState(max_entries=10)
+        key = "grace-key-30s"
+        is_leader, ev_leader, cached = state.get_or_create_inflight(key)
+        assert is_leader and ev_leader is not None
+        state.mark_disconnected(key, grace_s=30)
+        is_leader2, ev2, cached2 = state.get_or_create_inflight(key)
+        assert is_leader2 is False
+        assert ev2 is ev_leader
+        assert cached2 is None
+        result = {"status": 200, "headers": {}, "body": b"grace-result"}
+        state.complete_ok(key, result)
+        state.put_cached(key, result, ttl_s=600)
+        assert ev_leader.is_set()
+        cached_after = state.get_cached(key)
+        assert cached_after is not None
+        assert cached_after["body"] == b"grace-result"
+        c2 = state.get_cached(key)
+        assert c2["body"] == b"grace-result"
+
+    def test_grace_expired_outside_window_two_inferences(self):
+        state = DedupState(max_entries=10)
+        key = "grace-expired-key"
+        is_leader, ev, _ = state.get_or_create_inflight(key)
+        assert is_leader
+        state.mark_disconnected(key, grace_s=0.1)
+        time.sleep(0.2)
+        is_leader2, ev2, _ = state.get_or_create_inflight(key)
+        assert is_leader2 is True
+        assert ev2 is not None
+        assert ev2 is not ev
+
+    def test_grace_default_config(self):
+        import llamacpp_stack.cli.gateway as gw
+        import llamacpp_stack.install as inst
+
+        cfg_gw = gw._default_dedup_inflight_config()
+        assert "grace_s" in cfg_gw
+        assert cfg_gw["grace_s"] == 30
+        assert cfg_gw["tee_buffer_lines"] == 1024
+        assert cfg_gw["tee_buffer_bytes"] == 2097152
+        cfg_inst = inst._default_dedup_inflight_config()
+        assert cfg_inst["grace_s"] == 30
+        norm, _ = gw._normalize_dedup_inflight_config({"enabled": True, "grace_s": 30})
+        assert norm["grace_s"] == 30
+        norm2, _ = gw._normalize_dedup_inflight_config({"enabled": True, "grace_s": "bad"})
+        assert norm2["grace_s"] == 30
+        norm3, _ = gw._normalize_dedup_inflight_config({"enabled": True})
+        assert norm3["grace_s"] == 30
+
+    def test_tee_buffer_preserved_for_grace(self):
+        state = DedupState(max_entries=10)
+        tee = TeeBroadcast(tee_buffer_lines=1024, tee_buffer_bytes=2097152)
+        key = "tee-grace-key"
+        state.get_or_create_inflight(key)
+        state.mark_disconnected(key, grace_s=30)
+        for i in range(5):
+            tee.append(f"data: line{i}\n\n".encode())
+        gen = tee.subscribe_replay_then_live()
+        replay = [next(gen) for _ in range(5)]
+        assert len(replay) == 5
+        assert b"line0" in replay[0]
+        tee.close()

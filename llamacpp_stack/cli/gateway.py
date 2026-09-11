@@ -180,6 +180,7 @@ def _default_dedup_inflight_config() -> dict[str, object]:
         "max_entries": 2000,
         "tee_buffer_lines": 1024,
         "tee_buffer_bytes": 2097152,
+        "grace_s": 30,
     }
 
 
@@ -246,6 +247,7 @@ def _normalize_dedup_inflight_config(raw: object) -> tuple[dict[str, object], bo
     _clamp_int("max_entries", 2000, 1, 100000)
     _clamp_int("tee_buffer_lines", 1024, 1, 100000)
     _clamp_int("tee_buffer_bytes", 2097152, 1024, 104857600)
+    _clamp_int("grace_s", 30, 0, 86400)
     for k in defaults:
         if k not in normalized:
             normalized[k] = defaults[k]
@@ -394,17 +396,36 @@ def _dedup_send_json_with_header(handler_self, payload: dict, status: int = 200,
             pass
 
 
+def _dedup_log_graced_hit(key: str, leader_id: str, similar_id: str, grace_ms: int) -> None:
+    try:
+        log_api_event("dedup_graced_hit", {"leader_id": leader_id, "similar_id": similar_id, "key_prefix8": key[:8], "grace_ms": grace_ms})
+    except Exception:
+        pass
+
+def _dedup_log_similar_wait(key: str, leader_id: str, similar_id: str) -> None:
+    try:
+        log_api_event("dedup_similar_wait", {"leader_id": leader_id, "similar_id": similar_id, "key_prefix8": key[:8]})
+    except Exception:
+        pass
+
+def _dedup_log_grace_expired(key: str, grace_s: int) -> None:
+    try:
+        log_api_event("dedup_grace_expired", {"key_prefix8": key[:8], "grace_s": grace_s})
+    except Exception:
+        pass
+
 def _dedup_streaming_finalize(key: str, collected: list[bytes], dedup_cfg: dict, principal_hash: str, stream_flag: bool, truncated: bool, total_bytes: int, tee: object | None = None) -> None:  # type: ignore[no-untyped-def]
     try:
         if tee is not None and hasattr(tee, "close"):
             tee.close()  # type: ignore
     except Exception:
         pass
+    grace_s = float(dedup_cfg.get("grace_s", 30) or 30) if isinstance(dedup_cfg, dict) else 30
     if truncated:
         try:
             if DEDUP_STATE is not None:
                 DEDUP_STATE.complete_ok(key, {"status": 200, "headers": {}, "body": b""})  # type: ignore
-                DEDUP_STATE.forget(key)  # type: ignore
+                DEDUP_STATE.forget(key, grace_s=grace_s)  # type: ignore
         except Exception:
             pass
         log_api_event("dedup_stream_not_cached_truncated", {"key_prefix8": key[:8], "principal_hash8": principal_hash[:8], "stream": stream_flag, "bytes": total_bytes})
@@ -412,7 +433,7 @@ def _dedup_streaming_finalize(key: str, collected: list[bytes], dedup_cfg: dict,
     if not collected:
         try:
             if DEDUP_STATE is not None:
-                DEDUP_STATE.forget(key)  # type: ignore
+                DEDUP_STATE.forget(key, grace_s=grace_s)  # type: ignore
         except Exception:
             pass
         return
@@ -428,17 +449,17 @@ def _dedup_streaming_finalize(key: str, collected: list[bytes], dedup_cfg: dict,
                     DEDUP_STATE.complete_ok(key, result)  # type: ignore
                 else:
                     DEDUP_STATE.complete_ok(key, result)  # type: ignore
-                    DEDUP_STATE.forget(key)  # type: ignore
+                    DEDUP_STATE.forget(key, grace_s=grace_s)  # type: ignore
             log_api_event("dedup_stream_cached", {"key_prefix8": key[:8], "principal_hash8": principal_hash[:8], "stream": stream_flag, "bytes": len(body_bytes)})
         else:
             if DEDUP_STATE is not None:
                 DEDUP_STATE.complete_ok(key, {"status": 200, "headers": {}, "body": b""})  # type: ignore
-                DEDUP_STATE.forget(key)  # type: ignore
+                DEDUP_STATE.forget(key, grace_s=grace_s)  # type: ignore
             log_api_event("dedup_stream_not_cached_truncated", {"key_prefix8": key[:8], "principal_hash8": principal_hash[:8], "stream": stream_flag, "bytes": len(body_bytes)})
     except Exception:
         try:
             if DEDUP_STATE is not None:
-                DEDUP_STATE.forget(key)  # type: ignore
+                DEDUP_STATE.forget(key, grace_s=grace_s)  # type: ignore
         except Exception:
             pass
 
