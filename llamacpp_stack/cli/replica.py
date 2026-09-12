@@ -66,6 +66,85 @@ def _as_bool(value: object, default: bool = False) -> bool:
         return default
 
 
+def _default_llama_swap_config() -> dict[str, object]:
+    return {"logToStdout": "both", "logLevel": "info"}
+
+
+_LLAMA_SWAP_VALID_TOSTDOUT = {"proxy", "upstream", "both", "none"}
+_LLAMA_SWAP_VALID_LEVEL = {"trace", "debug", "info", "warn", "warning", "error"}
+
+
+def _normalize_llama_swap_config(raw: object) -> dict[str, object]:
+    defaults = _default_llama_swap_config()
+    if not isinstance(raw, dict):
+        return dict(defaults)
+    normalized: dict[str, object] = {}
+    raw_val = raw.get("logToStdout", raw.get("log_to_stdout"))
+    if raw_val is None:
+        normalized["logToStdout"] = defaults["logToStdout"]
+    else:
+        if not isinstance(raw_val, str):
+            raw_val = str(raw_val)
+        norm = str(raw_val).strip().lower()
+        if norm not in _LLAMA_SWAP_VALID_TOSTDOUT:
+            normalized["logToStdout"] = defaults["logToStdout"]
+        else:
+            normalized["logToStdout"] = norm
+    raw_level = raw.get("logLevel", raw.get("log_level"))
+    if raw_level is None:
+        normalized["logLevel"] = defaults["logLevel"]
+    else:
+        if not isinstance(raw_level, str):
+            raw_level = str(raw_level)
+        norm_level = str(raw_level).strip().lower()
+        if norm_level not in _LLAMA_SWAP_VALID_LEVEL:
+            normalized["logLevel"] = defaults["logLevel"]
+        else:
+            normalized["logLevel"] = norm_level
+    for k in defaults:
+        if k not in normalized:
+            normalized[k] = defaults[k]
+    return normalized
+
+
+def _effective_llama_swap_config() -> dict[str, object]:
+    try:
+        from llamacpp_stack.cli.server_commands import _load_server_config_payload  # type: ignore
+
+        payload = _load_server_config_payload(None)
+    except Exception:
+        try:
+            import importlib.util
+            import sys as _sys
+            from pathlib import Path as _P
+
+            fp = _P(__file__).parent.parent / "cli.py"
+            spec = importlib.util.spec_from_file_location("llamacpp_stack._cli_file_tmp2", fp)
+            if spec and spec.loader:
+                cli_file = _sys.modules.get("llamacpp_stack._cli_file")
+                if cli_file is not None and hasattr(cli_file, "_load_server_config_payload"):
+                    payload = cli_file._load_server_config_payload(None)
+                else:
+                    payload = {}
+            else:
+                payload = {}
+        except Exception:
+            payload = {}
+        if not payload:
+            for candidate in (Path.home() / ".config" / "heimdall-gateway" / "conf.json", Path("/etc/heimdall-gateway/conf.json")):
+                try:
+                    if candidate.exists():
+                        import json as _json
+
+                        payload = _json.loads(candidate.read_text(encoding="utf-8"))
+                        break
+                except Exception:
+                    continue
+    raw_logging = payload.get("logging") if isinstance(payload.get("logging"), dict) else {}
+    raw_ls = raw_logging.get("llama_swap") if isinstance(raw_logging, dict) else None
+    return _normalize_llama_swap_config(raw_ls)
+
+
 def resolve_global_replica_config(args=None) -> dict[str, object]:
     try:
         from llamacpp_stack.cli.server_commands import _load_server_config_payload
@@ -482,10 +561,14 @@ def render_llamaswap_config(
         yaml = None  # type: ignore
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _ls = _effective_llama_swap_config()
+    except Exception:
+        _ls = _default_llama_swap_config()
     data = {
         "healthCheckTimeout": 600,
-        "logLevel": "info",
-        "logToStdout": "proxy",
+        "logLevel": str(_ls.get("logLevel", "info")),
+        "logToStdout": str(_ls.get("logToStdout", "both")),
         "startPort": start_port,
         "sendLoadingState": False,
         "includeAliasesInList": True,
@@ -624,9 +707,13 @@ def ensure_replica_route_in_llamaswap_config(
         data = {}
     if not isinstance(data, dict):
         data = {}
+    try:
+        _ls2 = _effective_llama_swap_config()
+    except Exception:
+        _ls2 = _default_llama_swap_config()
     data.setdefault("healthCheckTimeout", 600)
-    data.setdefault("logLevel", "info")
-    data.setdefault("logToStdout", "proxy")
+    data.setdefault("logLevel", str(_ls2.get("logLevel", "info")))
+    data.setdefault("logToStdout", str(_ls2.get("logToStdout", "both")))
     data.setdefault("sendLoadingState", False)
     data.setdefault("includeAliasesInList", True)
     models = data.setdefault("models", {})

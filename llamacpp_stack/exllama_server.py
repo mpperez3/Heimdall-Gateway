@@ -14,7 +14,108 @@ stats = {
     "prompt_tokens_total": 0,
     "completion_tokens_total": 0,
     "context_length": None,
+    # last job measured timings for /slots (no fabrication)
+    "last_prefill_ms": None,
+    "last_decode_ms": None,
+    "last_prompt_n": None,
+    "last_predicted_n": None,
 }
+
+# print_timing emulation (beellama parity) — incremental task counter
+_slot_task_counter = 0
+_slot_task_lock = threading.Lock()
+_graphs_reused = 0
+_graphs_reused_lock = threading.Lock()
+
+
+def _log_both(msg: str) -> None:
+    """Write msg to BOTH stdout and stderr for llama-swap logToStdout=both capture.
+
+    llama-swap v251 Model Logs captures upstream stdout+stderr via logToStdout knob.
+    EXL3 must emit to both so Model Logs tab shows llama_model_loader / slot
+    print_timing / draft acceptance regardless of logToStdout setting.
+    """
+    try:
+        sys.stdout.write(msg + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
+    try:
+        sys.stderr.write(msg + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _emit_print_timing(prompt_n: int, predicted_n: int, prompt_ms: float, predicted_ms: float,
+                       draft_n, draft_n_accepted) -> None:
+    """Emit beellama-like `slot print_timing` lines to BOTH stdout+stderr for llama-swap capture.
+
+    Format matches llama.cpp:5d/8.2f/6.2f widths, includes prompt eval, eval, total,
+    graphs reused (fixed 0/incremental since EXL3 has no graph cache), and draft acceptance.
+    Real values: prompt_n/prompt_ms, predicted_n/predicted_ms, draft_n/draft_n_accepted.
+    Writes to both stdout and stderr so Model Logs appears with logToStdout=both/proxy/upstream.
+    """
+    global _slot_task_counter, _graphs_reused
+    try:
+        with _slot_task_lock:
+            _slot_task_counter += 1
+            task_id = int(_slot_task_counter)
+        slot_id = 0
+        # graphs reused — no EXL3 equivalent, use counter 0 (or incremental fixed)
+        with _graphs_reused_lock:
+            graphs = int(_graphs_reused)
+            # optionally increment for next call to show progression (keep 0 as safe fixed)
+            # _graphs_reused += 1
+
+        total_ms = float(prompt_ms or 0) + float(predicted_ms or 0)
+        total_n = int(prompt_n or 0) + int(predicted_n or 0)
+
+        # per-token rates
+        if prompt_n and prompt_ms and prompt_ms > 0:
+            p_ms_per = float(prompt_ms) / float(prompt_n)
+            p_tps = float(prompt_n) / (float(prompt_ms) / 1000.0)
+        else:
+            p_ms_per = 0.0
+            p_tps = 0.0
+        if predicted_n and predicted_ms and predicted_ms > 0:
+            e_ms_per = float(predicted_ms) / float(predicted_n)
+            e_tps = float(predicted_n) / (float(predicted_ms) / 1000.0)
+        else:
+            e_ms_per = 0.0
+            e_tps = 0.0
+
+        lines = []
+        # exact widths: %8.2f ms / %5d tokens (%6.2f ms per token, %8.2f tokens per second)
+        lines.append(
+            f"slot print_timing: id {slot_id:2d} | task {task_id:4d} | prompt eval time = {float(prompt_ms):8.2f} ms / {int(prompt_n):5d} tokens ({p_ms_per:6.2f} ms per token, {p_tps:8.2f} tokens per second)"
+        )
+        lines.append(
+            f"slot print_timing: id {slot_id:2d} | task {task_id:4d} |        eval time = {float(predicted_ms):8.2f} ms / {int(predicted_n):5d} tokens ({e_ms_per:6.2f} ms per token, {e_tps:8.2f} tokens per second)"
+        )
+        lines.append(
+            f"slot print_timing: id {slot_id:2d} | task {task_id:4d} |       total time = {total_ms:8.2f} ms / {total_n:5d} tokens"
+        )
+        lines.append(
+            f"slot print_timing: id {slot_id:2d} | task {task_id:4d} |    graphs reused = {graphs:9d}"
+        )
+        if draft_n is not None and int(draft_n) > 0:
+            try:
+                dn = int(draft_n)
+                da = int(draft_n_accepted) if draft_n_accepted is not None else 0
+                ratio = (da / dn) if dn else 0.0
+                # mean len approximated as dn / predicted_n if predicted_n else 0
+                mean_len = (float(dn) / float(predicted_n)) if predicted_n else 0.0
+                lines.append(
+                    f"slot print_timing: id {slot_id:2d} | task {task_id:4d} | draft acceptance = {ratio:.5f} ({da:4d} accepted / {dn:4d} generated)"
+                )
+            except Exception:
+                pass
+        for ln in lines:
+            _log_both(ln)
+    except Exception:
+        # never break generation on logging failure
+        pass
 
 def _bump_stats(prompt=0, completion=0):
     if prompt <= 0 and completion <= 0:
@@ -34,9 +135,182 @@ def _result_new_tokens(r):
     except Exception:
         return 0
 
+
+def _extract_draft_stats(job, generator):
+    try:
+        has_draft = False
+        try:
+            gd = generator.__dict__.get("draft_model", None) if hasattr(generator, "__dict__") else getattr(generator, "draft_model", None)
+            mtp = generator.__dict__.get("mtp_draft", False) if hasattr(generator, "__dict__") else getattr(generator, "mtp_draft", False)
+            ndt = generator.__dict__.get("num_draft_tokens", 0) if hasattr(generator, "__dict__") else getattr(generator, "num_draft_tokens", 0)
+            ngram = generator.__dict__.get("ngram_match_min", None) if hasattr(generator, "__dict__") else getattr(generator, "ngram_match_min", None)
+            has_draft = bool(
+                gd is not None
+                or bool(mtp)
+                or int(ndt or 0) > 0
+                or ngram
+            )
+        except Exception:
+            pass
+        accepted = int(getattr(job, "accepted_draft_tokens", 0) or 0)
+        rejected = int(getattr(job, "rejected_draft_tokens", 0) or 0)
+        draft_n = accepted + rejected
+        if has_draft:
+            return draft_n, accepted
+        if draft_n > 0:
+            return draft_n, accepted
+        return None, None
+    except Exception:
+        return None, None
+
+
+def _extract_cached_tokens(job):
+    try:
+        if hasattr(job, "cached_pages") and hasattr(job, "cached_tokens"):
+            try:
+                from exllamav3.generator.job import PAGE_SIZE as _PAGE_SIZE
+            except Exception:
+                _PAGE_SIZE = 256
+            try:
+                pages = int(getattr(job, "cached_pages", 0) or 0)
+                toks = int(getattr(job, "cached_tokens", 0) or 0)
+                seqs = getattr(job, "sequences", None)
+                denom = len(seqs) if seqs else 1
+                if denom <= 0:
+                    denom = 1
+                total = (pages * _PAGE_SIZE + toks) // denom
+                if total > 0:
+                    return total
+            except Exception:
+                pass
+        return None
+    except Exception:
+        return None
+
 TOOL_CALL_OPEN = "\u003ctool_call\u003e"
 TOOL_CALL_CLOSE = "\u003c/tool_call\u003e"
 HOLD_BACK = 16
+
+# ---------------------------------------------------------------------------
+# T2 single documented decision for decode_special_tokens (ONE place)
+# ---------------------------------------------------------------------------
+# Job(decode_special_tokens=False): special tokens like <|im_start|> /
+# <|im_end|> are NOT decoded into `text` — they are handled as
+# stop_conditions (Job stops and does not emit them).  Setting True would
+# leak raw markers into both streamed deltas and final content, requiring
+# stripping everywhere.  We choose False and keep stripping as
+# defence-in-depth (covers the HOLD_BACK=16 synthetic leak and any
+# tokenizer edge where a marker still appears mid-text).
+# Reference: exllamav3/generator/job.py:59 (param) / 231-249 (stop decode).
+DECODE_SPECIAL_TOKENS = False
+
+MARKER_IM_START = "<|im_start|>"
+MARKER_IM_END = "<|im_end|>"
+
+
+def strip_markers(text: str) -> str:
+    """Truncate at first marker, covering mid-text case.
+
+    Uses ``split("<|im_end|>")[0].split("<|im_start|>")[0]`` per T2
+    acceptance (4), e.g. ``"answer<|im_end|>junk" -> "answer"``.
+    Handles both markers; content ends at first ``<|im_end|>``.
+    """
+    return text.split(MARKER_IM_END)[0].split(MARKER_IM_START)[0]
+
+
+def _earliest_marker_pos(text: str) -> int:
+    """Return earliest index of either complete marker, or -1."""
+    a = text.find(MARKER_IM_START)
+    b = text.find(MARKER_IM_END)
+    if a < 0:
+        return b
+    if b < 0:
+        return a
+    return a if a < b else b
+
+
+def _earliest_user_stop_pos(text: str, stops: list[str] | None) -> int:
+    """Return earliest index of any user stop string, or -1."""
+    if not stops:
+        return -1
+    earliest = -1
+    for s in stops:
+        if not s:
+            continue
+        p = text.find(s)
+        if p >= 0 and (earliest < 0 or p < earliest):
+            earliest = p
+    return earliest
+
+
+def strip_user_stops(text: str, stops: list[str] | None) -> str:
+    """Truncate at first user stop occurrence."""
+    if not stops:
+        return text
+    pos = _earliest_user_stop_pos(text, stops)
+    if pos >= 0:
+        return text[:pos]
+    return text
+
+
+def _resolve_enable_thinking(reasoning) -> bool:
+    """Normalize reasoning param to enable_thinking bool (matches generate_full logic)."""
+    reasoning_norm = str(reasoning or "").strip().lower() if isinstance(reasoning, str) else reasoning
+    if reasoning_norm in ("off", "none", "false", "0"):
+        return False
+    elif reasoning_norm in ("low", "medium", "high", "on", "true", "1", "", None):
+        return True
+    else:
+        return bool(reasoning) if isinstance(reasoning, bool) else True
+
+
+def _resolve_preserve_thinking_extra(extra_kwargs: dict, reasoning) -> None:
+    """Inject preserve_thinking default false for Qwen if not provided (bundle family_defaults.qwen).
+
+    Mutates extra_kwargs in place. Matches spec default false per llamacpp_stack/bundle/llama_server_defaults.yaml:42-47.
+    """
+    if "preserve_thinking" not in extra_kwargs:
+        extra_kwargs["preserve_thinking"] = False
+
+
+def resolve_in_think_initial(tokenizer, input_ids, enable_thinking: bool) -> bool:
+    """Derive in_think from enable_thinking + template suffix (handles divergence).
+
+    T3 QA failure clause: if 27B/small template differs in generation prefix without
+    think, log suffix real and adjust per case instead of hardcode. We decode the
+    rendered prompt and inspect its tail.
+    """
+    try:
+        # exllamav3 tokenizer decode: decode(tensor) or decode(list)
+        prompt_text = None
+        if hasattr(tokenizer, "decode"):
+            try:
+                # input_ids is shape (1, n) tensor
+                prompt_text = tokenizer.decode(input_ids[0] if hasattr(input_ids, "__getitem__") else input_ids)
+                if isinstance(prompt_text, list):
+                    prompt_text = prompt_text[0] if prompt_text else ""
+            except Exception:
+                prompt_text = None
+        if not isinstance(prompt_text, str) and hasattr(tokenizer, "hf_chat_template"):
+            # fallback: try to render via tokenizer internals is already done
+            prompt_text = None
+        if isinstance(prompt_text, str):
+            # Template when enable_thinking=False ends with "<think>\\n\\n</think>\\n\\n"
+            # When True ends with "<think>\\n"
+            tail = prompt_text[-80:]
+            has_empty_think = "<think>\n\n</think>" in tail
+            has_open_think = tail.rstrip().endswith("<think>")
+            # Log suffix for divergence detection (both stdout+stderr for Model Logs)
+            _log_both(f"[exllama_server] enable_thinking={enable_thinking} prompt_tail={tail!r} has_empty_think={has_empty_think} has_open_think={has_open_think}")
+            if enable_thinking and has_empty_think:
+                # Divergence: template rendered empty think even though enable true
+                return False
+            if not enable_thinking and has_open_think and not has_empty_think:
+                return True
+            return bool(enable_thinking)
+    except Exception as e:
+        _log_both(f"[exllama_server] resolve_in_think fallback {e!r} enable={enable_thinking}")
+    return bool(enable_thinking)
 
 def build_model(argv, use_draft=True):
     from exllamav3 import model_init, Generator
@@ -88,6 +362,205 @@ def normalize_messages(messages):
             m["tool_calls"] = calls
         out.append(m)
     return out
+
+class StreamSplitter:
+    THINK_CLOSE = "\u003c/think\u003e"
+    TOOL_OPEN = TOOL_CALL_OPEN
+    TOOL_CLOSE = TOOL_CALL_CLOSE
+
+    def __init__(self, hold_back: int = HOLD_BACK, tool_schemas=None, in_think: bool = True, user_stops=None):
+        self.hold_back = int(hold_back)
+        self.tool_schemas = tool_schemas or {}
+        self.pending: str = ""
+        self.in_think: bool = bool(in_think)
+        self.call_idx: int = 0
+        self.calls_emitted: bool = False
+        self.user_stops: list[str] = [s for s in (user_stops or []) if s]
+
+    def push(self, chunk: str) -> None:
+        if chunk:
+            self.pending += chunk
+
+    def flush(self, final: bool = False) -> list[dict]:
+        out: list[dict] = []
+        pending = self.pending
+        in_think = self.in_think
+        call_idx = self.call_idx
+        calls_emitted = self.calls_emitted
+        schemas = self.tool_schemas
+        hb = self.hold_back
+
+        def _strip(s: str) -> str:
+            return s.split(MARKER_IM_END)[0].split(MARKER_IM_START)[0]
+
+        def _strip_all(s: str) -> str:
+            return strip_user_stops(_strip(s), self.user_stops)
+
+        while True:
+            if in_think:
+                close = pending.find(self.THINK_CLOSE)
+                if close >= 0:
+                    head, pending = pending[:close], pending[close + len(self.THINK_CLOSE):]
+                    head = _strip_all(head)
+                    if head.strip():
+                        out.append({"reasoning_content": head.lstrip("\n")})
+                    in_think = False
+                    continue
+                mpos = _earliest_marker_pos(pending)
+                upos = _earliest_user_stop_pos(pending, self.user_stops)
+                # combined earliest for final and hold_back
+                cpos = mpos if mpos >= 0 and (upos < 0 or mpos < upos) else upos
+                if final and cpos >= 0:
+                    pending = pending[:cpos]
+                    stripped = _strip_all(pending)
+                    if stripped.strip():
+                        out.append({"reasoning_content": stripped})
+                    pending = ""
+                    break
+                if cpos >= 0 and cpos < max(0, len(pending) - hb):
+                    truncated = _strip_all(pending[:cpos])
+                    if truncated.strip():
+                        out.append({"reasoning_content": truncated})
+                    pending = ""
+                    break
+                cut = len(pending) if final else max(0, len(pending) - hb)
+                piece = pending[:cut]
+                stripped = _strip_all(piece)
+                if len(stripped) < len(piece):
+                    if stripped.strip():
+                        out.append({"reasoning_content": stripped})
+                    pending = ""
+                    break
+                # also handle user stop inside piece that was held but now emittable via cut
+                spos = _earliest_user_stop_pos(piece, self.user_stops)
+                if spos >= 0:
+                    truncated = _strip_all(piece[:spos])
+                    if truncated.strip():
+                        out.append({"reasoning_content": truncated})
+                    pending = ""
+                    break
+                if stripped.strip():
+                    out.append({"reasoning_content": stripped})
+                pending = pending[cut:]
+                break
+            if TOOL_CALL_OPEN in pending:
+                head, rest = pending.split(TOOL_CALL_OPEN, 1)
+                orig_head = head
+                head = _strip_all(head)
+                marker_in_head = len(head) < len(orig_head)
+                user_in_head = _earliest_user_stop_pos(head, self.user_stops) >= 0 if not marker_in_head else False
+                # also check original head for user stop before stripping
+                if not marker_in_head:
+                    upos_h = _earliest_user_stop_pos(orig_head, self.user_stops)
+                    if upos_h >= 0:
+                        head = _strip_all(orig_head[:upos_h])
+                        if head.strip() or (final and head):
+                            out.append({"content": head})
+                        pending = ""
+                        break
+                if marker_in_head:
+                    if head.strip() or (final and head):
+                        out.append({"content": head})
+                    pending = ""
+                    break
+                if head.strip() or (final and head):
+                    out.append({"content": head})
+                if TOOL_CALL_CLOSE in rest:
+                    block, pending = rest.split(TOOL_CALL_CLOSE, 1)
+                    block_stripped = _strip_all(block)
+                    marker_in_block = len(block_stripped) < len(block)
+                    # user stop inside block also truncates
+                    if not marker_in_block:
+                        upos_b = _earliest_user_stop_pos(block, self.user_stops)
+                        if upos_b >= 0:
+                            block_stripped = _strip_all(block[:upos_b])
+                            pending = ""
+                            marker_in_block = True
+                    if marker_in_block:
+                        pending = ""
+                    _, calls = parse_tool_calls(TOOL_CALL_OPEN + block_stripped + TOOL_CALL_CLOSE, schemas)
+                    for c in calls:
+                        out.append({"tool_calls": [dict(c, index=call_idx)]})
+                        call_idx += 1
+                        calls_emitted = True
+                    if marker_in_block:
+                        break
+                    m2 = _earliest_marker_pos(pending)
+                    u2 = _earliest_user_stop_pos(pending, self.user_stops)
+                    c2 = m2 if m2 >= 0 and (u2 < 0 or m2 < u2) else u2
+                    if c2 >= 0 and (final or c2 < max(0, len(pending) - hb)):
+                        pending = pending[:c2]
+                        continue
+                    continue
+                if final and "\u003cfunction=" in rest:
+                    rest_stripped = _strip_all(rest)
+                    _, calls = parse_tool_calls(TOOL_CALL_OPEN + rest_stripped, schemas)
+                    for c in calls:
+                        out.append({"tool_calls": [dict(c, index=call_idx)]})
+                        call_idx += 1
+                        calls_emitted = True
+                    pending = ""
+                else:
+                    mpos2 = _earliest_marker_pos(rest)
+                    upos2 = _earliest_user_stop_pos(rest, self.user_stops)
+                    cpos2 = mpos2 if mpos2 >= 0 and (upos2 < 0 or mpos2 < upos2) else upos2
+                    if cpos2 >= 0 and (final or (len(head) + len(TOOL_CALL_OPEN) + cpos2) < max(0, len(pending) - hb)):
+                        pending = TOOL_CALL_OPEN + rest[:cpos2]
+                    else:
+                        pending = TOOL_CALL_OPEN + rest
+                break
+            mpos = _earliest_marker_pos(pending)
+            upos = _earliest_user_stop_pos(pending, self.user_stops)
+            cpos = mpos if mpos >= 0 and (upos < 0 or mpos < upos) else upos
+            if final and cpos >= 0:
+                truncated = _strip_all(pending[:cpos])
+                if truncated:
+                    out.append({"content": truncated})
+                pending = ""
+                break
+            if cpos >= 0 and cpos < max(0, len(pending) - hb):
+                truncated = _strip_all(pending[:cpos])
+                if truncated:
+                    out.append({"content": truncated})
+                pending = ""
+                break
+            cut = len(pending) if final else max(0, len(pending) - hb)
+            piece = pending[:cut]
+            stripped = _strip_all(piece)
+            if len(stripped) < len(piece):
+                if stripped:
+                    out.append({"content": stripped})
+                pending = ""
+                break
+            # user stop inside piece not at marker level
+            spos = _earliest_user_stop_pos(piece, self.user_stops)
+            if spos >= 0:
+                truncated = _strip_all(piece[:spos])
+                if truncated:
+                    out.append({"content": truncated})
+                pending = ""
+                break
+            if stripped:
+                out.append({"content": stripped})
+            pending = pending[cut:]
+            break
+
+        self.pending = pending
+        self.in_think = in_think
+        self.call_idx = call_idx
+        self.calls_emitted = calls_emitted
+        return out
+
+    def has_pending(self) -> bool:
+        return bool(self.pending)
+
+
+def split_stream_chunk(pending: str, in_think: bool, hold_back: int = HOLD_BACK, final: bool = False, tool_schemas=None, user_stops=None) -> tuple[list[dict], str, bool]:
+    s = StreamSplitter(hold_back=hold_back, tool_schemas=tool_schemas, in_think=in_think, user_stops=user_stops)
+    s.pending = pending
+    deltas = s.flush(final=final)
+    return deltas, s.pending, s.in_think
+
 
 def split_reasoning(text):
     close = text.find("\u003c/think\u003e")
@@ -223,17 +696,9 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
             messages = [{"role": "system", "content": directive}] + messages
     # reasoning: low/medium/high compatible with llama.cpp (llamacpp_stack/cli.py:3050 half_context)
     # off disables thinking, low/medium/high all enable it (Qwen3.8 always thinks)
-    reasoning_norm = str(reasoning or "").strip().lower() if isinstance(reasoning, str) else reasoning
-    if reasoning_norm in ("off", "none", "false", "0"):
-        enable_thinking = False
-    elif reasoning_norm in ("low", "medium", "high", "on", "true", "1", "", None):
-        enable_thinking = True
-    else:
-        enable_thinking = bool(reasoning) if isinstance(reasoning, bool) else True
+    enable_thinking = _resolve_enable_thinking(reasoning)
     extra_kwargs = dict(chat_template_kwargs) if isinstance(chat_template_kwargs, dict) else {}
-    # preserve_thinking false is default for Qwen (llamacpp_stack/bundle/llama_server_defaults.yaml)
-    if "preserve_thinking" not in extra_kwargs and reasoning_norm in ("low", "medium", "high"):
-        extra_kwargs["preserve_thinking"] = False
+    _resolve_preserve_thinking_extra(extra_kwargs, reasoning)
     try:
         input_ids = tokenizer.hf_chat_template(
             messages, add_generation_prompt=True, enable_thinking=enable_thinking,
@@ -272,7 +737,8 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
         stop_conditions = [x for x in sc if x not in seen and not seen.add(x)]
         job = Job(input_ids=input_ids, max_new_tokens=max_tokens,
                   stop_conditions=stop_conditions,
-                  sampler=sampler, seed=seed)
+                  sampler=sampler, seed=seed,
+                  decode_special_tokens=DECODE_SPECIAL_TOKENS)
         prefill_seen = 0
         _t_prefill_end_local = None
         with gen_lock:
@@ -309,10 +775,9 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
     job = run_once()
     if forced_choice and not parse_tool_calls(text, schemas)[1]:
         temperature = 0.0
+        _t_gen_start = time.perf_counter()
         job = run_once()
-    text = text.split("<|im_start|>")[0]
-    text = re.sub(r'^\s*<\|im_end\|>\s*', '', text)
-    text = re.sub(r'(\s*<\|im_(?:start|end)\|>[^\n]*)+$', '', text).strip()
+    text = strip_user_stops(strip_markers(text), stop).strip()
     seq = job.sequences[0]
     out_toks = int(seq.sequence_ids.seq_len - prompt_toks)
     content, calls = parse_tool_calls(text, schemas)
@@ -323,7 +788,15 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
                   "stop_condition": "stop", "banned": "content_filter"}.get(
                       reason, "stop")
     reasoning, content = split_reasoning(content)
-    return text, calls, finish, prompt_toks, out_toks, reasoning, content, prefill_ms, decode_ms
+    draft_n, draft_n_accepted = _extract_draft_stats(job, generator)
+    cached_real = _extract_cached_tokens(job)
+    with stats_lock:
+        stats["last_prefill_ms"] = float(prefill_ms)
+        stats["last_decode_ms"] = float(decode_ms)
+        stats["last_prompt_n"] = int(prompt_toks)
+        stats["last_predicted_n"] = int(out_toks)
+    _emit_print_timing(prompt_toks, out_toks, prefill_ms, decode_ms, draft_n, draft_n_accepted)
+    return text, calls, finish, prompt_toks, out_toks, reasoning, content, prefill_ms, decode_ms, draft_n, draft_n_accepted, cached_real
 
 async def models(request):
     ctx = stats.get("context_length")
@@ -340,8 +813,6 @@ async def health(request):
         pt = int(stats.get("prompt_tokens_total") or 0)
         ct = int(stats.get("completion_tokens_total") or 0)
         ctx = stats.get("context_length")
-        # llama-server compatible fields for llama-swap (Cached/Prompt/Generated/Prefill/Decode)
-        n_past = (pt + ct) % (ctx or 1) if ctx else 0
         return web.json_response({
             "ok": True,
             "status": "ok" if not busy else "loading",
@@ -353,15 +824,12 @@ async def health(request):
             "prompt_tokens_total": pt,
             "completion_tokens_total": ct,
             "total_tokens": pt + ct,
-            "cached_tokens": ctx or 0,
             "slots": [{
                 "id": 0,
                 "n_ctx": ctx or 0,
-                "n_past": n_past,
                 "is_processing": busy,
                 "prompt_tokens": pt,
                 "generated_tokens": ct,
-                "cached_tokens": n_past,
             }],
             "total_slots": 1,
             "idle_slots": 0 if busy else 1,
@@ -372,18 +840,14 @@ async def metrics(request):
         pt = int(stats.get("prompt_tokens_total") or 0)
         ct = int(stats.get("completion_tokens_total") or 0)
         ctx = stats.get("context_length")
-    # llama-swap expects llama-server style metrics (Cached/Prompt/Generated/Prefill/Decode)
-    # We map prompt→Prefill+Prompt, completion→Decode+Generated, context→Cached
     return web.json_response({
         "prompt_tokens": pt,
         "completion_tokens": ct,
         "total_tokens": pt + ct,
-        "cached_tokens": ctx or 0,
         "prompt": pt,
         "generated": ct,
         "prefill_tokens": pt,
         "decode_tokens": ct,
-        "cached": ctx or 0,
         "context_length": ctx,
     })
 
@@ -427,6 +891,236 @@ def parse_request(body):
         chat_template_kwargs=chat_template_kwargs,
     ), None
 
+def parse_completion_request(body):
+    """Parse legacy /completion body. Minimal llama.cpp compat.
+
+    Accepts: prompt (str, required), n_predict/n/max_tokens, temperature, top_p, top_k,
+    seed, stop, stream, model, reasoning/chat_template_kwargs.
+    Maps prompt -> single user message for generate_full.
+    """
+    prompt = body.get("prompt")
+    if prompt is None:
+        prompt = body.get("input")
+    if not isinstance(prompt, str) or not prompt:
+        return None, "`prompt` (string) is required"
+    n_predict = body.get("n_predict")
+    if n_predict is None:
+        n_predict = body.get("n")
+    if n_predict is None:
+        n_predict = body.get("max_tokens")
+    if n_predict is None:
+        n_predict = body.get("max_completion_tokens")
+    if n_predict is None:
+        n_predict = body.get("num_predict", 256)
+    try:
+        max_tokens = int(n_predict)
+    except Exception:
+        max_tokens = 256
+    if max_tokens < 0:
+        max_tokens = 1024
+    if max_tokens == 0:
+        max_tokens = 256
+    temperature = float(body.get("temperature", 0.6))
+    top_p = float(body.get("top_p", 0.95))
+    top_k = int(body.get("top_k", 20))
+    seed = body.get("seed")
+    stop = body.get("stop")
+    if isinstance(stop, str):
+        stop = [stop]
+    elif not isinstance(stop, list):
+        stop = None
+    reasoning = body.get("reasoning")
+    if reasoning is None:
+        reasoning = body.get("reasoning_budget")
+    if reasoning is None and isinstance(body.get("chat_template_kwargs"), dict):
+        reasoning = body["chat_template_kwargs"].get("reasoning")
+    chat_template_kwargs = body.get("chat_template_kwargs")
+    if not isinstance(chat_template_kwargs, dict):
+        chat_template_kwargs = None
+    messages = [{"role": "user", "content": prompt}]
+    return dict(
+        prompt=prompt,
+        messages=normalize_messages(messages),
+        max_tokens=max_tokens, temperature=temperature,
+        top_p=top_p, top_k=top_k,
+        seed=int(seed) if seed is not None else None,
+        stop=stop,
+        stream=bool(body.get("stream", False)),
+        model_id=body.get("model", "qwen3.8-27b-exl3-3.5bpw"),
+        reasoning=reasoning,
+        chat_template_kwargs=chat_template_kwargs,
+    ), None
+
+
+async def legacy_completion(request):
+    """POST /completion and POST /v1/completions compat - emulates llama.cpp.
+
+    Accepts prompt + n_predict + sampling params, maps prompt to user message,
+    calls generate_full, returns llama.cpp-like JSON with content, tokens_*, timings.
+    Supports stream=true via SSE (content chunks).
+    """
+    app = request.app
+    generator, tokenizer = app["generator"], app["tokenizer"]
+    try:
+        body = await request.json()
+    except web.HTTPRequestEntityTooLarge:
+        return web.json_response(
+            {"error": {"message": f"request body exceeds {request.app['max_body_mb']} MiB limit",
+                       "type": "invalid_request_error",
+                       "code": "request_entity_too_large"}},
+            status=413)
+    except Exception:
+        return web.json_response({"error": {"message": "invalid JSON"}}, status=400)
+    req, err = parse_completion_request(body)
+    if err:
+        return web.json_response({"error": {"message": err}}, status=400)
+
+    import asyncio
+    if not req["stream"]:
+        try:
+            result = await asyncio.to_thread(
+                generate_full, generator, tokenizer, req["messages"],
+                req["max_tokens"], req["temperature"], req["top_p"], req["top_k"],
+                req["seed"], None, None, req["stop"],
+                None, req.get("reasoning"), req.get("chat_template_kwargs"))
+            if len(result) == 12:
+                text, calls, finish, ptoks, otoks, reasoning, content, prefill_ms, decode_ms, draft_n, draft_n_accepted, cached_real = result
+            else:
+                text, calls, finish, ptoks, otoks, reasoning, content, prefill_ms, decode_ms = result
+                draft_n = draft_n_accepted = cached_real = None
+        except AssertionError as e:
+            return web.json_response(
+                {"error": {"message": f"context/cache: {e}", "type": "invalid_request_error"}},
+                status=400)
+        except Exception as e:
+            return web.json_response(
+                {"error": {"message": f"generation error: {e}", "type": "server_error"}},
+                status=500)
+        prompt_tps = ptoks / (prefill_ms / 1000) if prefill_ms > 0 else 0
+        gen_tps = otoks / (decode_ms / 1000) if decode_ms > 0 else 0
+        timings = {
+            "prompt_n": ptoks,
+            "predicted_n": otoks,
+            "prompt_ms": round(prefill_ms, 2),
+            "predicted_ms": round(decode_ms, 2),
+            "prompt_per_second": round(prompt_tps, 2),
+            "predicted_per_second": round(gen_tps, 2),
+        }
+        if draft_n is not None:
+            timings["draft_n"] = int(draft_n)
+            timings["draft_n_accepted"] = int(draft_n_accepted) if draft_n_accepted is not None else 0
+        if cached_real is not None:
+            timings["cache_n"] = int(cached_real)
+        resp_body = {
+            "content": content,
+            "tokens_predicted": otoks,
+            "tokens_evaluated": ptoks,
+            "tokens_cached": int(cached_real) if cached_real is not None else 0,
+            "truncated": finish == "length",
+            "stop": finish == "stop",
+            "stopped_eos": finish == "stop",
+            "stopped_word": False,
+            "stopped_limit": finish == "length",
+            "stopping_word": "",
+            "has_new_line": content.endswith("\n") if content else False,
+            "model": req["model_id"],
+            "timings": timings,
+            "tokens": [ptoks, otoks],
+            "prompt": req["prompt"],
+        }
+        resp_body["finish_reason"] = finish
+        if reasoning:
+            resp_body["reasoning_content"] = reasoning
+        resp = web.json_response(resp_body)
+        resp.headers["X-Prompt-Tokens"] = str(ptoks)
+        resp.headers["X-Completion-Tokens"] = str(otoks)
+        return resp
+
+    resp = web.StreamResponse(headers={
+        "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
+        "Connection": "keep-alive"})
+    await resp.prepare(request)
+    model_id = req["model_id"]
+
+    async def run():
+        loop = asyncio.get_event_loop()
+        queue = asyncio.Queue()
+
+        def on_text(chunk):
+            loop.call_soon_threadsafe(queue.put_nowait, ("delta", chunk))
+
+        def worker():
+            try:
+                result = generate_full(
+                    generator, tokenizer, req["messages"], req["max_tokens"],
+                    req["temperature"], req["top_p"], req["top_k"],
+                    req["seed"], None, None, req["stop"],
+                    on_text=on_text,
+                    reasoning=req.get("reasoning"), chat_template_kwargs=req.get("chat_template_kwargs"))
+                if len(result) == 12:
+                    _, calls, finish, ptoks, otoks, reasoning, content, prefill_ms, decode_ms, draft_n, draft_n_accepted, cached_real = result
+                else:
+                    _, calls, finish, ptoks, otoks, reasoning, content, prefill_ms, decode_ms = result
+                    draft_n = draft_n_accepted = cached_real = None
+                loop.call_soon_threadsafe(queue.put_nowait,
+                                          ("done", (finish, content, reasoning, ptoks, otoks, prefill_ms, decode_ms, draft_n, draft_n_accepted, cached_real)))
+            except Exception as e:
+                loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
+        loop.run_in_executor(None, worker)
+
+        _enable_thinking_stream = _resolve_enable_thinking(req.get("reasoning"))
+        splitter = StreamSplitter(hold_back=HOLD_BACK, tool_schemas={}, in_think=_enable_thinking_stream, user_stops=req.get("stop"))
+
+        async def flush_pending(final=False):
+            deltas = splitter.flush(final=final)
+            for d in deltas:
+                if "reasoning_content" in d:
+                    await resp.write(f"data: {json.dumps({'content': d['reasoning_content'], 'stop': False})}\n\n".encode())
+                elif "content" in d:
+                    await resp.write(f"data: {json.dumps({'content': d['content'], 'stop': False})}\n\n".encode())
+
+        while True:
+            kind, payload = await queue.get()
+            if kind == "error":
+                await resp.write(f'data: {json.dumps({"error": {"message": payload}})}\n\n'.encode())
+                break
+            if kind == "delta":
+                splitter.push(payload)
+                await flush_pending()
+            elif kind == "done":
+                await flush_pending(final=True)
+                finish, content, reasoning, ptoks, otoks, prefill_ms, decode_ms, draft_n, draft_n_accepted, cached_real = payload
+                prompt_tps = ptoks / (prefill_ms / 1000) if prefill_ms > 0 else 0
+                gen_tps = otoks / (decode_ms / 1000) if decode_ms > 0 else 0
+                timings = {
+                    "prompt_n": ptoks, "predicted_n": otoks,
+                    "prompt_ms": round(prefill_ms, 2), "predicted_ms": round(decode_ms, 2),
+                    "prompt_per_second": round(prompt_tps, 2), "predicted_per_second": round(gen_tps, 2),
+                }
+                if draft_n is not None:
+                    timings["draft_n"] = int(draft_n)
+                    timings["draft_n_accepted"] = int(draft_n_accepted) if draft_n_accepted is not None else 0
+                if cached_real is not None:
+                    timings["cache_n"] = int(cached_real)
+                final_obj = {
+                    "content": "",
+                    "tokens_predicted": otoks, "tokens_evaluated": ptoks,
+                    "tokens_cached": int(cached_real) if cached_real is not None else 0,
+                    "truncated": finish == "length", "stop": True,
+                    "stopped_eos": finish == "stop", "stopped_limit": finish == "length",
+                    "timings": timings, "model": model_id, "stop": True,
+                }
+                await resp.write(f"data: {json.dumps(final_obj)}\n\n".encode())
+                await resp.write(b"data: [DONE]\n\n")
+                break
+        await resp.write_eof()
+    try:
+        await run()
+    except ConnectionResetError:
+        pass
+    return resp
+
+
 async def chat_completions(request):
     app = request.app
     generator, tokenizer = app["generator"], app["tokenizer"]
@@ -447,11 +1141,16 @@ async def chat_completions(request):
     import asyncio
     if not req["stream"]:
         try:
-            text, calls, finish, ptoks, otoks, reasoning, content, prefill_ms, decode_ms = await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 generate_full, generator, tokenizer, req["messages"],
                 req["max_tokens"], req["temperature"], req["top_p"], req["top_k"],
                 req["seed"], req["tools"], req["tool_choice"], req["stop"],
                 None, req.get("reasoning"), req.get("chat_template_kwargs"))
+            if len(result) == 12:
+                text, calls, finish, ptoks, otoks, reasoning, content, prefill_ms, decode_ms, draft_n, draft_n_accepted, cached_real = result
+            else:
+                text, calls, finish, ptoks, otoks, reasoning, content, prefill_ms, decode_ms = result
+                draft_n = draft_n_accepted = cached_real = None
         except AssertionError as e:
             return web.json_response(
                 {"error": {"message": f"context/cache: {e}", "type": "invalid_request_error"}},
@@ -467,35 +1166,38 @@ async def chat_completions(request):
             msg["tool_calls"] = calls
         prompt_tps = ptoks / (prefill_ms / 1000) if prefill_ms > 0 else 0
         gen_tps = otoks / (decode_ms / 1000) if decode_ms > 0 else 0
-        with stats_lock:
-            ctx = stats.get("context_length") or 0
-        n_past = (ptoks) % ctx if ctx else 0
         reasoning_toks = len((reasoning or "").split()) if reasoning else 0
+        usage = {
+            "prompt_tokens": ptoks, "completion_tokens": otoks, "total_tokens": ptoks + otoks,
+            "completion_tokens_details": {"reasoning_tokens": reasoning_toks, "visible_tokens": otoks - reasoning_toks},
+        }
+        if cached_real is not None:
+            usage["prompt_tokens_details"] = {"cached_tokens": int(cached_real)}
+        timings = {
+            "prompt_n": ptoks,
+            "predicted_n": otoks,
+            "prompt_ms": round(prefill_ms, 2),
+            "predicted_ms": round(decode_ms, 2),
+            "prompt_per_second": round(prompt_tps, 2),
+            "predicted_per_second": round(gen_tps, 2),
+        }
+        if draft_n is not None:
+            timings["draft_n"] = int(draft_n)
+            timings["draft_n_accepted"] = int(draft_n_accepted) if draft_n_accepted is not None else 0
+        if cached_real is not None:
+            timings["cache_n"] = int(cached_real)
         resp = web.json_response({
             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
             "object": "chat.completion", "created": int(time.time()),
             "model": req["model_id"],
             "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-            "usage": {
-                "prompt_tokens": ptoks, "completion_tokens": otoks, "total_tokens": ptoks + otoks,
-                "prompt_tokens_details": {"cached_tokens": n_past},
-                "completion_tokens_details": {"reasoning_tokens": reasoning_toks, "visible_tokens": otoks - reasoning_toks},
-            },
-            "timings": {
-                "prompt_n": ptoks,
-                "predicted_n": otoks,
-                "prompt_ms": round(prefill_ms, 2),
-                "predicted_ms": round(decode_ms, 2),
-                "prompt_per_second": round(prompt_tps, 2),
-                "predicted_per_second": round(gen_tps, 2),
-                "cache_n": n_past,
-            },
+            "usage": usage,
+            "timings": timings,
             "system_fingerprint": "exl3-mtp",
         })
         resp.headers["X-Prompt-Tokens"] = str(ptoks)
         resp.headers["X-Completion-Tokens"] = str(otoks)
         resp.headers["X-Total-Tokens"] = str(ptoks + otoks)
-        resp.headers["X-Cached-Tokens"] = str(stats.get("context_length") or 0)
         return resp
 
     resp = web.StreamResponse(headers={
@@ -517,14 +1219,19 @@ async def chat_completions(request):
 
         def worker():
             try:
-                text, calls, finish, ptoks, otoks, reasoning, content, prefill_ms, decode_ms = generate_full(
+                result = generate_full(
                     generator, tokenizer, req["messages"], req["max_tokens"],
                     req["temperature"], req["top_p"], req["top_k"],
                     req["seed"], req["tools"], req["tool_choice"], req["stop"],
                     on_text=None if forced_choice else on_text,
                     reasoning=req.get("reasoning"), chat_template_kwargs=req.get("chat_template_kwargs"))
+                if len(result) == 12:
+                    _, calls, finish, ptoks, otoks, reasoning, content, prefill_ms, decode_ms, draft_n, draft_n_accepted, cached_real = result
+                else:
+                    _, calls, finish, ptoks, otoks, reasoning, content, prefill_ms, decode_ms = result
+                    draft_n = draft_n_accepted = cached_real = None
                 loop.call_soon_threadsafe(queue.put_nowait,
-                                          ("done", (calls, finish, reasoning, content, ptoks, otoks, prefill_ms, decode_ms)))
+                                          ("done", (calls, finish, reasoning, content, ptoks, otoks, prefill_ms, decode_ms, draft_n, draft_n_accepted, cached_real)))
             except Exception as e:
                 loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
         loop.run_in_executor(None, worker)
@@ -536,59 +1243,21 @@ async def chat_completions(request):
                                 "finish_reason": finish}]}
             await resp.write(f"data: {json.dumps(obj)}\n\n".encode())
 
-        pending, finish, calls_emitted = "", None, False
-        call_idx = [0]
-        in_think = [True]
-        THINK_CLOSE = "\u003c/think\u003e"
-
-        async def send_call(c):
-            nonlocal calls_emitted
-            calls_emitted = True
-            await send({"tool_calls": [dict(c, index=call_idx[0])]})
-            call_idx[0] += 1
+        finish = None
+        _enable_thinking_stream = _resolve_enable_thinking(req.get("reasoning"))
+        # Use template-aware resolution if possible; fallback to enable_thinking bool
+        # Chat template suffix divergence handled inside generate_full log; here we mirror enable_thinking
+        splitter = StreamSplitter(hold_back=HOLD_BACK, tool_schemas=req_schemas, in_think=_enable_thinking_stream, user_stops=req.get("stop"))
 
         async def flush_pending(final=False):
-            nonlocal pending
-            while True:
-                if in_think[0]:
-                    close = pending.find(THINK_CLOSE)
-                    if close >= 0:
-                        head, pending = pending[:close], pending[close + len(THINK_CLOSE):]
-                        if head.strip():
-                            await send({"reasoning_content": head.lstrip("\n")})
-                        in_think[0] = False
-                        continue
-                    cut = len(pending) if final else max(0, len(pending) - HOLD_BACK)
-                    piece = pending[:cut]
-                    if piece.strip():
-                        await send({"reasoning_content": piece})
-                    pending = pending[cut:]
-                    return
-                if TOOL_CALL_OPEN in pending:
-                    head, rest = pending.split(TOOL_CALL_OPEN, 1)
-                    if head.strip() or (final and head):
-                        await send({"content": head})
-                    if TOOL_CALL_CLOSE in rest:
-                        block, pending = rest.split(TOOL_CALL_CLOSE, 1)
-                        _, calls = parse_tool_calls(
-                            TOOL_CALL_OPEN + block + TOOL_CALL_CLOSE,
-                            req_schemas)
-                        for c in calls:
-                            await send_call(c)
-                        continue
-                    if final and "\u003cfunction=" in rest:
-                        _, calls = parse_tool_calls(TOOL_CALL_OPEN + rest,
-                                                    req_schemas)
-                        for c in calls:
-                            await send_call(c)
-                        pending = ""
-                    else:
-                        pending = TOOL_CALL_OPEN + rest
-                    return
-                cut = len(pending) if final else max(0, len(pending) - HOLD_BACK)
-                await send({"content": pending[:cut]})
-                pending = pending[cut:]
-                return
+            deltas = splitter.flush(final=final)
+            for d in deltas:
+                if "reasoning_content" in d:
+                    await send({"reasoning_content": d["reasoning_content"]})
+                elif "content" in d:
+                    await send({"content": d["content"]})
+                elif "tool_calls" in d:
+                    await send({"tool_calls": d["tool_calls"]})
 
         while True:
             kind, payload = await queue.get()
@@ -597,42 +1266,52 @@ async def chat_completions(request):
                     f'data: {json.dumps({"error": {"message": payload}})}\n\n'.encode())
                 break
             if kind == "delta":
-                pending += payload
+                splitter.push(payload)
                 await flush_pending()
             elif kind == "done":
-                calls, finish, reasoning, content, ptoks, otoks, prefill_ms, decode_ms = payload
+                if len(payload) == 11:
+                    calls, finish, reasoning, content, ptoks, otoks, prefill_ms, decode_ms, draft_n, draft_n_accepted, cached_real = payload
+                else:
+                    calls, finish, reasoning, content, ptoks, otoks, prefill_ms, decode_ms = payload
+                    draft_n = draft_n_accepted = cached_real = None
                 await flush_pending(final=True)
                 if forced_choice:
                     if reasoning:
                         await send({"reasoning_content": reasoning})
                     if content:
                         await send({"content": content})
-                if not calls_emitted and calls:
+                if not splitter.calls_emitted and calls:
                     for c in calls:
-                        await send_call(c)
+                        await send({"tool_calls": [dict(c, index=splitter.call_idx)]})
+                        splitter.call_idx += 1
+                    splitter.calls_emitted = True
                 prompt_tps = ptoks / (prefill_ms / 1000) if prefill_ms > 0 else 0
                 gen_tps = otoks / (decode_ms / 1000) if decode_ms > 0 else 0
-                with stats_lock:
-                    ctx = stats.get("context_length") or 0
-                n_past = ptoks % ctx if ctx else 0
+                usage = {
+                    "prompt_tokens": ptoks, "completion_tokens": otoks,
+                    "total_tokens": ptoks + otoks,
+                }
+                if cached_real is not None:
+                    usage["prompt_tokens_details"] = {"cached_tokens": int(cached_real)}
+                timings = {
+                    "prompt_n": ptoks,
+                    "predicted_n": otoks,
+                    "prompt_ms": round(prefill_ms, 2),
+                    "predicted_ms": round(decode_ms, 2),
+                    "prompt_per_second": round(prompt_tps, 2),
+                    "predicted_per_second": round(gen_tps, 2),
+                }
+                if draft_n is not None:
+                    timings["draft_n"] = int(draft_n)
+                    timings["draft_n_accepted"] = int(draft_n_accepted) if draft_n_accepted is not None else 0
+                if cached_real is not None:
+                    timings["cache_n"] = int(cached_real)
                 final_obj = {
                     "id": cid, "object": "chat.completion.chunk",
                     "created": int(time.time()), "model": model_id,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
-                    "usage": {
-                        "prompt_tokens": ptoks, "completion_tokens": otoks,
-                        "total_tokens": ptoks + otoks,
-                        "prompt_tokens_details": {"cached_tokens": n_past},
-                    },
-                    "timings": {
-                        "prompt_n": ptoks,
-                        "predicted_n": otoks,
-                        "prompt_ms": round(prefill_ms, 2),
-                        "predicted_ms": round(decode_ms, 2),
-                        "prompt_per_second": round(prompt_tps, 2),
-                        "predicted_per_second": round(gen_tps, 2),
-                        "cache_n": n_past,
-                    },
+                    "usage": usage,
+                    "timings": timings,
                 }
                 await resp.write(f"data: {json.dumps(final_obj)}\n\n".encode())
                 await resp.write(b"data: [DONE]\n\n")
@@ -683,20 +1362,20 @@ def main():
     if args.tensor_parallel:
         argv += ["-tp"]
 
-    print(f" == loading {args.model}"
-          + (" + MTP head" if use_mtp else
-             (f" + draft {args.draft_model}" if use_draft else " (no draft)"))
-          + " ...", flush=True)
-    print(f" -- Config: ctx-size={args.cache_size} cache_quant={args.cache_quant} grid_size={args.grid_size}"
-          f" tensor_parallel={args.tensor_parallel} cpu_cache={args.cpu_cache_size}"
-          f" host={args.host}:{args.port} max_body={args.max_body_mb}MiB", flush=True)
-    print(f" -- Loading {args.model}", flush=True)
-    print(f" -- Loading tokenizer...", flush=True)
+    _log_both(f" == loading {args.model}"
+           + (" + MTP head" if use_mtp else
+              (f" + draft {args.draft_model}" if use_draft else " (no draft)"))
+           + " ...")
+    _log_both(f" -- Config: ctx-size={args.cache_size} cache_quant={args.cache_quant} grid_size={args.grid_size}"
+           f" tensor_parallel={args.tensor_parallel} cpu_cache={args.cpu_cache_size}"
+           f" host={args.host}:{args.port} max_body={args.max_body_mb}MiB")
+    _log_both(f" -- Loading {args.model}")
+    _log_both(f" -- Loading tokenizer...")
     generator, tokenizer = build_model(argv, use_draft=use_draft)
     stats["context_length"] = int(args.cache_size)
-    print(f" -- n_ctx={args.cache_size} n_parallel=1 cache_quant={args.cache_quant} grid={args.grid_size}", flush=True)
-    print(" == model ready; accepting requests", flush=True)
-    print(f"llama_model_loader: loaded {args.model} n_ctx={args.cache_size} n_parallel=1", flush=True)
+    _log_both(f" -- n_ctx={args.cache_size} n_parallel=1 cache_quant={args.cache_quant} grid={args.grid_size}")
+    _log_both(" == model ready; accepting requests")
+    _log_both(f"llama_model_loader: loaded {args.model} n_ctx={args.cache_size} n_parallel=1")
 
     app = web.Application(client_max_size=args.max_body_mb * 1024 * 1024)
     app["generator"] = generator
@@ -708,17 +1387,26 @@ def main():
             pt = int(stats.get("prompt_tokens_total") or 0)
             ct = int(stats.get("completion_tokens_total") or 0)
             ctx = stats.get("context_length") or 0
-            n_past = (pt + ct) % ctx if ctx else 0
-        prompt_ms = max(1, int(pt * 12))
-        eval_ms = max(1, int(ct * 28))
-        return web.json_response([{
-            "id": 0, "n_ctx": ctx, "n_past": n_past, "is_processing": busy,
-            "prompt_tokens": pt, "generated_tokens": ct, "cached_tokens": n_past,
+            last_prefill = stats.get("last_prefill_ms")
+            last_decode = stats.get("last_decode_ms")
+            last_prompt_n = stats.get("last_prompt_n")
+            last_pred = stats.get("last_predicted_n")
+        slot = {
+            "id": 0, "n_ctx": ctx, "is_processing": busy,
+            "prompt_tokens": pt, "generated_tokens": ct,
             "n_prompt_tokens": pt, "n_generated": ct, "n_tokens": pt + ct,
             "prefill_tokens": pt, "decode_tokens": ct,
             "total_tokens": pt + ct, "tokens_evaluated": pt, "tokens_generated": ct,
-            "t_prompt_ms": prompt_ms, "t_eval_ms": eval_ms, "t_ms": prompt_ms + eval_ms,
-        }])
+        }
+        if last_prefill is not None and last_decode is not None:
+            slot["t_prompt_ms"] = round(float(last_prefill), 2)
+            slot["t_eval_ms"] = round(float(last_decode), 2)
+            slot["t_ms"] = round(float(last_prefill) + float(last_decode), 2)
+            if last_prompt_n is not None:
+                slot["prompt_n"] = int(last_prompt_n)
+            if last_pred is not None:
+                slot["predicted_n"] = int(last_pred)
+        return web.json_response([slot])
 
     async def props(request):
         with stats_lock:
@@ -728,12 +1416,28 @@ def main():
             "n_ctx": ctx, "model": "qwen3.8-27b-exl3-3.5bpw",
         })
 
+    async def index(request):
+        return web.json_response({
+            "model": "qwen3.8-27b-exl3-3.5bpw",
+            "status": "ok",
+            "endpoints": ["/health", "/metrics", "/slots", "/v1/chat/completions", "/completion"],
+        })
+
     app.router.add_get("/v1/models", models)
     app.router.add_get("/health", health)
     app.router.add_get("/slots", slots)
     app.router.add_get("/props", props)
     app.router.add_get("/metrics", metrics)
+    app.router.add_get("/", index)
+    try:
+        app.router.add_get("", index)
+    except Exception:
+        pass
+    app.router.add_get("/upstream", index)
     app.router.add_post("/v1/chat/completions", chat_completions)
+    app.router.add_post("/completion", legacy_completion)
+    app.router.add_post("/v1/completions", legacy_completion)
+    app.router.add_post("/v1/completion", legacy_completion)
     web.run_app(app, host=args.host, port=args.port, print=None)
 
 if __name__ == "__main__":

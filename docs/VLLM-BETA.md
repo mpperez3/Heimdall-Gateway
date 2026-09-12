@@ -85,6 +85,48 @@ The following flags are supported:
 - `--dtype float16|bfloat16|float32` → inference precision
 - `--n-gpu-layers N` → ignored (vLLM uses all GPU layers by default)
 
+### Metrics and per-request spec-decode
+
+vLLM always exposes `usage.prompt_tokens` and `usage.completion_tokens`
+natively. Speculative draft metrics (`draft_n`, `draft_n_accepted`,
+`metrics` field) are available only when the model was started with
+speculative decoding **and** the flag `--per-request-spec-decode-metrics`
+is active.
+
+Heimdall configures this flag via `vllm.defaults.per_request_spec_decode_metrics`
+in `llamacpp_stack/bundle/llama_server_defaults.yaml` (default `summary`).
+The flag is gated: the gateway runs `vllm-server --help | grep
+per-request-spec-decode-metrics` before emitting it. If the installed vLLM
+version does not support the flag, it is omitted and the server still starts.
+Supported values are `detailed`, `summary`, `none` (invalid falls back to
+`summary`). Without speculative config, `Drafted` correctly shows `-` in
+`Activity` even with the flag present.
+
+Like EXL3, vLLM **never emits `slot print_timing`**. Timing for vLLM lives
+only in the response `usage` (`prompt_tokens`, `completion_tokens`) and, when
+speculative is active, in the `metrics`/`draft_n` field. The Activity view
+at `:11436/api/metrics/activity` shows `Drafted` and `Cached` as `-` when no
+real data exists. Do not expect `slot print_timing` in the journal for vLLM.
+
+Copyable verification:
+
+```console
+$ heimdall-gateway config-keys --format json | jq '.vllm.defaults // .vllm'
+$ curl -s http://127.0.0.1:11435/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"MODEL_ID","messages":[{"role":"user","content":"hi"}],"stream":false}' | jq '.usage, .timings // .metrics'
+$ curl -s http://127.0.0.1:11436/api/metrics/activity | jq '.data[] | {model: .model, tokens: .tokens}'
+$ heimdall-gateway logs --lines 200 --journal | grep timing
+# vLLM -> no slot print_timing expected; check usage/metrics above
+```
+
+After changing the flag, apply the standard runbook:
+
+```console
+$ heimdall-gateway config-migrate && heimdall-gateway update
+$ systemctl --user restart heimdall-gateway-manager heimdall-gateway-router
+```
+
 ### Docker Deployment
 
 For production with llama-swap integration:
@@ -194,6 +236,13 @@ heimdall-gateway run -hf meta-llama/Llama-2-7b-chat-hf
 - Model may still be loading; wait 30-60 seconds
 - Check `/v1/models` endpoint for status
 - Review vLLM logs: `docker logs -f vllm-api-server`
+
+### No slot print_timing for vLLM in journal
+- This is expected. Only `llama-server` emits `slot print_timing`. For vLLM
+  check `curl :11435/v1/chat/completions | jq '.usage'` and
+  `curl :11436/api/metrics/activity`. `Drafted` appears only with speculative
+  decoding and the gated flag `per_request_spec_decode_metrics`. `Cached` is
+  `-` unless prefix caching is enabled.
 
 ## Reporting Issues
 

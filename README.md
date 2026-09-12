@@ -500,6 +500,102 @@ $ heimdall-gateway requests --lines 200
 An upstream 502 usually means that the selected model process exited during
 load or became unavailable. Look for `bundle_ref` in the 502 JSON and `*_with_bundle` in the rotated log `api-requests.log.YYYY-MM-DD[.partN]`; `logs --journal` includes journal tail + `nvidia-smi` hint (caps 12k/2k); raw bodies of last 10 requests are in `api-raw-requests.log` (ring 1 MiB cap, fallback `/tmp`). Do not diagnose only from the client-side retry.
 
+### Chat template / jinja source
+
+The chat template is not bundled with the gateway. It comes from the model
+repository itself, whether the backend is llama.cpp, EXL3 or vLLM. For a local
+checkout the file is:
+
+```text
+/var/llamacpp_models/<model>/chat_template.jinja
+```
+
+and the same template is duplicated inside `tokenizer_config.json` under the
+key `chat_template`. Both should match. Verify with a sha256 check:
+
+```console
+$ sha256sum /var/llamacpp_models/Qwen3.8-27B-EXL3-3.5bpw/chat_template.jinja
+$ python3 -c "import json,hashlib; d=json.load(open('/var/llamacpp_models/Qwen3.8-27B-EXL3-3.5bpw/tokenizer_config.json')); print(hashlib.sha256(d['chat_template'].encode()).hexdigest())"
+# both shas should be c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041 (or the repo's current template)
+```
+
+If the two differ, re-download or re-register the model (`heimdall-gateway
+update <id> --auto`). The gateway forwards `chat_template_kwargs` verbatim,
+so a custom `chat_template.jinja` in the model directory is respected without
+code changes. Do not edit templates under `llamacpp_stack/bundle/`.
+
+### Metrics per backend: what to expect
+
+Metrics surface in three places: the OpenAI body (`usage` and `timings`),
+the `Activity` view at `:11436/api/metrics/activity`, and the upstream log.
+Each backend exposes a different subset:
+
+| Metric | llama.cpp (`llama-server`) | EXL3 (`exllama`) | vLLM (`vllm-server`) |
+|---|---|---|---|
+| Prompt tokens (`prompt_n` / `prompt_tokens`) | Yes | Yes | Yes (native `usage.prompt_tokens`) |
+| Generated tokens (`predicted_n` / `completion_tokens`) | Yes | Yes | Yes (native `usage.completion_tokens`) |
+| Prefill / prompt timing (`prompt_ms`, `prompt_per_second`) | Yes (measured) | Yes (measured via `perf_counter`, `timings.prompt_ms`) | No, timings not emitted (use native latency) |
+| Decode timing (`predicted_ms`, `predicted_per_second`) | Yes (measured) | Yes (measured, `timings.predicted_ms`) | No |
+| Cached tokens (`cache_n` / `cached_tokens`, `X-Cached-Tokens`) | Yes when `cache_prompt` active, else - | `-` unless real prefix cache present (`cached_tokens`/`cache_n` only when `cached_pages` > 0) | `-` (no prefix cache by default) |
+| Drafted / speculative (`draft_n`, `draft_n_accepted`, `draft_acc_tokens`) | Yes with MTP/speculative | Yes with MTP (`draft_model=mtp`), real `accepted+rejected` from `Job`, else `-` | Only with speculative config **and** flag `per_request_spec_decode_metrics` (see below) |
+| `slot print_timing` in journal | Yes (`slot print_timing` line) | Never | Never |
+
+Where the table shows `-`, the UI and `timings` correctly show `-` or omit
+the field. The gateway never synthesizes `Cached` or `Drafted` counts.
+
+Check the live view:
+
+```console
+$ curl -s http://127.0.0.1:11436/api/metrics/activity | jq '.data[] | {model: .model, tokens: .tokens}'
+$ curl -s http://127.0.0.1:11435/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"MODEL_ID","messages":[{"role":"user","content":"hi"}],"stream":false}' | jq '.timings, .usage'
+```
+
+### Logs: llama_swap knob and where timing lives
+
+`logging.llama_swap` in `conf.json` controls what `llama-swap` writes to
+stdout and therefore what `journalctl` and `heimdall-gateway logs --journal`
+show:
+
+```json
+{
+  "logging": {
+    "llama_swap": {"logToStdout": "both", "logLevel": "info"}
+  }
+}
+```
+
+Whitelist for `logToStdout` is `proxy`, `upstream`, `both`, `none` (invalid
+falls back to `both`). `logLevel` is `trace`, `debug`, `info`, `warn`,
+`warning`, `error` (invalid falls back to `info`). Default is `both`/`info`.
+
+Copyable checks:
+
+```console
+$ heimdall-gateway config-keys --format json | jq '.logging.llama_swap'
+# -> {"logToStdout":"both","logLevel":"info"}
+
+$ heimdall-gateway logs --lines 200 --journal | grep timing
+$ curl -s http://127.0.0.1:11436/api/metrics/activity | jq .
+```
+
+Important: only `llama-server` processes emit `slot print_timing` lines.
+**EXL3 and vLLM never emit `slot print_timing`**. For those backends timing
+lives only in the response body `timings` object and the `Activity` view
+(`prompt_ms`, `predicted_ms`, `draft_n` when MTP/speculative is active).
+If you grep the journal and see no `print_timing` for an EXL3 or vLLM model,
+that is expected, check `timings` and `Activity` instead.
+
+Runbook after changing the knob:
+
+```console
+$ heimdall-gateway config-migrate
+$ heimdall-gateway update
+$ systemctl --user restart heimdall-gateway-manager heimdall-gateway-router
+# system: sudo systemctl restart heimdall-gateway-manager heimdall-gateway-router
+```
+
 ### A changed setting is not visible
 
 Confirm that the edited file matches the mode shown by `info`. Then migrate,
@@ -511,7 +607,7 @@ $ heimdall-gateway update
 $ heimdall-gateway info
 ```
 
-`config-migrate` adds `logging.requests_log` (`path`, `max_bytes` 65536-1GiB default 10485760, `retain_days` 1-30 default 3, `compress` bool) with defaults when missing and never overwrites existing values; second pass is idempotent (`changed==False`). `update` does not rewrite log files. Verify with `heimdall-gateway config-keys --format json | grep -q logging`.
+`config-migrate` adds `logging.requests_log` (`path`, `max_bytes` 65536-1GiB default 10485760, `retain_days` 1-30 default 3, `compress` bool) and `logging.llama_swap` (`logToStdout` default `both`, `logLevel` default `info`) with defaults when missing and never overwrites existing values; second pass is idempotent (`changed==False`). `update` does not rewrite log files. Verify with `heimdall-gateway config-keys --format json | jq '.logging'`.
 
 Do not edit the generated `config.yaml` as the long-term fix: the next update
 will regenerate it from `conf.json` and `catalog.json`.
@@ -566,15 +662,15 @@ $ heimdall-gateway hacks
 
 ## Related documentation
 
-- [`docs/LLM_INSTALL.md`](docs/LLM_INSTALL.md) — **LLM/agent install guide**
+- [`docs/LLM_INSTALL.md`](docs/LLM_INSTALL.md) - **LLM/agent install guide**
   (checklist, mandatory user questions, decision matrix, verification).
-- [`docs/LOCAL_OLLAMA_SETUP.md`](docs/LOCAL_OLLAMA_SETUP.md) — local Ollama
+- [`docs/LOCAL_OLLAMA_SETUP.md`](docs/LOCAL_OLLAMA_SETUP.md) - local Ollama
   compatibility setup.
-- [`docs/VLLM-BETA.md`](docs/VLLM-BETA.md) — vLLM beta backend notes.
-- [`docs/arg-hyphen-conventions.md`](docs/arg-hyphen-conventions.md) —
+- [`docs/VLLM-BETA.md`](docs/VLLM-BETA.md) - vLLM beta backend notes.
+- [`docs/arg-hyphen-conventions.md`](docs/arg-hyphen-conventions.md) -
   configuration key and CLI flag conventions.
-- [`docs/flags_llamacpp`](docs/flags_llamacpp) — llama.cpp flag reference.
-- [`docs/lllamacpp_flags_API.md`](docs/lllamacpp_flags_API.md) — API-facing
+- [`docs/flags_llamacpp`](docs/flags_llamacpp) - llama.cpp flag reference.
+- [`docs/lllamacpp_flags_API.md`](docs/lllamacpp_flags_API.md) - API-facing
   flag reference.
 
 ## Security notes

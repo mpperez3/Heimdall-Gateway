@@ -433,6 +433,47 @@ def _normalize_requests_log_config(raw: object) -> dict[str, object]:
     return normalized
 
 
+def _default_llama_swap_config() -> dict[str, object]:
+    return {"logToStdout": "both", "logLevel": "info"}
+
+
+_LLAMA_SWAP_LOGTOSTDOUT_VALUES = {"proxy", "upstream", "both", "none"}
+_LLAMA_SWAP_LOGLEVEL_VALUES = {"trace", "debug", "info", "warn", "warning", "error"}
+
+
+def _normalize_llama_swap_config(raw: object) -> dict[str, object]:
+    defaults = _default_llama_swap_config()
+    if not isinstance(raw, dict):
+        return dict(defaults)
+    normalized: dict[str, object] = {}
+    raw_val = raw.get("logToStdout", raw.get("log_to_stdout"))
+    if raw_val is None:
+        normalized["logToStdout"] = defaults["logToStdout"]
+    else:
+        if not isinstance(raw_val, str):
+            raw_val = str(raw_val)
+        norm = str(raw_val).strip().lower()
+        if norm not in _LLAMA_SWAP_LOGTOSTDOUT_VALUES:
+            normalized["logToStdout"] = defaults["logToStdout"]
+        else:
+            normalized["logToStdout"] = norm
+    raw_level = raw.get("logLevel", raw.get("log_level"))
+    if raw_level is None:
+        normalized["logLevel"] = defaults["logLevel"]
+    else:
+        if not isinstance(raw_level, str):
+            raw_level = str(raw_level)
+        norm_level = str(raw_level).strip().lower()
+        if norm_level not in _LLAMA_SWAP_LOGLEVEL_VALUES:
+            normalized["logLevel"] = defaults["logLevel"]
+        else:
+            normalized["logLevel"] = norm_level
+    for k in defaults:
+        if k not in normalized:
+            normalized[k] = defaults[k]
+    return normalized
+
+
 def _default_api_auth_config() -> dict[str, object]:
     return {"enabled": False, "api_key": ""}
 
@@ -533,10 +574,12 @@ def _normalize_server_config_payload(payload: dict[str, object]) -> dict[str, ob
     raw_logging = result.get("logging") if isinstance(result.get("logging"), dict) else {}
     raw_req = raw_logging.get("requests_log") if isinstance(raw_logging, dict) else None
     norm_req = _normalize_requests_log_config(raw_req)
-    result["logging"] = {"requests_log": norm_req}
+    raw_ls = raw_logging.get("llama_swap") if isinstance(raw_logging, dict) else None
+    norm_ls = _normalize_llama_swap_config(raw_ls)
+    result["logging"] = {"requests_log": norm_req, "llama_swap": norm_ls}
     if isinstance(raw_logging, dict):
         for k, v in raw_logging.items():
-            if k != "requests_log" and k not in result["logging"]:
+            if k not in ("requests_log", "llama_swap") and k not in result["logging"]:
                 result["logging"][k] = v
     result.setdefault("api_ctx_factor", 0.5)
     result.setdefault("idle_ttl", DEFAULT_IDLE_TTL)
@@ -3434,13 +3477,35 @@ def render_vllm_server_wrapper(layout: InstallLayout) -> str:
     )
 
 
+def _resolve_llama_swap_for_render() -> dict[str, object]:
+    for candidate in (
+        Path.home() / ".config" / "heimdall-gateway" / "conf.json",
+        Path("/etc/heimdall-gateway/conf.json"),
+    ):
+        try:
+            if candidate.exists():
+                import json as _json
+
+                payload = _json.loads(candidate.read_text(encoding="utf-8"))
+                raw_logging = payload.get("logging") if isinstance(payload.get("logging"), dict) else {}
+                raw_ls = raw_logging.get("llama_swap") if isinstance(raw_logging, dict) else None
+                return _normalize_llama_swap_config(raw_ls)
+        except Exception:
+            continue
+    return _default_llama_swap_config()
+
+
 def render_initial_config(config_path: Path, start_port: int = 18080) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _ls = _resolve_llama_swap_for_render()
+    except Exception:
+        _ls = _default_llama_swap_config()
     payload = CONFIG_YAML_HEADER + textwrap.dedent(
         f"""\
         healthCheckTimeout: 600
-        logLevel: info
-        logToStdout: proxy
+        logLevel: {str(_ls.get("logLevel", "info"))}
+        logToStdout: {str(_ls.get("logToStdout", "both"))}
         startPort: {start_port}
         sendLoadingState: false
         includeAliasesInList: true

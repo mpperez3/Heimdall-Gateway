@@ -422,6 +422,92 @@ def _normalize_requests_log_config(raw: object) -> tuple[dict[str, object], bool
     return normalized, changed
 
 
+def _default_llama_swap_config() -> dict[str, object]:
+    return {"logToStdout": "both", "logLevel": "info"}
+
+
+_LLAMA_SWAP_LOGTOSTDOUT_VALUES = {"proxy", "upstream", "both", "none"}
+_LLAMA_SWAP_LOGLEVEL_VALUES = {"trace", "debug", "info", "warn", "warning", "error"}
+
+
+def _normalize_llama_swap_config(raw: object) -> tuple[dict[str, object], bool]:
+    defaults = _default_llama_swap_config()
+    if not isinstance(raw, dict):
+        return dict(defaults), True
+    normalized: dict[str, object] = {}
+    changed = False
+    if "logToStdout" in raw:
+        raw_val = raw.get("logToStdout")
+    elif "log_to_stdout" in raw:
+        raw_val = raw.get("log_to_stdout")
+        changed = True
+    else:
+        raw_val = None
+        changed = True
+    if raw_val is None and changed and "logToStdout" not in raw and "log_to_stdout" not in raw:
+        normalized["logToStdout"] = defaults["logToStdout"]
+    else:
+        if not isinstance(raw_val, str):
+            raw_val_str = str(raw_val) if raw_val is not None else ""
+            changed = True
+        else:
+            raw_val_str = raw_val
+        norm = raw_val_str.strip().lower()
+        if norm not in _LLAMA_SWAP_LOGTOSTDOUT_VALUES:
+            normalized["logToStdout"] = defaults["logToStdout"]
+            changed = True
+        else:
+            normalized["logToStdout"] = norm
+            if norm != raw_val_str.strip():
+                changed = True
+            if isinstance(raw_val, str) and raw_val != norm and raw_val.strip().lower() == norm:
+                if raw_val != norm:
+                    changed = True
+    if "logLevel" in raw:
+        raw_level = raw.get("logLevel")
+    elif "log_level" in raw:
+        raw_level = raw.get("log_level")
+        changed = True
+    else:
+        raw_level = None
+        changed = True
+    if raw_level is None and "logLevel" not in raw and "log_level" not in raw:
+        normalized["logLevel"] = defaults["logLevel"]
+    else:
+        if not isinstance(raw_level, str):
+            raw_level_str = str(raw_level) if raw_level is not None else ""
+            changed = True
+        else:
+            raw_level_str = raw_level
+        norm_level = raw_level_str.strip().lower()
+        if norm_level not in _LLAMA_SWAP_LOGLEVEL_VALUES:
+            normalized["logLevel"] = defaults["logLevel"]
+            changed = True
+        else:
+            normalized["logLevel"] = norm_level
+            if norm_level != raw_level_str.strip():
+                changed = True
+            if isinstance(raw_level, str) and raw_level != norm_level:
+                if raw_level.strip().lower() == norm_level and raw_level != norm_level:
+                    changed = True
+    for k in raw:
+        if k not in {"logToStdout", "logLevel", "log_to_stdout", "log_level"}:
+            changed = True
+    for k in defaults:
+        if k not in normalized:
+            normalized[k] = defaults[k]
+            changed = True
+    return normalized, changed
+
+
+def _effective_llama_swap_config() -> dict[str, object]:
+    payload = _load_server_config_payload(None)
+    raw_logging = payload.get("logging") if isinstance(payload.get("logging"), dict) else {}
+    raw_ls = raw_logging.get("llama_swap") if isinstance(raw_logging, dict) else None
+    cfg, _ = _normalize_llama_swap_config(raw_ls)
+    return cfg
+
+
 def _effective_requests_log_config() -> dict[str, object]:
     payload = _load_server_config_payload(None)
     raw_logging = payload.get("logging") if isinstance(payload.get("logging"), dict) else {}
@@ -1417,6 +1503,11 @@ def normalize_server_config_payload(payload: dict[str, object]) -> tuple[dict[st
     norm_req, req_changed = _normalize_requests_log_config(raw_req)
     norm_logging["requests_log"] = norm_req
     if req_changed:
+        changed = True
+    raw_ls = raw_logging.get("llama_swap") if isinstance(raw_logging, dict) else None
+    norm_ls, ls_changed = _normalize_llama_swap_config(raw_ls)
+    norm_logging["llama_swap"] = norm_ls
+    if ls_changed:
         changed = True
     if norm_logging != result.get("logging"):
         result["logging"] = norm_logging
@@ -3153,10 +3244,14 @@ def render_llamaswap_config(
     replica_defaults: dict[str, object] | None = None,
 ):
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _ls = _effective_llama_swap_config()
+    except Exception:
+        _ls = _default_llama_swap_config()
     data = {
         "healthCheckTimeout": 600,
-        "logLevel": "info",
-        "logToStdout": "proxy",
+        "logLevel": str(_ls.get("logLevel", "info")),
+        "logToStdout": str(_ls.get("logToStdout", "both")),
         "startPort": start_port,
         "sendLoadingState": False,
         "includeAliasesInList": True,
@@ -3321,9 +3416,13 @@ def ensure_replica_route_in_llamaswap_config(
         data = {}
     if not isinstance(data, dict):
         data = {}
+    try:
+        _ls2 = _effective_llama_swap_config()
+    except Exception:
+        _ls2 = _default_llama_swap_config()
     data.setdefault("healthCheckTimeout", 600)
-    data.setdefault("logLevel", "info")
-    data.setdefault("logToStdout", "proxy")
+    data.setdefault("logLevel", str(_ls2.get("logLevel", "info")))
+    data.setdefault("logToStdout", str(_ls2.get("logToStdout", "both")))
     data.setdefault("sendLoadingState", False)
     data.setdefault("includeAliasesInList", True)
     models = data.setdefault("models", {})
@@ -5276,6 +5375,10 @@ def print_config_keys(args) -> int:
             if isinstance(pattern_values, dict):
                 vllm_keys.extend(f"family_defaults.{pattern}.{key}" for key in pattern_values)
     vllm_keys = sorted(set(vllm_keys))
+    try:
+        _logging_cfg = normalize_server_config_payload({})[0].get("logging", {})
+    except Exception:
+        _logging_cfg = {}
     if getattr(args, "format", "text") == "json":
         print(json.dumps({
             "catalog_model_top_level_keys": catalog_keys,
@@ -5283,6 +5386,7 @@ def print_config_keys(args) -> int:
             "experimental_keys": experimental_keys,
             "llama_server_defaults_keys": server_default_keys,
             "vllm_keys": vllm_keys,
+            "logging": _logging_cfg,
             "notes": [
                 "Catalog model top-level keys use snake_case.",
                 "Raw llama.cpp flags belong under server_overrides and may use dash or underscore spelling.",

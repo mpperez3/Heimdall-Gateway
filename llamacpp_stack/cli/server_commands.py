@@ -66,6 +66,57 @@ def normalize_tensor_split(value: str | None) -> str:
     parts = [p.strip() for p in normalized.split(",") if p.strip()]
     return ",".join(parts) if parts else default_tensor_split()
 _SERVER_FLAG_CACHE: dict[str, set[str]] = {}
+_VLLM_FLAG_CACHE: set[str] | None = None
+_VLLM_HELP_TEXT: str | None = None
+def _vllm_help_env() -> dict[str, str]:
+    env = os.environ.copy()
+    try:
+        from pathlib import Path as _P
+        vllm_bin = os.environ.get("VLLM_SERVER_BIN", "vllm-server")
+        cand_paths = [_P(vllm_bin)] if _P(vllm_bin).exists() else []
+        try:
+            from .constants import PRODUCT_SLUG as _SLUG
+            cand_paths.extend([_P.home() / ".local" / "opt" / _SLUG / "cuda" / "lib", _P.home() / ".local" / "opt" / _SLUG / "nccl" / "lib"])
+        except Exception:
+            pass
+        existing = env.get("LD_LIBRARY_PATH", "")
+        parts = [str(d) for d in cand_paths if d.exists()]
+        if existing:
+            parts.append(existing)
+        if parts:
+            env["LD_LIBRARY_PATH"] = os.pathsep.join(dict.fromkeys(parts))
+    except Exception:
+        pass
+    return env
+def get_vllm_supported_flags() -> set[str]:
+    global _VLLM_FLAG_CACHE, _VLLM_HELP_TEXT
+    if _VLLM_FLAG_CACHE is not None:
+        return _VLLM_FLAG_CACHE
+    flags: set[str] = set()
+    text = ""
+    try:
+        vllm_bin = os.environ.get("VLLM_SERVER_BIN", "vllm-server")
+        proc = subprocess.run([vllm_bin, "--help"], capture_output=True, text=True, timeout=8, env=_vllm_help_env())
+        text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    except Exception:
+        _VLLM_FLAG_CACHE = set()
+        _VLLM_HELP_TEXT = ""
+        return set()
+    _VLLM_HELP_TEXT = text
+    for m in re.findall(r"(--[A-Za-z0-9-]+)", text):
+        flags.add(m)
+    _VLLM_FLAG_CACHE = flags
+    return flags
+def vllm_server_supports_flag(flag: str) -> bool:
+    try:
+        return flag in get_vllm_supported_flags()
+    except Exception:
+        return False
+def get_vllm_help_text() -> str:
+    if _VLLM_HELP_TEXT is not None:
+        return _VLLM_HELP_TEXT
+    get_vllm_supported_flags()
+    return _VLLM_HELP_TEXT or ""
 def _server_help_env(server_path: Path | str | None) -> dict[str, str]:
     env = os.environ.copy()
     try:
@@ -685,6 +736,10 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
         else: cmd.extend([f, str(value)])
     except: pass
 def build_vllm_server_command(model, *, port: str, host: str | None = None, vllm_defaults: dict[str, object] | None = None) -> list[str]:
+    # vLLM TODO: emulate legacy /completion like exllama_server.py legacy_completion so
+    # vLLM y exl3 y futuros motores permitan http://127.0.0.1:11436/upstream/<model>/completion
+    # parity with llama.cpp. Add POST /completion + /v1/completions in vllm-server wrapper,
+    # mapping prompt->messages and reusing vLLM generate, returning llama.cpp compat JSON.
     options = resolve_vllm_options(model, vllm_defaults)
     command = [os.environ.get("VLLM_SERVER_BIN","vllm-server"), "--model", str(model.local_path), "--port", str(port), "--served-model-name", str(model.model_id)]
     resolved_host = str(options.pop("host", host or model.host) or "127.0.0.1")
@@ -694,6 +749,14 @@ def build_vllm_server_command(model, *, port: str, host: str | None = None, vllm
     for rk, val in options.items():
         k = str(rk).strip().lower().replace("-", "_")
         if not k or k in reserved or val is None:
+            continue
+        if k == "per_request_spec_decode_metrics":
+            if not vllm_server_supports_flag("--per-request-spec-decode-metrics"):
+                continue
+            vs = str(val).strip().lower()
+            if vs not in {"detailed", "summary", "none"}:
+                vs = "summary"
+            command.extend(["--per-request-spec-decode-metrics", vs])
             continue
         flag = f"--{k.replace('_','-')}"
         if isinstance(val, bool):
@@ -888,4 +951,4 @@ def build_llama_server_command(model, server_path: Path, *, port: str, host: str
             except Exception:
                 cmd = ["/usr/bin/env", f"CUDA_VISIBLE_DEVICES={','.join(str(g) for g in cuda_visible_devices)}", *cmd]
     return cmd
-__all__=["get_server_supported_flags","server_supports_flag","normalize_server_overrides","normalize_tensor_split","_normalize_bool_flag","resolve_api_ctx_factor","resolve_llama_server_defaults","resolve_vllm_defaults","resolve_vllm_options","resolve_request_reasoning_budget","_append_llama_server_flag","build_vllm_server_command","build_llama_server_command"]
+__all__=["get_server_supported_flags","server_supports_flag","get_vllm_supported_flags","vllm_server_supports_flag","get_vllm_help_text","normalize_server_overrides","normalize_tensor_split","_normalize_bool_flag","resolve_api_ctx_factor","resolve_llama_server_defaults","resolve_vllm_defaults","resolve_vllm_options","resolve_request_reasoning_budget","_append_llama_server_flag","build_vllm_server_command","build_llama_server_command"]
