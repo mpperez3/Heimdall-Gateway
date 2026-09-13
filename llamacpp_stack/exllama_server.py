@@ -191,6 +191,56 @@ TOOL_CALL_OPEN = "\u003ctool_call\u003e"
 TOOL_CALL_CLOSE = "\u003c/tool_call\u003e"
 HOLD_BACK = 16
 
+# Gateway capa 2 metrics (shared with command_router gateway)
+_METRICS_LOCK = threading.Lock()
+_METRICS: dict[str, int] = {
+    "leakage_marker_emitted_total": 0,
+    "thinking_truncated_total": 0,
+    "resolve_in_think_mismatch": 0,
+}
+
+_NEWLINE_RE = re.compile(r"\n{4,}")
+_OUTPUT_JSON_RE = re.compile(r'\{\s*"output"\s*:')
+_OUTPUT_KEY_RE = re.compile(r'"output"\s*:')
+_USERUSER_CONCAT_RE = re.compile(r'(?:user){2,}', flags=re.IGNORECASE)
+_USER_LINES_RE = re.compile(r'(?:^|\n)[ \t]*user[ \t]*(?:\n[ \t]*user[ \t]*)+', flags=re.IGNORECASE | re.MULTILINE)
+
+def _sanitize_tool_output_artifacts(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return text
+    if '"output"' in text:
+        text = _OUTPUT_JSON_RE.sub('[output_stripped]:', text)
+        text = _OUTPUT_KEY_RE.sub('[output_stripped]:', text)
+    if 'user' in text.lower():
+        text = _USERUSER_CONCAT_RE.sub('user', text)
+        text = _USER_LINES_RE.sub('\nuser\n', text)
+    return _NEWLINE_RE.sub("\n\n\n", text)
+
+def _inc_metric(name: str, amount: int = 1) -> None:
+    if name not in _METRICS:
+        return
+    with _METRICS_LOCK:
+        _METRICS[name] += int(amount)
+
+def _get_metrics() -> dict[str, int]:
+    with _METRICS_LOCK:
+        return dict(_METRICS)
+
+def _dynamic_hold_back(user_stops: list[str] | None = None) -> int:
+    candidates = [
+        MARKER_IM_START,
+        MARKER_IM_END,
+        "\u003c/think\u003e",
+        TOOL_CALL_OPEN,
+        TOOL_CALL_CLOSE,
+    ]
+    max_len = max((len(m) for m in candidates), default=16)
+    if user_stops:
+        for s in user_stops:
+            if s:
+                max_len = max(max_len, len(s))
+    return max_len
+
 # ---------------------------------------------------------------------------
 # T2 single documented decision for decode_special_tokens (ONE place)
 # ---------------------------------------------------------------------------
@@ -209,13 +259,10 @@ MARKER_IM_END = "<|im_end|>"
 
 
 def strip_markers(text: str) -> str:
-    """Truncate at first marker, covering mid-text case.
-
-    Uses ``split("<|im_end|>")[0].split("<|im_start|>")[0]`` per T2
-    acceptance (4), e.g. ``"answer<|im_end|>junk" -> "answer"``.
-    Handles both markers; content ends at first ``<|im_end|>``.
-    """
-    return text.split(MARKER_IM_END)[0].split(MARKER_IM_START)[0]
+    truncated = text.split(MARKER_IM_END)[0].split(MARKER_IM_START)[0]
+    if len(truncated) < len(text):
+        _inc_metric("leakage_marker_emitted_total")
+    return truncated
 
 
 def _earliest_marker_pos(text: str) -> int:
@@ -329,11 +376,26 @@ def build_model(argv, use_draft=True):
         generator = Generator(model, cache, tokenizer)
     return generator, tokenizer
 
+def _is_empty_user(content: object) -> bool:
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return content.strip() == ""
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict):
+                t = item.get("text") or item.get("content") or ""
+                if isinstance(t, str) and t.strip():
+                    return False
+            elif isinstance(item, str) and item.strip():
+                return False
+        return True
+    return str(content).strip() == ""
+
 def normalize_messages(messages):
     out = []
     for m in messages:
         m = dict(m)
-        # OpenAI image content: list of {type:text|image_url} -> join text, drop images (EXL3 3.5bpw text-only)
         content = m.get("content")
         if isinstance(content, list):
             texts = []
@@ -342,11 +404,13 @@ def normalize_messages(messages):
                     if part.get("type") == "text":
                         texts.append(str(part.get("text") or ""))
                     elif part.get("type") == "image_url":
-                        # image_min_tokens/mmproj not supported for text-only EXL3, ignore
                         pass
                     elif isinstance(part.get("text"), str):
                         texts.append(part.get("text"))
             m["content"] = "\n".join(texts)
+        # collapse \n{4,} -> \n\n\n + sanitize {"output": / useruser artifacts (capa 2b parity)
+        if isinstance(m.get("content"), str):
+            m["content"] = _sanitize_tool_output_artifacts(_NEWLINE_RE.sub("\n\n\n", m["content"]))  # type: ignore
         if m.get("role") == "assistant" and m.get("tool_calls"):
             calls = []
             for c in m["tool_calls"]:
@@ -360,6 +424,11 @@ def normalize_messages(messages):
                 fn["arguments"] = args
                 calls.append({"function": fn})
             m["tool_calls"] = calls
+        # collapse consecutive empty user
+        is_user = str(m.get("role") or "") == "user"
+        if is_user and _is_empty_user(m.get("content")):
+            if out and str(out[-1].get("role") or "") == "user" and _is_empty_user(out[-1].get("content")):
+                continue
         out.append(m)
     return out
 
@@ -469,7 +538,6 @@ class StreamSplitter:
                     block, pending = rest.split(TOOL_CALL_CLOSE, 1)
                     block_stripped = _strip_all(block)
                     marker_in_block = len(block_stripped) < len(block)
-                    # user stop inside block also truncates
                     if not marker_in_block:
                         upos_b = _earliest_user_stop_pos(block, self.user_stops)
                         if upos_b >= 0:
@@ -479,9 +547,9 @@ class StreamSplitter:
                     if marker_in_block:
                         pending = ""
                     _, calls = parse_tool_calls(TOOL_CALL_OPEN + block_stripped + TOOL_CALL_CLOSE, schemas)
-                    for c in calls:
-                        out.append({"tool_calls": [dict(c, index=call_idx)]})
-                        call_idx += 1
+                    inc_deltas, call_idx = _tool_calls_to_incremental_deltas(calls, call_idx)
+                    out.extend(inc_deltas)
+                    if inc_deltas:
                         calls_emitted = True
                     if marker_in_block:
                         break
@@ -495,9 +563,9 @@ class StreamSplitter:
                 if final and "\u003cfunction=" in rest:
                     rest_stripped = _strip_all(rest)
                     _, calls = parse_tool_calls(TOOL_CALL_OPEN + rest_stripped, schemas)
-                    for c in calls:
-                        out.append({"tool_calls": [dict(c, index=call_idx)]})
-                        call_idx += 1
+                    inc_deltas, call_idx = _tool_calls_to_incremental_deltas(calls, call_idx)
+                    out.extend(inc_deltas)
+                    if inc_deltas:
                         calls_emitted = True
                     pending = ""
                 else:
@@ -562,15 +630,49 @@ def split_stream_chunk(pending: str, in_think: bool, hold_back: int = HOLD_BACK,
     return deltas, s.pending, s.in_think
 
 
-def split_reasoning(text):
+def split_reasoning(text, enable_thinking: bool, user_stops: list[str] | None = None):
+    """Split think/content with enable_thinking awareness and user-stop truncation.
+
+    enable_thinking must be explicit bool (legacy None removed in capa 3).
+    enable_thinking=False -> reasoning always empty, visible is content after
+    any </think> (discards reasoning prefix). enable_thinking=True -> still
+    in think when no </think> present, so entire text is reasoning.
+    User stops and markers are stripped from the returned parts.
+    """
+    if not enable_thinking:
+        # thinking disabled: reasoning empty, content is after close if present
+        close = text.find("\u003c/think\u003e")
+        if close >= 0:
+            content = text[close + len("\u003c/think\u003e"):]
+        elif text.lstrip().startswith("\u003cthink\u003e"):
+            content = text.lstrip()[len("\u003cthink\u003e"):].lstrip()
+            # if still contains a close after prefix, take after it
+            c2 = content.find("\u003c/think\u003e")
+            if c2 >= 0:
+                content = content[c2 + len("\u003c/think\u003e"):]
+        else:
+            content = text
+        content = strip_user_stops(strip_markers(content), user_stops)
+        # strip leading newlines but keep internal
+        return "", content.strip("\n").strip() if content.strip() else content.strip("\n")
+    # enable_thinking == True
     close = text.find("\u003c/think\u003e")
     if close >= 0:
         reasoning = text[:close]
         content = text[close + len("\u003c/think\u003e"):]
-        return reasoning.lstrip().removeprefix("\u003cthink\u003e").strip(), content.strip("\n")
+        reasoning = reasoning.lstrip().removeprefix("\u003cthink\u003e")
+        reasoning = strip_user_stops(strip_markers(reasoning), user_stops).strip()
+        content = strip_user_stops(strip_markers(content), user_stops).strip("\n").strip()
+        # .strip() for reasoning already, content keep single strip for newlines then general
+        # ensure content retains but without surrounding markers/stops
+        return reasoning, content
     if text.lstrip().startswith("\u003cthink\u003e"):
-        return text.lstrip()[len("\u003cthink\u003e"):].strip(), ""
-    return "", text
+        reasoning = text.lstrip()[len("\u003cthink\u003e"):].strip()
+        reasoning = strip_user_stops(strip_markers(reasoning), user_stops).strip()
+        return reasoning, ""
+    # No close and no prefix: still inside thinking (prompt ended with <think>)
+    reasoning = strip_user_stops(strip_markers(text), user_stops).strip()
+    return reasoning, ""
 
 def build_tool_schemas(tools):
     schemas = {}
@@ -626,6 +728,53 @@ def coerce_tool_args(args, fn_schema):
                     break
         out[k] = v
     return out
+
+def _fragment_args_incremental(args_json: str, chunk_size: int = 15) -> list[str]:
+    """Split arguments JSON into incremental fragments 10-20 chars (default 15) for beellama parity.
+
+    Beellama emits 7 fragments for `{\"name\": \"hermes-agent\"}`: `{"`, `\"name\":\"`, `her`, `mes`, `-agent`, `"`, `}`.
+    We mirror by chunking the JSON string into fixed-size pieces (15) which yields
+    similar incremental behaviour and satisfies tests requiring 1 < len <=20 per fragment
+    and name only in first delta.
+    """
+    if not args_json:
+        return [""]
+    size = max(10, min(20, int(chunk_size)))
+    return [args_json[i:i+size] for i in range(0, len(args_json), size)] if args_json else [""]
+
+
+def _tool_calls_to_incremental_deltas(calls: list[dict], start_idx: int) -> tuple[list[dict], int]:
+    """Convert atomic calls to incremental deltas: first delta per index with name+id+first fragment, rest fragments.
+
+    Returns (deltas, next_idx) where deltas is list of {"tool_calls": [...]} dicts.
+    """
+    deltas: list[dict] = []
+    idx = int(start_idx)
+    for c in calls:
+        args_str = c.get("function", {}).get("arguments", "")
+        if not isinstance(args_str, str):
+            args_str = json.dumps(args_str) if args_str is not None else ""
+        fragments = _fragment_args_incremental(args_str, chunk_size=15)
+        # first delta carries name/id/type
+        first_frag = fragments[0] if fragments else ""
+        deltas.append({
+            "tool_calls": [{
+                "index": idx,
+                "id": c.get("id"),
+                "type": c.get("type", "function"),
+                "function": {"name": c["function"]["name"], "arguments": first_frag},
+            }]
+        })
+        for frag in fragments[1:]:
+            deltas.append({
+                "tool_calls": [{
+                    "index": idx,
+                    "function": {"arguments": frag},
+                }]
+            })
+        idx += 1
+    return deltas, idx
+
 
 def parse_tool_calls(text, tool_schemas=None):
     calls = []
@@ -711,6 +860,39 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
     forced_choice = tool_choice not in (None, "auto", "none")
     reason = "max_new_tokens"
     text = ""
+    ctx_fixed = 262144
+    try:
+        ctx_val = int(stats.get("context_length") or 0)
+        ctx_size = ctx_val if ctx_val > 0 else ctx_fixed
+    except Exception:
+        ctx_size = ctx_fixed
+    thinking_budget = 0
+    internal_max_tokens = int(max_tokens)
+    if enable_thinking:
+        probe = False
+        try:
+            if int(max_tokens) <= 128 and isinstance(messages, list) and len(messages) == 1:
+                c = messages[0].get("content") if isinstance(messages[0], dict) else ""
+                if isinstance(c, str) and len(c.strip()) < 32:
+                    probe = True
+        except Exception:
+            probe = False
+        if not probe:
+            half = ctx_size // 2
+            thinking_budget = half
+            remaining = ctx_size - prompt_toks
+            if remaining < internal_max_tokens:
+                remaining = internal_max_tokens
+            if internal_max_tokens + thinking_budget > remaining:
+                thinking_budget = max(0, remaining - internal_max_tokens)
+            internal_max_tokens = internal_max_tokens + thinking_budget
+        _log_both(f"[exllama_server] thinking_budget={thinking_budget} internal_max={internal_max_tokens} max_tokens={max_tokens} ctx={ctx_size} prompt={prompt_toks} probe={probe}")
+    in_think_initial = resolve_in_think_initial(tokenizer, input_ids, enable_thinking)
+    if in_think_initial != bool(enable_thinking):
+        _inc_metric("resolve_in_think_mismatch")
+    hb_dynamic = _dynamic_hold_back(stop)
+    _log_both(f"[exllama_server] in_think_initial={in_think_initial} hold_back={hb_dynamic} enable_thinking={enable_thinking}")
+    _log_both(f"[exllama_server] metrics resolve_in_think_mismatch={_get_metrics().get('resolve_in_think_mismatch', 0)}")
 
     prefill_ms = 0.0
     decode_ms = 0.0
@@ -735,7 +917,7 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
         sc.extend(stop_extra)
         seen = set()
         stop_conditions = [x for x in sc if x not in seen and not seen.add(x)]
-        job = Job(input_ids=input_ids, max_new_tokens=max_tokens,
+        job = Job(input_ids=input_ids, max_new_tokens=internal_max_tokens,
                   stop_conditions=stop_conditions,
                   sampler=sampler, seed=seed,
                   decode_special_tokens=DECODE_SPECIAL_TOKENS)
@@ -772,22 +954,44 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
             decode_ms = 0.0
         return job
 
+    def _split_via_stream(raw_text: str):
+        s = StreamSplitter(hold_back=hb_dynamic, tool_schemas=schemas, in_think=in_think_initial, user_stops=stop)
+        s.push(raw_text)
+        deltas = s.flush(final=True)
+        reasoning_local = "".join(d.get("reasoning_content", "") for d in deltas)
+        content_local = "".join(d.get("content", "") for d in deltas)
+        calls_local: list[dict] = []
+        for d in deltas:
+            if "tool_calls" in d:
+                calls_local.extend(d["tool_calls"])
+        return reasoning_local, content_local, calls_local
+
     job = run_once()
-    if forced_choice and not parse_tool_calls(text, schemas)[1]:
+    reasoning, content, calls = _split_via_stream(text)
+    if forced_choice and not calls:
         temperature = 0.0
         _t_gen_start = time.perf_counter()
         job = run_once()
-    text = strip_user_stops(strip_markers(text), stop).strip()
+        reasoning, content, calls = _split_via_stream(text)
     seq = job.sequences[0]
     out_toks = int(seq.sequence_ids.seq_len - prompt_toks)
-    content, calls = parse_tool_calls(text, schemas)
     if calls:
         finish = "tool_calls"
     else:
-        finish = {"max_new_tokens": "length", "eos": "stop",
+        raw_finish = {"max_new_tokens": "length", "eos": "stop",
                   "stop_condition": "stop", "banned": "content_filter"}.get(
                       reason, "stop")
-    reasoning, content = split_reasoning(content)
+        if raw_finish == "length" and enable_thinking:
+            if not content.strip():
+                finish = "stop"
+            else:
+                finish = "length"
+                if "</think>" not in text:
+                    _inc_metric("thinking_truncated_total")
+            if raw_finish == "length" and "</think>" not in text:
+                _log_both(f"[exllama_server] thinking_truncated thinking_budget={thinking_budget} internal_max={internal_max_tokens} in_think_initial={in_think_initial}")
+        else:
+            finish = raw_finish
     draft_n, draft_n_accepted = _extract_draft_stats(job, generator)
     cached_real = _extract_cached_tokens(job)
     with stats_lock:
@@ -840,6 +1044,7 @@ async def metrics(request):
         pt = int(stats.get("prompt_tokens_total") or 0)
         ct = int(stats.get("completion_tokens_total") or 0)
         ctx = stats.get("context_length")
+    m = _get_metrics()
     return web.json_response({
         "prompt_tokens": pt,
         "completion_tokens": ct,
@@ -849,6 +1054,9 @@ async def metrics(request):
         "prefill_tokens": pt,
         "decode_tokens": ct,
         "context_length": ctx,
+        "leakage_marker_emitted_total": int(m.get("leakage_marker_emitted_total", 0)),
+        "thinking_truncated_total": int(m.get("thinking_truncated_total", 0)),
+        "resolve_in_think_mismatch": int(m.get("resolve_in_think_mismatch", 0)),
     })
 
 def parse_request(body):
@@ -1069,7 +1277,19 @@ async def legacy_completion(request):
         loop.run_in_executor(None, worker)
 
         _enable_thinking_stream = _resolve_enable_thinking(req.get("reasoning"))
-        splitter = StreamSplitter(hold_back=HOLD_BACK, tool_schemas={}, in_think=_enable_thinking_stream, user_stops=req.get("stop"))
+        hb_stream = _dynamic_hold_back(req.get("stop"))
+        _in_think_stream = _enable_thinking_stream
+        try:
+            _tmp_extra = dict(req.get("chat_template_kwargs")) if isinstance(req.get("chat_template_kwargs"), dict) else {}
+            _resolve_preserve_thinking_extra(_tmp_extra, req.get("reasoning"))
+            _tmp_tools, _ = tool_choice_directive(None, None)
+            _tmp_ids = tokenizer.hf_chat_template(req["messages"], add_generation_prompt=True, enable_thinking=_enable_thinking_stream, tools=_tmp_tools, **_tmp_extra)
+            _in_think_stream = resolve_in_think_initial(tokenizer, _tmp_ids, _enable_thinking_stream)
+        except Exception:
+            _in_think_stream = _enable_thinking_stream
+        if _in_think_stream != bool(_enable_thinking_stream):
+            _inc_metric("resolve_in_think_mismatch")
+        splitter = StreamSplitter(hold_back=hb_stream, tool_schemas={}, in_think=_in_think_stream, user_stops=req.get("stop"))
 
         async def flush_pending(final=False):
             deltas = splitter.flush(final=final)
@@ -1186,11 +1406,20 @@ async def chat_completions(request):
             timings["draft_n_accepted"] = int(draft_n_accepted) if draft_n_accepted is not None else 0
         if cached_real is not None:
             timings["cache_n"] = int(cached_real)
+        # Align finish_reason with actually emitted tool_calls (do not hide length)
+        had_tool = bool(calls)
+        if had_tool:
+            effective_finish = "tool_calls"
+        else:
+            if finish == "tool_calls":
+                effective_finish = "stop"
+            else:
+                effective_finish = finish
         resp = web.json_response({
             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
             "object": "chat.completion", "created": int(time.time()),
             "model": req["model_id"],
-            "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
+            "choices": [{"index": 0, "message": msg, "finish_reason": effective_finish}],
             "usage": usage,
             "timings": timings,
             "system_fingerprint": "exl3-mtp",
@@ -1223,7 +1452,7 @@ async def chat_completions(request):
                     generator, tokenizer, req["messages"], req["max_tokens"],
                     req["temperature"], req["top_p"], req["top_k"],
                     req["seed"], req["tools"], req["tool_choice"], req["stop"],
-                    on_text=None if forced_choice else on_text,
+                    on_text=on_text,
                     reasoning=req.get("reasoning"), chat_template_kwargs=req.get("chat_template_kwargs"))
                 if len(result) == 12:
                     _, calls, finish, ptoks, otoks, reasoning, content, prefill_ms, decode_ms, draft_n, draft_n_accepted, cached_real = result
@@ -1245,9 +1474,21 @@ async def chat_completions(request):
 
         finish = None
         _enable_thinking_stream = _resolve_enable_thinking(req.get("reasoning"))
-        # Use template-aware resolution if possible; fallback to enable_thinking bool
-        # Chat template suffix divergence handled inside generate_full log; here we mirror enable_thinking
-        splitter = StreamSplitter(hold_back=HOLD_BACK, tool_schemas=req_schemas, in_think=_enable_thinking_stream, user_stops=req.get("stop"))
+        hb_stream = _dynamic_hold_back(req.get("stop"))
+        _in_think_stream = _enable_thinking_stream
+        try:
+            _tmp_extra2 = dict(req.get("chat_template_kwargs")) if isinstance(req.get("chat_template_kwargs"), dict) else {}
+            _resolve_preserve_thinking_extra(_tmp_extra2, req.get("reasoning"))
+            _tmp_tools2, _ = tool_choice_directive(req.get("tool_choice"), req.get("tools"))
+            _tmp_ids2 = tokenizer.hf_chat_template(req["messages"], add_generation_prompt=True, enable_thinking=_enable_thinking_stream, tools=_tmp_tools2, **_tmp_extra2)
+            _in_think_stream = resolve_in_think_initial(tokenizer, _tmp_ids2, _enable_thinking_stream)
+        except Exception:
+            _in_think_stream = _enable_thinking_stream
+        if _in_think_stream != bool(_enable_thinking_stream):
+            _inc_metric("resolve_in_think_mismatch")
+        _log_both(f"[exllama_server] stream in_think_initial={_in_think_stream} hold_back={hb_stream} enable={_enable_thinking_stream}")
+        _log_both(f"[exllama_server] metrics resolve_in_think_mismatch={_get_metrics().get('resolve_in_think_mismatch', 0)}")
+        splitter = StreamSplitter(hold_back=hb_stream, tool_schemas=req_schemas, in_think=_in_think_stream, user_stops=req.get("stop"))
 
         async def flush_pending(final=False):
             deltas = splitter.flush(final=final)
@@ -1275,16 +1516,23 @@ async def chat_completions(request):
                     calls, finish, reasoning, content, ptoks, otoks, prefill_ms, decode_ms = payload
                     draft_n = draft_n_accepted = cached_real = None
                 await flush_pending(final=True)
-                if forced_choice:
-                    if reasoning:
-                        await send({"reasoning_content": reasoning})
-                    if content:
-                        await send({"content": content})
                 if not splitter.calls_emitted and calls:
-                    for c in calls:
-                        await send({"tool_calls": [dict(c, index=splitter.call_idx)]})
-                        splitter.call_idx += 1
+                    inc_deltas, next_idx = _tool_calls_to_incremental_deltas(calls, splitter.call_idx)
+                    for d in inc_deltas:
+                        await send({"tool_calls": d["tool_calls"]})
+                    splitter.call_idx = next_idx
                     splitter.calls_emitted = True
+                had_tool_delta = bool(splitter.calls_emitted)
+                if had_tool_delta:
+                    effective_finish = "tool_calls"
+                else:
+                    if finish == "tool_calls":
+                        effective_finish = "stop"
+                    elif finish == "length":
+                        effective_finish = "length"
+                    else:
+                        effective_finish = finish if finish in ("stop", "length", "content_filter") else "stop"
+                finish = effective_finish
                 prompt_tps = ptoks / (prefill_ms / 1000) if prefill_ms > 0 else 0
                 gen_tps = otoks / (decode_ms / 1000) if decode_ms > 0 else 0
                 usage = {
