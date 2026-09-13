@@ -190,6 +190,7 @@ def _extract_cached_tokens(job):
 TOOL_CALL_OPEN = "\u003ctool_call\u003e"
 TOOL_CALL_CLOSE = "\u003c/tool_call\u003e"
 HOLD_BACK = 16
+# finish_reason coherence: tool_calls only if had_tool_delta else stop/length (commit 4)
 
 # Gateway capa 2 metrics (shared with command_router gateway)
 _METRICS_LOCK = threading.Lock()
