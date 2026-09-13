@@ -26,8 +26,193 @@ integration logic.
 """
 import os
 import argparse
+import json
+import re
+import threading
 from pathlib import Path
 from typing import Callable, Any, Union
+
+# ---------------------------------------------------------------------------
+# Gateway sanitization (capa 2): normalize_messages + metrics
+# Spec: colapsar user vacíos consecutivos y \n{4,} -> \n\n\n,
+#       preserve_thinking False, forward thinking_budget,
+#       metrics leakage_marker_emitted_total / thinking_truncated_total / resolve_in_think_mismatch
+#       log thinking_budget/internal_max/in_think_initial + api_raw_requests.log ring
+# ---------------------------------------------------------------------------
+_GATEWAY_METRICS_LOCK = threading.Lock()
+_GATEWAY_METRICS: dict[str, int] = {
+    "leakage_marker_emitted_total": 0,
+    "thinking_truncated_total": 0,
+    "resolve_in_think_mismatch": 0,
+}
+
+_NEWLINE_RE = re.compile(r"\n{4,}")
+_MARKER_RE = re.compile(r"<\|im_start\|>|<\|im_end\|>")
+# Generic artifact sanitization (capa 2b): evita que {"output": llegue a content
+# y colapsa useruser literales que priman degeneración (59× user + output JSON).
+_OUTPUT_JSON_RE = re.compile(r'\{\s*"output"\s*:')
+_OUTPUT_KEY_RE = re.compile(r'"output"\s*:')
+_USERUSER_CONCAT_RE = re.compile(r'(?:user){2,}', flags=re.IGNORECASE)
+# líneas consecutivas "user" (con o sin espacios/nuevas líneas) -> una sola
+_USER_LINES_RE = re.compile(r'(?:^|\n)[ \t]*user[ \t]*(?:\n[ \t]*user[ \t]*)+', flags=re.IGNORECASE | re.MULTILINE)
+
+def _sanitize_text_newlines(text: str) -> str:
+    if not isinstance(text, str):
+        return str(text or "")
+    return _NEWLINE_RE.sub("\n\n\n", text)
+
+def _sanitize_tool_output_artifacts(text: str) -> str:
+    """Elimina {"output": y colapsa useruser/repeticiones literales.
+
+    - {"output": y "output": son marcadores de tool output serializado que
+      nunca deberían viajar como user content; se reemplazan por
+      [output_stripped] para no primar al modelo.
+    - useruser / user\\nuser\\nuser literales son artefactos de transcripts
+      corruptos que degeneran Qwen; se colapsan a un único 'user'.
+    Genérico y determinista, no reordena mensajes.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    # output JSON fisura
+    if '"output"' in text:
+        text = _OUTPUT_JSON_RE.sub('[output_stripped]:', text)
+        # por si quedó "output": sin llave (p.ej. output ya sin {)
+        text = _OUTPUT_KEY_RE.sub('[output_stripped]:', text)
+    # useruser concatenado sin espacios (useruseruser...)
+    if 'user' in text.lower():
+        text = _USERUSER_CONCAT_RE.sub('user', text)
+        text = _USER_LINES_RE.sub('\nuser\n', text)
+    return text
+
+def _is_empty_user_content(content: object) -> bool:
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return content.strip() == ""
+    if isinstance(content, list):
+        # list of parts - empty if no text parts with non-empty text
+        for item in content:
+            if isinstance(item, dict):
+                t = item.get("text") or item.get("content") or ""
+                if isinstance(t, str) and t.strip():
+                    return False
+                # image parts count as non-empty? treat as non-empty to avoid collapsing
+                if item.get("type") in {"image_url", "input_image"}:
+                    return False
+            elif isinstance(item, str) and item.strip():
+                return False
+        return True
+    return str(content).strip() == ""
+
+def _sanitize_content_field(content: object) -> object:
+    def _sanitize_str(s: str) -> str:
+        return _sanitize_text_newlines(_sanitize_tool_output_artifacts(_sanitize_text_newlines(s)))
+    if isinstance(content, str):
+        return _sanitize_str(content)
+    if isinstance(content, list):
+        out: list[object] = []
+        for item in content:
+            if isinstance(item, dict):
+                copy = dict(item)
+                for key in ("text", "content", "output"):
+                    if isinstance(copy.get(key), str):
+                        copy[key] = _sanitize_str(copy[key])
+                out.append(copy)
+            elif isinstance(item, str):
+                out.append(_sanitize_str(item))
+            else:
+                out.append(item)
+        return out
+    return content
+
+def normalize_messages(messages: list[dict] | None) -> list[dict]:
+    """Gateway sanitization: collapse consecutive empty user + \\n{4,} -> \\n\\n\\n.
+
+    Preserves tool_calls etc. Must not break dedup: deterministic, no reordering
+    beyond collapsing empties.
+    """
+    if not isinstance(messages, list):
+        return []
+    out: list[dict] = []
+    for raw in messages:
+        if not isinstance(raw, dict):
+            continue
+        m = dict(raw)
+        # sanitize content newlines
+        if "content" in m:
+            m["content"] = _sanitize_content_field(m.get("content"))
+        # image content list -> join text handled elsewhere; here we keep list form
+        # collapse consecutive empty user
+        is_user = str(m.get("role") or "") == "user"
+        is_empty = _is_empty_user_content(m.get("content"))
+        if is_user and is_empty:
+            if out and str(out[-1].get("role") or "") == "user" and _is_empty_user_content(out[-1].get("content")):
+                # collapse: skip this duplicate empty user
+                continue
+        out.append(m)
+    return out
+
+def _ensure_preserve_thinking_false(payload: dict) -> None:
+    """Enforce chat_template_kwargs preserve_thinking=False (gateway layer)."""
+    if not isinstance(payload, dict):
+        return
+    ctk = payload.get("chat_template_kwargs")
+    # handle string JSON case (llama-server flag style)
+    if isinstance(ctk, str):
+        try:
+            parsed = json.loads(ctk) if ctk.strip().startswith("{") else {}
+            if not isinstance(parsed, dict):
+                parsed = {}
+            parsed["preserve_thinking"] = False
+            payload["chat_template_kwargs"] = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+            return
+        except Exception:
+            payload["chat_template_kwargs"] = json.dumps({"preserve_thinking": False}, ensure_ascii=False)
+            return
+    if not isinstance(ctk, dict):
+        ctk = {}
+    ctk["preserve_thinking"] = False
+    payload["chat_template_kwargs"] = ctk
+    # also handle top-level reasoning ensure we don't override existing but enforce template
+    # payload may have chat_template_kwargs as dict -> set
+
+def _forward_thinking_budget(payload: dict) -> None:
+    """Ensure thinking_budget_tokens is preserved/forwarded if present; no-op if absent."""
+    # gateway must not drop thinking_budget_tokens that was resolved via resolve_request_reasoning_budget
+    # This is a no-op keeper to make intent explicit; actual budget is set by caller.
+    if not isinstance(payload, dict):
+        return
+    # normalize alternative key reasoning_budget_tokens -> thinking_budget_tokens
+    if "reasoning_budget_tokens" in payload and "thinking_budget_tokens" not in payload:
+        try:
+            payload["thinking_budget_tokens"] = int(payload.get("reasoning_budget_tokens"))  # type: ignore
+        except Exception:
+            pass
+
+def sanitize_gateway_payload(payload: dict, messages: list[dict] | None = None) -> list[dict]:
+    """Gateway capa 2 sanitization entry: messages + preserve_thinking + thinking_budget."""
+    msgs = messages if messages is not None else payload.get("messages") if isinstance(payload, dict) else None
+    normalized = normalize_messages(msgs if isinstance(msgs, list) else [])
+    if isinstance(payload, dict):
+        payload["messages"] = normalized
+        _ensure_preserve_thinking_false(payload)
+        _forward_thinking_budget(payload)
+    return normalized
+
+def inc_gateway_metric(name: str, amount: int = 1) -> None:
+    if name not in _GATEWAY_METRICS:
+        return
+    with _GATEWAY_METRICS_LOCK:
+        _GATEWAY_METRICS[name] += int(amount)
+
+def get_gateway_metrics() -> dict[str, int]:
+    with _GATEWAY_METRICS_LOCK:
+        return dict(_GATEWAY_METRICS)
+
+def reset_gateway_metrics() -> None:
+    with _GATEWAY_METRICS_LOCK:
+        for k in _GATEWAY_METRICS:
+            _GATEWAY_METRICS[k] = 0
 
 
 def is_catalog_owner(catalog_path: Path) -> bool:

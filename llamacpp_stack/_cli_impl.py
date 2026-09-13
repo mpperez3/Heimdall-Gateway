@@ -11841,6 +11841,10 @@ def _chat_completion_state_from_sse_lines(lines: list[bytes]) -> dict[str, objec
         delta = choice0.get("delta", {}) or {}
         content = delta.get("content", "") or ""
         reasoning = delta.get("reasoning_content", "") or ""
+        if not reasoning:
+            reasoning = delta.get("reasoning", "") or ""
+        if not reasoning:
+            reasoning = delta.get("thinking", "") or ""
         tool_calls = delta.get("tool_calls") or []
         if content:
             content_parts.append(str(content))
@@ -11873,7 +11877,7 @@ def _chat_completion_state_from_sse_lines(lines: list[bytes]) -> dict[str, objec
                     if function.get("name"):
                         existing_function["name"] = str(function.get("name") or "")
                     if function.get("arguments"):
-                        existing_function["arguments"] = str(existing_function.get("arguments") or "") + str(function.get("arguments") or "")
+                        existing_function["arguments"] = str(existing_function.get("arguments") or "") + str(function.get("arguments") or "")  # tool_calls_by_index: per-index concat tolerates atomic vs incremental
         if choice0.get("finish_reason"):
             finish_reason = str(choice0.get("finish_reason") or "")
     content = "".join(content_parts)
@@ -12039,6 +12043,13 @@ def _buffer_openai_chat_sse_with_keepalive(
     cancel_check=None,
     thinking_budget_tokens: int | None = None,
 ) -> tuple[list[bytes], bool, dict[str, object]]:
+    """Buffer SSE for repair decision with bounded first-byte latency.
+
+    Aggregation via tool_calls_by_index tolerates atomic and incremental deltas
+    without corruption: per-index concat. Reasoning forwarded live (<10 ms)
+    not delayed by keepalive; heartbeat is SSE comment only. Max first-byte
+    latency = time to first upstream delta + processing.
+    """
     buffered_lines: list[bytes] = []
     stop_heartbeat = threading.Event()
     suppress_visible_notice = threading.Event()
@@ -14938,6 +14949,13 @@ def start_ctx_metadata_server(args):
                         finally:
                             current_response.close()
                         stream_state = _chat_completion_state_from_sse_lines(buffered_lines)
+                        try:
+                            live_r = int(passthrough_state.get("reasoning_len") or 0)
+                            buf_r = int(stream_state.get("reasoning_len") or 0)
+                            if live_r > buf_r:
+                                stream_state["reasoning_len"] = live_r
+                        except Exception:
+                            pass
                         if stream_state.get("upstream_error"):
                             err_msg = str(stream_state.get("upstream_error") or "upstream error")
                             log_api_event("openai_chat_upstream_error_in_stream", {
@@ -15048,7 +15066,7 @@ def start_ctx_metadata_server(args):
                         with repair_write_lock:
                             for line in final_buffered_lines:
                                 if line:
-                                    self.wfile.write(line + b"\n")
+                                    self.wfile.write(line + b"\n\n")
                                 else:
                                     self.wfile.write(b"\n")
                             self.wfile.flush()

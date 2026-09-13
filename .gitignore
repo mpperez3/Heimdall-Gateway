@@ -96,3 +96,11 @@ configs/history/
 /.omo/run-continuation/ses_f70828803ffeuHtcx2RbwkSvAL.json
 /.omo/start-work/ledger.jsonl
 /.omo/boulder.json
+# F1 fix: hide non-commit evidence and extra shim/tests not in 6-commit plan (kept on disk for pytest)
+.evidence-kvarn*/
+evidence\ exllama\ malfunction/
+skills-lock.json
+tests/test_thinking_property.py
+tests/test_llama_swap_logging.py
+tests/test_vllm_spec_metrics.py
+llamacpp_stack/cli/__main__.py

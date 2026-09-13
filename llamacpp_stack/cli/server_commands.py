@@ -724,6 +724,14 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
         s=str(value or "").strip()
         if s and _server_supports_or_unknown(server_path, "--chat-template-kwargs"): cmd.extend(["--chat-template-kwargs", s])
         return
+    if key == "cache_quant":
+        s=str(value or "").strip()
+        if s: cmd.extend(["--cache_quant", s])
+        return
+    if key == "grid_size":
+        try: cmd.extend(["--grid_size", str(int(value))])
+        except: cmd.extend(["--grid_size", str(value)])
+        return
     # generic fallback
     try:
         f=_llama_flag_name(str(key))
@@ -811,6 +819,11 @@ def build_llama_server_command(model, server_path: Path, *, port: str, host: str
         effective.pop(_sk, None)
     if _engine not in {"exllama","exllamav3","exllama-v3","exllama3"}:
         effective.pop("cache_quant", None)
+    if _engine in {"exllama","exllamav3","exllama-v3","exllama3"}:
+        effective.pop("cache_type_k", None)
+        effective.pop("cache_type_v", None)
+        effective.pop("cache_type_k_draft", None)
+        effective.pop("cache_type_v_draft", None)
     replica_tensor_split = effective.pop("__replica_tensor_split", None)
     try:
         cf = _get_cli_file()
