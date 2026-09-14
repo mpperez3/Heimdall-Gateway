@@ -1016,16 +1016,19 @@ OPTIONAL_ENGINE_ORDER: list[tuple[str, str]] = [
     ("1", "beellama"),
     ("2", "vllm"),
     ("3", "exllama"),
+    ("4", "buun"),
 ]
 OPTIONAL_ENGINE_LABELS: dict[str, str] = {
     "beellama": "beellama (kvarn4/MTP)",
     "vllm": "vLLM",
     "exllama": "EXL3 (ExLlamaV2+DFlash2)",
+    "buun": "buun (EXL3+FP8 native)",
 }
 OPTIONAL_TOKEN_MAP: dict[str, str] = {
     "1": "beellama",
     "2": "vllm",
     "3": "exllama",
+    "4": "buun",
     "beellama": "beellama",
     "kvarn4": "beellama",
     "mtp": "beellama",
@@ -1035,6 +1038,7 @@ OPTIONAL_TOKEN_MAP: dict[str, str] = {
     "exl3": "exllama",
     "exllamav3": "exllama",
     "exllama-v3": "exllama",
+    "buun": "buun",
 }
 
 
@@ -1044,8 +1048,8 @@ def parse_optional_selection(raw: str | None) -> set[str]:
     text = str(raw).strip().lower()
     if not text or text in {"none", "no", "n", "0", "-", "skip"}:
         return set()
-    if text in {"all", "a", "1,2,3", "1 2 3", "1, 2, 3", "123"}:
-        return {"beellama", "vllm", "exllama"}
+    if text in {"all", "a", "1,2,3", "1 2 3", "1, 2, 3", "123", "1,2,3,4", "1 2 3 4", "1234"}:
+        return {"beellama", "vllm", "exllama", "buun"}
     # Normalize separators: commas and whitespace
     parts = re.split(r"[,\s]+", text)
     selected: set[str] = set()
@@ -1054,7 +1058,7 @@ def parse_optional_selection(raw: str | None) -> set[str]:
         if not token:
             continue
         if token in {"all", "a"}:
-            return {"beellama", "vllm", "exllama"}
+            return {"beellama", "vllm", "exllama", "buun"}
         if token in {"none", "no", "n", "0"}:
             continue
         mapped = OPTIONAL_TOKEN_MAP.get(token)
@@ -1062,7 +1066,7 @@ def parse_optional_selection(raw: str | None) -> set[str]:
             selected.add(mapped)
         else:
             # Unknown token ignored to keep prompt forgiving; could also warn
-            print(f"[!] Ignoring unknown optional '{part}' (valid: 1,2,3, all, none)")
+            print(f"[!] Ignoring unknown optional '{part}' (valid: 1,2,3,4, all, none)")
     return selected
 
 
@@ -1074,7 +1078,7 @@ def prompt_optionals(default_raw: str | None = None) -> set[str]:
         # Non-empty explicit flag already parsed without prompting
         if str(default_raw).strip() != "":
             return parsed
-    prompt = "¿Qué opcionales instalar? [1] beellama (kvarn4/MTP) [2] vLLM [3] EXL3 (ExLlamaV2+DFlash2) [all/none or e.g. 1,2]: "
+    prompt = "¿Qué opcionales instalar? [1] beellama (kvarn4/MTP) [2] vLLM [3] EXL3 (ExLlamaV2+DFlash2) [4] buun (EXL3+FP8 native) [all/none or e.g. 1,2]: "
     if default_raw is not None:
         # Show pre-selected default in prompt when re-prompting
         pass
@@ -1094,7 +1098,7 @@ def prompt_optionals(default_raw: str | None = None) -> set[str]:
             return selected
         # If parse failed (unknown tokens), show hint and re-prompt
         # parse_optional_selection already printed warning
-        print("  Valid: 1, 2, 3, 1,2, 1 2, all, none")
+        print("  Valid: 1, 2, 3, 4, 1,2, 1 2, all, none")
 
 
 def resolve_optionals_selection(args: argparse.Namespace) -> set[str]:
@@ -1103,7 +1107,7 @@ def resolve_optionals_selection(args: argparse.Namespace) -> set[str]:
     if raw is not None and str(raw).strip() != "":
         selected = parse_optional_selection(str(raw))
         # Persist normalized form for re-exec
-        args.optionals = ",".join(sorted(selected, key=lambda x: {"beellama": 0, "vllm": 1, "exllama": 2}.get(x, 99))) if selected else "none"
+        args.optionals = ",".join(sorted(selected, key=lambda x: {"beellama": 0, "vllm": 1, "exllama": 2, "buun": 3}.get(x, 99))) if selected else "none"
         return selected
     # Check env var for non-interactive callers
     env_raw = os.environ.get("HEIMDALL_GATEWAY_OPTIONALS", "").strip()
@@ -1115,7 +1119,7 @@ def resolve_optionals_selection(args: argparse.Namespace) -> set[str]:
         args.optionals = "none"
         return set()
     selected = prompt_optionals(default_raw=raw)
-    args.optionals = ",".join(sorted(selected, key=lambda x: {"beellama": 0, "vllm": 1, "exllama": 2}.get(x, 99))) if selected else "none"
+    args.optionals = ",".join(sorted(selected, key=lambda x: {"beellama": 0, "vllm": 1, "exllama": 2, "buun": 3}.get(x, 99))) if selected else "none"
     return selected
 
 
@@ -5529,7 +5533,7 @@ def _install_optional_engines(layout: InstallLayout, selected: set[str], runtime
     pythonpath_val = str(layout.python_root)
     if pythonpath_val:
         env["HEIMDALL_GATEWAY_PYTHONPATH"] = pythonpath_val
-    for engine in sorted(selected, key=lambda x: {"beellama": 0, "vllm": 1, "exllama": 2}.get(x, 99)):
+    for engine in sorted(selected, key=lambda x: {"beellama": 0, "vllm": 1, "exllama": 2, "buun": 3}.get(x, 99)):
         if engine == "beellama":
             if dry_run:
                 print(f"[dry-run] would install beellama via build_beellama(install_root={layout.install_root}, python_exec={runtime_python}) with HEIMDALL_GATEWAY_PYTHONPATH={pythonpath_val}")
@@ -5586,6 +5590,26 @@ def _install_optional_engines(layout: InstallLayout, selected: set[str], runtime
                 print("[*] EXL3 (exllama) installed successfully.")
             except Exception as exc:
                 print(f"[!] EXL3 install failed: {exc}")
+        elif engine == "buun":
+            if dry_run:
+                print(f"[dry-run] would install buun via build_buun(install_root={layout.install_root}, python_exec={runtime_python}) with HEIMDALL_GATEWAY_PYTHONPATH={pythonpath_val}")
+                continue
+            try:
+                from llamacpp_stack.buun_install import build_buun
+
+                print(f"[*] Installing buun (EXL3+FP8 native) into {layout.install_root} ...")
+                env_before = os.environ.get("HEIMDALL_GATEWAY_PYTHONPATH")
+                os.environ["HEIMDALL_GATEWAY_PYTHONPATH"] = pythonpath_val
+                try:
+                    build_buun(install_root=layout.install_root, python_exec=str(runtime_python), dry_run=False)
+                finally:
+                    if env_before is None:
+                        os.environ.pop("HEIMDALL_GATEWAY_PYTHONPATH", None)
+                    else:
+                        os.environ["HEIMDALL_GATEWAY_PYTHONPATH"] = env_before
+                print("[*] buun installed successfully.")
+            except Exception as exc:
+                print(f"[!] buun install failed: {exc}")
 
 
 def _update_catalog_engines_for_optionals(layout: InstallLayout, selected: set[str], dry_run: bool) -> None:
@@ -5838,6 +5862,21 @@ def install_stack(args: argparse.Namespace) -> int:
         write_api_security_config(layout, api_auth_config, api_https_config, args.dry_run)
         if api_auth_config.get("enabled"):
             print(f"Heimdall Gateway API key saved in {layout.config_dir / SERVER_CONFIG_BASENAME} -> api_auth.api_key")
+        if args.dry_run:
+            try:
+                _raw_opt = getattr(args, "optionals", None)
+                if _raw_opt is not None and str(_raw_opt).strip() != "":
+                    _sel = parse_optional_selection(str(_raw_opt))
+                    if _sel:
+                        try:
+                            _rt = layout.runtime_venv / "bin" / "python"
+                            if not _rt.exists():
+                                _rt = Path(sys.executable)
+                        except Exception:
+                            _rt = Path(sys.executable)
+                        _install_optional_engines(layout, _sel, _rt, True)
+            except Exception:
+                pass
         # Ensure services are installed/enabled as well as restarted. A package-only
         # reinstall may run on a machine where the unit files exist under our
         # config dir but systemd currently says "Unit not loaded". enable --now
@@ -6089,7 +6128,7 @@ def install_stack(args: argparse.Namespace) -> int:
                 selected_optionals = parse_optional_selection(str(raw_opt))
             else:
                 selected_optionals = set()
-                print("[dry-run] would prompt: ¿Qué opcionales instalar? [1] beellama (kvarn4/MTP) [2] vLLM [3] EXL3 (ExLlamaV2+DFlash2) -> none (use --optionals 1,2 or all to select)")
+                print("[dry-run] would prompt: ¿Qué opcionales instalar? [1] beellama (kvarn4/MTP) [2] vLLM [3] EXL3 (ExLlamaV2+DFlash2) [4] buun (EXL3+FP8 native) -> none (use --optionals 1,2 or all to select)")
             if selected_optionals:
                 _install_optional_engines(layout, selected_optionals, runtime_python, True)
                 _update_catalog_engines_for_optionals(layout, selected_optionals, True)

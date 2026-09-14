@@ -1,0 +1,2 @@
+buun rpath stub - ensures buun/lib exists for LD_LIBRARY_PATH and $ORIGIN rpath
+repo=spiritbuun/buun-llama-cpp ref=c7f114d bin=buun/bin/llama-server-buun
