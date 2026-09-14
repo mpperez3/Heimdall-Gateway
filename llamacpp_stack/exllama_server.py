@@ -434,6 +434,7 @@ def normalize_messages(messages):
     return out
 
 class StreamSplitter:
+    THINK_OPEN = "\u003cthink\u003e"
     THINK_CLOSE = "\u003c/think\u003e"
     TOOL_OPEN = TOOL_CALL_OPEN
     TOOL_CLOSE = TOOL_CALL_CLOSE
@@ -513,6 +514,31 @@ class StreamSplitter:
                     out.append({"reasoning_content": stripped})
                 pending = pending[cut:]
                 break
+            think_pos = pending.find(self.THINK_OPEN)
+            tool_pos = pending.find(TOOL_CALL_OPEN)
+            if think_pos >= 0 and (tool_pos < 0 or think_pos < tool_pos):
+                head, rest = pending.split(self.THINK_OPEN, 1)
+                orig_head = head
+                head_stripped = _strip_all(head)
+                marker_in_head = len(head_stripped) < len(orig_head)
+                if marker_in_head:
+                    if head_stripped.strip() or (final and head_stripped):
+                        out.append({"content": head_stripped})
+                    pending = ""
+                    break
+                upos_h = _earliest_user_stop_pos(orig_head, self.user_stops)
+                if upos_h >= 0:
+                    head_stripped = _strip_all(orig_head[:upos_h])
+                    if head_stripped.strip() or (final and head_stripped):
+                        out.append({"content": head_stripped})
+                    pending = ""
+                    break
+                if head_stripped.strip() or (final and head_stripped):
+                    out.append({"content": head_stripped})
+                pending = rest
+                in_think = True
+                continue
+
             if TOOL_CALL_OPEN in pending:
                 head, rest = pending.split(TOOL_CALL_OPEN, 1)
                 orig_head = head
