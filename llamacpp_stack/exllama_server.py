@@ -875,6 +875,26 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
     enable_thinking = _resolve_enable_thinking(reasoning)
     extra_kwargs = dict(chat_template_kwargs) if isinstance(chat_template_kwargs, dict) else {}
     _resolve_preserve_thinking_extra(extra_kwargs, reasoning)
+    # History sliding window: long history causes re-thinking of all turns (90K reasoning for 10 msgs).
+    # Only last turn should be reasoned; keep system + last 5 messages to bound prompt and reasoning.
+    # Matches task requirement: if messages_count>5 and tools 37, truncate to [-6:] and log prompt_tail.
+    _orig_msg_count = len(messages) if isinstance(messages, list) else 0
+    _tools_count_for_log = len(tools_rendered) if isinstance(tools_rendered, list) else 0
+    if isinstance(messages, list) and len(messages) > 6:
+        # preserve system if present, else sliding window of last 6 raw
+        _has_system = bool(messages and isinstance(messages[0], dict) and messages[0].get("role") == "system")
+        if _has_system:
+            _sys = [messages[0]]
+            _non_sys = [m for m in messages[1:] if isinstance(m, dict)]
+            # keep last 5 non-system => total 6 including system
+            _keep = _non_sys[-5:] if len(_non_sys) > 5 else _non_sys
+            messages = _sys + _keep
+        else:
+            messages = messages[-6:]
+        try:
+            _log_both(f"[exllama_server] history_truncated orig={_orig_msg_count} truncated={len(messages)} tools={_tools_count_for_log} preserve_thinking={extra_kwargs.get('preserve_thinking')}")
+        except Exception:
+            pass
     try:
         input_ids = tokenizer.hf_chat_template(
             messages, add_generation_prompt=True, enable_thinking=enable_thinking,
