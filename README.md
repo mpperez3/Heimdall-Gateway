@@ -185,6 +185,30 @@ When the repository metadata and files identify a supported MTP layout,
 Heimdall derives the draft configuration. Always inspect `info`, `list`, and
 the generated command when validating a new model family.
 
+### EXL3 / FP8 native (buun) — `quant_method: exl3` + `-hf`
+
+Native safetensors via `buun-llama-cpp` (`spiritbuun/buun-llama-cpp c7f114d`, binary `buun/bin/llama-server-buun`, installed as optional engine `--optionals buun`). 91 quant types vs 43 mainline. Use `-hf` (not `--model` GGUF) and `server_overrides.engine: buun` with `quant_method: exl3`. Soporta EXL3 3.5bpw (EXL3_3/EXL3_4 mix) + FP8_BLOCK 128 + BF16.
+
+| Quant label | Buun loader | Notes |
+|---|---|---|
+| **3.5bpw EXL3 → EXL3_3/4 mix** | `quant_method: exl3` | Ej. `turboderp/Qwen3.8-27B-EXL3` / `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` — single `.safetensors` dir, not GGUF |
+| **FP8_BLOCK 128** | `quant_method: exl3` | Block-wise FP8 (128) — native, not GGUF `Q8_0` |
+| **BF16** | `quant_method: exl3` | Native BF16 safetensors path |
+| **NVFP4 / FP8 misc** | `quant_method: exl3` via buun o `vllm` fallback | Use buun for EXL3-native, vLLM for HF NVFP4 (see `docs/VLLM-BETA.md`) |
+
+Buun defaults (`llamacpp_stack/bundle/llama_server_defaults.yaml:buun`): `cache_quant 4`, `grid_size 110`, `keep 40000`, `cache_ram 65536` — mirrors `qwen3.8-27b-EXL3` catalog entry; global `llama_server_defaults` remains base.
+
+```console
+# Via gateway (recommended) — registers native HF safetensors with buun engine
+$ heimdall-gateway add -hf turboderp/Qwen3.8-27B-exl3 --engine buun
+$ heimdall-gateway run -hf turboderp/Qwen3.8-27B-exl3 --engine buun --auto
+# Direct native binary (no gateway) — same flags the gateway generates
+$ buun/bin/llama-server-buun -hf turboderp/Qwen3.8-27B-exl3 -ngl auto --fit on --ctx-size 262144 --port 11436
+$ llama-server -hf turboderp/Qwen3.8-27B-exl3 -ngl auto --fit on  # when buun is default llama-server build
+```
+
+Verify: `heimdall-gateway info | grep buun`, `cat ~/.local/state/heimdall-gateway/config.yaml | grep buun/bin/llama-server-buun`, `buun/bin/llama-server-buun --help 2>&1 | grep -qi exl3`.
+
 ## OpenAI-compatible API
 
 The default API is available at `http://127.0.0.1:11435`. If API HTTPS or
@@ -530,15 +554,15 @@ Metrics surface in three places: the OpenAI body (`usage` and `timings`),
 the `Activity` view at `:11436/api/metrics/activity`, and the upstream log.
 Each backend exposes a different subset:
 
-| Metric | llama.cpp (`llama-server`) | EXL3 (`exllama`) | vLLM (`vllm-server`) |
-|---|---|---|---|
-| Prompt tokens (`prompt_n` / `prompt_tokens`) | Yes | Yes | Yes (native `usage.prompt_tokens`) |
-| Generated tokens (`predicted_n` / `completion_tokens`) | Yes | Yes | Yes (native `usage.completion_tokens`) |
-| Prefill / prompt timing (`prompt_ms`, `prompt_per_second`) | Yes (measured) | Yes (measured via `perf_counter`, `timings.prompt_ms`) | No, timings not emitted (use native latency) |
-| Decode timing (`predicted_ms`, `predicted_per_second`) | Yes (measured) | Yes (measured, `timings.predicted_ms`) | No |
-| Cached tokens (`cache_n` / `cached_tokens`, `X-Cached-Tokens`) | Yes when `cache_prompt` active, else - | `-` unless real prefix cache present (`cached_tokens`/`cache_n` only when `cached_pages` > 0) | `-` (no prefix cache by default) |
-| Drafted / speculative (`draft_n`, `draft_n_accepted`, `draft_acc_tokens`) | Yes with MTP/speculative | Yes with MTP (`draft_model=mtp`), real `accepted+rejected` from `Job`, else `-` | Only with speculative config **and** flag `per_request_spec_decode_metrics` (see below) |
-| `slot print_timing` in journal | Yes (`slot print_timing` line) | Never | Never |
+| Metric | llama.cpp (`llama-server`) | EXL3 (`exllama` legacy) | EXL3 native (`buun`/`buun-llama-cpp`) | vLLM (`vllm-server`) |
+|---|---|---|---|---|
+| Prompt tokens (`prompt_n` / `prompt_tokens`) | Yes | Yes | Yes | Yes (native `usage.prompt_tokens`) |
+| Generated tokens (`predicted_n` / `completion_tokens`) | Yes | Yes | Yes | Yes (native `usage.completion_tokens`) |
+| Prefill / prompt timing (`prompt_ms`, `prompt_per_second`) | Yes (measured) | Yes (measured via `perf_counter`, `timings.prompt_ms`) | Yes (measured via `perf_counter`, `timings.prompt_ms` — same as exllama) | No, timings not emitted (use native latency) |
+| Decode timing (`predicted_ms`, `predicted_per_second`) | Yes (measured) | Yes (measured, `timings.predicted_ms`) | Yes (measured, `timings.predicted_ms`) | No |
+| Cached tokens (`cache_n` / `cached_tokens`, `X-Cached-Tokens`) | Yes when `cache_prompt` active, else - | `-` unless real prefix cache present (`cached_tokens`/`cache_n` only when `cached_pages` > 0) | `-` unless real prefix cache present (`cached_tokens`/`cache_n` only when `cached_pages` > 0) — same as exllama | `-` (no prefix cache by default) |
+| Drafted / speculative (`draft_n`, `draft_n_accepted`, `draft_acc_tokens`) | Yes with MTP/speculative | Yes with MTP (`draft_model=mtp`), real `accepted+rejected` from `Job`, else `-` | Yes with MTP (`draft_model=mtp`), real `accepted+rejected` from `Job`, else `-` — same as exllama | Only with speculative config **and** flag `per_request_spec_decode_metrics` (see below) |
+| `slot print_timing` in journal | Yes (`slot print_timing` line) | Never | Never | Never |
 
 Where the table shows `-`, the UI and `timings` correctly show `-` or omit
 the field. The gateway never synthesizes `Cached` or `Drafted` counts.
@@ -581,11 +605,11 @@ $ curl -s http://127.0.0.1:11436/api/metrics/activity | jq .
 ```
 
 Important: only `llama-server` processes emit `slot print_timing` lines.
-**EXL3 and vLLM never emit `slot print_timing`**. For those backends timing
+**EXL3 (exllama legacy and buun native) and vLLM never emit `slot print_timing`**. For those backends timing
 lives only in the response body `timings` object and the `Activity` view
 (`prompt_ms`, `predicted_ms`, `draft_n` when MTP/speculative is active).
-If you grep the journal and see no `print_timing` for an EXL3 or vLLM model,
-that is expected, check `timings` and `Activity` instead.
+If you grep the journal and see no `print_timing` for an EXL3 (buun/exllama) or vLLM model,
+that is expected, check `timings` and `Activity` instead. Buun metrics = exllama metrics (see table above).
 
 Runbook after changing the knob:
 

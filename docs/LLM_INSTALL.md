@@ -247,9 +247,29 @@ curl -s http://127.0.0.1:11435/v1/chat/completions \
 
 # MTP / speculative (cuando el repo indica draft)
 heimdall-gateway run -hf org/base-model:Q4_K_M --speculative -hf org/draft-model:IQ1_M
+
+# EXL3 / FP8 native (buun) — quant_method: exl3 + -hf, engine buun
+# 3.5bpw EXL3 -> EXL3_3/4 mix, FP8_BLOCK 128, BF16 (91 tipos vs 43 mainline)
+# Repo: turboderp/Qwen3.8-27B-EXL3 o Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw (safetensors dir)
+heimdall-gateway add -hf turboderp/Qwen3.8-27B-exl3 --engine buun
+heimdall-gateway run -hf turboderp/Qwen3.8-27B-exl3 --engine buun --auto
+# Direct native (sin gateway) — mismo flag que genera el gateway
+buun/bin/llama-server-buun -hf turboderp/Qwen3.8-27B-exl3 -ngl auto --fit on --ctx-size 262144 --port 11436
+llama-server -hf turboderp/Qwen3.8-27B-exl3 -ngl auto --fit on  # si buun es el build activo
 ```
 
 `--auto` hace probe de ctx real; `--skip-ctx` lo omite. `validate -hf ... --auto` valida sin servir.
+
+### EXL3 / FP8 native — tabla buun
+
+| Quant label | Loader buun | Notas |
+|---|---|---|
+| **3.5bpw EXL3 → EXL3_3/4 mix** | `quant_method: exl3` | `.safetensors` nativo (no GGUF), single file `Qwen3.8-27B-EXL3-3.5bpw.safetensors` en dir `/var/llamacpp_models/Qwen3.8-27B-EXL3-3.5bpw` |
+| **FP8_BLOCK 128** | `quant_method: exl3` | Block-wise FP8 128, tipo nativo buun |
+| **BF16** | `quant_method: exl3` | Safetensors BF16, no requiere quant GGUF |
+| **NVFP4 / FP8 misc** | `quant_method: exl3` (buun) o `vllm` | Buun para EXL3-native; vLLM para HF NVFP4 (`docs/VLLM-BETA.md`) |
+
+Defaults buun (`llamacpp_stack/bundle/llama_server_defaults.yaml:buun`): `cache_quant 4`, `grid_size 110`, `keep 40000`, `cache_ram 65536` — mismo que `qwen3.8-27b-EXL3` catalog entry (EXL3 3.5bpw → EXL3_3/4 mix). Instala con `--optionals buun` (`spiritbuun/buun-llama-cpp@c7f114d`, bin `buun/bin/llama-server-buun`). Verificar: `cat config.yaml | grep buun`, `buun/bin/llama-server-buun --help | grep -qi exl3`.
 
 ## 7. Ficheros clave (no editar `config.yaml` a mano)
 
@@ -271,12 +291,14 @@ heimdall-gateway config-keys --format json | jq '.logging.llama_swap'
 heimdall-gateway config-keys --format json | jq '.logging.requests_log'
 ```
 
-Verifica metricas por backend con:
+Verifica metricas por backend (buun = EXL3 native, mismos timings que exllama legacy) con:
 
 ```bash
 curl -s http://127.0.0.1:11436/api/metrics/activity | jq '.data[] | {model, tokens}'
 heimdall-gateway logs --lines 200 --journal | grep timing
-# llama.cpp -> slot print_timing presente; EXL3/vLLM -> sin print_timing es esperado, timing en timings/Activity
+# llama.cpp -> slot print_timing presente
+# buun (EXL3 native) / exllama legacy / vLLM -> sin print_timing es ESPERADO, timing en timings/Activity (prompt_ms, predicted_ms, draft_n con MTP)
+# buun: timings medidos via perf_counter igual que exllama; Cached "-" salvo cached_pages>0; Drafted con MTP (draft_model=mtp)
 ```
 
 ## 8. Errores comunes y que decir al usuario
@@ -284,8 +306,8 @@ heimdall-gateway logs --lines 200 --journal | grep timing
 *   **`502 upstream` / `Connection refused :11436`**: `llama-server` del modelo crasheo en load (OOM, ctx 262k en GPU pequena, draft MTP incompatible). Buscar `bundle_ref` en JSON 502 y `*_with_bundle` en log rotado `api-requests.log.YYYY-MM-DD[.partN]` + `api-raw-requests.log` (últimas 10 RAW, 1 MiB cap, fallback `/tmp`). `uv run heimdall-gateway logs --lines 200 --journal` trae journal + `nvidia-smi`. Bundle caps: journal 12k/nvidia 2k/HTTP 4000.
 *   **`model provider failed after retries` (Hermes)**: wrapper generico; ver `requests --lines 200` para `openai_chat_upstream_network_error` / `llamaswap_guard_backend_error`. Casi siempre router caido o modelo no cargado.
 *   **`context shown too small`**: `curl /v1/models | jq` tiene el real; cliente cacheo metadata vieja -> refrescar cliente o `update --auto`.
-*   **Sin `slot print_timing` en EXL3/vLLM**: es esperado. Solo `llama-server` emite `slot print_timing`. Para EXL3 y vLLM el timing vive en `timings` (`prompt_ms`/`predicted_ms`/`draft_n`) y en `curl :11436/api/metrics/activity`. No reportes como bug si `heimdall-gateway logs --journal | grep timing` no muestra `print_timing` para esos backends.
-*   **Metricas `Cached`/`Drafted` en `-`**: es esperado cuando no hay prefix-cache real o no hay MTP/speculative. EXL3 muestra `Cached -` salvo `cached_pages>0`; `Drafted -` sin `draft_model=mtp`. vLLM muestra `Drafted` solo con `per_request_spec_decode_metrics` activo y modelo speculative. No hay fabricacion.
+*   **Sin `slot print_timing` en EXL3 (exllama/buun)/vLLM**: es esperado. Solo `llama-server` emite `slot print_timing`. Para **buun (EXL3 native)**, exllama legacy y vLLM el timing vive en `timings` (`prompt_ms`/`predicted_ms`/`draft_n`) y en `curl :11436/api/metrics/activity`. No reportes como bug si `heimdall-gateway logs --journal | grep timing` no muestra `print_timing` para esos backends. Buun: `timings.prompt_ms`/`predicted_ms` medidos, `draft_n`/`draft_n_accepted` solo con MTP.
+*   **Metricas `Cached`/`Drafted` en `-`**: es esperado cuando no hay prefix-cache real o no hay MTP/speculative. **Buun** (igual que exllama) muestra `Cached -` salvo `cached_pages>0`; `Drafted -` sin `draft_model=mtp`. vLLM muestra `Drafted` solo con `per_request_spec_decode_metrics` activo y modelo speculative. No hay fabricacion. Para EXL3 nativo buun `cache_n 256` hits existen (ver T1 evidence 5 hits 256 en `qwen3.8-27b-EXL3`) cuando `cached_pages>0`.
 *   **`BrokenPipeError` en guard**: cliente cerro stream; no critico.
 *   **Instalacion colgada compilando `llama.cpp`**: tarda 10-20 min con CUDA; usa `--llama-cpp-mode prebuilt` si el usuario quiere rapido.
 *   **Permisos `system`**: el installer re-ejecuta con `sudo -E` automaticamente (`maybe_reexec_system_install`); no intentes `sudo` manual si el LLM no tiene `NOPASSWD`.

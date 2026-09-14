@@ -87,6 +87,24 @@ mtp_defaults:
   spec_draft_n_min: 0
   spec_draft_p_min: 0.75
 
+# buun (EXL3 native) — spiritbuun/buun-llama-cpp c7f114d
+# Native safetensors engine for EXL3 (+ FP8/BF16/NVFP4). Applied when
+# catalog entry has server_overrides.engine == "buun" (see T2 buun_install.py).
+# Quant: 3.5bpw EXL3 -> EXL3_3/4 mix, FP8_BLOCK 128, BF16 (91 types vs 43 mainline).
+# Loader expects quant_method: exl3 + --hf / -hf flag (not --model GGUF).
+# These are buun-tuned defaults; global llama_server_defaults remain the base
+# (no duplicar global — solo quirks EXL3 nativos).
+buun:
+  # EXL3 native quirks (mirrors qwen3.8-27b-EXL3 catalog entry)
+  cache_quant: 4
+  grid_size: 110
+  keep: 40000
+  cache_ram: 65536
+  quant_method: exl3
+  # FP8_BLOCK 128 / BF16 are model properties, not server flags — documented here for reference
+  fp8_block: 128
+  dtype: bf16
+
 # vLLM defaults are kept separate from llama.cpp flags. They are applied only
 # to catalog entries whose backend is `vllm`.
 vllm:
