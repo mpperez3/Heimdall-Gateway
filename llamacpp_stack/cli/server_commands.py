@@ -813,12 +813,15 @@ def build_llama_server_command(model, server_path: Path, *, port: str, host: str
         effective.pop("swa_full", None)
     effective.pop("replicas", None); effective.pop("placement", None)
     _engine = str(effective.pop("engine", None) or "").strip().lower().replace("_","-")
+    if _engine in {"buun-beta"}:
+        _engine = "buun"
     effective.pop("auto_performance", None); effective.pop("__family_defaults", None)
     effective.pop("speculative_defaults", None); effective.pop("mtp_defaults", None)
     for _sk in ("enabled","id_prefix","allow_multiple_variants"):
         effective.pop(_sk, None)
     if _engine not in {"exllama","exllamav3","exllama-v3","exllama3"}:
         effective.pop("cache_quant", None)
+        effective.pop("grid_size", None)
     if _engine in {"exllama","exllamav3","exllama-v3","exllama3"}:
         effective.pop("cache_type_k", None)
         effective.pop("cache_type_v", None)
@@ -924,7 +927,27 @@ def build_llama_server_command(model, server_path: Path, *, port: str, host: str
         if resolved_host and resolved_host not in {"0.0.0.0","::","[::]"}:
             vc.extend(["--host", resolved_host])
         return vc
-    cmd=[str(server_path),"--port",str(port)]
+    effective_server_path = server_path
+    s_path_str = str(server_path)
+    if _engine == "buun":
+        if "llama-server-buun" in s_path_str:
+            effective_server_path = s_path_str
+        else:
+            cand = Path(s_path_str).parent / "buun" / "bin" / "llama-server-buun"
+            effective_server_path = str(cand)
+    elif _engine == "beellama":
+        if "llama-server-beellama" in s_path_str:
+            effective_server_path = s_path_str
+        else:
+            cand = Path(s_path_str).parent / "beellama" / "bin" / "llama-server-beellama"
+            effective_server_path = str(cand)
+    elif _engine == "exllama":
+        if "llama-server-exllama" in s_path_str:
+            effective_server_path = s_path_str
+        else:
+            cand = Path(s_path_str).parent / "exllama" / "bin" / "llama-server-exllama"
+            effective_server_path = str(cand)
+    cmd=[str(effective_server_path),"--port",str(port)]
     if include_model_path:
         cmd.extend(["--model", str(model.local_path)])
     if not fit_enabled:

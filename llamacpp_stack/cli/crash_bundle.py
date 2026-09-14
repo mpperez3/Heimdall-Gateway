@@ -22,9 +22,10 @@ HTTP_BUNDLE_CAP = 4000  # used at call-site when embedding bundle in HTTP
 JOURNAL_TIMEOUT = 3.0
 NVIDIA_TIMEOUT = 3.0
 
-VALID_ENGINES = {"llama-server", "beellama", "vllm", "exllama", "llama-swap", "manager"}
+VALID_ENGINES = {"llama-server", "beellama", "buun", "vllm", "exllama", "llama-swap", "manager"}
 ENGINE_ALIASES = {
     "llama-server-beellama": "beellama",
+    "llama-server-buun": "buun",
 }
 
 
@@ -41,17 +42,16 @@ def _unavailable(exc: BaseException) -> str:
 def _detect_engine(engine_hint: str | None, cmdline: str | None) -> str:
     hint = (engine_hint or "").strip().lower()
     cl = (cmdline or "").lower()
-    # direct hint match first
     if hint in VALID_ENGINES:
-        # Normalize beellama variants: llama-server-beellama etc handled via cmdline too
         if hint == "beellama":
             return "beellama"
+        if hint == "buun":
+            return "buun"
         if hint in {"vllm", "exllama", "llama-swap", "manager", "llama-server"}:
-            # If cmdline contradicts hint, cmdline wins for beellama/vllm detection
-            # but preserve explicit manager
             if hint == "manager":
                 return "manager"
-            # Check cmdline for stronger signals
+            if "buun" in cl:
+                return "buun"
             if "beellama" in cl:
                 return "beellama"
             if "vllm" in cl:
@@ -61,7 +61,8 @@ def _detect_engine(engine_hint: str | None, cmdline: str | None) -> str:
             if "llama-swap" in cl:
                 return "llama-swap"
             return hint
-    # cmdline-based detection
+    if "buun" in cl:
+        return "buun"
     if "beellama" in cl:
         return "beellama"
     if "vllm" in cl:
@@ -70,10 +71,10 @@ def _detect_engine(engine_hint: str | None, cmdline: str | None) -> str:
         return "exllama"
     if "llama-swap" in cl:
         return "llama-swap"
-    # Also detect vllm entrypoints
     if "vllm.entrypoints" in cl or "vllm serve" in cl:
         return "vllm"
-    # fallback: if hint was beellama-like string
+    if hint and "buun" in hint:
+        return "buun"
     if hint and "beellama" in hint:
         return "beellama"
     if hint and "vllm" in hint:
@@ -82,7 +83,6 @@ def _detect_engine(engine_hint: str | None, cmdline: str | None) -> str:
         return "exllama"
     if hint and "llama-swap" in hint:
         return "llama-swap"
-    # default
     return "llama-server"
 
 

@@ -593,8 +593,15 @@ def render_llamaswap_config(
         engine = str((getattr(use_model, "server_overrides", {}) or {}).get("engine") or "").strip().lower().replace("_", "-")
         if engine in {"exllamav3", "exllama-v3", "exllama3"}:
             engine = "exllama"
+        if engine in {"buun-beta"}:
+            engine = "buun"
         effective_server_path = server_path
-        if engine == "beellama":
+        if engine == "buun":
+            candidate = Path(server_path).parent / "buun" / "bin" / "llama-server-buun"
+            if candidate.exists():
+                effective_server_path = str(candidate)
+                print(f"[buun] {use_model.model_id} -> {effective_server_path}", flush=True)
+        elif engine == "beellama":
             candidate = Path(server_path).parent / "beellama" / "bin" / "llama-server-beellama"
             if candidate.exists():
                 effective_server_path = str(candidate)
@@ -726,8 +733,15 @@ def ensure_replica_route_in_llamaswap_config(
         replica_engine = str((getattr(replica, "server_overrides", {}) or {}).get("engine") or "").strip().lower().replace("_", "-")
         if replica_engine in {"exllamav3", "exllama-v3", "exllama3"}:
             replica_engine = "exllama"
+        if replica_engine in {"buun-beta"}:
+            replica_engine = "buun"
         effective_replica_server_path = Path(server_path)
-        if replica_engine == "beellama":
+        if replica_engine == "buun":
+            cand = Path(server_path).parent / "buun" / "bin" / "llama-server-buun"
+            if cand.exists():
+                effective_replica_server_path = cand
+                print(f"[buun] {replica.model_id} -> {effective_replica_server_path}", flush=True)
+        elif replica_engine == "beellama":
             cand = Path(server_path).parent / "beellama" / "bin" / "llama-server-beellama"
             if cand.exists():
                 effective_replica_server_path = cand

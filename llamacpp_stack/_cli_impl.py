@@ -1997,6 +1997,8 @@ def _is_vllm_backend() -> bool:
 
 def _normalize_model_backend(value: object, filename: object = "", local_path: object = "") -> str:
     normalized = str(value or "").strip().lower().replace("_", "-")
+    if normalized in {"buun", "buun-beta"}:
+        return "buun"
     if normalized in {"exllama", "exlama", "exllamav3", "exllama-v3", "exllama-v3", "exllama3"}:
         return "exllama"
     if str(filename or "").strip().lower() == "hf-native":
@@ -2005,6 +2007,8 @@ def _normalize_model_backend(value: object, filename: object = "", local_path: o
     if local.is_dir() and not str(filename or "").lower().endswith(".gguf"):
         # Do not hardcode model names like exl3 here; backend is determined by explicit backend field only
         # See: keep model-specific names out of generic backend detection to avoid coupling
+        if normalized in {"buun", "buun-beta"}:
+            return "buun"
         if normalized in {"exllama", "exlama", "exllamav3", "exllama-v3", "exllama-v3", "exllama3"}:
             return "exllama"
         return "vllm"
@@ -3287,8 +3291,15 @@ def render_llamaswap_config(
         engine = str((getattr(use_model, "server_overrides", {}) or {}).get("engine") or "").strip().lower().replace("_", "-")
         if engine in {"exllamav3", "exllama-v3", "exllama3"}:
             engine = "exllama"
+        if engine in {"buun-beta"}:
+            engine = "buun"
         effective_server_path = server_path
-        if engine == "beellama":
+        if engine == "buun":
+            candidate = Path(server_path).parent / "buun" / "bin" / "llama-server-buun"
+            if candidate.exists():
+                effective_server_path = str(candidate)
+                print(f"[buun] {use_model.model_id} -> {effective_server_path}", flush=True)
+        elif engine == "beellama":
             candidate = Path(server_path).parent / "beellama" / "bin" / "llama-server-beellama"
             if candidate.exists():
                 effective_server_path = str(candidate)
@@ -3436,8 +3447,15 @@ def ensure_replica_route_in_llamaswap_config(
         replica_engine = str((getattr(replica, "server_overrides", {}) or {}).get("engine") or "").strip().lower().replace("_", "-")
         if replica_engine in {"exllamav3", "exllama-v3", "exllama3"}:
             replica_engine = "exllama"
+        if replica_engine in {"buun-beta"}:
+            replica_engine = "buun"
         effective_replica_server_path = Path(server_path)
-        if replica_engine == "beellama":
+        if replica_engine == "buun":
+            cand = Path(server_path).parent / "buun" / "bin" / "llama-server-buun"
+            if cand.exists():
+                effective_replica_server_path = cand
+                print(f"[buun] {replica.model_id} -> {effective_replica_server_path}", flush=True)
+        elif replica_engine == "beellama":
             cand = Path(server_path).parent / "beellama" / "bin" / "llama-server-beellama"
             if cand.exists():
                 effective_replica_server_path = cand
@@ -4425,6 +4443,8 @@ def build_llama_server_command(
     effective.pop("replicas", None)
     effective.pop("placement", None)
     _engine = str(effective.pop("engine", None) or "").strip().lower().replace("_", "-")
+    if _engine in {"buun-beta"}:
+        _engine = "buun"
     effective.pop("auto_performance", None)
     effective.pop("__family_defaults", None)
     # speculative_defaults is internal config for orchestration, not a
@@ -4445,6 +4465,7 @@ def build_llama_server_command(
     # emit it so the wrapper picks it up via parse_known_args.
     if _engine not in {"exllama", "exllamav3", "exllama-v3", "exllama3"}:
         effective.pop("cache_quant", None)
+        effective.pop("grid_size", None)
 
     # Internal escape hatch for generated replicas: tensor_split must be relative
     # to CUDA_VISIBLE_DEVICES, not normalized against all host GPUs.
@@ -7857,10 +7878,15 @@ def _model_candidate_files(model: ManagedModel) -> list[Path]:
         filename = Path(str(getattr(model, "filename", "") or "")).name
         if "-00001-of-" in filename and local_path.parent.exists():
             prefix = filename.split("-00001-of-")[0]
-            for pattern in (f"{prefix}-*-of-*.gguf", f"{prefix}-*-of-*.gguf.part"):
-                for shard in local_path.parent.glob(pattern):
-                    if shard.is_file():
-                        candidates.add(shard)
+            for suffix in (".gguf", ".safetensors", ".bin"):
+                for part in ("", ".part"):
+                    pattern = f"{prefix}-*-of-*{suffix}{part}"
+                    for shard in local_path.parent.glob(pattern):
+                        if shard.is_file():
+                            candidates.add(shard)
+            if not candidates:
+                candidates.add(local_path)
+                candidates.add(local_path.with_name(local_path.name + ".part"))
         else:
             candidates.add(local_path)
             candidates.add(local_path.with_name(local_path.name + ".part"))
@@ -8081,7 +8107,7 @@ def _orphan_file_aliases(path: Path) -> set[str]:
     aliases: set[str] = set()
     candidates = [path.name, path.stem]
     for value in candidates:
-        base = re.sub(r"(?i)\.gguf$", "", value)
+        base = re.sub(r"(?i)\.(gguf|safetensors|bin)(\.part)?$", "", value)
         aliases.add(base)
         aliases.add(re.sub(r"[-._]?\d{5}-of-\d{5}$", "", base))
         aliases.add(re.sub(r"[-._]?\d+-of-\d+$", "", base))
@@ -8093,7 +8119,7 @@ def _remove_orphan_files_by_reference(reference: str, models_dir: Path, progress
     if not canonical_reference:
         return 0
 
-    patterns = ("*.gguf", "*.gguf.part")
+    patterns = ("*.gguf", "*.gguf.part", "*.safetensors", "*.safetensors.part", "*.bin", "*.bin.part")
     deleted = 0
     for pattern in patterns:
         for file_path in models_dir.rglob(pattern):
