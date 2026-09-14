@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
+import warnings
+
 import yaml
 
 
@@ -5105,6 +5107,16 @@ def _ensure_basic_server_config(layout: InstallLayout) -> None:
         with open(config_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(ui_config, f, default_flow_style=False, sort_keys=False)
         print(f"Restored and verified metadata (aliases, descriptions) for {len(catalog_raw)} models in UI configuration.")
+
+    for _model in catalog_raw:
+        if not isinstance(_model, dict):
+            continue
+        _over = _model.get("server_overrides") if isinstance(_model.get("server_overrides"), dict) else {}
+        if str(_over.get("engine") or "").strip().lower() == "exllama":
+            _mid = str(_model.get("model_id") or _model.get("repo_id") or "unknown")
+            warnings.warn(f"engine exllama deprecated, use buun for EXL3 ({_mid})", DeprecationWarning, stacklevel=2)
+            print(f"[!] DeprecationWarning: engine exllama deprecated, use buun for EXL3 ({_mid})", file=sys.stderr)
+            break
 
 
 def maybe_rerun_auto_ctx(layout: InstallLayout, install_services: bool, dry_run: bool, args: argparse.Namespace) -> None:

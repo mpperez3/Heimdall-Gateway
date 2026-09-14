@@ -19,8 +19,10 @@ import os
 import pwd
 import re
 import socket
+import sys
 import threading
 import time
+import warnings
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -338,6 +340,13 @@ def sync_config_from_server_config_for_startup(args) -> str:
     catalog, catalog_diag = load_catalog_with_diagnostics(args.catalog, _args_server_config_path(args))
     if catalog_diag:
         raise RuntimeError(f"Refusing startup sync from an invalid catalog: {catalog_diag}")
+    for _entry in catalog:
+        _so = getattr(_entry, "server_overrides", {}) or {}
+        if isinstance(_so, dict) and str(_so.get("engine") or "").strip().lower() == "exllama":
+            _mid = str(getattr(_entry, "model_id", "") or "unknown")
+            warnings.warn(f"engine exllama deprecated, use buun for EXL3 ({_mid})", DeprecationWarning, stacklevel=2)
+            print(f"[!] DeprecationWarning: engine exllama deprecated, use buun for EXL3 ({_mid})", file=sys.stderr, flush=True)
+            break
     replica_defaults = resolve_global_replica_config(args)
     render_llamaswap_config(
         catalog,

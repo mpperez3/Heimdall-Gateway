@@ -183,3 +183,26 @@ def daemon_handler_for_update(req: dict, send_event, sock_in) -> int:
         daemon_executor=_update_models_locally,
         executor_needs_callbacks=False,
     )
+
+
+_SHARDED_EXL3_SUFFIXES = (".safetensors", ".safetensors.part", ".bin", ".bin.part")
+_SHARDED_GGUF_SUFFIXES = (".gguf", ".gguf.part")
+
+
+def _is_sharded_exl3_artifact(path: Path) -> bool:
+    name = path.name.lower()
+    if not any(name.endswith(suf) for suf in _SHARDED_EXL3_SUFFIXES):
+        return False
+    return "-of-" in name and bool(__import__("re").search(r"-\d{5}-of-\d{5}(\.safetensors|\.bin)", name))
+
+
+def remove_orphans_with_exl3_support(args, progress_callback=None) -> int:
+    from llamacpp_stack.cli import find_orphan_model_files as _find_orphans
+    from llamacpp_stack.cli import remove_orphan_models as _remove_orphans
+
+    catalog = __import__("llamacpp_stack.cli", fromlist=["load_catalog"]).load_catalog(args.catalog, args.server_config)
+    orphans = _find_orphans(catalog, Path(args.models_dir))
+    exl3_orphans = [p for p in orphans if _is_sharded_exl3_artifact(p)]
+    if exl3_orphans and progress_callback:
+        progress_callback({"type": "info", "message": f"EXL3 sharded artifacts detected: {len(exl3_orphans)} (model-00001-of-00002.safetensors) — handled like GGUF shards, requires --yes"})
+    return _remove_orphans(args, progress_callback=progress_callback)

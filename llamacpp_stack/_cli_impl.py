@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import base64
 import errno
+import warnings
 import hashlib
 import hmac
 import html
@@ -4807,6 +4808,91 @@ def persist_server_config(args) -> None:
 
 
 
+def _is_buun_available(args=None) -> bool:
+    candidates = [
+        Path.home() / ".local" / "opt" / "heimdall-gateway" / "buun" / "bin" / "llama-server-buun",
+        Path("/opt/heimdall-gateway/buun/bin/llama-server-buun"),
+        Path("/var/lib/heimdall-gateway/buun/bin/llama-server-buun"),
+    ]
+    try:
+        if args is not None and getattr(args, "llama_server", None):
+            base = Path(str(getattr(args, "llama_server")))
+            candidates.append(base.parent / "buun" / "bin" / "llama-server-buun")
+            candidates.append(base.parent.parent / "buun" / "bin" / "llama-server-buun")
+    except Exception:
+        pass
+    for cand in candidates:
+        try:
+            if cand.exists() and cand.is_file():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _is_exl3_model_entry(entry: dict) -> bool:
+    quant = str(entry.get("quant") or "").strip().lower()
+    if "exl3" in quant:
+        return True
+    fn = str(entry.get("filename") or "").strip().lower()
+    if "exl3" in fn:
+        return True
+    repo = str(entry.get("repo_id") or "").strip().lower()
+    if "exl3" in repo:
+        return True
+    so = entry.get("server_overrides")
+    if isinstance(so, dict):
+        qm = str(so.get("quant_method") or "").strip().lower()
+        if qm == "exl3":
+            return True
+    return False
+
+
+def _migrate_exllama_to_buun_catalog(args) -> tuple[bool, str]:
+    catalog_path = Path(getattr(args, "catalog", DEFAULT_CATALOG_PATH)) if getattr(args, "catalog", None) else Path(DEFAULT_CATALOG_PATH)
+    if not catalog_path.exists():
+        return False, ""
+    try:
+        raw_text = catalog_path.read_text(encoding="utf-8")
+        payload = json.loads(raw_text) if raw_text.strip() else []
+    except Exception:
+        return False, ""
+    if not isinstance(payload, list):
+        return False, ""
+    changed_any = False
+    messages: list[str] = []
+    buun_available = _is_buun_available(args)
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        so = entry.get("server_overrides")
+        if not isinstance(so, dict):
+            continue
+        eng = str(so.get("engine") or "").strip().lower()
+        if eng != "exllama":
+            continue
+        mid = str(entry.get("model_id") or entry.get("repo_id") or "unknown")
+        warn_msg = f"engine exllama deprecated, use buun for EXL3 ({mid})"
+        warnings.warn(warn_msg, DeprecationWarning, stacklevel=2)
+        print(f"[!] DeprecationWarning: {warn_msg}", file=sys.stderr)
+        messages.append(warn_msg)
+        if _is_exl3_model_entry(entry):
+            if buun_available:
+                so["engine"] = "buun"
+                changed_any = True
+                print(f"[*] Migrated {mid}: server_overrides.engine exllama -> buun", file=sys.stderr)
+            else:
+                print(f"[!] buun binary not found; keeping {mid} on exllama (install with --optionals buun)", file=sys.stderr)
+    if changed_any:
+        try:
+            catalog_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            _clear_catalog_cache(catalog_path)
+        except Exception as exc:
+            print(f"[!] Failed to write migrated catalog: {exc}", file=sys.stderr)
+            return False, "; ".join(messages)
+    return changed_any, "; ".join(messages)
+
+
 def _rewrite_legacy_api_https_paths(payload: dict[str, object], server_config_path: Path) -> bool:
     https = payload.get("api_https")
     if not isinstance(https, dict):
@@ -4858,9 +4944,10 @@ def migrate_server_config(args) -> int:
     before = path.read_text(encoding="utf-8") if path.exists() else ""
     before_summary = _server_config_summary_for_print(before)
     persist_server_config(args)
+    catalog_changed, _ = _migrate_exllama_to_buun_catalog(args)
     after = path.read_text(encoding="utf-8") if path.exists() else ""
     after_summary = _server_config_summary_for_print(after)
-    changed = before != after
+    changed = (before != after) or catalog_changed
     print(f"Server config migrated: {path} ({'changed' if changed else 'already current'})")
     print("Before:", json.dumps(before_summary, sort_keys=True))
     print("After: ", json.dumps(after_summary, sort_keys=True))
