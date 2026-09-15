@@ -15,7 +15,8 @@ _CACHE_TYPE_ALIASES = {
     "q8": "q8_0", "8bit": "q8_0", "int8": "q8_0", "q4": "q4_0", "4bit": "q4_0", "int4": "q4_0",
     "fp16": "f16", "float16": "f16", "fp32": "f32", "float32": "f32",
 }
-_VALID_CACHE_TYPES = {"f32","f16","bf16","q8_0","q4_0","q4_1","iq4_nl","q5_0","q5_1","kvarn2","kvarn3","kvarn4","kvarn5","kvarn6","kvarn8","karn2","karn3","karn4","karn5","karn6","karn8"}
+_VALID_CACHE_TYPES = {"f32","f16","bf16","q8_0","q4_0","q4_1","iq4_nl","q5_0","q5_1","kvarn2","kvarn3","kvarn4","kvarn5","kvarn6","kvarn8","karn2","karn3","karn4","karn5","karn6","karn8","turbo8","turbo4","turbo3","turbo2","turbo3_tcq","turbo2_tcq","turbo1_tcq","vbr"}
+_TURBO_CACHE_TYPES = {"turbo8","turbo4","turbo3","turbo2","turbo3_tcq","turbo2_tcq","turbo1_tcq","vbr"}
 def _normalize_cache_type_value(value: object) -> str | None:
     text = str(value or "").strip().lower()
     if not text:
@@ -274,12 +275,17 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
             bv = _normalize_bool_flag(raw_val)
             normalized[key] = ("on" if bv else "off") if bv is not None else str(raw_val).strip()
             continue
-        if key in {"split_mode","cache_type_k","cache_type_v","host","model_draft","hf_repo_draft","reasoning_format","reasoning_budget_message","chat_template_file","chat_template","device","chat_template_kwargs"}:
-            if key in {"cache_type_k","cache_type_v"}:
-                v = _normalize_cache_type_value(raw_val)
-                if v is not None:
-                    normalized[key] = v
-                continue
+        if key in {"cache_type","cache_type_k","cache_type_v"}:
+            v = _normalize_cache_type_value(raw_val)
+            if v is not None:
+                normalized[key] = v
+            continue
+        if key in {"vbr_floor","vbr_entry","vbr_codec","vbr_vram","vbr_vram_budget","vbr_min_bits","vbr_min_bpv"}:
+            sval = str(raw_val or "").strip()
+            if sval:
+                normalized[key] = sval.lower() if key in {"vbr_floor","vbr_entry"} else sval
+            continue
+        if key in {"split_mode","host","model_draft","hf_repo_draft","reasoning_format","reasoning_budget_message","chat_template_file","chat_template","device","chat_template_kwargs"}:
             if key == "chat_template_kwargs":
                 if isinstance(raw_val, dict):
                     normalized[key] = json.dumps(raw_val, ensure_ascii=False, separators=(",",":"))
@@ -827,6 +833,16 @@ def build_llama_server_command(model, server_path: Path, *, port: str, host: str
         effective.pop("cache_type_v", None)
         effective.pop("cache_type_k_draft", None)
         effective.pop("cache_type_v_draft", None)
+    if _engine == "buun":
+        _ct = str(effective.get("cache_type") or "").strip().lower()
+        if _ct in _TURBO_CACHE_TYPES:
+            effective.pop("cache_type_k", None)
+            effective.pop("cache_type_v", None)
+            effective.pop("cache_type_k_draft", None)
+            effective.pop("cache_type_v_draft", None)
+        if _ct != "vbr":
+            for _vk in ("vbr_floor","vbr_entry","vbr_codec","vbr_vram","vbr_vram_budget","vbr_min_bits","vbr_min_bpv"):
+                effective.pop(_vk, None)
     replica_tensor_split = effective.pop("__replica_tensor_split", None)
     try:
         cf = _get_cli_file()

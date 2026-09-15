@@ -618,6 +618,24 @@ def render_llamaswap_config(
             server_defaults=resolved_defaults,
             vllm_defaults=resolved_vllm_defaults,
         )
+        try:
+            ct = str((getattr(use_model, "server_overrides", {}) or {}).get("cache_type") or "").strip().lower()
+            if engine == "buun" and ct in {"turbo8","turbo4","turbo3","turbo2","turbo3_tcq","turbo2_tcq","turbo1_tcq","vbr"}:
+                filtered: list[str] = []
+                skip = False
+                for idx, part in enumerate(cmd):
+                    if skip:
+                        skip = False
+                        continue
+                    if part in {"--cache-type-k","--cache-type-v"}:
+                        nxt = cmd[idx+1] if idx+1 < len(cmd) else ""
+                        if nxt.strip().lower() == "f16":
+                            skip = True
+                            continue
+                    filtered.append(part)
+                cmd = filtered
+        except Exception:
+            pass
         if public_base_model_id is not None:
             cmd = _command_with_cuda_visible_devices(cmd, replica_gpu_set)
             replica_group_members.append(m.model_id)
@@ -757,6 +775,22 @@ def ensure_replica_route_in_llamaswap_config(
             server_defaults=resolved_defaults,
             vllm_defaults=_resolve_vllm(),
         )
+        try:
+            ct2 = str((getattr(replica, "server_overrides", {}) or {}).get("cache_type") or "").strip().lower()
+            if replica_engine == "buun" and ct2 in {"turbo8","turbo4","turbo3","turbo2","turbo3_tcq","turbo2_tcq","turbo1_tcq","vbr"}:
+                filtered2: list[str] = []
+                skip2 = False
+                for j, part in enumerate(cmd):
+                    if skip2:
+                        skip2 = False
+                        continue
+                    if part in {"--cache-type-k","--cache-type-v"} and j+1 < len(cmd) and cmd[j+1].strip().lower() == "f16":
+                        skip2 = True
+                        continue
+                    filtered2.append(part)
+                cmd = filtered2
+        except Exception:
+            pass
         cmd = _command_with_cuda_visible_devices(cmd, gpu_set)
         models[rid] = {
             "cmd": " ".join(shell_quote(part) for part in cmd),
