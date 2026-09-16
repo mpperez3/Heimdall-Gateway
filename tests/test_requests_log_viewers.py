@@ -36,7 +36,7 @@ def _make_rotated_files(base: Path, dates_and_contents: list[tuple[str, list[str
 
 class TestCandidateGlob:
     def test_glob_enumerates_dated(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG", str(tmp_path / "api-requests.log"))
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG", str(tmp_path / "api-requests.log"))
         base = tmp_path / "api-requests.log"
         dates = ["2026-09-09", "2026-09-10", "2026-09-11"]
         for d in dates:
@@ -83,7 +83,7 @@ class TestCandidateGlob:
         other = tmp_path / "other" / "api-requests.log"
         other.parent.mkdir(parents=True, exist_ok=True)
         (other.parent / "api-requests.log.2026-09-12").write_text("other\n")
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG", str(other))
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG", str(other))
         paths = _candidate_request_log_paths(explicit)
         assert any(str(p).startswith(str(explicit.parent)) for p in paths)
         assert any("2026-09-10" in str(p) for p in paths)
@@ -92,7 +92,7 @@ class TestCandidateGlob:
     def test_candidate_none_includes_tmp_fallback(self, tmp_path, monkeypatch):
         # Ensure fallback tmp is included when no rotated elsewhere
         fallback = tmp_path / "fallback.log"
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK", str(fallback))
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_FALLBACK", str(fallback))
         fallback_dated = tmp_path / "fallback.log.2026-09-11"
         # fallback base parent is tmp_path, prefix is fallback.log
         # But _candidate with None will look at DEFAULT etc. Not fallback's prefix?
@@ -206,7 +206,7 @@ class TestShowLogs:
         base = tmp_path / "api-requests.log"
         p = tmp_path / "api-requests.log.2026-09-11"
         p.write_text("entry1\n")
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG", str(base))
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG", str(base))
         args = type("A", (), {"path": str(base), "lines": 5, "since": None, "journal": False})()
         rc = show_logs(args)
         assert rc == 0
@@ -232,7 +232,14 @@ class TestBuildInfoText:
         text = build_info_text(None)
         assert "api-requests.log.YYYY-MM-DD" in text
         assert "rotado diario, 3 días" in text
-        # Should not contain single file pattern without date
-        # The old pattern was DEFAULT_REQUESTS_LOG_PATH without suffix
-        # New should contain .YYYY-MM-DD
         assert "API Requests Log:" in text
+
+
+def test_legacy_heimdall_requests_log_env_fallback(tmp_path, monkeypatch):
+    from llamacpp_stack._cli_impl import _candidate_request_log_paths
+
+    legacy = tmp_path / "legacy-viewer.log"
+    legacy_key = "HEIMDALL_GATEWAY_REQUESTS_LOG"
+    monkeypatch.setenv(legacy_key, str(legacy))
+    candidates = _candidate_request_log_paths(None)
+    assert any(str(c).startswith(str(legacy)) for c in candidates) or legacy in candidates

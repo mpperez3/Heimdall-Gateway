@@ -328,7 +328,7 @@ class InstallHelpersTest(unittest.TestCase):
             try:
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=3) as response:
                     body = response.read().decode("utf-8")
-                self.assertIn("Heimdall Gateway API", body)
+                self.assertIn("LLM Server API", body)
                 self.assertIn("secret-local", body)
                 self.assertIn("/v1/models", body)
                 self.assertIn(str(server_config), body)
@@ -453,8 +453,8 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertTrue(auth["enabled"])
             self.assertTrue(str(auth["api_key"]).startswith("lcsk_"))
             self.assertTrue(https["enabled"])
-            self.assertTrue(str(https["cert_file"]).endswith("heimdall-gateway-api.crt"))
-            self.assertTrue(str(https["key_file"]).endswith("heimdall-gateway-api.key"))
+            self.assertTrue(str(https["cert_file"]).endswith("llm-server-api.crt"))
+            self.assertTrue(str(https["key_file"]).endswith("llm-server-api.key"))
 
 
 
@@ -1088,10 +1088,11 @@ class InstallHelpersTest(unittest.TestCase):
 
     def test_resolve_llama_cpp_ref_prompts_for_specific_commit(self) -> None:
         with (
-            mock.patch.dict("os.environ", {"HEIMDALL_GATEWAY_LLAMA_CPP_REF_PROMPTED": ""}, clear=False),
+            mock.patch.dict("os.environ", {"LLM_SERVER_LLAMA_CPP_REF_PROMPTED": "", "HEIMDALL_GATEWAY_LLAMA_CPP_REF_PROMPTED": ""}, clear=False),
             mock.patch("sys.stdin.isatty", return_value=True),
             mock.patch("builtins.input", side_effect=["2", "e8023568d05ffdb9d0ac65695c521ea7e72c6b75"]),
         ):
+            os.environ.pop("LLM_SERVER_LLAMA_CPP_REF_PROMPTED", None)
             os.environ.pop("HEIMDALL_GATEWAY_LLAMA_CPP_REF_PROMPTED", None)
             self.assertEqual(
                 resolve_llama_cpp_ref(None, "source"),
@@ -1106,7 +1107,7 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertEqual(resolve_llama_cpp_ref(None, "source"), "")
 
     def test_resolve_llama_cpp_ref_uses_env_default(self) -> None:
-        with mock.patch.dict("os.environ", {"HEIMDALL_GATEWAY_LLAMA_CPP_REF": "abc123"}, clear=False):
+        with mock.patch.dict("os.environ", {"LLM_SERVER_LLAMA_CPP_REF": "abc123"}, clear=False):
             self.assertEqual(resolve_llama_cpp_ref(None, "source"), "abc123")
 
     def test_build_llama_cpp_from_source_passes_cuda_compiler(self) -> None:
@@ -1292,16 +1293,16 @@ class InstallHelpersTest(unittest.TestCase):
             api_key_file="",
         )
         dummy_layout = Namespace(
-            install_root=Path("/opt/heimdall-gateway"),
-            state_dir=Path("/var/lib/heimdall-gateway"),
+            install_root=Path("/opt/llm-server"),
+            state_dir=Path("/var/lib/llm-server"),
             models_dir=Path("/models/llamacpp"),
             public_host="0.0.0.0",
             public_port=11436,
             mode="system",
-            config_dir=Path("/etc/heimdall-gateway"),
+            config_dir=Path("/etc/llm-server"),
             bin_dir=Path("/usr/local/bin"),
-            run_dir=Path("/run/heimdall-gateway"),
-            runtime_venv=Path("/opt/heimdall-gateway/venv"),
+            run_dir=Path("/run/llm-server"),
+            runtime_venv=Path("/opt/llm-server/venv"),
         )
         with (
             mock.patch("llamacpp_stack.install.resolve_install_mode", return_value="system"),
@@ -1344,11 +1345,11 @@ class InstallHelpersTest(unittest.TestCase):
         )
         models_dir = Path("/workvols/models")
         layout = Namespace(
-            install_root=Path("/opt/heimdall-gateway"),
-            state_dir=Path("/var/lib/heimdall-gateway"), models_dir=models_dir,
+            install_root=Path("/opt/llm-server"),
+            state_dir=Path("/var/lib/llm-server"), models_dir=models_dir,
             public_host="0.0.0.0", public_port=11436, mode="system",
-            config_dir=Path("/etc/heimdall-gateway"), bin_dir=Path("/usr/local/bin"),
-            run_dir=Path("/run/heimdall-gateway"), runtime_venv=Path("/opt/heimdall-gateway/venv"),
+            config_dir=Path("/etc/llm-server"), bin_dir=Path("/usr/local/bin"),
+            run_dir=Path("/run/llm-server"), runtime_venv=Path("/opt/llm-server/venv"),
         )
         with mock.patch("llamacpp_stack.install.resolve_install_mode", return_value="system"), \
              mock.patch("llamacpp_stack.install.existing_public_host", return_value="0.0.0.0"), \
@@ -1697,7 +1698,7 @@ class InstallHelpersTest(unittest.TestCase):
             mock.patch("builtins.input", side_effect=["1", "2", "e8023568"]),
         ):
             self.assertEqual(resolve_llama_cpp_mode(None), "source")
-            self.assertEqual(os.environ.get("HEIMDALL_GATEWAY_LLAMA_CPP_REF"), "e8023568")
+            self.assertEqual(os.environ.get("LLM_SERVER_LLAMA_CPP_REF"), "e8023568")
 
     def test_resolve_llama_cpp_ref_does_not_reprompt_after_latest_choice(self) -> None:
         with (
@@ -1917,16 +1918,16 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertIn("ps", help_text)
         self.assertIn("requests [-n LINES]", help_text)
         self.assertIn("info", help_text)
-        self.assertIn("Example: heimdall-gateway add", help_text)
-        self.assertIn("Example: heimdall-gateway run", help_text)
-        self.assertIn("Example: heimdall-gateway remove", help_text)
-        self.assertIn("Example: heimdall-gateway rm", help_text)
-        self.assertIn("Example: heimdall-gateway update", help_text)
-        self.assertIn("Example: heimdall-gateway validate", help_text)
-        self.assertIn("Example: heimdall-gateway daemon", help_text)
-        self.assertIn("Example: heimdall-gateway list", help_text)
-        self.assertIn("Example: heimdall-gateway ps", help_text)
-        self.assertIn("Example: heimdall-gateway requests", help_text)
+        self.assertIn("Example: llm-server add", help_text)
+        self.assertIn("Example: llm-server run", help_text)
+        self.assertIn("Example: llm-server remove", help_text)
+        self.assertIn("Example: llm-server rm", help_text)
+        self.assertIn("Example: llm-server update", help_text)
+        self.assertIn("Example: llm-server validate", help_text)
+        self.assertIn("Example: llm-server daemon", help_text)
+        self.assertIn("Example: llm-server list", help_text)
+        self.assertIn("Example: llm-server ps", help_text)
+        self.assertIn("Example: llm-server requests", help_text)
         self.assertIn("For endpoints/runtime/service/config details run", help_text)
         self.assertNotIn("Default endpoints:", help_text)
         self.assertNotIn("Installed versions:", help_text)
@@ -1941,7 +1942,7 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertFalse(help_text.startswith("=" * 72))
         self.assertNotIn("llama.cpp  SuperServer", help_text)
         self.assertNotRegex(help_text, r"(?m)^\s*llamacpp-superserver v\d")
-        self.assertRegex(help_text, r"usage: heimdall-gateway")
+        self.assertRegex(help_text, r"usage: llm-server")
         self.assertIn("info", help_text)
         self.assertNotIn("llama-swap-guard", help_text)
         self.assertNotIn("==SUPPRESS==", help_text)
@@ -1952,10 +1953,10 @@ class InstallHelpersTest(unittest.TestCase):
             public_port=11436,
             api_port=11435,
             models_dir=Path("/models/llamacpp"),
-            config=Path("/var/lib/heimdall-gateway/config.yaml"),
-            catalog=Path("/var/lib/heimdall-gateway/catalog.json"),
-            server_config=Path("/etc/heimdall-gateway/conf.json"),
-            llama_server=Path("/opt/heimdall-gateway/llama-server"),
+            config=Path("/var/lib/llm-server/config.yaml"),
+            catalog=Path("/var/lib/llm-server/catalog.json"),
+            server_config=Path("/etc/llm-server/conf.json"),
+            llama_server=Path("/opt/llm-server/llama-server"),
             idle_ttl=300,
         )
         with (
@@ -1964,9 +1965,9 @@ class InstallHelpersTest(unittest.TestCase):
             mock.patch(
                 "llamacpp_stack.cli.service_commands_for_mode",
                 return_value=(
-                    "sudo systemctl start heimdall-gateway-manager heimdall-gateway-router",
-                    "sudo systemctl status heimdall-gateway-manager heimdall-gateway-router",
-                    "sudo systemctl restart heimdall-gateway-manager heimdall-gateway-router",
+                    "sudo systemctl start llm-server-manager llm-server-router",
+                    "sudo systemctl status llm-server-manager llm-server-router",
+                    "sudo systemctl restart llm-server-manager llm-server-router",
                 ),
             ),
             mock.patch(
@@ -1993,12 +1994,12 @@ class InstallHelpersTest(unittest.TestCase):
             info_text = build_info_text(args)
 
         self.assertIn("Default endpoints:", info_text)
-        self.assertIn("Heimdall Gateway API:       http://0.0.0.0:11435", info_text)
+        self.assertIn("LLM Server API:       http://0.0.0.0:11435", info_text)
         self.assertIn("Installed versions:", info_text)
         self.assertIn("llama.cpp:           b8808", info_text)
         self.assertIn("llama-swap:          v202", info_text)
         self.assertIn("Runtime info:", info_text)
-        self.assertIn("Install root:        /opt/heimdall-gateway", info_text)
+        self.assertIn("Install root:        /opt/llm-server", info_text)
         self.assertIn("Models dir:          /models/llamacpp", info_text)
         self.assertIn("Service management:", info_text)
         self.assertIn("Install mode:        system", info_text)
@@ -2518,15 +2519,15 @@ class InstallHelpersTest(unittest.TestCase):
         with mock.patch.dict(
             os.environ,
             {
-                "HEIMDALL_GATEWAY_NCCL_ROOT": "/opt/heimdall-gateway/nccl",
+                "LLM_SERVER_NCCL_ROOT": "/opt/llm-server/nccl",
                 "LD_LIBRARY_PATH": "/existing/lib",
             },
             clear=True,
         ):
             env = _probe_runtime_env()
         self.assertIsNotNone(env)
-        self.assertIn("/opt/heimdall-gateway/nccl/lib64", env["LD_LIBRARY_PATH"])
-        self.assertIn("/opt/heimdall-gateway/nccl/lib", env["LD_LIBRARY_PATH"])
+        self.assertIn("/opt/llm-server/nccl/lib64", env["LD_LIBRARY_PATH"])
+        self.assertIn("/opt/llm-server/nccl/lib", env["LD_LIBRARY_PATH"])
         self.assertIn("/existing/lib", env["LD_LIBRARY_PATH"])
 
     def test_print_install_summary_invokes_help_when_command_exists(self) -> None:
@@ -3890,7 +3891,15 @@ class InstallHelpersTest(unittest.TestCase):
                 ),
             ):
                 self.assertTrue(stop_systemd_units(layout, dry_run=False))
-            run_mock.assert_called_once_with(["systemctl", "stop", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME])
+            self.assertEqual(run_mock.call_count, 2)
+            self.assertEqual(
+                run_mock.call_args_list[0],
+                mock.call(["systemctl", "stop", MANAGER_SERVICE_NAME, SWAP_SERVICE_NAME, "heimdall-gateway-manager.service", "heimdall-gateway-router.service"]),
+            )
+            self.assertEqual(
+                run_mock.call_args_list[1],
+                mock.call(["systemctl", "disable", "heimdall-gateway-manager.service", "heimdall-gateway-router.service"]),
+            )
 
     def test_update_config_root_falls_back_to_local_when_manager_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4616,20 +4625,20 @@ class InstallHelpersTest(unittest.TestCase):
     def test_desired_models_dir_owner_uses_service_identity_for_system_mode(self) -> None:
         layout = InstallLayout(
             mode="system",
-            state_dir=Path("/var/lib/heimdall-gateway"),
-            bin_dir=Path("/opt/heimdall-gateway/bin"),
-            install_root=Path("/opt/heimdall-gateway"),
-            cuda_root=Path("/opt/heimdall-gateway/cuda"),
+            state_dir=Path("/var/lib/llm-server"),
+            bin_dir=Path("/opt/llm-server/bin"),
+            install_root=Path("/opt/llm-server"),
+            cuda_root=Path("/opt/llm-server/cuda"),
             models_dir=Path("/var/llamacpp_models"),
-            config_dir=Path("/etc/heimdall-gateway"),
-            run_dir=Path("/run/heimdall-gateway"),
+            config_dir=Path("/etc/llm-server"),
+            run_dir=Path("/run/llm-server"),
             service_user=DEFAULT_SERVICE_USER,
             service_group=DEFAULT_SERVICE_USER,
             public_host="127.0.0.1",
             public_port=11435,
-            manager_socket=Path("/run/heimdall-gateway/manager.sock"),
-            python_root=Path("/opt/heimdall-gateway/python"),
-            runtime_venv=Path("/opt/heimdall-gateway/venv"),
+            manager_socket=Path("/run/llm-server/manager.sock"),
+            python_root=Path("/opt/llm-server/python"),
+            runtime_venv=Path("/opt/llm-server/venv"),
         )
         self.assertEqual(desired_models_dir_owner(layout), (DEFAULT_SERVICE_USER, DEFAULT_SERVICE_USER))
 
@@ -5146,7 +5155,7 @@ class InstallHelpersTest(unittest.TestCase):
             rendered_text = config_path.read_text(encoding="utf-8")
             self.assertIn("ttl: 10", rendered_text)
             self.assertIn("sendLoadingState: false", rendered_text)
-            self.assertTrue(rendered_text.startswith("# Heimdall Gateway config.yaml"))
+            self.assertTrue(rendered_text.startswith("# LLM Server config.yaml"))
 
 
     def test_global_replica_enabled_ignores_stale_per_model_disabled_flag(self) -> None:
@@ -7060,7 +7069,7 @@ models:
             message = get_gpu_conflict_message("model-b", [model_a, model_b])
         self.assertIn("Cannot load model 'model-b'", message)
         self.assertIn("model-a (pid 123, 4096 MiB)", message)
-        self.assertIn("heimdall-gateway unload", message)
+        self.assertIn("llm-server unload", message)
 
     def test_get_gpu_conflict_message_ignores_foreign_process(self) -> None:
         model = ManagedModel(
@@ -7693,7 +7702,7 @@ models:
             mock.patch("llamacpp_stack.cli.subprocess.run", side_effect=fake_run),
             mock.patch("llamacpp_stack.cli.time.sleep"),
         ):
-            self.assertTrue(restart_service_to_free_vram("heimdall-gateway-router.service"))
+            self.assertTrue(restart_service_to_free_vram("llm-server-router.service"))
 
         self.assertEqual(calls[0][:3], ["systemctl", "--user", "restart"])
 
@@ -7709,7 +7718,7 @@ models:
             mock.patch("llamacpp_stack.cli.subprocess.run", side_effect=fake_run),
             mock.patch("llamacpp_stack.cli.time.sleep"),
         ):
-            self.assertTrue(restart_service_to_free_vram("heimdall-gateway-router.service"))
+            self.assertTrue(restart_service_to_free_vram("llm-server-router.service"))
 
         self.assertEqual(calls[0][:2], ["systemctl", "restart"])
 
@@ -7962,15 +7971,15 @@ models:
             manager_unit = render_manager_service(layout)
             router_unit = render_llamaswap_service(layout)
 
-        self.assertIn("HEIMDALL_GATEWAY_ROOT=", env_text)
-        self.assertIn("HEIMDALL_GATEWAY_CONFIG=", env_text)
+        self.assertIn("LLM_SERVER_ROOT=", env_text)
+        self.assertIn("LLM_SERVER_CONFIG=", env_text)
         self.assertIn("LLAMA_SERVER_BIN=", env_text)
         self.assertIn("LLAMASWAP_BIN=", env_text)
         self.assertNotIn("LLAMACPP_", env_text)
-        self.assertIn("Description=Heimdall Gateway manager", manager_unit)
-        self.assertIn("Description=Heimdall Gateway router", router_unit)
-        self.assertIn("heimdall-gateway-manager-start", manager_unit)
-        self.assertIn("heimdall-gateway-router-start", router_unit)
+        self.assertIn("Description=LLM Server manager", manager_unit)
+        self.assertIn("Description=LLM Server router", router_unit)
+        self.assertIn("llm-server-manager-start", manager_unit)
+        self.assertIn("llm-server-router-start", router_unit)
 
     def test_migrate_legacy_user_install_copies_small_state_and_removes_legacy_wrappers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

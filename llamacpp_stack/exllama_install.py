@@ -117,12 +117,21 @@ def _default_exllama_install_root(install_root: Path) -> Path:
 def _resolve_install_root(explicit: str | None) -> Path:
     if explicit:
         return Path(explicit).expanduser().resolve()
+    # Use PRODUCT_SLUG for install roots (llm-server)
+    try:
+        from llamacpp_stack.cli.constants import PRODUCT_SLUG as _SLUG
+    except Exception:
+        _SLUG = "llm-server"
     if os.geteuid() == 0:
-        return Path("/opt/heimdall-gateway")
+        return Path("/opt") / _SLUG
     env_root = os.environ.get("HEIMDALL_GATEWAY_ROOT") or os.environ.get("HEIMDALL_GATEWAY_INSTALL_ROOT")
     if env_root:
         return Path(env_root).expanduser().resolve()
-    return Path.home() / ".local" / "opt" / "heimdall-gateway"
+    # Also respect new LLM_SERVER_* env roots if set
+    env_root2 = os.environ.get("LLM_SERVER_ROOT") or os.environ.get("LLM_SERVER_INSTALL_ROOT")
+    if env_root2:
+        return Path(env_root2).expanduser().resolve()
+    return Path.home() / ".local" / "opt" / _SLUG
 
 
 def _venv_python(exllama_root: Path) -> Path:
@@ -282,7 +291,7 @@ def _write_wrapper(exllama_root: Path, venv_python: Path, install_root: Path, dr
     content = textwrap.dedent(f"""\
         #!/usr/bin/env bash
         set -euo pipefail
-        # ExLlamaV3 wrapper - EXL3 engine for Heimdall Gateway
+        # ExLlamaV3 wrapper - EXL3 engine for LLM Server
         # Engine: {DEFAULT_ENGINE_NAME} (server_overrides.engine = 'exllama')
         EXLLAMA_ROOT="{exllama_root}"
         VENV_PYTHON="{venv_python}"
@@ -341,6 +350,24 @@ def _write_wrapper(exllama_root: Path, venv_python: Path, install_root: Path, dr
     return wrapper
 
 
+def _is_exllama_reusable(exllama_root: Path) -> bool:
+    bin_path = exllama_root / "bin/llama-server-exllama"
+    if not bin_path.exists() or not os.access(str(bin_path), os.X_OK):
+        return False
+    # exllamav3_ext.so may live in venv site-packages or directly under exllama/
+    if (exllama_root / "exllamav3_ext.so").exists():
+        return True
+    for cand in exllama_root.rglob("exllamav3_ext*"):
+        if cand.is_file():
+            return True
+    venv = exllama_root / "venv"
+    if venv.exists():
+        for cand in venv.rglob("exllamav3_ext*"):
+            if cand.is_file():
+                return True
+    return False
+
+
 def build_exllama(
     repo: str = DEFAULT_EXLLAMA_REPO,
     ref: str = DEFAULT_EXLLAMA_REF,
@@ -359,6 +386,18 @@ def build_exllama(
         install_root = _resolve_install_root(None)
     exllama_root = _default_exllama_install_root(install_root)
     venv_python_target = exllama_root / "venv" / "bin" / "python"
+
+    if not dry_run and _is_exllama_reusable(exllama_root):
+        print(f"[*] Reusing existing exllama build from legacy migration: {exllama_root / 'bin/llama-server-exllama'} (skip compile)")
+        # Ensure wrapper still fresh (chmod +x)
+        try:
+            (exllama_root / "bin/llama-server-exllama").chmod(0o755)
+        except Exception:
+            pass
+        return exllama_root / "bin/llama-server-exllama"
+    if dry_run and _is_exllama_reusable(exllama_root):
+        print(f"[dry-run] would reuse exllama build from legacy migration: {exllama_root / 'bin/llama-server-exllama'} (skip compile)")
+        return exllama_root / "bin/llama-server-exllama"
 
     python_exec = python_exec or sys.executable
 

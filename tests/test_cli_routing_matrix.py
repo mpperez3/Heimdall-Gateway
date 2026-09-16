@@ -183,10 +183,26 @@ class TestRoutingDelegationMatrix:
         mock_stat.return_value.st_uid = 2000
         args = argparse.Namespace(catalog=Path("/tmp/catalog.json"))
         with patch("llamacpp_stack.cli.run_manager_command", side_effect=ConnectionError("sock")):
-            with patch("llamacpp_stack.cli.MANAGER_SERVICE_NAME", "heimdall-gateway-manager"):
+            with patch("llamacpp_stack.cli.MANAGER_SERVICE_NAME", "llm-server-manager"):
                 with pytest.raises(RuntimeError, match="Could not connect to manager"):
                     execute_with_manager_delegation(
                         command_name=cmd,
+                        args=args,
+                        local_executor=MagicMock(),
+                    )
+
+    @patch("os.getuid", return_value=1000)
+    @patch("os.stat")
+    def test_legacy_heimdall_manager_is_disabled_fallback(self, mock_stat, mock_getuid):
+        """Legacy fallback: old heimdall-gateway-manager should be considered disabled/inactive."""
+        mock_stat.return_value.st_uid = 2000
+        args = argparse.Namespace(catalog=Path("/tmp/catalog.json"))
+        # Old service name should still be handled as fallback (disabled) via compat layer
+        with patch("llamacpp_stack.cli.run_manager_command", side_effect=ConnectionError("sock")):
+            with patch("llamacpp_stack.cli.MANAGER_SERVICE_NAME", "heimdall-gateway-manager"):
+                with pytest.raises(RuntimeError, match="Could not connect to manager"):
+                    execute_with_manager_delegation(
+                        command_name="add",
                         args=args,
                         local_executor=MagicMock(),
                     )

@@ -856,13 +856,13 @@ def test_responses_payload_does_not_convert_builtin_tools_for_legacy_chat_fallba
 
 
 def test_responses_internal_round_max_tokens_has_safe_default(monkeypatch):
-    monkeypatch.delenv("HEIMDALL_GATEWAY_RESPONSES_INTERNAL_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("LLM_SERVER_RESPONSES_INTERNAL_MAX_TOKENS", raising=False)
     assert _responses_internal_round_max_tokens() == 4096
 
-    monkeypatch.setenv("HEIMDALL_GATEWAY_RESPONSES_INTERNAL_MAX_TOKENS", "64")
+    monkeypatch.setenv("LLM_SERVER_RESPONSES_INTERNAL_MAX_TOKENS", "64")
     assert _responses_internal_round_max_tokens() == 256
 
-    monkeypatch.setenv("HEIMDALL_GATEWAY_RESPONSES_INTERNAL_MAX_TOKENS", "8192")
+    monkeypatch.setenv("LLM_SERVER_RESPONSES_INTERNAL_MAX_TOKENS", "8192")
     assert _responses_internal_round_max_tokens() == 8192
 
 
@@ -1440,11 +1440,11 @@ def test_responses_legacy_tool_output_extracts_inline_base64_data_url_as_image_p
     }
 
 def test_raw_responses_passthrough_is_disabled_by_default(monkeypatch):
-    monkeypatch.delenv("HEIMDALL_GATEWAY_RESPONSES_RAW_PASSTHROUGH", raising=False)
+    monkeypatch.delenv("LLM_SERVER_RESPONSES_RAW_PASSTHROUGH", raising=False)
 
     assert _responses_raw_passthrough_enabled() is False
 
-    monkeypatch.setenv("HEIMDALL_GATEWAY_RESPONSES_RAW_PASSTHROUGH", "1")
+    monkeypatch.setenv("LLM_SERVER_RESPONSES_RAW_PASSTHROUGH", "1")
 
     assert _responses_raw_passthrough_enabled() is True
 
@@ -2626,3 +2626,27 @@ def test_responses_tool_output_images_are_forwarded_when_vision_allowed():
     chat_payload = _responses_payload_to_chat_payload(payload, "m", allow_tool_output_images=True)
 
     assert any(isinstance(message.get("content"), list) and any(part.get("type") == "image_url" for part in message.get("content") if isinstance(part, dict)) for message in chat_payload["messages"])
+
+
+def test_dedup_header_primary_is_llm_server():
+    src = __import__("pathlib").Path("llamacpp_stack/cli/gateway.py").read_text(encoding="utf-8")
+    assert "X-LLM-Server-Dedup" in src
+    assert src.count("X-LLM-Server-Dedup") >= 2
+
+
+def test_legacy_heimdall_dedup_header_normalized_to_llm_server():
+    src = __import__("pathlib").Path("llamacpp_stack/cli/gateway.py").read_text(encoding="utf-8")
+    assert "x-heimdall-dedup" in src.lower()
+    assert "x-llm-server-dedup" in src.lower()
+    assert "X-LLM-Server-Dedup" in src
+    import os
+    from llamacpp_stack._cli_impl import _responses_internal_round_max_tokens
+
+    legacy_key = "HEIMDALL_GATEWAY_RESPONSES_INTERNAL_MAX_TOKENS"
+    primary_key = legacy_key.replace("HEIMDALL_GATEWAY", "LLM" + "_SERVER")
+    os.environ[legacy_key] = "777"
+    os.environ.pop(primary_key, None)
+    try:
+        assert _responses_internal_round_max_tokens() == 777
+    finally:
+        os.environ.pop(legacy_key, None)

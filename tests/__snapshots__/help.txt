@@ -1,13 +1,12 @@
-usage: heimdall-gateway [-h] [--models-dir MODELS_DIR] [--config CONFIG]
-                        [--server-config SERVER_CONFIG] [--catalog CATALOG]
-                        [--llama-server LLAMA_SERVER] [--service SERVICE]
-                        [--start-port START_PORT] [--public-host PUBLIC_HOST]
-                        [--public-port PUBLIC_PORT] [--api-port API_PORT]
-                        [--idle-ttl IDLE_TTL]
-                        [--api-ctx-factor API_CTX_FACTOR]
-                        [--flatten | --no-flatten]
-                        {add,run,remove,rm,unload,update,config-migrate,refresh-templates,remove-templates,validate,daemon,debug,auto-performance,list,ps,requests,logs,hacks,info}
-                        ...
+usage: llm-server [-h] [--models-dir MODELS_DIR] [--config CONFIG]
+                  [--server-config SERVER_CONFIG] [--catalog CATALOG]
+                  [--llama-server LLAMA_SERVER] [--service SERVICE]
+                  [--start-port START_PORT] [--public-host PUBLIC_HOST]
+                  [--public-port PUBLIC_PORT] [--api-port API_PORT]
+                  [--idle-ttl IDLE_TTL] [--api-ctx-factor API_CTX_FACTOR]
+                  [--flatten | --no-flatten]
+                  {add,run,remove,rm,unload,update,config-migrate,refresh-templates,remove-templates,validate,daemon,debug,auto-performance,list,ps,requests,logs,hacks,info}
+                  ...
 
 Manage GGUF models for llama-swap + llama-server.
 
@@ -57,100 +56,100 @@ options:
 Command guide:
   add [repo ...] [-hf HF ...] [--auto|--skip-ctx]
     Register/download one or more models into the catalog.
-    Example: heimdall-gateway add -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M
+    Example: llm-server add -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M
   run [repo|-hf HF] [--auto] [--no-chat]
     Ensure model exists and start chat (or only preload with --no-chat).
-    Example: heimdall-gateway run -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M --auto
-    Pair example: heimdall-gateway run -hf org/master:Q4 --speculative -hf org/draft:IQ1
+    Example: llm-server run -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M --auto
+    Pair example: llm-server run -hf org/master:Q4 --speculative -hf org/draft:IQ1
   remove [repo ...|-hf HF ...] [--keep-files]
     Remove models from config/catalog and delete files by default.
-    Example: heimdall-gateway remove qwen2.5-32b-instruct-q4_k_m
+    Example: llm-server remove qwen2.5-32b-instruct-q4_k_m
   rm [repo ...|-hf HF ...] [--keep-files]
     Alias of remove (also deletes model files by default).
-    Example: heimdall-gateway rm qwen2.5-32b-instruct-q4_k_m
+    Example: llm-server rm qwen2.5-32b-instruct-q4_k_m
   update [repo ...|-hf HF ...] [--auto|--preserve-ctx|--sync-gguf-ctx]
     Refresh config and optionally re-probe ctx.
-    Example: heimdall-gateway update qwen2.5-32b-instruct-q4_k_m --auto
+    Example: llm-server update qwen2.5-32b-instruct-q4_k_m --auto
   update [--check|--dry-run] [--only DEP ...] [--yes] [--force] [--list]
     Update registered dependencies (llama.cpp, llama-swap, vLLM, heimdall-gateway, ...).
-    Example: heimdall-gateway update --check
-    Example: heimdall-gateway update --only vllm --yes
-    Example: heimdall-gateway update --list
+    Example: llm-server update --check
+    Example: llm-server update --only vllm --yes
+    Example: llm-server update --list
   validate [repo|-hf HF] [--auto]
     Probe/validate a model and context settings before serving.
-    Example: heimdall-gateway validate -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M --auto
+    Example: llm-server validate -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M --auto
   daemon
     Start the manager daemon loop (socket/API lifecycle automation).
-    Example: heimdall-gateway daemon
+    Example: llm-server daemon
   list
     Show configured models (ctx, memory estimate, speed hints).
-    Example: heimdall-gateway list
+    Example: llm-server list
   ps
     Alias view for model table/state (same rendering as list).
-    Example: heimdall-gateway ps
+    Example: llm-server ps
   requests [-n LINES]
     Show recent API request log entries.
-    Example: heimdall-gateway requests -n 50 (or heimdall-gateway requests -n 1)
+    Example: llm-server requests -n 50 (or llm-server requests -n 1)
   logs [-n LINES] [--journal]
     Show request log and journalctl command/output for crash diagnostics.
-    Example: heimdall-gateway logs -n 200 --journal
+    Example: llm-server logs -n 200 --journal
   hacks
     List source patches, aggressive build flags and runtime safe-mode knobs.
-    Example: heimdall-gateway hacks
+    Example: llm-server hacks
   info
     Show endpoints, runtime paths, versions, service commands and status.
-    Example: heimdall-gateway info
+    Example: llm-server info
   Help     Show options for any command.
-    Example: heimdall-gateway <command> -h
-For endpoints/runtime/service/config details run: heimdall-gateway info
+    Example: llm-server <command> -h
+For endpoints/runtime/service/config details run: llm-server info
 
 ---EPILOG---
 Command guide:
   add [repo ...] [-hf HF ...] [--auto|--skip-ctx]
     Register/download one or more models into the catalog.
-    Example: heimdall-gateway add -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M
+    Example: llm-server add -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M
   run [repo|-hf HF] [--auto] [--no-chat]
     Ensure model exists and start chat (or only preload with --no-chat).
-    Example: heimdall-gateway run -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M --auto
-    Pair example: heimdall-gateway run -hf org/master:Q4 --speculative -hf org/draft:IQ1
+    Example: llm-server run -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M --auto
+    Pair example: llm-server run -hf org/master:Q4 --speculative -hf org/draft:IQ1
   remove [repo ...|-hf HF ...] [--keep-files]
     Remove models from config/catalog and delete files by default.
-    Example: heimdall-gateway remove qwen2.5-32b-instruct-q4_k_m
+    Example: llm-server remove qwen2.5-32b-instruct-q4_k_m
   rm [repo ...|-hf HF ...] [--keep-files]
     Alias of remove (also deletes model files by default).
-    Example: heimdall-gateway rm qwen2.5-32b-instruct-q4_k_m
+    Example: llm-server rm qwen2.5-32b-instruct-q4_k_m
   update [repo ...|-hf HF ...] [--auto|--preserve-ctx|--sync-gguf-ctx]
     Refresh config and optionally re-probe ctx.
-    Example: heimdall-gateway update qwen2.5-32b-instruct-q4_k_m --auto
+    Example: llm-server update qwen2.5-32b-instruct-q4_k_m --auto
   update [--check|--dry-run] [--only DEP ...] [--yes] [--force] [--list]
     Update registered dependencies (llama.cpp, llama-swap, vLLM, heimdall-gateway, ...).
-    Example: heimdall-gateway update --check
-    Example: heimdall-gateway update --only vllm --yes
-    Example: heimdall-gateway update --list
+    Example: llm-server update --check
+    Example: llm-server update --only vllm --yes
+    Example: llm-server update --list
   validate [repo|-hf HF] [--auto]
     Probe/validate a model and context settings before serving.
-    Example: heimdall-gateway validate -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M --auto
+    Example: llm-server validate -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M --auto
   daemon
     Start the manager daemon loop (socket/API lifecycle automation).
-    Example: heimdall-gateway daemon
+    Example: llm-server daemon
   list
     Show configured models (ctx, memory estimate, speed hints).
-    Example: heimdall-gateway list
+    Example: llm-server list
   ps
     Alias view for model table/state (same rendering as list).
-    Example: heimdall-gateway ps
+    Example: llm-server ps
   requests [-n LINES]
     Show recent API request log entries.
-    Example: heimdall-gateway requests -n 50 (or heimdall-gateway requests -n 1)
+    Example: llm-server requests -n 50 (or llm-server requests -n 1)
   logs [-n LINES] [--journal]
     Show request log and journalctl command/output for crash diagnostics.
-    Example: heimdall-gateway logs -n 200 --journal
+    Example: llm-server logs -n 200 --journal
   hacks
     List source patches, aggressive build flags and runtime safe-mode knobs.
-    Example: heimdall-gateway hacks
+    Example: llm-server hacks
   info
     Show endpoints, runtime paths, versions, service commands and status.
-    Example: heimdall-gateway info
+    Example: llm-server info
   Help     Show options for any command.
-    Example: heimdall-gateway <command> -h
-For endpoints/runtime/service/config details run: heimdall-gateway info
+    Example: llm-server <command> -h
+For endpoints/runtime/service/config details run: llm-server info

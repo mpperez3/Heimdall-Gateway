@@ -1,4 +1,4 @@
-"""Heimdall Gateway cli package - re-exports for compat.
+"""LLM Server cli package - re-exports for compat.
 
 Both `from llamacpp_stack.cli import ManagedModel` and
 `from llamacpp_stack.cli.models import ManagedModel` must work.

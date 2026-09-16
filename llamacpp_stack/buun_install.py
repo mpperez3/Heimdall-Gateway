@@ -127,6 +127,11 @@ def _resolve_cuda_arch() -> str:
     return "native"
 
 
+def _is_buun_reusable(buun_root: Path) -> bool:
+    bin_path = buun_root / "bin/llama-server-buun"
+    return bin_path.exists() and os.access(str(bin_path), os.X_OK)
+
+
 def build_buun(
     repo: str = DEFAULT_BUUN_REPO,
     ref: str = DEFAULT_BUUN_REF,
@@ -139,15 +144,19 @@ def build_buun(
     Mirrors beellama_install.build_beellama with buun specifics:
     - repo spiritbuun/buun-llama-cpp@c7f114d
     - bin buun/bin/llama-server-buun
-    - cmake flags -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native (fallback 110;120)
+    - cmake flags -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native (fallback 110/120)
     - rpath $ORIGIN via install helpers
     - wrapper pre-check ``llama-server-buun --help``
     """
     if install_root is None:
+        try:
+            from llamacpp_stack.cli.constants import PRODUCT_SLUG as _SLUG
+        except Exception:
+            _SLUG = "llm-server"
         if os.geteuid() == 0:
-            install_root = Path("/opt/heimdall-gateway")
+            install_root = Path("/opt") / _SLUG
         else:
-            install_root = Path.home() / ".local" / "opt" / "heimdall-gateway"
+            install_root = Path.home() / ".local" / "opt" / _SLUG
 
     buun_root = _default_buun_install_root(install_root)
     src_dir = buun_root / "src"
@@ -155,13 +164,33 @@ def build_buun(
     bin_path = buun_root / "bin" / "llama-server-buun"
 
     if dry_run:
+        if _is_buun_reusable(buun_root):
+            print(f"[dry-run] would reuse buun build from legacy migration: {bin_path} (skip compile)")
+            return bin_path
         print(f"[dry-run] would install buun via build_buun(install_root={install_root}, python_exec={python_exec or sys.executable}) with HEIMDALL_GATEWAY_PYTHONPATH={os.environ.get('HEIMDALL_GATEWAY_PYTHONPATH','')}")
         print(f"[dry-run] would clone {repo}@{ref} -> {src_dir}")
         print(f"[dry-run] would cmake -B {build_dir} -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native && cmake --build {build_dir} -j && cmake --install {build_dir} --prefix {buun_root}")
         print(f"[dry-run] would install binary at {bin_path} with rpath lib")
         return bin_path
 
-    # Pre-check wrapper if already installed (never throw)
+    if _is_buun_reusable(buun_root):
+        # Also verify --help works; if not, fall through to rebuild
+        try:
+            r = subprocess.run([str(bin_path), "--help"], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                print(f"[*] Reusing existing buun build from legacy migration: {bin_path} (skip compile, --help OK)")
+                try:
+                    bin_path.chmod(0o755)
+                except Exception:
+                    pass
+                return bin_path
+            else:
+                print(f"[*] buun binary present but --help returned {r.returncode}, rebuilding")
+        except Exception:
+            print(f"[*] Reusing existing buun build from legacy migration: {bin_path} (skip compile)")
+            return bin_path
+
+    # Pre-check wrapper if already installed (never throw) — legacy path kept for diagnostics
     if bin_path.exists():
         try:
             r = subprocess.run(

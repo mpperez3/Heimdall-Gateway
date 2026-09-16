@@ -29,9 +29,9 @@ class TestLogApiEventAppendJsonl:
         """log_api_event appends 3 JSONL lines, each parseable, with ts+kind."""
         target = tmp_path / "api-requests.log"
         # Ensure clean env fallback not interfering
-        monkeypatch.delenv("HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK", raising=False)
+        monkeypatch.delenv("LLM_SERVER_REQUESTS_LOG_FALLBACK", raising=False)
         monkeypatch.delenv("LLAMACPP_REQUESTS_LOG_FALLBACK", raising=False)
-        monkeypatch.delenv("HEIMDALL_GATEWAY_DEBUG_LOGGING", raising=False)
+        monkeypatch.delenv("LLM_SERVER_DEBUG_LOGGING", raising=False)
         monkeypatch.delenv("LLAMACPP_DEBUG_LOGGING", raising=False)
 
         for i in range(3):
@@ -52,7 +52,7 @@ class TestLogApiEventAppendJsonl:
     def test_append_does_not_truncate_previous(self, tmp_path, monkeypatch):
         """Second call preserves first line (open mode 'a', not 'w')."""
         target = tmp_path / "api-requests.log"
-        monkeypatch.delenv("HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK", raising=False)
+        monkeypatch.delenv("LLM_SERVER_REQUESTS_LOG_FALLBACK", raising=False)
         monkeypatch.delenv("LLAMACPP_REQUESTS_LOG_FALLBACK", raising=False)
         log_api_event("first", {"v": 1}, log_path=target)
         first_content = target.read_text(encoding="utf-8")
@@ -131,7 +131,7 @@ class TestCandidateRequestLogPaths:
         assert has_explicit
 
     def test_explicit_without_env_is_first(self, tmp_path, monkeypatch):
-        monkeypatch.delenv("HEIMDALL_GATEWAY_REQUESTS_LOG", raising=False)
+        monkeypatch.delenv("LLM_SERVER_REQUESTS_LOG", raising=False)
         explicit = tmp_path / "explicit2.log"
         candidates = _candidate_request_log_paths(explicit)
         has_explicit = explicit in candidates or any(str(c).startswith(str(explicit)) for c in candidates)
@@ -139,7 +139,7 @@ class TestCandidateRequestLogPaths:
 
     def test_env_takes_precedence_over_default(self, tmp_path, monkeypatch):
         env_path = tmp_path / "env.log"
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG", str(env_path))
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG", str(env_path))
         candidates = _candidate_request_log_paths(None)
         # After rotation T4, candidates are rotated files (api-requests.log.YYYY-MM-DD*) ordered by date.
         # Env without rotated files should still be represented, or its rotated prefix should appear.
@@ -152,7 +152,7 @@ class TestCandidateRequestLogPaths:
     def test_explicit_env_default_ordering(self, tmp_path, monkeypatch):
         explicit = tmp_path / "explicit3.log"
         env_path = tmp_path / "env2.log"
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG", str(env_path))
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG", str(env_path))
         candidates = _candidate_request_log_paths(explicit)
         has_explicit = explicit in candidates or any(str(c).startswith(str(explicit)) for c in candidates)
         assert has_explicit
@@ -163,7 +163,7 @@ class TestCandidateRequestLogPaths:
         assert len(candidates) == len(set(candidates))
 
     def test_default_always_present(self, monkeypatch):
-        monkeypatch.delenv("HEIMDALL_GATEWAY_REQUESTS_LOG", raising=False)
+        monkeypatch.delenv("LLM_SERVER_REQUESTS_LOG", raising=False)
         candidates = _candidate_request_log_paths(None)
         has_default = DEFAULT_REQUESTS_LOG_PATH in candidates or any(str(c).startswith(str(DEFAULT_REQUESTS_LOG_PATH)) for c in candidates) or any("api-requests.log.2" in str(c) for c in candidates)
         assert has_default
@@ -175,7 +175,7 @@ class TestLogApiEventFallback:
         primary = tmp_path / "primary" / "api-requests.log"
         fallback = tmp_path / "fallback" / "api-requests.log"
         # Patch _env_value to return our fallback path for that key, or simply set env var
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK", str(fallback))
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_FALLBACK", str(fallback))
         # Ensure primary parent exists but we'll mock open to fail on primary
         original_open = Path.open
 
@@ -198,7 +198,7 @@ class TestLogApiEventFallback:
     def test_fallback_also_creates_parent_dirs(self, tmp_path, monkeypatch):
         primary = tmp_path / "nope" / "a.log"
         fallback = tmp_path / "also_nope" / "deep" / "b.log"
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK", str(fallback))
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_FALLBACK", str(fallback))
         original_open = Path.open
 
         def fake_open(self, *args, **kwargs):
@@ -215,7 +215,7 @@ class TestLogApiEventFallback:
     def test_both_fail_does_not_raise(self, tmp_path, monkeypatch, capsys):
         primary = tmp_path / "p.log"
         fallback = tmp_path / "f.log"
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK", str(fallback))
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_FALLBACK", str(fallback))
 
         with patch.object(Path, "open", side_effect=OSError("all fail")):
             # Should not raise
@@ -265,8 +265,17 @@ class TestRealLogSizeReporting:
         p.write_text(data, encoding="utf-8")
         before = p.read_text(encoding="utf-8")
         size = p.stat().st_size
-        # Any read helper should not modify
         _tail_text_file(p, lines=1)
         after = p.read_text(encoding="utf-8")
         assert before == after
         assert p.stat().st_size == size
+
+
+def test_legacy_heimdall_requests_log_fallback_still_resolves(tmp_path, monkeypatch):
+    from llamacpp_stack._cli_impl import _candidate_request_log_paths
+
+    legacy = tmp_path / "legacy-baseline.log"
+    legacy_key = "HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK"
+    monkeypatch.setenv(legacy_key, str(legacy))
+    candidates = _candidate_request_log_paths(None)
+    assert any(str(c).startswith(str(legacy)) for c in candidates) or legacy in candidates

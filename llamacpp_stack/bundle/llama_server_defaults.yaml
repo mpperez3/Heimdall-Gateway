@@ -1,4 +1,4 @@
-# Editable defaults for heimdall-gateway installs.
+# Editable defaults for llm-server installs (legacy: heimdall-gateway).
 #
 # The installer copies this file to the config directory on first install as
 # `llama_server_defaults.yaml`. Edit the copied file to change the defaults

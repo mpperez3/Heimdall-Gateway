@@ -1,4 +1,4 @@
-"""Registry for updatable Heimdall Gateway dependencies.
+"""Registry for updatable LLM Server dependencies.
 
 Each dependency (llama.cpp, llama-swap, vLLM, etc.) registers itself via
 ``register_dependency`` so ``heimdall-gateway update`` can discover and
@@ -362,19 +362,23 @@ def update_vllm(layout, *, dry_run: bool = False, force: bool = False, **kwargs)
 
 
 @register_dependency(
-    "heimdall-gateway",
-    "Heimdall Gateway Python package",
-    aliases=["heimdall", "gateway", "heimdall-gateway-manager"],
+    "llm-server",
+    "LLM Server Python package",
+    aliases=["llm_server", "llmserver", "heimdall-gateway", "heimdall", "gateway", "heimdall-gateway-manager"],
 )
 def update_heimdall_gateway(layout, *, dry_run: bool = False, force: bool = False, **kwargs) -> dict:
     try:
         from importlib.metadata import version as pkg_version
-        current = pkg_version("heimdall-gateway")
+
+        try:
+            current = pkg_version("llm-server")
+        except Exception:
+            current = pkg_version("heimdall-gateway")
     except Exception:
         current = "unknown"
 
     if dry_run:
-        return {"name": "heimdall-gateway", "old": current, "new": "latest", "action": "dry-run"}
+        return {"name": "llm-server", "old": current, "new": "latest", "action": "dry-run"}
 
     try:
         from llamacpp_stack.install import resolve_uv_executable
@@ -385,13 +389,13 @@ def update_heimdall_gateway(layout, *, dry_run: bool = False, force: bool = Fals
         # Prefer upgrading the runtime venv's copy; also upgrade host env if running from host
         targets: list[list[str]] = []
         if uv_bin and runtime_python.exists():
-            targets.append([uv_bin, "pip", "install", "--python", str(runtime_python), "--upgrade", "heimdall-gateway"])
+            targets.append([uv_bin, "pip", "install", "--python", str(runtime_python), "--upgrade", "llm-server"])
         # Also upgrade the current python environment (host) when not inside runtime venv
         # Use pip/uv if available
         if uv_bin:
-            targets.append([uv_bin, "pip", "install", "--python", sys.executable, "--upgrade", "heimdall-gateway"])
+            targets.append([uv_bin, "pip", "install", "--python", sys.executable, "--upgrade", "llm-server"])
         else:
-            targets.append([sys.executable, "-m", "pip", "install", "--upgrade", "heimdall-gateway"])
+            targets.append([sys.executable, "-m", "pip", "install", "--upgrade", "llm-server"])
 
         last_error = None
         for cmd in targets:
@@ -426,16 +430,19 @@ def update_heimdall_gateway(layout, *, dry_run: bool = False, force: bool = Fals
         try:
             from importlib.metadata import version as pkg_version2
 
-            new_ver = pkg_version2("heimdall-gateway")
+            try:
+                new_ver = pkg_version2("llm-server")
+            except Exception:
+                new_ver = pkg_version2("heimdall-gateway")
         except Exception:
             new_ver = current
 
         if last_error and new_ver == current:
-            return {"name": "heimdall-gateway", "old": current, "new": new_ver, "action": "error", "reason": last_error}
+            return {"name": "llm-server", "old": current, "new": new_ver, "action": "error", "reason": last_error}
         action = "updated" if new_ver != current else "skipped"
-        return {"name": "heimdall-gateway", "old": current, "new": new_ver, "action": action}
+        return {"name": "llm-server", "old": current, "new": new_ver, "action": action}
     except Exception as exc:
-        return {"name": "heimdall-gateway", "old": current, "new": current, "action": "error", "reason": str(exc)}
+        return {"name": "llm-server", "old": current, "new": current, "action": "error", "reason": str(exc)}
 
 
 # ---------------------------------------------------------------------------
@@ -526,7 +533,7 @@ def handle_dependency_update(args) -> int:
     try:
         layout = _detect_layout_from_args(args)
     except Exception as exc:
-        print(f"[!] No existing Heimdall Gateway installation detected: {exc}", file=sys.stderr)
+        print(f"[!] No existing LLM Server installation detected: {exc}", file=sys.stderr)
         print("Run 'heimdall-gateway install --mode user --backend auto' first.", file=sys.stderr)
         return 1
 

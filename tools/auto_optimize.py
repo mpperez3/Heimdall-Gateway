@@ -5,7 +5,7 @@ import json
 import sys
 
 # Remote Debug Server
-MANAGER_URL = os.environ.get("HEIMDALL_GATEWAY_URL", "http://127.0.0.1:11435").rstrip("/")
+MANAGER_URL = os.environ.get("LLM_SERVER_URL", os.environ.get("HEIMDALL_GATEWAY_URL", "http://127.0.0.1:11435")).rstrip("/")
 MODEL_ID = "speculative-gemma-4-31b-it-claude-opus-distill.q8_0"
 
 # Exclude Device 6 entirely from tensor split as it was OOMing on compute buffers

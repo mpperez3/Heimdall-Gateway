@@ -36,7 +36,7 @@ docker-compose -f docker-compose-vllm.yaml logs -f vllm
 The installer provisions both engines. Use automatic routing:
 
 ```bash
-heimdall-gateway install --backend auto
+llm-server install --backend auto
 ```
 
 The installer will:
@@ -64,10 +64,10 @@ python -m vllm.entrypoints.openai.api_server \
 
 ```bash
 # A repository without GGUF is routed to vLLM automatically
-heimdall-gateway run -hf meta-llama/Llama-2-7b-hf
+llm-server run -hf meta-llama/Llama-2-7b-hf
 
 # Or with custom parameters
-heimdall-gateway run \
+llm-server run \
   -hf meta-llama/Llama-2-7b-hf \
   --n-gpu-layers 40 \
   --ctx-size 4096
@@ -93,7 +93,7 @@ natively. Speculative draft metrics (`draft_n`, `draft_n_accepted`,
 speculative decoding **and** the flag `--per-request-spec-decode-metrics`
 is active.
 
-Heimdall configures this flag via `vllm.defaults.per_request_spec_decode_metrics`
+LLM Server configures this flag via `vllm.defaults.per_request_spec_decode_metrics`
 in `llamacpp_stack/bundle/llama_server_defaults.yaml` (default `summary`).
 The flag is gated: the gateway runs `vllm-server --help | grep
 per-request-spec-decode-metrics` before emitting it. If the installed vLLM
@@ -111,20 +111,20 @@ real data exists. Do not expect `slot print_timing` in the journal for vLLM.
 Copyable verification:
 
 ```console
-$ heimdall-gateway config-keys --format json | jq '.vllm.defaults // .vllm'
+$ llm-server config-keys --format json | jq '.vllm.defaults // .vllm'
 $ curl -s http://127.0.0.1:11435/v1/chat/completions \
     -H 'Content-Type: application/json' \
     -d '{"model":"MODEL_ID","messages":[{"role":"user","content":"hi"}],"stream":false}' | jq '.usage, .timings // .metrics'
 $ curl -s http://127.0.0.1:11436/api/metrics/activity | jq '.data[] | {model: .model, tokens: .tokens}'
-$ heimdall-gateway logs --lines 200 --journal | grep timing
+$ llm-server logs --lines 200 --journal | grep timing
 # vLLM -> no slot print_timing expected; check usage/metrics above
 ```
 
 After changing the flag, apply the standard runbook:
 
 ```console
-$ heimdall-gateway config-migrate && heimdall-gateway update
-$ systemctl --user restart heimdall-gateway-manager heimdall-gateway-router
+$ llm-server config-migrate && llm-server update
+$ systemctl --user restart llm-server-manager llm-server-router
 ```
 
 ### Docker Deployment
@@ -181,10 +181,10 @@ If you need to revert to llama.cpp:
 
 ```bash
 # Reinstall with llama.cpp backend
-heimdall-gateway install --backend llama.cpp --update-binaries
+llm-server install --backend llama.cpp --update-binaries
 
 # Or manually specify
-heimdall-gateway install --backend llama.cpp --llama-cpp-mode prebuilt
+llm-server install --backend llama.cpp --llama-cpp-mode prebuilt
 ```
 
 ## Environment Variables
@@ -224,7 +224,7 @@ export VLLM_GPU_MEMORY_UTILIZATION=0.9         # GPU memory usage percentage
 export VLLM_GPU_MEMORY_UTILIZATION=0.7
 
 # Or use smaller model
-heimdall-gateway run -hf meta-llama/Llama-2-7b-chat-hf
+llm-server run -hf meta-llama/Llama-2-7b-chat-hf
 ```
 
 ### Model not found
@@ -266,6 +266,9 @@ Planned improvements for vLLM beta:
 - [ ] Multi-GPU distribution
 - [ ] Batch request queuing
 - [ ] Native speculative decoding support
+
+
+> **Nota de migracion desde heimdall-gateway (deprecado):** `llm-server` es el nuevo comando canonico; `heimdall-gateway` sigue como alias deprecado con aviso en stderr. Migra automatica de rutas y env `HEIMDALL_GATEWAY_*` → `LLM_SERVER_*`.
 
 ## References
 

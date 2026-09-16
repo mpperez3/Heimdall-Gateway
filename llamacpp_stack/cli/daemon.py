@@ -1,4 +1,4 @@
-"""Heimdall Gateway daemon/auto-watch extracted from cli.py.
+"""LLM Server daemon/auto-watch extracted from cli.py.
 
 Preserves:
 - sync_config_from_server_config_for_startup (render-only, no API wait)
@@ -334,7 +334,7 @@ def sync_config_from_server_config_for_startup(args) -> str:
     raw_server_config = _load_server_config_payload(args)
     warnings = _server_config_validation_warnings(raw_server_config)
     for warning in warnings:
-        print(f"[!] Heimdall Gateway config warning: {warning}", flush=True)
+        print(f"[!] LLM Server config warning: {warning}", flush=True)
         log_api_event("server_config_validation_warning", {"warning": warning, "server_config": str(_args_server_config_path(args))})
     persist_server_config(args)
     catalog, catalog_diag = load_catalog_with_diagnostics(args.catalog, _args_server_config_path(args))
@@ -464,15 +464,16 @@ def read_install_manifest():
 
 
 def get_heimdall_gateway_version() -> str:
-    forced = _env_value("HEIMDALL_GATEWAY_VERSION", "LLAMACPP_SUPERSERVER_VERSION", "").strip()
+    forced = (os.environ.get("LLM_SERVER_VERSION", "").strip() or _env_value("HEIMDALL_GATEWAY_VERSION", "LLAMACPP_SUPERSERVER_VERSION", "").strip())
     if forced:
         return forced
-    try:
-        return version("heimdall-gateway")
-    except PackageNotFoundError:
-        pass
-    except Exception:
-        pass
+    for _pkg in ("llm-server", "heimdall-gateway"):
+        try:
+            return version(_pkg)
+        except PackageNotFoundError:
+            continue
+        except Exception:
+            continue
     # Fallback for local editable runs.
     pyproject_path = Path(__file__).resolve().parent.parent.parent / "pyproject.toml"
     try:
@@ -495,8 +496,8 @@ def render_heimdall_gateway_banner() -> str:
         "| | | (_| | | | | | | (_| | (__| |  | |_| |_) |\n"
         "|_|_|\\__,_|_| |_| |_|\\__,_|\\___|_|   \\__| .__/\n"
         "                                           |_|   \n"
-        "              Heimdall Gateway\n"
-        f"         heimdall-gateway v{get_heimdall_gateway_version()}\n"
+                 "              LLM Server\n"
+        f"         llm-server v{get_heimdall_gateway_version()}\n"
         f"{divider}"
     )
 
@@ -610,7 +611,7 @@ def build_info_text(args=None) -> str:
     return (
         "Default endpoints:\n"
         f"  llama-swap UI/backend: {ui_url}\n"
-        f"  Heimdall Gateway API:       {api_url}\n"
+        f"  LLM Server API:       {api_url}\n"
         "Installed versions:\n"
         f"  llama.cpp:           {llama_cpp_tag}\n"
         f"  llama-swap:          {llamaswap_tag}\n"
@@ -661,8 +662,8 @@ def daemon_mode(args):
     # catalog.json or conf.json. This is render-only and does not wait for
     # llama-swap/API because the router service may still be starting.
     try:
-        print(f"[*] Using Heimdall Gateway server config: {_args_server_config_path(args)}", flush=True)
-        print("[*] Syncing Heimdall Gateway config on startup...", flush=True)
+        print(f"[*] Using LLM Server server config: {_args_server_config_path(args)}", flush=True)
+        print("[*] Syncing LLM Server config on startup...", flush=True)
         sync_config_from_server_config_for_startup(args)
         log_api_event("startup_config_sync_done", {"config": str(args.config), "catalog": str(args.catalog)})
     except Exception as exc:
@@ -685,7 +686,7 @@ def daemon_mode(args):
             api_p = ap_fn(args) if ap_fn is not None else 11435  # type: ignore
         except Exception:
             api_p = 11435
-        raise RuntimeError(f"Could not start Heimdall Gateway API on {args.public_host}:{api_p}")
+        raise RuntimeError(f"Could not start LLM Server API on {args.public_host}:{api_p}")
     unload_guard_thread = guard_fn(args) if guard_fn is not None else None  # type: ignore
     auto_update_thread = start_catalog_auto_update_watch(args)
 

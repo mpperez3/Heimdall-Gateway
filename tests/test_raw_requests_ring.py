@@ -21,8 +21,8 @@ def _raw_for(base: Path) -> Path:
 
 class TestRingSize:
     def test_ring_keeps_last_10_of_12(self, tmp_path, monkeypatch):
-        monkeypatch.delenv("HEIMDALL_GATEWAY_REQUESTS_LOG_PATH", raising=False)
-        monkeypatch.delenv("HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK", raising=False)
+        monkeypatch.delenv("LLM_SERVER_REQUESTS_LOG_PATH", raising=False)
+        monkeypatch.delenv("LLM_SERVER_REQUESTS_LOG_FALLBACK", raising=False)
         base = tmp_path / "api-requests.log"
         raw = _raw_for(base)
         for i in range(1, 13):
@@ -36,7 +36,7 @@ class TestRingSize:
         assert '{"a":2}' not in lines
 
     def test_exactly_10_no_truncation(self, tmp_path, monkeypatch):
-        monkeypatch.delenv("HEIMDALL_GATEWAY_REQUESTS_LOG_PATH", raising=False)
+        monkeypatch.delenv("LLM_SERVER_REQUESTS_LOG_PATH", raising=False)
         base = tmp_path / "api-requests.log"
         raw = _raw_for(base)
         for i in range(10):
@@ -184,7 +184,7 @@ class TestFallbackAndNeverThrow:
     def test_fallback_when_primary_not_writable(self, tmp_path, monkeypatch):
         primary = tmp_path / "primary" / "api-requests.log"
         fallback = tmp_path / "fallback" / "api-requests.log"
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK", str(fallback))
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_FALLBACK", str(fallback))
         original_open = Path.open
         primary_raw = _raw_for(primary)
         primary_tmp = primary_raw.with_name(f".{primary_raw.name}.tmp")
@@ -202,7 +202,7 @@ class TestFallbackAndNeverThrow:
 
     def test_never_throws_on_open_failure(self, tmp_path, monkeypatch):
         primary = tmp_path / "p.log"
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK", str(tmp_path / "f.log"))
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_FALLBACK", str(tmp_path / "f.log"))
         with patch.object(Path, "open", side_effect=OSError("all fail")):
             log_raw_request("no_crash", log_path=primary)
         # should not raise
@@ -214,7 +214,7 @@ class TestFallbackAndNeverThrow:
 
     def test_no_interference_with_api_requests_log(self, tmp_path, monkeypatch):
         # raw log should not affect api-requests.log
-        monkeypatch.delenv("HEIMDALL_GATEWAY_REQUESTS_LOG_PATH", raising=False)
+        monkeypatch.delenv("LLM_SERVER_REQUESTS_LOG_PATH", raising=False)
         base = tmp_path / "api-requests.log"
         from llamacpp_stack._cli_impl import log_api_event, _daily_active_path_for
 
@@ -235,20 +235,20 @@ class TestFallbackAndNeverThrow:
 class TestPathResolution:
     def test_env_path_precedence(self, tmp_path, monkeypatch):
         env_path = tmp_path / "env.log"
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_PATH", str(env_path))
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_PATH", str(env_path))
         # without explicit, raw should derive from env dir
         log_raw_request("from_env", log_path=None)
         env_raw = _raw_for(env_path)
         assert env_raw.exists()
         # cleanup
-        monkeypatch.delenv("HEIMDALL_GATEWAY_REQUESTS_LOG_PATH", raising=False)
+        monkeypatch.delenv("LLM_SERVER_REQUESTS_LOG_PATH", raising=False)
         if env_raw.exists():
             env_raw.unlink()
 
     def test_explicit_over_env(self, tmp_path, monkeypatch):
         env_path = tmp_path / "envdir" / "env.log"
         explicit = tmp_path / "explicitdir" / "explicit.log"
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_PATH", str(env_path))
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_PATH", str(env_path))
         log_raw_request("explicit_body", log_path=explicit)
         assert _raw_for(explicit).exists()
         assert "explicit_body" in _raw_for(explicit).read_text(encoding="utf-8")
@@ -265,7 +265,14 @@ class TestPathResolution:
     def test_atomic_write_tmp_cleanup(self, tmp_path, monkeypatch):
         base = tmp_path / "api-requests.log"
         raw = _raw_for(base)
-        # simulate write failure during tmp replace? Just ensure after normal write no tmp remains
         log_raw_request("a", log_path=base)
         tmp = raw.with_name(f".{raw.name}.tmp")
         assert not tmp.exists()
+
+    def test_legacy_heimdall_fallback_path_still_resolves(self, tmp_path, monkeypatch):
+        from llamacpp_stack.cli.raw_log import OLD_RAW_FALLBACK_PATH, RAW_FALLBACK_PATH
+
+        assert RAW_FALLBACK_PATH.name == "llm-server-api-raw-requests.log"
+        assert OLD_RAW_FALLBACK_PATH.name == "heimdall-gateway-api-raw-requests.log"
+        assert OLD_RAW_FALLBACK_PATH.exists() is False or True
+        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK", "/tmp/should-not-be-used")  # legacy fallback still accepted

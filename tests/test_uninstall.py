@@ -14,16 +14,16 @@ from llamacpp_stack.install import InstallLayout
 def _make_layout(tmp: Path, mode: str = "user") -> InstallLayout:
     if mode == "user":
         home = tmp / "home"
-        install_root = home / ".local/opt/heimdall-gateway"
-        state_dir = home / ".local/state/heimdall-gateway"
-        config_dir = home / ".config/heimdall-gateway"
-        run_dir = home / ".local/run/heimdall-gateway"
+        install_root = home / ".local/opt/llm-server"
+        state_dir = home / ".local/state/llm-server"
+        config_dir = home / ".config/llm-server"
+        run_dir = home / ".local/run/llm-server"
         bin_dir = home / ".local/bin"
     else:
-        install_root = tmp / "opt/heimdall-gateway"
-        state_dir = tmp / "var/lib/heimdall-gateway"
-        config_dir = tmp / "etc/heimdall-gateway"
-        run_dir = tmp / "run/heimdall-gateway"
+        install_root = tmp / "opt/llm-server"
+        state_dir = tmp / "var/lib/llm-server"
+        config_dir = tmp / "etc/llm-server"
+        run_dir = tmp / "run/llm-server"
         bin_dir = tmp / "usr/local/bin"
     models_dir = tmp / "models"
     for p in (install_root, state_dir, config_dir, run_dir, bin_dir, models_dir):
@@ -257,7 +257,7 @@ class UninstallDetectionTest(unittest.TestCase):
     def test_detects_mode_with_config_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
-            (home / ".config/heimdall-gateway").mkdir(parents=True)
+            (home / ".config/llm-server").mkdir(parents=True)
             with mock.patch("pathlib.Path.home", return_value=home), \
                  mock.patch.object(uninstall_mod, "existing_public_host", return_value=None), \
                  mock.patch.object(uninstall_mod, "choose_layout", side_effect=lambda mode, *_a, **_k: self._dummy_layout(mode)):
@@ -307,6 +307,8 @@ class UninstallDryRunTest(unittest.TestCase):
                  redirect_stdout(io.StringIO()) as out:
                 rc = uninstall_mod.uninstall_stack(_args(mode="user", dry_run=True))
             self.assertEqual(rc, 0)
+            self.assertIn("uv tool uninstall llm-server", out.getvalue())
+            # legacy fallback verification (compat probed)
             self.assertIn("uv tool uninstall heimdall-gateway", out.getvalue())
 
 

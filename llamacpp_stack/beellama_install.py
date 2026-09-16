@@ -96,6 +96,11 @@ def _default_beellama_install_root(install_root: Path) -> Path:
     return install_root / "beellama"
 
 
+def _is_beellama_reusable(beellama_root: Path) -> bool:
+    bin_path = beellama_root / "bin/llama-server-beellama"
+    return bin_path.exists() and os.access(str(bin_path), os.X_OK)
+
+
 def build_beellama(
     repo: str = DEFAULT_BEELLAMA_REPO,
     ref: str = DEFAULT_BEELLAMA_REF,
@@ -105,17 +110,25 @@ def build_beellama(
     """Clone and build beellama.cpp, return binary path."""
     if install_root is None:
         # reuse same layout as llama.cpp: user vs system
+        from llamacpp_stack.cli.constants import PRODUCT_SLUG
         from llamacpp_stack.install import InstallLayout, detect_existing_mode
 
         # fallback to user install root
-        install_root = Path.home() / ".local" / "opt" / "heimdall-gateway"
+        install_root = Path.home() / ".local" / "opt" / PRODUCT_SLUG
         if os.geteuid() == 0:
-            install_root = Path("/opt") / "heimdall-gateway"
+            install_root = Path("/opt") / PRODUCT_SLUG
 
     beellama_root = _default_beellama_install_root(install_root)
     src_dir = beellama_root / "src"
     build_dir = beellama_root / "build"
     bin_path = beellama_root / "bin" / "llama-server-beellama"
+    if _is_beellama_reusable(beellama_root):
+        print(f"[*] Reusing existing beellama build from legacy migration: {bin_path} (skip compile)")
+        try:
+            bin_path.chmod(0o755)
+        except Exception:
+            pass
+        return bin_path
 
     if not src_dir.exists():
         print(f"[*] Cloning {repo}@{ref} (shallow) -> {src_dir}")

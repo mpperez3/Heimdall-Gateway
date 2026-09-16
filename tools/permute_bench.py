@@ -5,7 +5,7 @@ import json
 import time
 import sys
 
-BASE_URL = os.environ.get("HEIMDALL_GATEWAY_URL", "http://127.0.0.1:11435").rstrip("/")
+BASE_URL = os.environ.get("LLM_SERVER_URL", os.environ.get("HEIMDALL_GATEWAY_URL", "http://127.0.0.1:11435")).rstrip("/")
 MODEL_ID = "speculative-gemma-4-31b-it-claude-opus-distill.q8_0"
 
 # USER'S REVISED BASELINE (Q8, 256k Context)

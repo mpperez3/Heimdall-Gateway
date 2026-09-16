@@ -2,7 +2,7 @@
 
 Single responsibility: store raw request bodies without parsing.
 Reuses path resolution precedence from T2 (explicit > env > conf > DEFAULT).
-Falls back to /tmp/heimdall-gateway-api-raw-requests.log on primary failure.
+Falls back to /tmp/llm-server-api-raw-requests.log on primary failure.
 Ring keeps exactly last 10 lines, atomic tmp+rename, never throws.
 """
 from __future__ import annotations
@@ -32,14 +32,15 @@ def _get_env_value(primary: str, legacy: str | None = None, default: str = "") -
 RAW_BASENAME = "api-raw-requests.log"
 RAW_MAX_CHARS = 1048576  # 1 MiB per request cap
 RAW_RING_SIZE = 10
-RAW_FALLBACK_PATH = Path("/tmp/heimdall-gateway-api-raw-requests.log")
+RAW_FALLBACK_PATH = Path("/tmp/llm-server-api-raw-requests.log")
+OLD_RAW_FALLBACK_PATH = Path("/tmp/heimdall-gateway-api-raw-requests.log")  # legacy fallback
 
 
 def _resolve_requests_log_base_path(explicit: Path | None) -> Path:
     """Replicate _resolve_requests_log_base_path precedence: explicit > env > conf > default."""
     if explicit is not None:
         return Path(explicit).expanduser()
-    env_path = _get_env_value("HEIMDALL_GATEWAY_REQUESTS_LOG_PATH", "LLAMACPP_REQUESTS_LOG_PATH", "")
+    env_path = _get_env_value("LLM_SERVER_REQUESTS_LOG_PATH", "HEIMDALL_GATEWAY_REQUESTS_LOG_PATH", "")
     if env_path.strip():
         return Path(env_path.strip()).expanduser()
     # conf.json logging.requests_log.path
@@ -58,8 +59,10 @@ def _resolve_requests_log_base_path(explicit: Path | None) -> Path:
         import json
 
         for candidate in (
-            Path.home() / ".config/heimdall-gateway/conf.json",
-            Path("/etc/heimdall-gateway/conf.json"),
+            Path.home() / f".config/{'llm-server'}/conf.json",
+            Path("/etc/llm-server/conf.json"),
+            Path.home() / ".config/heimdall-gateway/conf.json",  # legacy fallback
+            Path("/etc/heimdall-gateway/conf.json"),  # legacy fallback
         ):
             if candidate.exists():
                 payload = json.loads(candidate.read_text(encoding="utf-8"))
@@ -155,8 +158,8 @@ def log_raw_request(raw_body: bytes | str | None, *, log_path: Path | str | None
     - Sanitizes newlines to keep 1 line per request (\\n escaped).
     - Ring buffer: keep last 10 lines, discard older.
     - Resolves base path via explicit > env > conf > default, then derives raw path as dir/base/api-raw-requests.log.
-    - Fallback to /tmp/heimdall-gateway-api-raw-requests.log if primary not writable.
-    - Never raises; on total failure prints to stderr only if HEIMDALL_GATEWAY_DEBUG_LOGGING set.
+    - Fallback to /tmp/llm-server-api-raw-requests.log if primary not writable.
+    - Never raises; on total failure prints to stderr only if LLM_SERVER_DEBUG_LOGGING set.
     """
     try:
         # 1. Decode
@@ -196,13 +199,13 @@ def log_raw_request(raw_body: bytes | str | None, *, log_path: Path | str | None
         try:
             fallback_base = Path(
                 _get_env_value(
+                    "LLM_SERVER_REQUESTS_LOG_FALLBACK",
                     "HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK",
-                    "LLAMACPP_REQUESTS_LOG_FALLBACK",
-                    "/tmp/heimdall-gateway-api-requests.log",
+                    "/tmp/llm-server-api-requests.log",
                 )
             ).expanduser()
             fallback_target = _raw_path_for_base(fallback_base)
-            # Ensure canonical fallback is /tmp/heimdall-gateway-api-raw-requests.log if fallback_base is default tmp path
+            # Ensure canonical fallback is /tmp/llm-server-api-raw-requests.log if fallback_base is default tmp path
             if fallback_target == Path("/tmp/api-raw-requests.log"):
                 fallback_target = RAW_FALLBACK_PATH
         except Exception:
@@ -227,12 +230,16 @@ def log_raw_request(raw_body: bytes | str | None, *, log_path: Path | str | None
         if fallback_target != RAW_FALLBACK_PATH and primary_target != RAW_FALLBACK_PATH:
             if _try(RAW_FALLBACK_PATH):
                 return
+        # legacy fallback: old heimdall raw path if new missing
+        if OLD_RAW_FALLBACK_PATH not in (primary_target, fallback_target, RAW_FALLBACK_PATH):
+            if _try(OLD_RAW_FALLBACK_PATH):
+                return
 
-        if _get_env_value("HEIMDALL_GATEWAY_DEBUG_LOGGING", "LLAMACPP_DEBUG_LOGGING", ""):
+        if _get_env_value("LLM_SERVER_DEBUG_LOGGING", "HEIMDALL_GATEWAY_DEBUG_LOGGING", ""):
             print(f"[!] log_raw_request failed to write to any candidate: {', '.join(errors)}", file=sys.stderr)
     except Exception:
         # Never throw; debug only
-        if _get_env_value("HEIMDALL_GATEWAY_DEBUG_LOGGING", "LLAMACPP_DEBUG_LOGGING", ""):
+        if _get_env_value("LLM_SERVER_DEBUG_LOGGING", "HEIMDALL_GATEWAY_DEBUG_LOGGING", ""):
             import traceback
 
             print(f"[!] log_raw_request unexpected error: {traceback.format_exc()}", file=sys.stderr)

@@ -208,13 +208,16 @@ def collect_engine_crash_bundle(
                 return 0.1
             return min(default, rem)
 
-        # Journal router
         remaining = _remaining(JOURNAL_TIMEOUT)
         try:
             if time.monotonic() >= deadline:
                 journal_router = _unavailable(TimeoutError("global timeout"))
             else:
-                journal_router = _run_journal("heimdall-gateway-router", timeout=remaining)
+                journal_router = _run_journal("llm-server-router", timeout=remaining)
+                if not journal_router or journal_router.startswith("unavailable"):
+                    _fb = _run_journal("heimdall-gateway-router", timeout=_remaining(JOURNAL_TIMEOUT))
+                    if _fb and not _fb.startswith("unavailable"):
+                        journal_router = _fb if journal_router.startswith("unavailable") else journal_router
         except BaseException as exc:  # noqa: BLE001
             journal_router = _unavailable(exc)
 
@@ -223,7 +226,11 @@ def collect_engine_crash_bundle(
             if time.monotonic() >= deadline:
                 journal_manager = _unavailable(TimeoutError("global timeout"))
             else:
-                journal_manager = _run_journal("heimdall-gateway-manager", timeout=remaining)
+                journal_manager = _run_journal("llm-server-manager", timeout=remaining)
+                if not journal_manager or journal_manager.startswith("unavailable"):
+                    _fb2 = _run_journal("heimdall-gateway-manager", timeout=_remaining(JOURNAL_TIMEOUT))
+                    if _fb2 and not _fb2.startswith("unavailable"):
+                        journal_manager = _fb2 if journal_manager.startswith("unavailable") else journal_manager
         except BaseException as exc:  # noqa: BLE001
             journal_manager = _unavailable(exc)
 

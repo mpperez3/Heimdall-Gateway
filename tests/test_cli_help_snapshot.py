@@ -132,7 +132,7 @@ class TestHelpSnapshotGolden:
         # Must contain install-specific flags
         for needle in ["--mode", "--backend", "--models-dir", "--idle-ttl", "--public-host", "--public-port", "--no-install-services", "--dry-run"]:
             assert needle in help_text, f"install parser help missing {needle!r}"
-        assert "Install Heimdall Gateway" in help_text
+        assert "Install LLM Server" in help_text
         # Ensure --dry-run is documented
         assert "dry-run" in help_text.lower()
         # Snapshot determinism: second call yields same help

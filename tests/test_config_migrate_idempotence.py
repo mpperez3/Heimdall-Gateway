@@ -485,10 +485,9 @@ class TestConfigKeysLogging:
             text=True,
             timeout=10,
         )
-        # fallback: try heimdall-gateway binary if module fails
         if result.returncode != 0:
             import shutil
-            bin_path = shutil.which("heimdall-gateway")
+            bin_path = shutil.which("llm-server") or shutil.which("heimdall-gateway")
             if bin_path:
                 result = subprocess.run([bin_path, "config-keys", "--format", "json"], capture_output=True, text=True, timeout=10)
         if result.returncode == 0 and result.stdout.strip():

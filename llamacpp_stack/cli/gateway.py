@@ -1,4 +1,4 @@
-"""Heimdall Gateway HTTP/dedup/Responses/tool-repair extracted from cli.py.
+"""LLM Server HTTP/dedup/Responses/tool-repair extracted from cli.py.
 
 Preserves ports 11435/11436, DEDUP_STATE wiring, Responses proxy, tool-repair,
 and manager_hint/run_manager_command. No top-level import of replica/server_commands
@@ -355,13 +355,13 @@ def _dedup_send_cached_response(handler_self, cached_result: dict, hit_type: str
     handler_self.send_header("Content-Length", str(len(body)))
     hdr_val = "hit" if hit_type == "hit" else "shared"
     try:
-        handler_self.send_header("X-Heimdall-Dedup", hdr_val)
+        handler_self.send_header("X-LLM-Server-Dedup", hdr_val)
     except Exception:
         pass
     try:
         for k, v in (headers or {}).items():
             lk = str(k).lower()
-            if lk in {"content-type", "content-length", "connection", "transfer-encoding", "content-encoding", "x-heimdall-dedup"}:
+            if lk in {"content-type", "content-length", "connection", "transfer-encoding", "content-encoding", "x-llm-server-dedup", "x-heimdall-dedup"}:  # x-heimdall-dedup compat fallback
                 continue
             try:
                 handler_self.send_header(k, str(v))
@@ -383,7 +383,7 @@ def _dedup_send_json_with_header(handler_self, payload: dict, status: int = 200,
     handler_self.send_header("Content-Type", "application/json; charset=utf-8")
     handler_self.send_header("Content-Length", str(len(encoded)))
     try:
-        handler_self.send_header("X-Heimdall-Dedup", dedup_header)
+        handler_self.send_header("X-LLM-Server-Dedup", dedup_header)  # compat: old x-heimdall-dedup accepted inbound, normalized to new outbound
     except Exception:
         pass
     handler_self.end_headers()

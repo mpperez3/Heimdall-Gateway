@@ -1,8 +1,8 @@
-/# Heimdall Gateway
+/# LLM Server
 
 > **Are you an LLM / coding agent?** Go to [`docs/LLM_INSTALL.md`](docs/LLM_INSTALL.md) for the full install checklist, pre-checks, mandatory user questions, and copy-paste commands. Human overview continues below.
 
-Heimdall Gateway is a local, OpenAI-compatible inference gateway for running
+LLM Server is a local, OpenAI-compatible inference gateway for running
 and switching large language models on your own hardware. It manages model
 artifacts, generates the runtime configuration, and routes requests through
 `llama-swap` to `llama.cpp` or the vLLM beta backend, exposing diagnostics
@@ -26,22 +26,22 @@ installation.
 - Provides request logs, service diagnostics, configuration validation, and
   safe orphan-model cleanup.
 
-The public command is **`heimdall-gateway`**. There is no legacy public CLI
+The public command is **`llm-server`**. There is no legacy public CLI
 alias.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    C[OpenAI-compatible client] --> A["Heimdall API :11435"]
+    C[OpenAI-compatible client] --> A["LLM Server API :11435"]
     A --> S["llama-swap :11436 (router service)"]
     S --> CPP["llama-server / GGUF"]
     S --> V["vllm-server / HF-native"]
     A --> D[("conf.json + catalog.json")]
 ```
 
-The API service (`heimdall-gateway-manager`) and the router service
-(`heimdall-gateway-router`, which runs `llama-swap`) are separate from the
+The API service (`llm-server-manager`) and the router service
+(`llm-server-router`, which runs `llama-swap`) are separate from the
 model processes. Every model process is spawned by `llama-swap` on demand:
 GGUF models run on `llama-server`, while native Hugging Face repositories run
 on the vLLM beta backend. An idle installation does not have to keep every
@@ -62,18 +62,18 @@ model in VRAM.
 
 ```console
 $ python3.12 -m pip install .
-$ heimdall-gateway install --mode user --backend auto
+$ llm-server install --mode user --backend auto
 ```
 
 The installer creates the user services and stores state below
-`~/.local/state/heimdall-gateway`. For a development checkout, use an
+`~/.local/state/llm-server`. For a development checkout, use an
 editable install:
 
 ```console
 $ python3.12 -m venv .venv
 $ . .venv/bin/activate
 $ python -m pip install -e .
-$ heimdall-gateway install --mode user --backend auto
+$ llm-server install --mode user --backend auto
 ```
 
 For a checkout without a prior `pip install`, the bundled wrapper is equivalent
@@ -87,11 +87,11 @@ $ ./llamacpp_stack/bundle/install_llamacpp_stack.sh --mode user --backend auto
 
 ```console
 $ python3.12 -m pip install .
-$ sudo heimdall-gateway install --mode system --backend auto
+$ sudo llm-server install --mode system --backend auto
 ```
 
-System installations use `/etc/heimdall-gateway` for configuration and
-`/var/lib/heimdall-gateway` for runtime state. The installer may ask for
+System installations use `/etc/llm-server` for configuration and
+`/var/lib/llm-server` for runtime state. The installer may ask for
 backend, network, TLS, and model-directory settings on the first install.
 
 ### Update an existing installation
@@ -102,23 +102,23 @@ regenerate certificates unless explicitly requested.
 
 ```console
 # User installation
-$ heimdall-gateway install --mode user --backend auto
+$ llm-server install --mode user --backend auto
 
 # System installation
-$ sudo heimdall-gateway install --mode system --backend auto
+$ sudo llm-server install --mode system --backend auto
 ```
 
 Use `--regenerate-api-cert` only when a new API certificate is really needed.
 Use `--dry-run` to inspect an installation plan without changing the machine:
 
 ```console
-$ heimdall-gateway install --mode user --backend auto --dry-run
+$ llm-server install --mode user --backend auto --dry-run
 ```
 
 For all installer options:
 
 ```console
-$ heimdall-gateway install --help
+$ llm-server install --help
 ```
 
 ## First checks
@@ -126,18 +126,18 @@ $ heimdall-gateway install --help
 After installation, restart the services and inspect the effective runtime:
 
 ```console
-$ systemctl --user restart heimdall-gateway-manager heimdall-gateway-router
-$ heimdall-gateway info
+$ systemctl --user restart llm-server-manager llm-server-router
+$ llm-server info
 ```
 
 Typical output looks like this; paths and versions depend on the installation:
 
 ```text
 ========================================================================
-                         Heimdall Gateway
+                         LLM Server
 Default endpoints:
   llama-swap UI/backend: http://127.0.0.1:11436
-  Heimdall Gateway API: http://127.0.0.1:11435
+  LLM Server API: http://127.0.0.1:11435
 Installed versions:
   llama.cpp:           b10156
   llama-swap:          v244
@@ -149,7 +149,7 @@ Service management:
 ```
 
 For a system installation, use `sudo systemctl restart
-heimdall-gateway-manager heimdall-gateway-router` and the corresponding
+llm-server-manager llm-server-router` and the corresponding
 `sudo systemctl status` commands.
 
 ## Download and run a model
@@ -160,29 +160,29 @@ the selected model.
 
 ```console
 # GGUF repository with a quantization selector
-$ heimdall-gateway add -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M
+$ llm-server add -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M
 
 # Download, configure, load, and warm it
-$ heimdall-gateway run -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M --auto
+$ llm-server run -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M --auto
 
 # Update the configuration for a catalog model
-$ heimdall-gateway update qwen2.5-32b-instruct-q4_k_m --auto
+$ llm-server update qwen2.5-32b-instruct-q4_k_m --auto
 
 # Validate a model without starting a chat
-$ heimdall-gateway validate -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M --auto
+$ llm-server validate -hf Qwen/Qwen2.5-32B-Instruct-GGUF:Q4_K_M --auto
 ```
 
 For speculative/MTP models, the base and draft model can be supplied together:
 
 ```console
-$ heimdall-gateway run \
+$ llm-server run \
     -hf org/base-model:Q4_K_M \
     --speculative \
     -hf org/draft-model:IQ1_M
 ```
 
 When the repository metadata and files identify a supported MTP layout,
-Heimdall derives the draft configuration. Always inspect `info`, `list`, and
+LLM Server derives the draft configuration. Always inspect `info`, `list`, and
 the generated command when validating a new model family.
 
 ### EXL3 / FP8 native (buun) — `quant_method: exl3` + `-hf`
@@ -200,14 +200,14 @@ Buun defaults (`llamacpp_stack/bundle/llama_server_defaults.yaml:buun`): `cache_
 
 ```console
 # Via gateway (recommended) — registers native HF safetensors with buun engine
-$ heimdall-gateway add -hf turboderp/Qwen3.8-27B-exl3 --engine buun
-$ heimdall-gateway run -hf turboderp/Qwen3.8-27B-exl3 --engine buun --auto
+$ llm-server add -hf turboderp/Qwen3.8-27B-exl3 --engine buun
+$ llm-server run -hf turboderp/Qwen3.8-27B-exl3 --engine buun --auto
 # Direct native binary (no gateway) — same flags the gateway generates
 $ buun/bin/llama-server-buun -hf turboderp/Qwen3.8-27B-exl3 -ngl auto --fit on --ctx-size 262144 --port 11436
 $ llama-server -hf turboderp/Qwen3.8-27B-exl3 -ngl auto --fit on  # when buun is default llama-server build
 ```
 
-Verify: `heimdall-gateway info | grep buun`, `cat ~/.local/state/heimdall-gateway/config.yaml | grep buun/bin/llama-server-buun`, `buun/bin/llama-server-buun --help 2>&1 | grep -qi exl3`.
+Verify: `llm-server info | grep buun`, `cat ~/.local/state/llm-server/config.yaml | grep buun/bin/llama-server-buun`, `buun/bin/llama-server-buun --help 2>&1 | grep -qi exl3`.
 
 ## OpenAI-compatible API
 
@@ -258,12 +258,12 @@ them:
 
 | Purpose | User mode | System mode |
 |---|---|---|
-| Global settings | `~/.config/heimdall-gateway/conf.json` | `/etc/heimdall-gateway/conf.json` |
-| Model catalog | `~/.local/state/heimdall-gateway/catalog.json` | `/var/lib/heimdall-gateway/catalog.json` |
-| Generated llama-swap config | `~/.local/state/heimdall-gateway/config.yaml` | `/var/lib/heimdall-gateway/config.yaml` |
-| Templates | `~/.config/heimdall-gateway/templates` | `/etc/heimdall-gateway/templates` |
-| Request log (rotated daily, split, 3-day retention) | `~/.local/state/heimdall-gateway/api-requests.log.YYYY-MM-DD[.partN]` + symlink `api-requests.log` → active day; prune >3 days; fallback `/tmp` | `/var/lib/heimdall-gateway/api-requests.log.YYYY-MM-DD[.partN]` |
-| Raw ring (last 10 raw) | `~/.local/state/heimdall-gateway/api-raw-requests.log` (fallback `/tmp/heimdall-gateway-api-raw-requests.log`, 1 MiB cap) | `/var/lib/heimdall-gateway/api-raw-requests.log` |
+| Global settings | `~/.config/llm-server/conf.json` | `/etc/llm-server/conf.json` |
+| Model catalog | `~/.local/state/llm-server/catalog.json` | `/var/lib/llm-server/catalog.json` |
+| Generated llama-swap config | `~/.local/state/llm-server/config.yaml` | `/var/lib/llm-server/config.yaml` |
+| Templates | `~/.config/llm-server/templates` | `/etc/llm-server/templates` |
+| Request log (rotated daily, split, 3-day retention) | `~/.local/state/llm-server/api-requests.log.YYYY-MM-DD[.partN]` + symlink `api-requests.log` → active day; prune >3 days; fallback `/tmp` | `/var/lib/llm-server/api-requests.log.YYYY-MM-DD[.partN]` |
+| Raw ring (last 10 raw) | `~/.local/state/llm-server/api-raw-requests.log` (fallback `/tmp/llm-server-api-raw-requests.log`, 1 MiB cap) | `/var/lib/llm-server/api-raw-requests.log` |
 
 `conf.json` contains global service settings and llama-server defaults.
 `catalog.json` contains the model inventory and per-model overrides.
@@ -271,9 +271,9 @@ them:
 second hand-maintained catalog. After changing the catalog or global defaults:
 
 ```console
-$ heimdall-gateway config-migrate
-$ heimdall-gateway update
-$ systemctl --user restart heimdall-gateway-manager heimdall-gateway-router
+$ llm-server config-migrate
+$ llm-server update
+$ systemctl --user restart llm-server-manager llm-server-router
 ```
 
 `info` prints the effective paths and reachability. A service restart also
@@ -282,8 +282,8 @@ reports the configuration it is using and warns about invalid values.
 Inspect supported keys and their locations with:
 
 ```console
-$ heimdall-gateway config-keys
-$ heimdall-gateway config-keys --format json
+$ llm-server config-keys
+$ llm-server config-keys --format json
 ```
 
 ### Global llama-server defaults
@@ -331,7 +331,7 @@ copying them into every model entry:
 ```
 
 `reasoning_budget: "half_context"` is the safe default for reasoning models.
-Heimdall sends half of the model's configured context as a request-level
+LLM Server sends half of the model's configured context as a request-level
 `thinking_budget_tokens` value, then clamps it to the active `max_tokens` (or
 `predict`) while reserving room for visible output. Tiny one-message capability
 probes are sent with a zero thinking budget so they cannot consume their whole
@@ -439,7 +439,7 @@ Desactivada por defecto mediante el flag `experimental.dedup_inflight`.
 * `stream_flag` distingue `stream:true` de `stream:false`, con buckets separados aunque el resto coincida.
 * `sha256(json_canónico)` sobre el body filtrado a la allowlist y serializado con `json.dumps(..., sort_keys=True, separators=(",",":"), ensure_ascii=False)`, preservando el orden de las listas. Campos incluidos: `model`, `messages`, `prompt`, `input`, `temperature`, `top_p`, `top_k`, `seed`, `max_tokens`, `stop`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `response_format`, `tools`, `tool_choice`, `n`, `logprobs`, `stream`, `stream_options`, `encoding_format`, `dimensions`. Todo lo demás queda fuera, incluidos `Authorization`, `X-Request-ID`, `X-Correlation-ID`, `User-Agent`, `X-Forwarded-For`, `Date` o `Idempotency-Key`.
 
-**Semántica singleflight.** La segunda request idéntica no se descarta, espera al líder hasta `max_wait_ms` y recibe la misma respuesta, con copia profunda de `status + headers relevantes + body` por seguidor. Transparente salvo el header diagnóstico `X-Heimdall-Dedup: hit|miss|shared` y los eventos `log_api_event` con prefijos `dedup_hit`, `dedup_shared`, `dedup_miss`, `dedup_wait_timeout`, `dedup_bypass_overload` y similares.
+**Semántica singleflight.** La segunda request idéntica no se descarta, espera al líder hasta `max_wait_ms` y recibe la misma respuesta, con copia profunda de `status + headers relevantes + body` por seguidor. Transparente salvo el header diagnóstico `X-LLM-Server-Dedup: hit|miss|shared (legacy X-Heimdall-Dedup aun aceptado — compat deprecado, migra desde heimdall-gateway)` y los eventos `log_api_event` con prefijos `dedup_hit`, `dedup_shared`, `dedup_miss`, `dedup_wait_timeout`, `dedup_bypass_overload` y similares.
 
 **Caché TTL 600 s.** Tras un éxito del líder se guarda el resultado durante `ttl_s` y las siguientes idénticas se sirven desde caché sin ir al upstream. Solo se cachean éxitos `2xx`, los errores `4xx/5xx`, excepciones o streams interrumpidos no se cachean, solo se propagan a los seguidores en vuelo y se olvidan. Un stream truncado por superar `tee_buffer_bytes` tampoco se cachea, solo se deduplica en vuelo. Cada seguidor recibe copia profunda para evitar interferencias.
 
@@ -456,10 +456,10 @@ Desactivada por defecto mediante el flag `experimental.dedup_inflight`.
 **Activación y verificación:**
 
 ```console
-$ heimdall-gateway config-migrate && heimdall-gateway update
-$ systemctl --user restart heimdall-gateway-manager heimdall-gateway-router
-# system: sudo systemctl restart heimdall-gateway-manager heimdall-gateway-router
-$ heimdall-gateway config-keys --format json | jq '.experimental.dedup_inflight'
+$ llm-server config-migrate && llm-server update
+$ systemctl --user restart llm-server-manager llm-server-router
+# system: sudo systemctl restart llm-server-manager llm-server-router
+$ llm-server config-keys --format json | jq '.experimental.dedup_inflight'
 ```
 
 ## Replicas, loading, and observability
@@ -473,11 +473,11 @@ different PIDs and internal IDs.
 Useful operator commands:
 
 ```console
-$ heimdall-gateway list
-$ heimdall-gateway ps
-$ heimdall-gateway requests --lines 100
-$ heimdall-gateway logs --lines 200 --journal
-$ systemctl --user status heimdall-gateway-manager heimdall-gateway-router
+$ llm-server list
+$ llm-server ps
+$ llm-server requests --lines 100
+$ llm-server logs --lines 200 --journal
+$ systemctl --user status llm-server-manager llm-server-router
 ```
 
 For a system installation, prepend `sudo` to service and journal commands.
@@ -491,8 +491,8 @@ operations. Before deleting artifacts, preview files that are not referenced
 by the catalog:
 
 ```console
-$ heimdall-gateway remove-orphans --dry-run
-$ heimdall-gateway remove-orphans --yes
+$ llm-server remove-orphans --dry-run
+$ llm-server remove-orphans --yes
 ```
 
 The cleanup command understands GGUF shard directories and stays below the
@@ -502,23 +502,23 @@ falls back to elevated deletion when a real permission error requires it.
 Other lifecycle commands:
 
 ```console
-$ heimdall-gateway unload MODEL_ID
-$ heimdall-gateway remove MODEL_ID
-$ heimdall-gateway refresh-templates
-$ heimdall-gateway remove-templates
+$ llm-server unload MODEL_ID
+$ llm-server remove MODEL_ID
+$ llm-server refresh-templates
+$ llm-server remove-templates
 ```
 
 ## Troubleshooting
 
 ### API is unavailable or returns 502
 
-Check the two Heimdall services, then inspect the supervisor, rotated request log and crash bundle:
+Check the two LLM Server services, then inspect the supervisor, rotated request log and crash bundle:
 
 ```console
-$ heimdall-gateway info
-$ systemctl --user status heimdall-gateway-manager heimdall-gateway-router
-$ heimdall-gateway logs --lines 200 --journal
-$ heimdall-gateway requests --lines 200
+$ llm-server info
+$ systemctl --user status llm-server-manager llm-server-router
+$ llm-server logs --lines 200 --journal
+$ llm-server requests --lines 200
 ```
 
 An upstream 502 usually means that the selected model process exited during
@@ -543,7 +543,7 @@ $ python3 -c "import json,hashlib; d=json.load(open('/var/llamacpp_models/Qwen3.
 # both shas should be c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041 (or the repo's current template)
 ```
 
-If the two differ, re-download or re-register the model (`heimdall-gateway
+If the two differ, re-download or re-register the model (`llm-server
 update <id> --auto`). The gateway forwards `chat_template_kwargs` verbatim,
 so a custom `chat_template.jinja` in the model directory is respected without
 code changes. Do not edit templates under `llamacpp_stack/bundle/`.
@@ -579,7 +579,7 @@ $ curl -s http://127.0.0.1:11435/v1/chat/completions \
 ### Logs: llama_swap knob and where timing lives
 
 `logging.llama_swap` in `conf.json` controls what `llama-swap` writes to
-stdout and therefore what `journalctl` and `heimdall-gateway logs --journal`
+stdout and therefore what `journalctl` and `llm-server logs --journal`
 show:
 
 ```json
@@ -597,10 +597,10 @@ falls back to `both`). `logLevel` is `trace`, `debug`, `info`, `warn`,
 Copyable checks:
 
 ```console
-$ heimdall-gateway config-keys --format json | jq '.logging.llama_swap'
+$ llm-server config-keys --format json | jq '.logging.llama_swap'
 # -> {"logToStdout":"both","logLevel":"info"}
 
-$ heimdall-gateway logs --lines 200 --journal | grep timing
+$ llm-server logs --lines 200 --journal | grep timing
 $ curl -s http://127.0.0.1:11436/api/metrics/activity | jq .
 ```
 
@@ -614,10 +614,10 @@ that is expected, check `timings` and `Activity` instead. Buun metrics = exllama
 Runbook after changing the knob:
 
 ```console
-$ heimdall-gateway config-migrate
-$ heimdall-gateway update
-$ systemctl --user restart heimdall-gateway-manager heimdall-gateway-router
-# system: sudo systemctl restart heimdall-gateway-manager heimdall-gateway-router
+$ llm-server config-migrate
+$ llm-server update
+$ systemctl --user restart llm-server-manager llm-server-router
+# system: sudo systemctl restart llm-server-manager llm-server-router
 ```
 
 ### A changed setting is not visible
@@ -626,12 +626,12 @@ Confirm that the edited file matches the mode shown by `info`. Then migrate,
 regenerate, and restart:
 
 ```console
-$ heimdall-gateway config-migrate
-$ heimdall-gateway update
-$ heimdall-gateway info
+$ llm-server config-migrate
+$ llm-server update
+$ llm-server info
 ```
 
-`config-migrate` adds `logging.requests_log` (`path`, `max_bytes` 65536-1GiB default 10485760, `retain_days` 1-30 default 3, `compress` bool) and `logging.llama_swap` (`logToStdout` default `both`, `logLevel` default `info`) with defaults when missing and never overwrites existing values; second pass is idempotent (`changed==False`). `update` does not rewrite log files. Verify with `heimdall-gateway config-keys --format json | jq '.logging'`.
+`config-migrate` adds `logging.requests_log` (`path`, `max_bytes` 65536-1GiB default 10485760, `retain_days` 1-30 default 3, `compress` bool) and `logging.llama_swap` (`logToStdout` default `both`, `logLevel` default `info`) with defaults when missing and never overwrites existing values; second pass is idempotent (`changed==False`). `update` does not rewrite log files. Verify with `llm-server config-keys --format json | jq '.logging'`.
 
 Do not edit the generated `config.yaml` as the long-term fix: the next update
 will regenerate it from `conf.json` and `catalog.json`.
@@ -678,10 +678,10 @@ well.
 Useful local commands:
 
 ```console
-$ heimdall-gateway --help
-$ heimdall-gateway info
-$ heimdall-gateway config-keys --format json
-$ heimdall-gateway hacks
+$ llm-server --help
+$ llm-server info
+$ llm-server config-keys --format json
+$ llm-server hacks
 ```
 
 ## Related documentation
@@ -696,6 +696,11 @@ $ heimdall-gateway hacks
 - [`docs/flags_llamacpp`](docs/flags_llamacpp) - llama.cpp flag reference.
 - [`docs/lllamacpp_flags_API.md`](docs/lllamacpp_flags_API.md) - API-facing
   flag reference.
+
+
+## Migracion desde heimdall-gateway
+
+> **Compatibilidad:** `heimdall-gateway` fue renombrado a `llm-server`. El binario `heimdall-gateway` sigue disponible como alias deprecado que delega en `llm-server` y emite `WARNING: heimdall-gateway is deprecated, use llm-server` en stderr. Las instalaciones previas migran automaticamente (copy-if-missing) desde `~/.config/heimdall-gateway` / `~/.local/state/heimdall-gateway` / `/etc/heimdall-gateway` / `/var/lib/heimdall-gateway` / `/opt/heimdall-gateway` a las nuevas rutas `llm-server`; se crea backup `*.pre-llm-server-migration-<stamp>` y se deshabilitan las units viejas `heimdall-gateway-manager` / `heimdall-gateway-router`. Variables `HEIMDALL_GATEWAY_*` siguen aceptadas como fallback de `LLM_SERVER_*` (migra: deprecado).
 
 ## Security notes
 

@@ -29,6 +29,11 @@ try:
         legacy_layout_paths,
         _sudo_prefix,
     )
+
+    try:
+        from llamacpp_stack.install import heimdall_legacy_layout_paths
+    except ImportError:
+        heimdall_legacy_layout_paths = None  # type: ignore[assignment]
 except ImportError:
     from install import (
         CLI_COMMAND,
@@ -50,6 +55,11 @@ except ImportError:
         legacy_layout_paths,
         _sudo_prefix,
     )
+
+    try:
+        from install import heimdall_legacy_layout_paths  # type: ignore[import-not-found]
+    except ImportError:
+        heimdall_legacy_layout_paths = None  # type: ignore[assignment]
 
 
 def _run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -193,31 +203,67 @@ def _has_model_files(path: Path, max_dirs: int = 5000) -> bool:
 
 
 def _legacy_removal_targets(mode: str, preserve_models: bool) -> list[tuple[Path, Path | None]]:
-    """Legacy (pre-Heimdall) paths that the installer historically created.
+    """Legacy (pre-Heimdall) + heimdall-gateway paths that the installer historically created.
 
     Returns (path, models_to_preserve_inside) tuples. Legacy state/install
     dirs are only removed when they do not contain model artifacts; config
-    and run dirs never contain models.
+    and run dirs never contain models. Covers both 1st-gen (llamacpp-superserver)
+    and 2nd-gen (heimdall-gateway) layouts.
     """
-    legacy = legacy_layout_paths(mode)
     targets: list[tuple[Path, Path | None]] = []
-    # Config dirs: always safe to remove (env files, server json, legacy unit
-    # copies). They never contain models.
-    targets.append((legacy["config_dir"], None))
-    if "alt_config_dir" in legacy:
-        targets.append((legacy["alt_config_dir"], None))
-    # Run dirs: sockets/pids only.
-    targets.append((legacy["run_dir"], None))
-    # State and install roots: skip absent paths; keep when they hold model artifacts.
-    for key in ("state_dir", "install_root"):
-        path = legacy[key]
-        if not (path.exists() or path.is_symlink()):
-            continue
-        if preserve_models and _has_model_files(path):
-            print(f"[i] Keeping {path} (contains model artifacts). Remove manually if desired.")
-            continue
-        targets.append((path, None))
-    # Deduplicate (same path can appear for config/run keys across modes)
+
+    # Collect from both legacy families: llamacpp-superserver (1st-gen) and
+    # heimdall-gateway (2nd-gen). Each provides config/state/install/run dirs.
+    legacy_dicts: list[dict[str, Path]] = []
+    try:
+        legacy_dicts.append(legacy_layout_paths(mode))
+    except Exception:
+        pass
+    # heimdall legacy: use helper if available, else fallback to hardcoded paths
+    if heimdall_legacy_layout_paths is not None:
+        try:
+            legacy_dicts.append(heimdall_legacy_layout_paths(mode))
+        except Exception:
+            pass
+    else:
+        # Fallback hardcoded heimdall paths when helper unavailable
+        if mode == "system":
+            legacy_dicts.append({
+                "config_dir": Path("/etc/heimdall-gateway"),
+                "state_dir": Path("/var/lib/heimdall-gateway"),
+                "install_root": Path("/opt/heimdall-gateway"),
+                "run_dir": Path("/run/heimdall-gateway"),
+                "systemd_dir": Path("/etc/systemd/system"),
+                "bin_dir": Path("/usr/local/bin"),
+            })
+        else:
+            legacy_dicts.append({
+                "config_dir": Path.home() / ".config/heimdall-gateway",
+                "state_dir": Path.home() / ".local/state/heimdall-gateway",
+                "install_root": Path.home() / ".local/opt/heimdall-gateway",
+                "run_dir": Path.home() / ".local/run/heimdall-gateway",
+                "systemd_dir": Path.home() / ".config/systemd/user",
+                "bin_dir": Path.home() / ".local/bin",
+            })
+
+    for legacy in legacy_dicts:
+        # Config dirs: always safe to remove (env files, server json, legacy unit
+        # copies). They never contain models.
+        targets.append((legacy["config_dir"], None))
+        if "alt_config_dir" in legacy:
+            targets.append((legacy["alt_config_dir"], None))
+        # Run dirs: sockets/pids only.
+        targets.append((legacy["run_dir"], None))
+        # State and install roots: skip absent paths; keep when they hold model artifacts.
+        for key in ("state_dir", "install_root"):
+            path = legacy[key]
+            if not (path.exists() or path.is_symlink()):
+                continue
+            if preserve_models and _has_model_files(path):
+                print(f"[i] Keeping {path} (contains model artifacts). Remove manually if desired.")
+                continue
+            targets.append((path, None))
+    # Deduplicate (same path can appear for config/run keys across modes/families)
     seen: set[Path] = set()
     unique: list[tuple[Path, Path | None]] = []
     for path, keep in targets:
@@ -229,7 +275,7 @@ def _legacy_removal_targets(mode: str, preserve_models: bool) -> list[tuple[Path
 
 
 def _uv_tool_installed() -> bool:
-    """True when the CLI is installed via 'uv tool install heimdall-gateway'."""
+    """True when the CLI is installed via 'uv tool install' (either name)."""
     if not _uv_tool_executable_path():
         return False
     uv = shutil.which("uv")
@@ -242,11 +288,11 @@ def _uv_tool_installed() -> bool:
     except Exception:
         return False
     # Text output looks like:
-    #   heimdall-gateway v0.1.0
-    #   - heimdall-gateway
+    #   llm-server v0.1.0 / heimdall-gateway v0.1.0
+    #   - llm-server / - heimdall-gateway
     for line in result.stdout.splitlines():
         name = line.strip().lstrip("-").strip()
-        if name.startswith(f"{PRODUCT_SLUG} "):
+        if name.startswith(f"{PRODUCT_SLUG} ") or name.startswith("heimdall-gateway "):
             return True
     return False
 
@@ -275,16 +321,27 @@ def _remove_uv_tool(dry_run: bool) -> None:
     if not _uv_tool_installed():
         return
     if dry_run:
-        print("[dry-run] would run: uv tool uninstall heimdall-gateway")
+        print("[dry-run] would run: uv tool uninstall llm-server; uv tool uninstall heimdall-gateway (either name)")
         return
     uv = shutil.which("uv")
     if uv is None:
         return
-    result = _run([uv, "tool", "uninstall", PRODUCT_SLUG], check=False)
-    if result.returncode == 0:
-        print("[i] Removed the 'heimdall-gateway' uv tool install.")
-    else:
-        print(f"[i] Could not remove the uv tool install (continuing): {result.stderr.strip() or result.stdout.strip()}")
+    successes: list[str] = []
+    last_result: subprocess.CompletedProcess[str] | None = None
+    for tool_name in (PRODUCT_SLUG, "heimdall-gateway"):
+        result = _run([uv, "tool", "uninstall", tool_name], check=False)
+        last_result = result
+        if result.returncode == 0:
+            print(f"[i] Removed the '{tool_name}' uv tool install.")
+            successes.append(tool_name)
+        else:
+            out = (result.stderr.strip() or result.stdout.strip())
+            if "No tools" in out or "not found" in out.lower() or "No package" in out:
+                continue
+    if not successes and last_result is not None:
+        err = (last_result.stderr.strip() or last_result.stdout.strip())
+        if err:
+            print(f"[i] Could not remove the uv tool install (continuing): {err}")
 
 
 def _remove_service_user(layout: InstallLayout, dry_run: bool) -> None:
@@ -358,6 +415,8 @@ def uninstall_systemd_units(layout: InstallLayout, dry_run: bool) -> None:
         SWAP_SERVICE_NAME,
         LEGACY_MANAGER_SERVICE_NAME,
         LEGACY_SWAP_SERVICE_NAME,
+        "heimdall-gateway-manager.service",
+        "heimdall-gateway-router.service",
     ]
 
     if layout.mode == "user":
@@ -369,8 +428,8 @@ def uninstall_systemd_units(layout: InstallLayout, dry_run: bool) -> None:
         unit_dir = Path("/etc/systemd/system")
         use_sudo = True
 
-    # Discover additional Heimdall/legacy units dynamically
-    for pattern in ("*heimdall*", "*llamacpp-superserver*", "*llamaswap*"):
+    # Discover additional LLM Server (incl. legacy Heimdall)/legacy + llm-server units dynamically
+    for pattern in ("*llm-server*", "*heimdall*", "*llamacpp-superserver*", "*llamaswap*"):
         try:
             result = _run(base_systemctl + ["list-units", "--all", "--full", "--no-legend", pattern], check=False)
             for line in result.stdout.splitlines():
@@ -402,16 +461,35 @@ def uninstall_systemd_units(layout: InstallLayout, dry_run: bool) -> None:
         unit_dir / SWAP_SERVICE_NAME,
         unit_dir / LEGACY_MANAGER_SERVICE_NAME,
         unit_dir / LEGACY_SWAP_SERVICE_NAME,
+        unit_dir / "heimdall-gateway-manager.service",
+        unit_dir / "heimdall-gateway-router.service",
         unit_dir / "default.target.wants" / MANAGER_SERVICE_NAME,
         unit_dir / "default.target.wants" / SWAP_SERVICE_NAME,
         unit_dir / "default.target.wants" / LEGACY_MANAGER_SERVICE_NAME,
         unit_dir / "default.target.wants" / LEGACY_SWAP_SERVICE_NAME,
+        unit_dir / "default.target.wants" / "heimdall-gateway-manager.service",
+        unit_dir / "default.target.wants" / "heimdall-gateway-router.service",
         unit_dir / "multi-user.target.wants" / MANAGER_SERVICE_NAME,
         unit_dir / "multi-user.target.wants" / SWAP_SERVICE_NAME,
         unit_dir / "multi-user.target.wants" / LEGACY_MANAGER_SERVICE_NAME,
         unit_dir / "multi-user.target.wants" / LEGACY_SWAP_SERVICE_NAME,
+        unit_dir / "multi-user.target.wants" / "heimdall-gateway-manager.service",
+        unit_dir / "multi-user.target.wants" / "heimdall-gateway-router.service",
     ):
         _remove_path(path, dry_run, use_sudo=use_sudo)
+
+    # Scan and remove any residual *heimdall*/*llm-server* unit files not in canonical list
+    for pattern in ("*heimdall*", "*llm-server*"):
+        try:
+            for candidate in unit_dir.glob(pattern):
+                if candidate.name.endswith(".service") or candidate.name.endswith(".wants"):
+                    _remove_path(candidate, dry_run, use_sudo=use_sudo)
+            for candidate in (unit_dir / "default.target.wants").glob(pattern):
+                _remove_path(candidate, dry_run, use_sudo=use_sudo)
+            for candidate in (unit_dir / "multi-user.target.wants").glob(pattern):
+                _remove_path(candidate, dry_run, use_sudo=use_sudo)
+        except Exception:
+            pass
 
     reload_cmd = base_systemctl + ["daemon-reload"]
     if dry_run:
@@ -445,7 +523,7 @@ def _has_sudo_access() -> bool:
 
 
 def _systemd_unit_exists(mode: str) -> bool:
-    """Check if the Heimdall manager service exists via systemctl."""
+    """Check if the LLM Server (legacy Heimdall) manager service exists via systemctl."""
     if shutil.which("systemctl") is None:
         return False
     try:
@@ -493,8 +571,11 @@ def _systemd_unit_exists(mode: str) -> bool:
 def _system_install_present() -> bool:
     """Explicit check for system install traces as described in task spec."""
     system_paths = [
+        Path("/opt/llm-server"),
         Path("/opt/heimdall-gateway"),
+        Path("/etc/llm-server"),
         Path("/etc/heimdall-gateway"),
+        Path("/var/lib/llm-server"),
         Path("/var/lib/heimdall-gateway"),
     ]
     if any(p.exists() or p.is_symlink() for p in system_paths):
@@ -517,11 +598,14 @@ def _detect_modes_to_uninstall(requested_mode: str | None) -> list[str]:
             layout.config_dir,
             layout.run_dir,
         ]
-        # Explicit system paths per task spec (only for system mode)
+        # Explicit system paths per task spec (only for system mode) — both families
         if mode == "system":
             traces.extend([
+                Path("/opt/llm-server"),
                 Path("/opt/heimdall-gateway"),
+                Path("/etc/llm-server"),
                 Path("/etc/heimdall-gateway"),
+                Path("/var/lib/llm-server"),
                 Path("/var/lib/heimdall-gateway"),
             ])
         legacy = legacy_layout_paths(mode)
@@ -532,9 +616,49 @@ def _detect_modes_to_uninstall(requested_mode: str | None) -> list[str]:
             legacy["run_dir"],
             legacy["systemd_dir"] / MANAGER_SERVICE_NAME,
             legacy["bin_dir"] / CLI_COMMAND,
+            legacy["systemd_dir"] / "heimdall-gateway-manager.service",
+            legacy["systemd_dir"] / "heimdall-gateway-router.service",
+            legacy["bin_dir"] / "heimdall-gateway",
+            legacy["bin_dir"] / "heimdall-gateway-manager-start",
+            legacy["bin_dir"] / "heimdall-gateway-router-start",
         ]
         if "alt_config_dir" in legacy:
             legacy_traces.append(legacy["alt_config_dir"])
+        # Also check heimdall legacy layout directly
+        if heimdall_legacy_layout_paths is not None:
+            try:
+                heimdall_legacy = heimdall_legacy_layout_paths(mode)
+                legacy_traces.extend([
+                    heimdall_legacy["config_dir"],
+                    heimdall_legacy["state_dir"],
+                    heimdall_legacy["install_root"],
+                    heimdall_legacy["run_dir"],
+                    heimdall_legacy["systemd_dir"] / "heimdall-gateway-manager.service",
+                    heimdall_legacy["systemd_dir"] / "heimdall-gateway-router.service",
+                    heimdall_legacy["bin_dir"] / "heimdall-gateway",
+                ])
+            except Exception:
+                pass
+        else:
+            # Fallback hardcoded heimdall paths
+            if mode == "system":
+                legacy_traces.extend([
+                    Path("/etc/heimdall-gateway"),
+                    Path("/var/lib/heimdall-gateway"),
+                    Path("/opt/heimdall-gateway"),
+                    Path("/run/heimdall-gateway"),
+                    Path("/etc/systemd/system/heimdall-gateway-manager.service"),
+                    Path("/usr/local/bin/heimdall-gateway"),
+                ])
+            else:
+                legacy_traces.extend([
+                    Path.home() / ".config/heimdall-gateway",
+                    Path.home() / ".local/state/heimdall-gateway",
+                    Path.home() / ".local/opt/heimdall-gateway",
+                    Path.home() / ".local/run/heimdall-gateway",
+                    Path.home() / ".config/systemd/user/heimdall-gateway-manager.service",
+                    Path.home() / ".local/bin/heimdall-gateway",
+                ])
         has_file_traces = any(p.exists() or p.is_symlink() for p in [*traces, *legacy_traces])
         has_systemd_traces = _systemd_unit_exists(mode)
         if has_file_traces or has_systemd_traces:
@@ -552,7 +676,6 @@ def _detect_modes_to_uninstall(requested_mode: str | None) -> list[str]:
 
 
 def _collect_bin_targets(layout: InstallLayout) -> list[Path]:
-    # bin_dir contains wrappers and CLI entry
     bin_dir = layout.bin_dir
     seen: set[str] = set()
     targets: list[Path] = []
@@ -561,6 +684,9 @@ def _collect_bin_targets(layout: InstallLayout) -> list[Path]:
         SWAP_WRAPPER_NAME,
         CLI_COMMAND,
         LEGACY_CLI_COMMAND,
+        "heimdall-gateway",
+        "heimdall-gateway-manager-start",
+        "heimdall-gateway-router-start",
         "llamacpp-manager-start",
         "llamaswap-start",
         "llamacpp-superserver",
@@ -572,6 +698,33 @@ def _collect_bin_targets(layout: InstallLayout) -> list[Path]:
         if name not in seen:
             seen.add(name)
             targets.append(bin_dir / name)
+    # Also handle alternative bin locations: /usr/local/bin, ~/.local/bin, ~/.local/opt/*/bin
+    extra_bin_dirs: list[Path] = []
+    if layout.mode == "user":
+        extra_bin_dirs.append(Path.home() / ".local/bin")
+        extra_bin_dirs.append(Path("/usr/local/bin"))
+        try:
+            opt_base = Path.home() / ".local/opt"
+            if opt_base.exists():
+                for child in opt_base.iterdir():
+                    bin_candidate = child / "bin"
+                    if bin_candidate.is_dir():
+                        extra_bin_dirs.append(bin_candidate)
+        except Exception:
+            pass
+        extra_bin_dirs.append(Path.home() / ".local/opt/llm-server/bin")
+        extra_bin_dirs.append(Path.home() / ".local/opt/heimdall-gateway/bin")
+    else:
+        extra_bin_dirs.append(Path("/usr/local/bin"))
+        extra_bin_dirs.append(Path.home() / ".local/bin")
+    for extra_dir in extra_bin_dirs:
+        if extra_dir == bin_dir:
+            continue
+        for name in (CLI_COMMAND, "heimdall-gateway", MANAGER_WRAPPER_NAME, SWAP_WRAPPER_NAME, "heimdall-gateway-manager-start", "heimdall-gateway-router-start"):
+            key = f"{extra_dir}:{name}"
+            if key not in seen:
+                seen.add(key)
+                targets.append(extra_dir / name)
     return targets
 
 
@@ -595,12 +748,16 @@ def _build_confirmation(modes: list[str], per_mode_info: list[tuple[InstallLayou
         if layout.mode == "system":
             removals.append(f"/etc/systemd/system/{MANAGER_SERVICE_NAME}")
             removals.append(f"/etc/systemd/system/{SWAP_SERVICE_NAME}")
+            removals.append("/etc/systemd/system/heimdall-gateway-manager.service")
+            removals.append("/etc/systemd/system/heimdall-gateway-router.service")
             removals.append(f"service user '{layout.service_user}'")
             removals.append("ufw rules for the gateway ports (if present)")
         else:
             removals.append(f"~/.config/systemd/user/{MANAGER_SERVICE_NAME}")
             removals.append(f"~/.config/systemd/user/{SWAP_SERVICE_NAME}")
-    removals.append("'heimdall-gateway' uv tool install (if installed via 'uv tool install')")
+            removals.append("~/.config/systemd/user/heimdall-gateway-manager.service")
+            removals.append("~/.config/systemd/user/heimdall-gateway-router.service")
+    removals.append("'llm-server' + 'heimdall-gateway' uv tool installs (if installed via 'uv tool install')")
     kept: list[str] = [str(mdir) for _l, mdir in per_mode_info] if not remove_models else []
 
     seen = set()
@@ -643,7 +800,7 @@ def uninstall_stack(args: argparse.Namespace) -> int:
 
     # Confirmation prompt (skipped in dry-run or with --yes)
     if not dry_run and not assume_yes:
-        print("This will remove Heimdall Gateway installations from:")
+        print("This will remove LLM Server installations from:")
         for r in uniq_removals:
             print(f"  - {r}")
         if kept:
@@ -671,14 +828,14 @@ def uninstall_stack(args: argparse.Namespace) -> int:
     if dry_run:
         models_paths = ", ".join(str(mdir) for _l, mdir in per_mode_info)
         if remove_models:
-            print(f"[dry-run] Would remove Heimdall Gateway ({', '.join(modes)} mode) including models at {models_paths}")
+            print(f"[dry-run] Would remove LLM Server ({', '.join(modes)} mode) including models at {models_paths}")
         else:
-            print(f"[dry-run] Would remove Heimdall Gateway ({', '.join(modes)} mode) keeping models at {models_paths}")
+            print(f"[dry-run] Would remove LLM Server ({', '.join(modes)} mode) keeping models at {models_paths}")
 
     # Perform removal per mode
     for layout, models_dir in per_mode_info:
         use_sudo = layout.mode == "system"
-        print(f"{'[dry-run] ' if dry_run else ''}Uninstalling Heimdall Gateway ({layout.mode} mode)...")
+        print(f"{'[dry-run] ' if dry_run else ''}Uninstalling LLM Server ({layout.mode} mode)...")
         uninstall_systemd_units(layout, dry_run)
 
         if remove_models:
@@ -733,14 +890,14 @@ def uninstall_stack(args: argparse.Namespace) -> int:
         print("Dry-run complete. No changes were made.")
     else:
         suffix = " (models removed)" if remove_models else " (models preserved)"
-        print(f"Heimdall Gateway ({', '.join(modes)} mode) uninstalled{suffix}.")
+        print(f"LLM Server ({', '.join(modes)} mode) uninstalled{suffix}.")
 
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Uninstall Heimdall Gateway (removes all traces except models).",
+        description="Uninstall LLM Server (removes all traces except models).",
         epilog=(
             "Models are never deleted automatically. Remove them manually with: "
             "rm -rf <models_dir>   (or pass --remove-models to delete them as part of the uninstall)"

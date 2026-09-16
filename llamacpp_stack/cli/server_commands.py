@@ -635,8 +635,17 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
     if key == "mirostat": cmd.extend(["--mirostat", str(int(value))]); return
     if key == "mirostat_ent": cmd.extend(["--mirostat-ent", str(float(value))]); return
     if key == "mirostat_lr": cmd.extend(["--mirostat-lr", str(float(value))]); return
-    if key == "cache_type_k": cmd.extend(["--cache-type-k", str(value)]); return
-    if key == "cache_type_v": cmd.extend(["--cache-type-v", str(value)]); return
+    if key == "cache_type_k":
+        sv = str(value).strip().lower()
+        # buun uses turbo* instead of kvarn* (same bits); map kvarn->turbo for buun compatibility
+        if sv.startswith("kvarn"): sv = sv.replace("kvarn", "turbo", 1)
+        elif sv.startswith("karn"): sv = sv.replace("karn", "turbo", 1)
+        cmd.extend(["--cache-type-k", sv]); return
+    if key == "cache_type_v":
+        sv = str(value).strip().lower()
+        if sv.startswith("kvarn"): sv = sv.replace("kvarn", "turbo", 1)
+        elif sv.startswith("karn"): sv = sv.replace("karn", "turbo", 1)
+        cmd.extend(["--cache-type-v", sv]); return
     if key == "fit":
         vs=None
         if isinstance(value, bool): vs="on" if value else "off"

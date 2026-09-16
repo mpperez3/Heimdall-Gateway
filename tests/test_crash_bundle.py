@@ -177,7 +177,7 @@ def test_proxy_502_wiring_mock_source_contains_bundle():
     assert "proxy_error_with_bundle" in src_gw
     assert '"engine":' in src_cli or "'engine':" in src_cli or '"engine"' in src_cli
     assert "bundle_ref" in src_cli
-    assert "uv run heimdall-gateway logs --lines 200 --journal" in src_cli
+    assert "uv run llm-server logs --lines 200 --journal" in src_cli
     # unload guard wiring
     assert "model_unexpected_unload_with_bundle" in src_cli
     # guard child exit
@@ -196,12 +196,12 @@ def test_proxy_502_json_shape_with_bundle_via_mock():
     # Mock wiring: error truncation and bundle_ref
     exc = RuntimeError("connection refused by backend which is down and not responding to any request")
     err_short = f"upstream unavailable: {exc}"[:200]
-    payload = {"error": err_short, "engine": fake_bundle["engine"], "hint": "uv run heimdall-gateway logs --lines 200 --journal", "bundle_ref": "abcd1234"}
+    payload = {"error": err_short, "engine": fake_bundle["engine"], "hint": "uv run llm-server logs --lines 200 --journal", "bundle_ref": "abcd1234"}
     assert "error" in payload
     assert payload["error"].startswith("upstream unavailable:")
     assert len(payload["error"]) <= 200
     assert payload["engine"] in {"llama-server", "beellama", "vllm", "exllama", "llama-swap", "manager"}
-    assert payload["hint"] == "uv run heimdall-gateway logs --lines 200 --journal"
+    assert payload["hint"] == "uv run llm-server logs --lines 200 --journal"
     assert payload["bundle_ref"] == "abcd1234"
     # Ensure full bundle would be in log, truncated in HTTP
     bundle_json = json.dumps(fake_bundle)
@@ -241,3 +241,11 @@ def test_file_under_600_lines():
     src = pathlib.Path("llamacpp_stack/cli/crash_bundle.py").read_text(encoding="utf-8")
     lines = src.splitlines()
     assert len(lines) < 600, f"crash_bundle.py has {len(lines)} lines, must be <600"
+
+
+def test_legacy_heimdall_journal_fallback_still_tried():
+    src = pathlib.Path("llamacpp_stack/cli/crash_bundle.py").read_text(encoding="utf-8")
+    assert "llm-server-router" in src
+    assert "llm-server-manager" in src
+    assert "heimdall-gateway-router" in src
+    assert "heimdall-gateway-manager" in src

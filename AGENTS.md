@@ -1,22 +1,22 @@
-# AGENTS.md — Heimdall Gateway (llamacpp-stack)
+# AGENTS.md — LLM Server (llamacpp-stack)
 
 > Guía para agentes de codificación (LLMs) que trabajan en este repositorio. Lee este archivo antes de explorar, instalar, testear o modificar código.
 
 ## 1. Qué es este repo
 
-**Heimdall Gateway** es un gateway de inferencia local, compatible con OpenAI, para ejecutar y rotar LLMs en hardware propio. Orquesta:
+**LLM Server** es un gateway de inferencia local, compatible con OpenAI, para ejecutar y rotar LLMs en hardware propio. Orquesta:
 
 - Descarga y registro de modelos GGUF de Hugging Face (selección de quant, shards).
 - Generación de `config.yaml` para `llama-swap` desde un catálogo (`catalog.json`) + ajustes globales (`conf.json`).
 - Ruteo OpenAI-compatible hacia `llama.cpp` (`llama-server`) o backend `vLLM` (beta).
 - Réplicas conversation-affine, auto-context, MTP/speculative, defaults por familia, placement GPU, logs/diagnóstico y cleanup seguro de huérfanos.
 
-Comando público único: **`heimdall-gateway`** (`llamacpp_stack/llamacpp_api_install.py:main` -> `pyproject.toml:15`). No hay alias legacy.
+Comando público único: **`llm-server`** (`llamacpp_stack/llamacpp_api_install.py:main` -> `pyproject.toml:15`). No hay alias legacy.
 
 Arquitectura resumida:
 
 ```
-cliente OpenAI --> Heimdall API :11435 --> llama-swap :11436 --> llama-server (GGUF) / vllm-server (HF)
+cliente OpenAI --> LLM Server API :11435 --> llama-swap :11436 --> llama-server (GGUF) / vllm-server (HF)
                                       --> conf.json + catalog.json --> config.yaml (generado)
 ```
 
@@ -49,7 +49,7 @@ Esto aplica a:
 | Sincronizar lockfile | — | `uv sync` (lee `uv.lock` + `pyproject.toml`) |
 | Añadir dependencia | `pip install <pkg>` | `uv add <pkg>` / `uv pip install <pkg>` |
 | Correr tests | `pytest -q` | `uv run pytest -q` |
-| Correr CLI | `heimdall-gateway info` | `uv run heimdall-gateway info` |
+| Correr CLI | `llm-server info` | `uv run llm-server info` |
 | Correr script Python | `python tools/foo.py` | `uv run python tools/foo.py` |
 
 > Si necesitas reproducir exactamente un comando del `README.md` o de `docs/LLM_INSTALL.md` para verificar documentación, puedes mostrar ambas variantes, pero ejecuta la variante `uv`.
@@ -63,7 +63,7 @@ Esto aplica a:
 ### Nota para `install.py` / bundle
 
 - `llamacpp_stack/install.py` y `llamacpp_stack/bundle/install_llamacpp_stack.sh` son los instaladores de **usuario final** del gateway (servicios systemd, modelos, certs). Crean su propio bootstrap venv si hace falta.
-- Cuando como agente **desarrollas o testeas** esos instaladores, usa `uv` para preparar el entorno de desarrollo desde el que los invocas (`uv run heimdall-gateway install --mode user --backend auto --dry-run`), no para reemplazar la lógica interna del instalador salvo que el cambio solicitado sea precisamente migrar el instalador a `uv`.
+- Cuando como agente **desarrollas o testeas** esos instaladores, usa `uv` para preparar el entorno de desarrollo desde el que los invocas (`uv run llm-server install --mode user --backend auto --dry-run`), no para reemplazar la lógica interna del instalador salvo que el cambio solicitado sea precisamente migrar el instalador a `uv`.
 
 ---
 
@@ -85,7 +85,7 @@ python3.12 --version 2>&1; which python3.12
 nvidia-smi 2>&1 | head -n 30 || echo "sin GPU/driver"
 df -h /var /home 2>&1 | head -n 20
 ss -tlnp | grep -E '11434|11435|11436' || echo "puertos libres"
-heimdall-gateway info 2>&1 | head -n 80 || echo "gateway no instalado"
+llm-server info 2>&1 | head -n 80 || echo "gateway no instalado"
 ```
 
 ---
@@ -94,7 +94,7 @@ heimdall-gateway info 2>&1 | head -n 80 || echo "gateway no instalado"
 
 ```
 .
-├── llamacpp_stack/          # Paquete principal (heimdall-gateway)
+├── llamacpp_stack/          # Paquete principal (llm-server)
 │   ├── cli.py               # Shim <400 líneas — solo re-exports desde cli/* (sin lógica duplicada)
 │   ├── cli/                 # Paquete modularizado (env, constants, models, parser, replica, server_commands, gateway, daemon)
 │   │   ├── __init__.py      # Re-exports lazy + _CliPackageModule compat (from cli import X y from cli.parser import X)
@@ -110,7 +110,7 @@ heimdall-gateway info 2>&1 | head -n 80 || echo "gateway no instalado"
 │   │   └── daemon.py        # daemon_mode, auto-watch, build_info_text, show_info
 │   ├── _cli_impl.py         # Implementación legacy completa (20k líneas) — fallback para símbolos aún no extraídos
 │   ├── install.py           # Instalador user/system, prompts, resolve_* (fuente de verdad)
-│   ├── llamacpp_api_install.py  # Entry point `heimdall-gateway`
+│   ├── llamacpp_api_install.py  # Entry point `llm-server`
 │   ├── command_router.py    # Ruteo API -> llama-swap
 │   ├── managed_commands.py  # Comandos `add`/`run`/`update`/`validate`
 │   ├── auto_performance.py / auto_perf_runner.py
@@ -127,7 +127,7 @@ heimdall-gateway info 2>&1 | head -n 80 || echo "gateway no instalado"
 │   └── flags_llamacpp
 ├── tests/                   # pytest (ver §7)
 ├── tools/                   # bench/verify scripts
-├── skills/heimdall-autotune/ # Skill de autotuning
+├── skills/llm-server-autotune/ # Skill de autotuning
 ├── templates/               # Templates de config
 ├── Dockerfile / Dockerfile.llamacpp / Dockerfile.vllm
 ├── docker-compose-vllm.yaml
@@ -141,12 +141,12 @@ Ficheros de **instalación real** (no editar `config.yaml` a mano):
 
 | Propósito | user mode | system mode |
 |---|---|---|
-| Settings globales | `~/.config/heimdall-gateway/conf.json` | `/etc/heimdall-gateway/conf.json` |
-| Catálogo modelos | `~/.local/state/heimdall-gateway/catalog.json` | `/var/lib/heimdall-gateway/catalog.json` |
-| Runtime generado | `~/.local/state/heimdall-gateway/config.yaml` | `/var/lib/heimdall-gateway/config.yaml` |
-| Env wrappers | `~/.config/heimdall-gateway/heimdall-gateway.env` | `/etc/heimdall-gateway/heimdall-gateway.env` |
-| Request log (rotado diario, split, 3 días) | `~/.local/state/heimdall-gateway/api-requests.log.YYYY-MM-DD[.partN]` + symlink `api-requests.log` → día activo; prune 3 días; fallback `/tmp` | `/var/lib/heimdall-gateway/api-requests.log.YYYY-MM-DD[.partN]` |
-| Raw ring (últimas 10 sin procesar) | `~/.local/state/heimdall-gateway/api-raw-requests.log` (fallback `/tmp/heimdall-gateway-api-raw-requests.log`, 1 MiB cap) | `/var/lib/heimdall-gateway/api-raw-requests.log` |
+| Settings globales | `~/.config/llm-server/conf.json` | `/etc/llm-server/conf.json` |
+| Catálogo modelos | `~/.local/state/llm-server/catalog.json` | `/var/lib/llm-server/catalog.json` |
+| Runtime generado | `~/.local/state/llm-server/config.yaml` | `/var/lib/llm-server/config.yaml` |
+| Env wrappers | `~/.config/llm-server/llm-server.env` | `/etc/llm-server/llm-server.env` |
+| Request log (rotado diario, split, 3 días) | `~/.local/state/llm-server/api-requests.log.YYYY-MM-DD[.partN]` + symlink `api-requests.log` → día activo; prune 3 días; fallback `/tmp` | `/var/lib/llm-server/api-requests.log.YYYY-MM-DD[.partN]` |
+| Raw ring (últimas 10 sin procesar) | `~/.local/state/llm-server/api-raw-requests.log` (fallback `/tmp/llm-server-api-raw-requests.log`, 1 MiB cap) | `/var/lib/llm-server/api-raw-requests.log` |
 
 ---
 
@@ -168,17 +168,17 @@ uv sync
 uv pip install -e .
 
 # 3. Verificar CLI
-uv run heimdall-gateway --help
-uv run heimdall-gateway info
-uv run heimdall-gateway config-keys --format json | head -n 80
+uv run llm-server --help
+uv run llm-server info
+uv run llm-server config-keys --format json | head -n 80
 
 # 4. Tests
 uv run pytest -q
 
 # 5. Instalación local de prueba (no toca sistema, sin servicios)
-uv run heimdall-gateway install --mode user --backend auto \
+uv run llm-server install --mode user --backend auto \
   --llama-cpp-mode prebuilt \
-  --models-dir /tmp/heimdall-models \
+  --models-dir /tmp/llm-server-models \
   --public-host 127.0.0.1 --public-port 11436 \
   --no-api-auth --no-api-https --idle-ttl 300 \
   --no-install-services --dry-run
@@ -195,22 +195,22 @@ Si el usuario te pide instalar el gateway, sigue **estrictamente** `docs/LLM_INS
 1. Ejecuta pre-checks (§1 de ese doc) y guarda outputs.
 2. Haz **Q1–Q8 en un solo bloque** (modo, models-dir, backend, método llama.cpp, red/puertos, auth/TLS, modelos iniciales, tuning). No re-preguntes lo ya respondido. En non-TTY usa defaults + flags explícitos.
 3. Ejecuta siempre primero con `--dry-run`, revisa el plan, luego sin `--dry-run`.
-4. Verifica con `heimdall-gateway info` + `curl /v1/models` + `curl /api/replicas`.
+4. Verifica con `llm-server info` + `curl /v1/models` + `curl /api/replicas`.
 5. No asumas `sudo`, puertos o descargas de GB sin confirmar.
 
 Comandos canónicos (variante `uv`):
 
 ```bash
 # Nueva instalación user, auto, interactiva mínima
-uv run heimdall-gateway install --mode user --backend auto --models-dir /var/llamacpp_models --idle-ttl 300 --dry-run
-uv run heimdall-gateway install --mode user --backend auto --models-dir /var/llamacpp_models --idle-ttl 300
+uv run llm-server install --mode user --backend auto --models-dir /var/llamacpp_models --idle-ttl 300 --dry-run
+uv run llm-server install --mode user --backend auto --models-dir /var/llamacpp_models --idle-ttl 300
 
 # System (re-ejecuta con sudo -E interno si hace falta)
-uv run heimdall-gateway install --mode system --backend auto --models-dir /var/llamacpp_models --public-host 0.0.0.0 --public-port 11436
+uv run llm-server install --mode system --backend auto --models-dir /var/llamacpp_models --public-host 0.0.0.0 --public-port 11436
 
 # No interactivo / CI
 uv run python -m llamacpp_stack.install --mode user --backend auto --llama-cpp-mode prebuilt \
-  --models-dir /tmp/heimdall-models --public-host 127.0.0.1 --public-port 11436 \
+  --models-dir /tmp/llm-server-models --public-host 127.0.0.1 --public-port 11436 \
   --no-api-auth --no-api-https --idle-ttl 300 --no-install-services --dry-run
 ```
 
@@ -241,9 +241,9 @@ Notas:
 ## 8. Docker
 
 ```bash
-docker build -t heimdall-gateway -f Dockerfile .
-docker build -t heimdall-llamacpp -f Dockerfile.llamacpp .
-docker build -t heimdall-vllm -f Dockerfile.vllm .
+docker build -t llm-server -f Dockerfile .
+docker build -t llm-server-llamacpp -f Dockerfile.llamacpp .
+docker build -t llm-server-vllm -f Dockerfile.vllm .
 docker compose -f docker-compose-vllm.yaml up --build
 ```
 
@@ -255,19 +255,19 @@ docker compose -f docker-compose-vllm.yaml up --build
 - Tras editar `conf.json` o `catalog.json`:
 
   ```bash
-  uv run heimdall-gateway config-migrate
-  uv run heimdall-gateway update
-  systemctl --user restart heimdall-gateway-manager heimdall-gateway-router
-  # system: sudo systemctl restart heimdall-gateway-manager heimdall-gateway-router
+  uv run llm-server config-migrate
+  uv run llm-server update
+  systemctl --user restart llm-server-manager llm-server-router
+  # system: sudo systemctl restart llm-server-manager llm-server-router
   ```
 
 - Inspección de claves soportadas:
 
   ```bash
-  uv run heimdall-gateway config-keys
-  uv run heimdall-gateway config-keys --format json
-  uv run heimdall-gateway info
-  uv run heimdall-gateway hacks
+  uv run llm-server config-keys
+  uv run llm-server config-keys --format json
+  uv run llm-server info
+  uv run llm-server hacks
   ```
 
 - Defaults tunables: `llamacpp_stack/bundle/llama_server_defaults.yaml` (sampling, KV-cache, batching, GPU, context).
@@ -286,7 +286,7 @@ docker compose -f docker-compose-vllm.yaml up --build
 
 ## 11. Troubleshooting (resumen)
 
-- **API 502 / Connection refused :11436**: `llama-server` crasheó en load (OOM, ctx excesivo, draft MTP incompatible). Buscar `bundle_ref` en JSON 502 y `*_with_bundle` en log rotado `api-requests.log.YYYY-MM-DD[.partN]`; `uv run heimdall-gateway logs --lines 200 --journal` trae journal + hint `nvidia-smi`; raw body de últimas 10 sin procesar en `api-raw-requests.log` (ring 1 MiB cap, fallback `/tmp`).
+- **API 502 / Connection refused :11436**: `llama-server` crasheó en load (OOM, ctx excesivo, draft MTP incompatible). Buscar `bundle_ref` en JSON 502 y `*_with_bundle` en log rotado `api-requests.log.YYYY-MM-DD[.partN]`; `uv run llm-server logs --lines 200 --journal` trae journal + hint `nvidia-smi`; raw body de últimas 10 sin procesar en `api-raw-requests.log` (ring 1 MiB cap, fallback `/tmp`).
 - **Setting no visible**: confirmar `info` muestra el `mode` correcto, luego `config-migrate && update && restart`. `config-migrate` añade `logging.requests_log` con defaults si falta, nunca sobrescribe valores existentes, segunda pasada idempotente.
 - **GPU equivocada**: inspeccionar `CUDA_VISIBLE_DEVICES`/`--device`/`--tensor-split` en `ps`/`logs`.
 - **Contexto pequeño en cliente**: `curl /v1/models | jq` tiene el real; el cliente puede tener metadata cacheada.
@@ -310,7 +310,7 @@ Ver `README.md#Troubleshooting` y `docs/LLM_INSTALL.md#8`.
 - `docs/LLM_INSTALL.md` — checklist canónico para agentes (pre-checks, Q1–Q8, matriz, comandos, verificación).
 - `llamacpp_stack/install.py` — fuente de verdad de prompts/flags (`prompt_bool`, `prompt_choice`, `resolve_*`, `build_cli_parser`).
 - `docs/VLLM-BETA.md`, `docs/LOCAL_OLLAMA_SETUP.md`, `docs/arg-hyphen-conventions.md`, `docs/flags_llamacpp`, `docs/lllamacpp_flags_API.md`.
-- `skills/heimdall-autotune/SKILL.md` — loop de autotuning.
+- `skills/llm-server-autotune/SKILL.md` — loop de autotuning.
 
 ---
 

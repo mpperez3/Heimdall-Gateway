@@ -133,8 +133,10 @@ except Exception:
 # Paths & Constants
 def _load_installed_env() -> None:
     candidates = [
-        Path.home() / ".config/heimdall-gateway/heimdall-gateway.env",
-        Path("/etc/heimdall-gateway/heimdall-gateway.env"),
+        Path.home() / ".config/llm-server/llm-server.env",
+        Path("/etc/llm-server/llm-server.env"),
+        Path.home() / ".config/heimdall-gateway/heimdall-gateway.env",  # legacy fallback
+        Path("/etc/heimdall-gateway/heimdall-gateway.env"),  # legacy fallback
         Path.home() / ".config/llamacpp-superserver/llamacpp-superserver.env",
         Path("/etc/llamacpp-superserver/llamacpp-superserver.env"),
         Path.home() / ".config/llamacpp/llamacpp-stack.env",
@@ -185,7 +187,21 @@ def _json_loads_allow_comments(text: str, path_desc: str = "") -> object:
 
 
 def _env_path(name: str, default: str) -> Path:
-    return Path(os.environ.get(name, default)).expanduser()
+    val = os.environ.get(name)
+    if val:
+        return Path(val).expanduser()
+    if name.startswith("LLM_SERVER_"):
+        heimdall = name.replace("LLM_SERVER_", "HEIMDALL_GATEWAY_", 1)
+        if os.environ.get(heimdall):
+            return Path(os.environ[heimdall]).expanduser()
+        llamacpp = heimdall.replace("HEIMDALL_GATEWAY_", "LLAMACPP_", 1)
+        if os.environ.get(llamacpp):
+            return Path(os.environ[llamacpp]).expanduser()
+    if name.startswith("HEIMDALL_GATEWAY_"):
+        llamacpp = name.replace("HEIMDALL_GATEWAY_", "LLAMACPP_", 1)
+        if os.environ.get(llamacpp):
+            return Path(os.environ[llamacpp]).expanduser()
+    return Path(default).expanduser()
 
 
 def _env_value(primary: str, legacy: str | None = None, default: str = "") -> str:
@@ -193,6 +209,18 @@ def _env_value(primary: str, legacy: str | None = None, default: str = "") -> st
         return str(os.environ[primary])
     if legacy and os.environ.get(legacy):
         return str(os.environ[legacy])
+    if legacy and legacy.startswith("HEIMDALL_GATEWAY_"):
+        llamacpp_key = legacy.replace("HEIMDALL_GATEWAY_", "LLAMACPP_", 1)
+        if os.environ.get(llamacpp_key):
+            return str(os.environ[llamacpp_key])
+        if legacy == "HEIMDALL_GATEWAY_DEBUG" and os.environ.get("DEBUG_LLAMACPP"):
+            return str(os.environ["DEBUG_LLAMACPP"])
+    if primary.startswith("LLM_SERVER_") and legacy and legacy.startswith("HEIMDALL_GATEWAY_"):
+        llamacpp_key = legacy.replace("HEIMDALL_GATEWAY_", "LLAMACPP_", 1)
+        if os.environ.get(llamacpp_key):
+            return str(os.environ[llamacpp_key])
+        if legacy == "HEIMDALL_GATEWAY_DEBUG" and os.environ.get("DEBUG_LLAMACPP"):
+            return str(os.environ["DEBUG_LLAMACPP"])
     return default
 
 
@@ -200,14 +228,14 @@ def _env_path2(primary: str, legacy: str | None, default: str) -> Path:
     return Path(_env_value(primary, legacy, default)).expanduser()
 
 
-PRODUCT_NAME = "Heimdall Gateway"
-PRODUCT_SLUG = "heimdall-gateway"
-SOCKET_PATH = _env_value("HEIMDALL_GATEWAY_MANAGER_SOCKET", "LLAMACPP_MANAGER_SOCKET", f"/run/{PRODUCT_SLUG}/manager.sock")
-DEFAULT_MODELS_DIR = _env_path2("HEIMDALL_GATEWAY_MODELS", "LLAMACPP_MODELS", f"/var/lib/{PRODUCT_SLUG}/models")
-DEFAULT_CONFIG_PATH = _env_path2("HEIMDALL_GATEWAY_CONFIG", "LLAMACPP_CONFIG", f"/var/lib/{PRODUCT_SLUG}/config.yaml")
-DEFAULT_CATALOG_PATH = _env_path2("HEIMDALL_GATEWAY_CATALOG", "LLAMACPP_CATALOG", f"/var/lib/{PRODUCT_SLUG}/catalog.json")
+PRODUCT_NAME = "LLM Server"
+PRODUCT_SLUG = "llm-server"
+SOCKET_PATH = _env_value("LLM_SERVER_MANAGER_SOCKET", "HEIMDALL_GATEWAY_MANAGER_SOCKET", f"/run/{PRODUCT_SLUG}/manager.sock")
+DEFAULT_MODELS_DIR = _env_path2("LLM_SERVER_MODELS", "HEIMDALL_GATEWAY_MODELS", f"/var/lib/{PRODUCT_SLUG}/models")
+DEFAULT_CONFIG_PATH = _env_path2("LLM_SERVER_CONFIG", "HEIMDALL_GATEWAY_CONFIG", f"/var/lib/{PRODUCT_SLUG}/config.yaml")
+DEFAULT_CATALOG_PATH = _env_path2("LLM_SERVER_CATALOG", "HEIMDALL_GATEWAY_CATALOG", f"/var/lib/{PRODUCT_SLUG}/catalog.json")
 DEFAULT_SERVER_CONFIG_PATH = _env_path(
-    "HEIMDALL_GATEWAY_SERVER_CONFIG",
+    "LLM_SERVER_SERVER_CONFIG",
     _env_value(
         "HEIMDALL_GATEWAY_SERVER_CONFIG",
         "LLAMACPP_SERVER_CONFIG",
@@ -217,17 +245,17 @@ DEFAULT_SERVER_CONFIG_PATH = _env_path(
     ),
 )
 ALTERNATE_SERVER_CONFIG_BASENAME = "conf.json"
-DEFAULT_SERVICE_NAME = _env_value("HEIMDALL_GATEWAY_SERVICE_NAME", "LLAMACPP_SERVICE_NAME", "llamaswap")
-CLI_COMMAND = "heimdall-gateway"
+DEFAULT_SERVICE_NAME = _env_value("LLM_SERVER_SERVICE_NAME", "HEIMDALL_GATEWAY_SERVICE_NAME", "llamaswap")
+CLI_COMMAND = "llm-server"
 LEGACY_CLI_COMMAND = "llamacpp-superserver"
-MANAGER_SERVICE_NAME = "heimdall-gateway-manager"
-SWAP_SERVICE_NAME = "heimdall-gateway-router"
+MANAGER_SERVICE_NAME = "llm-server-manager"
+SWAP_SERVICE_NAME = "llm-server-router"
 DEFAULT_LLAMA_SERVER = _env_path("LLAMA_SERVER_BIN", f"/opt/{PRODUCT_SLUG}/llama.cpp/build/bin/llama-server")
 def _is_vllm_backend() -> bool:
-    backend = _env_value("HEIMDALL_GATEWAY_BACKEND", "LLAMACPP_BACKEND", "")
+    backend = _env_value("LLM_SERVER_BACKEND", "HEIMDALL_GATEWAY_BACKEND", "")
     # Debug print to stderr so it shows up in logs even if stdout is captured
-    if _env_value("HEIMDALL_GATEWAY_DEBUG", "DEBUG_LLAMACPP", ""):
-        print(f"DEBUG: _is_vllm_backend check. HEIMDALL_GATEWAY_BACKEND='{backend}'", file=sys.stderr)
+    if _env_value("LLM_SERVER_DEBUG", "HEIMDALL_GATEWAY_DEBUG", ""):
+        print(f"DEBUG: _is_vllm_backend check. LLM_SERVER_BACKEND='{backend}'", file=sys.stderr)
     return backend == "vllm-beta"
 
 DEFAULT_CTX_SIZE = 8192
@@ -237,14 +265,14 @@ CHAT_TOOL_CONTINUE_REPAIR_THINKING_BUDGET_TOKENS = 512
 MODEL_PROBE_REASONING_MAX_TOKENS = 128
 try:
     DEFAULT_API_CTX_FACTOR = float(
-        os.environ.get("HEIMDALL_GATEWAY_API_CTX_FACTOR", os.environ.get("LLAMACPP_API_CTX_FACTOR", os.environ.get("LLAMACPP_CTX_DISPLAY_RATIO", "0.5")))
+        _env_value("LLM_SERVER_API_CTX_FACTOR", "HEIMDALL_GATEWAY_API_CTX_FACTOR", os.environ.get("LLAMACPP_API_CTX_FACTOR", os.environ.get("LLAMACPP_CTX_DISPLAY_RATIO", "0.5")))
     )
 except ValueError:
     DEFAULT_API_CTX_FACTOR = 0.5
 DEFAULT_N_GPU_LAYERS = 999
-DEFAULT_IDLE_TTL = int(_env_value("HEIMDALL_GATEWAY_IDLE_TTL", "LLAMACPP_IDLE_TTL", os.environ.get("LLAMACPP_DEFAULT_TTL", "300")))
-DEFAULT_MODEL_SWITCH_GRACE_S = int(_env_value("HEIMDALL_GATEWAY_MODEL_SWITCH_GRACE_S", "LLAMACPP_MODEL_SWITCH_GRACE_S", "30"))
-DEFAULT_MAX_CONCURRENT_PER_MODEL = int(_env_value("HEIMDALL_GATEWAY_MAX_CONCURRENT_PER_MODEL", "LLAMACPP_MAX_CONCURRENT_PER_MODEL", "2"))
+DEFAULT_IDLE_TTL = int(_env_value("LLM_SERVER_IDLE_TTL", "HEIMDALL_GATEWAY_IDLE_TTL", os.environ.get("LLAMACPP_DEFAULT_TTL", "300")))
+DEFAULT_MODEL_SWITCH_GRACE_S = int(_env_value("LLM_SERVER_MODEL_SWITCH_GRACE_S", "HEIMDALL_GATEWAY_MODEL_SWITCH_GRACE_S", "30"))
+DEFAULT_MAX_CONCURRENT_PER_MODEL = int(_env_value("LLM_SERVER_MAX_CONCURRENT_PER_MODEL", "HEIMDALL_GATEWAY_MAX_CONCURRENT_PER_MODEL", "2"))
 LLAMASWAP_UPSTREAM_STATIC_BLOCKED_BASENAMES = {
     "sw.js",
     "service-worker.js",
@@ -324,21 +352,21 @@ def default_tensor_split() -> str:
 
 DEFAULT_TENSOR_SPLIT = default_tensor_split()
 DEFAULT_START_PORT = 18080
-DEFAULT_PUBLIC_HOST = _env_value("HEIMDALL_GATEWAY_PUBLIC_HOST", "LLAMACPP_PUBLIC_HOST", "127.0.0.1")
-DEFAULT_PUBLIC_PORT = int(_env_value("HEIMDALL_GATEWAY_PUBLIC_PORT", "LLAMACPP_PUBLIC_PORT", "11437"))
-DEFAULT_API_PORT = int(_env_value("HEIMDALL_GATEWAY_API_PORT", "LLAMACPP_API_PORT", str(DEFAULT_PUBLIC_PORT - 1)))
+DEFAULT_PUBLIC_HOST = _env_value("LLM_SERVER_PUBLIC_HOST", "HEIMDALL_GATEWAY_PUBLIC_HOST", "127.0.0.1")
+DEFAULT_PUBLIC_PORT = int(_env_value("LLM_SERVER_PUBLIC_PORT", "HEIMDALL_GATEWAY_PUBLIC_PORT", "11437"))
+DEFAULT_API_PORT = int(_env_value("LLM_SERVER_API_PORT", "HEIMDALL_GATEWAY_API_PORT", str(DEFAULT_PUBLIC_PORT - 1)))
 DEFAULT_REQUESTS_LOG_PATH = _env_path(
-    "HEIMDALL_GATEWAY_REQUESTS_LOG",
-    "/var/lib/heimdall-gateway/api-requests.log"
+    "LLM_SERVER_REQUESTS_LOG",
+    f"/var/lib/{PRODUCT_SLUG}/api-requests.log"
     if os.geteuid() == 0
-    else str(Path.home() / ".local/state/heimdall-gateway/api-requests.log"),
+    else str(Path.home() / f".local/state/{PRODUCT_SLUG}/api-requests.log"),
 )
 DEFAULT_LAST_CHAT_RESPONSE_LOG_PATH = Path(_env_value(
+    "LLM_SERVER_LAST_CHAT_RESPONSE_LOG",
     "HEIMDALL_GATEWAY_LAST_CHAT_RESPONSE_LOG",
-    "LLAMACPP_LAST_CHAT_RESPONSE_LOG",
     str(DEFAULT_REQUESTS_LOG_PATH.with_name("last-chat-response.json")),
 )).expanduser()
-SYSTEM_REQUESTS_LOG_PATH = Path("/var/lib/heimdall-gateway/api-requests.log")
+SYSTEM_REQUESTS_LOG_PATH = Path(f"/var/lib/{PRODUCT_SLUG}/api-requests.log")
 
 
 def _default_requests_log_config() -> dict[str, object]:
@@ -514,14 +542,14 @@ def _effective_requests_log_config() -> dict[str, object]:
     raw_logging = payload.get("logging") if isinstance(payload.get("logging"), dict) else {}
     raw_req = raw_logging.get("requests_log") if isinstance(raw_logging, dict) else None
     cfg, _ = _normalize_requests_log_config(raw_req)
-    env_max = _env_value("HEIMDALL_GATEWAY_REQUESTS_LOG_MAX_BYTES", "LLAMACPP_REQUESTS_LOG_MAX_BYTES", "")
+    env_max = _env_value("LLM_SERVER_REQUESTS_LOG_MAX_BYTES", "HEIMDALL_GATEWAY_REQUESTS_LOG_MAX_BYTES", "")
     if env_max.strip():
         try:
             iv = int(env_max.strip())
             cfg["max_bytes"] = max(65536, min(1073741824, iv))
         except Exception:
             pass
-    env_retain = _env_value("HEIMDALL_GATEWAY_REQUESTS_LOG_RETAIN_DAYS", "LLAMACPP_REQUESTS_LOG_RETAIN_DAYS", "")
+    env_retain = _env_value("LLM_SERVER_REQUESTS_LOG_RETAIN_DAYS", "HEIMDALL_GATEWAY_REQUESTS_LOG_RETAIN_DAYS", "")
     if env_retain.strip():
         try:
             iv = int(env_retain.strip())
@@ -534,7 +562,7 @@ def _effective_requests_log_config() -> dict[str, object]:
 def _resolve_requests_log_base_path(explicit: Path | None) -> Path:
     if explicit is not None:
         return Path(explicit).expanduser()
-    env_path = _env_value("HEIMDALL_GATEWAY_REQUESTS_LOG_PATH", "LLAMACPP_REQUESTS_LOG_PATH", "")
+    env_path = _env_value("LLM_SERVER_REQUESTS_LOG_PATH", "HEIMDALL_GATEWAY_REQUESTS_LOG_PATH", "")
     if env_path.strip():
         return Path(env_path.strip()).expanduser()
     cfg = _effective_requests_log_config()
@@ -652,7 +680,7 @@ MODEL_ACTIVITY: dict[str, dict[str, float | str]] = {}
 LAST_ACTIVITY_MODEL_ID = ""
 
 LLAMASWAP_CONFIG_HEADER = (
-    "# Heimdall Gateway config.yaml\n"
+    "# LLM Server config.yaml\n"
     "# Purpose: llama-swap routing and per-model command map generated from catalog.\n"
     "# This file is regenerated by install/update operations.\n"
     "# Example:\n"
@@ -1386,8 +1414,10 @@ def _resolve_api_prefix() -> str:
     try:
         # conf.json lives next to the server config; try both user and system paths
         for candidate in (
-            Path.home() / ".config" / "heimdall-gateway" / "conf.json",
-            Path("/etc/heimdall-gateway/conf.json"),
+            Path.home() / ".config" / PRODUCT_SLUG / "conf.json",
+            Path(f"/etc/{PRODUCT_SLUG}/conf.json"),
+            Path.home() / ".config/heimdall-gateway/conf.json",  # legacy fallback
+            Path("/etc/heimdall-gateway/conf.json"),  # legacy fallback
         ):
             if candidate.exists():
                 payload = json.loads(candidate.read_text("utf-8"))
@@ -1713,15 +1743,15 @@ def _ensure_server_config_metadata(payload: dict[str, object]) -> dict[str, obje
     meta = payload.get("_meta")
     if not isinstance(meta, dict):
         meta = {}
-    # _meta is documentation owned by Heimdall Gateway, not user configuration.
+    # _meta is documentation owned by LLM Server, not user configuration.
     # Do not store example config values here: they look like duplicated active
     # settings and can contradict the real top-level keys.
-    meta["purpose"] = "Global Heimdall Gateway settings consumed by CLI/services."
+    meta["purpose"] = "Global LLM Server settings consumed by CLI/services."
     meta[
         "note"
     ] = "Active settings are top-level keys only. Model definitions live in catalog.json; config.yaml is generated for llama-swap."
     meta.pop("example", None)
-    meta["security"] = "Set api_auth.enabled/api_auth.api_key for Bearer or X-API-Key auth. Set api_https.enabled with cert_file/key_file to serve the Heimdall Gateway API over HTTPS."
+    meta["security"] = "Set api_auth.enabled/api_auth.api_key for Bearer or X-API-Key auth. Set api_https.enabled with cert_file/key_file to serve the LLM Server API over HTTPS."
     meta["service_restart_help"] = {
         "system_mode": f"sudo systemctl restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
         "user_mode": f"systemctl --user restart {MANAGER_SERVICE_NAME} {SWAP_SERVICE_NAME}",
@@ -2799,7 +2829,7 @@ def _should_probe_repo_for_mtp_drafter(repo_id: str, filename: str, model_id: st
         return True
     # Some Unsloth Gemma 4 GGUF repos ship an MTP drafter (`mtp-gemma-4-31B-it.gguf`)
     # while the repo and selected main model filenames do not contain "mtp".
-    # Heimdall Gateway launches local GGUFs with --model, so it must explicitly
+    # LLM Server launches local GGUFs with --model, so it must explicitly
     # discover/download this drafter instead of relying on llama.cpp -hf magic.
     return "unsloth/gemma-4-31b-it" in haystack and str(filename or "").strip().lower().endswith(".gguf")
 
@@ -4695,7 +4725,7 @@ def build_llama_server_command(
         "reasoning_budget_message",
     ):
         if key in effective:
-            # Defaults generated by Heimdall Gateway should be conservative and must
+            # Defaults generated by LLM Server should be conservative and must
             # not inject unsupported flags into older/different llama.cpp builds.
             # Explicit per-model catalog overrides are different: if the user
             # configured a flag, emit it and let llama.cpp decide.
@@ -4810,9 +4840,12 @@ def persist_server_config(args) -> None:
 
 def _is_buun_available(args=None) -> bool:
     candidates = [
-        Path.home() / ".local" / "opt" / "heimdall-gateway" / "buun" / "bin" / "llama-server-buun",
-        Path("/opt/heimdall-gateway/buun/bin/llama-server-buun"),
-        Path("/var/lib/heimdall-gateway/buun/bin/llama-server-buun"),
+        Path.home() / f".local/opt/{PRODUCT_SLUG}/buun/bin/llama-server-buun",
+        Path(f"/opt/{PRODUCT_SLUG}/buun/bin/llama-server-buun"),
+        Path(f"/var/lib/{PRODUCT_SLUG}/buun/bin/llama-server-buun"),
+        Path.home() / ".local/opt/heimdall-gateway/buun/bin/llama-server-buun",  # legacy fallback
+        Path("/opt/heimdall-gateway/buun/bin/llama-server-buun"),  # legacy fallback
+        Path("/var/lib/heimdall-gateway/buun/bin/llama-server-buun"),  # legacy fallback
     ]
     try:
         if args is not None and getattr(args, "llama_server", None):
@@ -4964,7 +4997,7 @@ def log_api_event(kind: str, payload: dict | None = None, log_path: Path | str |
     }
     line = json.dumps(entry, ensure_ascii=False) + "\n"
     line_bytes_len = len(line.encode("utf-8"))
-    fallback_base = Path(_env_value("HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK", "LLAMACPP_REQUESTS_LOG_FALLBACK", "/tmp/heimdall-gateway-api-requests.log")).expanduser()
+    fallback_base = Path(_env_value("LLM_SERVER_REQUESTS_LOG_FALLBACK", "HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK", f"/tmp/{PRODUCT_SLUG}-api-requests.log")).expanduser()
     try:
         cfg = _effective_requests_log_config()
         max_bytes = int(cfg.get("max_bytes", 10485760))
@@ -6729,16 +6762,19 @@ def infer_install_mode() -> str:
         return "user"
 
     system_markers = (
-        "/etc/heimdall-gateway",
-        "/var/lib/heimdall-gateway",
-        "/opt/heimdall-gateway",
+        f"/etc/{PRODUCT_SLUG}",
+        f"/var/lib/{PRODUCT_SLUG}",
+        f"/opt/{PRODUCT_SLUG}",
+        "/etc/heimdall-gateway",  # legacy fallback
+        "/var/lib/heimdall-gateway",  # legacy fallback
+        "/opt/heimdall-gateway",  # legacy fallback
     )
     config_values = [str(path.expanduser()) for path in config_paths]
     if any(any(marker in value for marker in system_markers) for value in config_values):
         return "system"
 
     socket_path = str(Path(SOCKET_PATH).expanduser())
-    if "/run/heimdall-gateway" in socket_path:
+    if f"/run/{PRODUCT_SLUG}" in socket_path or "/run/heimdall-gateway" in socket_path:  # legacy fallback
         return "system"
     if str(home) in socket_path:
         return "user"
@@ -6779,7 +6815,7 @@ def _show_local_catalog_fallback(args, reason: Exception) -> None:
     elif _has_gguf_files(args.models_dir):
         print(
             "Detected GGUF files in the models directory, but there are no registered catalog entries yet. "
-            "Register models first with 'heimdall-gateway run <hf-repo[:quant]>' or 'add'."
+            "Register models first with 'llm-server run <hf-repo[:quant]>' or 'add'."
         )
 
 def _ask_confirmation(prompt: str, progress_callback = None, default: bool = False) -> bool:
@@ -7477,7 +7513,7 @@ def ensure_model_available(args, progress_callback = None):
         if model_partials:
             _emit_message(
                 "Detected partial downloads for this model; skipping automatic ctx probe. "
-                "Re-run with `heimdall-gateway update --auto --model-id {}` after downloads finish.".format(mid),
+                "Re-run with `llm-server update --auto --model-id {}` after downloads finish.".format(mid),
                 progress_callback,
             )
             # Keep desired_ctx as-is (fallback or default) and avoid probing.
@@ -8027,7 +8063,7 @@ def _delete_path_with_permission_fallback(path: Path, root: Path | None = None) 
 
     The root check is mandatory for cleanup commands so a malformed catalog or
     symlink cannot turn an orphan cleanup into an arbitrary file deletion.
-    ``sudo`` is deliberately a last resort: normal Heimdall installs should
+    ``sudo`` is deliberately a last resort: normal LLM Server installs should
     have the model tree owned by the service account.
     """
     path = Path(path)
@@ -8852,8 +8888,8 @@ def model_has_enough_free_vram_to_load(model: ManagedModel, *, safety_vram_mib: 
 def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DEFAULT_PUBLIC_HOST, port=DEFAULT_PUBLIC_PORT) -> str | None:
     """Generate a user-friendly error message for GPU conflicts.
     
-    Uses only the local Heimdall Gateway installation for model management.
-    If a GPU conflict is detected, suggests using 'heimdall-gateway unload' to free resources.
+    Uses only the local LLM Server installation for model management.
+    If a GPU conflict is detected, suggests using 'llm-server unload' to free resources.
     """
     processes = get_llama_server_processes()
     process_by_pid = {proc["pid"]: proc for proc in processes}
@@ -8896,7 +8932,7 @@ def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DE
         joined += f"; +{len(conflicts) - 4} more"
     return (
         f"Cannot load model '{model_id}' because the GPU is already in use: {joined}. "
-        "Use 'heimdall-gateway unload <model>' to free resources, or wait for those workloads to finish."
+        "Use 'llm-server unload <model>' to free resources, or wait for those workloads to finish."
     )
 
 
@@ -11029,7 +11065,7 @@ def _responses_payload_to_chat_payload(
 
 
 def _responses_internal_round_max_tokens() -> int:
-    raw = _env_value("HEIMDALL_GATEWAY_RESPONSES_INTERNAL_MAX_TOKENS", "LLAMACPP_RESPONSES_INTERNAL_MAX_TOKENS", "4096")
+    raw = _env_value("LLM_SERVER_RESPONSES_INTERNAL_MAX_TOKENS", "HEIMDALL_GATEWAY_RESPONSES_INTERNAL_MAX_TOKENS", "4096")
     try:
         value = int(raw)
     except (TypeError, ValueError):
@@ -11051,7 +11087,7 @@ def _responses_tool_choice_to_chat_tool_choice(tool_choice: object) -> object:
     return tool_choice
 
 def _responses_raw_passthrough_enabled() -> bool:
-    value = _env_value("HEIMDALL_GATEWAY_RESPONSES_RAW_PASSTHROUGH", "LLAMACPP_SUPERSERVER_RESPONSES_RAW_PASSTHROUGH", "")
+    value = _env_value("LLM_SERVER_RESPONSES_RAW_PASSTHROUGH", "HEIMDALL_GATEWAY_RESPONSES_RAW_PASSTHROUGH", "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -12717,7 +12753,7 @@ def run_llamaswap_guard(args) -> int:
                 try:
                     _err_short_g2 = f"upstream unavailable: {exc}"[:200]
                     _eng_g2 = (_bundle_guard2.get("engine") if isinstance(_bundle_guard2, dict) else "llama-server") or "llama-server"
-                    _hint_g2 = "uv run heimdall-gateway logs --lines 200 --journal"
+                    _hint_g2 = "uv run llm-server logs --lines 200 --journal"
                     _ref_g2 = _bundle_ref_guard2 or __import__("uuid").uuid4().hex[:8]
                     payload_g2 = {"error": _err_short_g2, "engine": _eng_g2, "hint": _hint_g2, "bundle_ref": _ref_g2}
                     data_g2 = _json_guard2.dumps(payload_g2).encode("utf-8", errors="replace")
@@ -13118,19 +13154,23 @@ def _candidate_request_log_paths(explicit_path: Path | None = None) -> list[Path
     bases: list[Path] = []
     if explicit_path is not None:
         bases.append(explicit_path)
-    user_log = Path.home() / ".local/state/heimdall-gateway/api-requests.log"
+    user_log = Path.home() / f".local/state/{PRODUCT_SLUG}/api-requests.log"
     bases.append(user_log)
+    # legacy fallback
+    legacy_user_log = Path.home() / ".local/state/heimdall-gateway/api-requests.log"  # legacy fallback
+    if legacy_user_log not in bases:
+        bases.append(legacy_user_log)
     if SYSTEM_REQUESTS_LOG_PATH not in bases:
         bases.append(SYSTEM_REQUESTS_LOG_PATH)
     if DEFAULT_REQUESTS_LOG_PATH not in bases:
         bases.append(DEFAULT_REQUESTS_LOG_PATH)
-    env_path = _env_value("HEIMDALL_GATEWAY_REQUESTS_LOG", "HEIMDALL_GATEWAY_REQUESTS_LOG", "")
+    env_path = _env_value("LLM_SERVER_REQUESTS_LOG", "HEIMDALL_GATEWAY_REQUESTS_LOG", "")
     if env_path:
         path = Path(env_path).expanduser()
         if path not in bases:
             bases.insert(0, path)
     try:
-        fallback_raw = _env_value("HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK", "LLAMACPP_REQUESTS_LOG_FALLBACK", "/tmp/heimdall-gateway-api-requests.log")
+        fallback_raw = _env_value("LLM_SERVER_REQUESTS_LOG_FALLBACK", "HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK", f"/tmp/{PRODUCT_SLUG}-api-requests.log")
         fallback_base = Path(fallback_raw).expanduser()
         if fallback_base not in bases:
             bases.append(fallback_base)
@@ -13548,7 +13588,7 @@ def start_ctx_metadata_server(args):
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Heimdall Gateway API</title>
+  <title>LLM Server API</title>
   <style>
     body {{ font-family: system-ui, sans-serif; max-width: 980px; margin: 32px auto; padding: 0 18px; line-height: 1.45; }}
     code, pre {{ background: #f4f4f5; border-radius: 6px; padding: 2px 5px; }}
@@ -13560,7 +13600,7 @@ def start_ctx_metadata_server(args):
   </style>
 </head>
 <body>
-  <h1>Heimdall Gateway API</h1>
+  <h1>LLM Server API</h1>
   <p>Esta pagina muestra informacion sensible y solo se sirve completa a clientes locales/loopback.</p>
   <table>
     <tr><th>Base URL</th><td><code>{escaped_base}</code></td></tr>
@@ -13978,7 +14018,7 @@ def start_ctx_metadata_server(args):
                 try:
                     _err_short = f"upstream unavailable: {exc}"[:200]
                     _engine_name = (_bundle_proxy.get("engine") if isinstance(_bundle_proxy, dict) else "llama-server") or "llama-server"
-                    _hint = "uv run heimdall-gateway logs --lines 200 --journal"
+                    _hint = "uv run llm-server logs --lines 200 --journal"
                     _ref = _bundle_ref_proxy or _uuid_bundle.uuid4().hex[:8]  # type: ignore
                     _dedup_send_json_with_header(
                         self,
@@ -18260,8 +18300,8 @@ def _stop_process(proc):
 def _probe_runtime_env() -> dict[str, str] | None:
     env = os.environ.copy()
     lib_paths: list[str] = []
-    cuda_root = _env_value("HEIMDALL_GATEWAY_CUDA_ROOT", "LLAMACPP_CUDA_ROOT", "").strip()
-    nccl_root = _env_value("HEIMDALL_GATEWAY_NCCL_ROOT", "LLAMACPP_NCCL_ROOT", "").strip()
+    cuda_root = _env_value("LLM_SERVER_CUDA_ROOT", "HEIMDALL_GATEWAY_CUDA_ROOT", "").strip()
+    nccl_root = _env_value("LLM_SERVER_NCCL_ROOT", "HEIMDALL_GATEWAY_NCCL_ROOT", "").strip()
     if cuda_root:
         env["CUDA_PATH"] = cuda_root
         lib_paths.extend([f"{cuda_root}/lib64", f"{cuda_root}/lib"])
@@ -19536,7 +19576,7 @@ def ensure_catalog_mtp_drafters(
     """Backfill MTP drafter files/flags for already-installed local GGUF models.
 
     llama.cpp can auto-discover a repo-root MTP drafter when launched with
-    `-hf`, but Heimdall Gateway launches downloaded GGUFs with `--model`.  Existing
+    `-hf`, but LLM Server launches downloaded GGUFs with `--model`.  Existing
     installs therefore need an explicit local drafter file and `--model-draft`.
     """
     token = getattr(args, "hf_token", None) or os.environ.get("HF_TOKEN")
@@ -20004,7 +20044,7 @@ def sync_config_from_server_config_for_startup(args) -> str:
     raw_server_config = _load_server_config_payload(args)
     warnings = _server_config_validation_warnings(raw_server_config)
     for warning in warnings:
-        print(f"[!] Heimdall Gateway config warning: {warning}", flush=True)
+        print(f"[!] LLM Server config warning: {warning}", flush=True)
         log_api_event("server_config_validation_warning", {"warning": warning, "server_config": str(_args_server_config_path(args))})
     persist_server_config(args)
     catalog, catalog_diag = load_catalog_with_diagnostics(args.catalog, _args_server_config_path(args))
@@ -20273,8 +20313,8 @@ def daemon_mode(args):
     # catalog.json or conf.json. This is render-only and does not wait for
     # llama-swap/API because the router service may still be starting.
     try:
-        print(f"[*] Using Heimdall Gateway server config: {_args_server_config_path(args)}", flush=True)
-        print("[*] Syncing Heimdall Gateway config on startup...", flush=True)
+        print(f"[*] Using LLM Server server config: {_args_server_config_path(args)}", flush=True)
+        print("[*] Syncing LLM Server config on startup...", flush=True)
         sync_config_from_server_config_for_startup(args)
         log_api_event("startup_config_sync_done", {"config": str(args.config), "catalog": str(args.catalog)})
     except Exception as exc:
@@ -20288,7 +20328,7 @@ def daemon_mode(args):
         raise RuntimeError(f"Could not create manager socket directory for {SOCKET_PATH}: {exc}") from exc
     ctx_metadata_server = start_ctx_metadata_server(args)
     if ctx_metadata_server is None:
-        raise RuntimeError(f"Could not start Heimdall Gateway API on {args.public_host}:{resolve_api_port(args)}")
+        raise RuntimeError(f"Could not start LLM Server API on {args.public_host}:{resolve_api_port(args)}")
     unload_guard_thread = start_unexpected_unload_guard(args)
     auto_update_thread = start_catalog_auto_update_watch(args)
     
@@ -20457,15 +20497,16 @@ def read_install_manifest():
 
 
 def get_heimdall_gateway_version() -> str:
-    forced = _env_value("HEIMDALL_GATEWAY_VERSION", "LLAMACPP_SUPERSERVER_VERSION", "").strip()
+    forced = (os.environ.get("LLM_SERVER_VERSION", "").strip() or _env_value("HEIMDALL_GATEWAY_VERSION", "LLAMACPP_SUPERSERVER_VERSION", "").strip())
     if forced:
         return forced
-    try:
-        return version("heimdall-gateway")
-    except PackageNotFoundError:
-        pass
-    except Exception:
-        pass
+    for _pkg in ("llm-server", "heimdall-gateway"):
+        try:
+            return version(_pkg)
+        except PackageNotFoundError:
+            continue
+        except Exception:
+            continue
     # Fallback for local editable runs.
     pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
     try:
@@ -20488,8 +20529,8 @@ def render_heimdall_gateway_banner() -> str:
         "| | | (_| | | | | | | (_| | (__| |  | |_| |_) |\n"
         "|_|_|\\__,_|_| |_| |_|\\__,_|\\___|_|   \\__| .__/\n"
         "                                           |_|   \n"
-        "              Heimdall Gateway\n"
-        f"         heimdall-gateway v{get_heimdall_gateway_version()}\n"
+        "              LLM Server\n"
+        f"         llm-server v{get_heimdall_gateway_version()}\n"
         f"{divider}"
     )
 
@@ -20548,7 +20589,7 @@ def build_info_text(args = None) -> str:
     return (
         "Default endpoints:\n"
         f"  llama-swap UI/backend: {ui_url}\n"
-        f"  Heimdall Gateway API:       {api_url}\n"
+        f"  LLM Server API:       {api_url}\n"
         "Installed versions:\n"
         f"  llama.cpp:           {llama_cpp_tag}\n"
         f"  llama-swap:          {llamaswap_tag}\n"
@@ -20837,7 +20878,7 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     p_config_keys = sub.add_parser(
         "config-keys",
         help="List valid configuration/catalog keys",
-        description="Print valid Heimdall Gateway catalog/conf keys and explain where raw llama.cpp flags belong.",
+        description="Print valid LLM Server catalog/conf keys and explain where raw llama.cpp flags belong.",
     )
     subparsers["config-keys"] = p_config_keys
     p_config_keys.set_defaults(func=print_config_keys)

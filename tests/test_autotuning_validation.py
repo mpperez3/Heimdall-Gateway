@@ -14,12 +14,13 @@ from pathlib import Path
 
 # Test configuration
 MODEL_PATH = Path(__file__).parent.parent / "models" / "test-model.gguf"
-LLAMA_SERVER = Path.home() / ".local/opt/heimdall-gateway/llama-server"
+LLAMA_SERVER = Path.home() / ".local/opt/llm-server/llama-server"
+LEGACY_LLAMA_SERVER = Path.home() / ".local/opt/heimdall-gateway/llama-server"
 FALLBACK_SERVER = Path(__file__).resolve().parents[1] / "llama.cpp-source" / "build" / "bin" / "llama-server"
 
 def find_llama_server():
     """Find llama-server binary."""
-    for server in [LLAMA_SERVER, FALLBACK_SERVER]:
+    for server in [LLAMA_SERVER, LEGACY_LLAMA_SERVER, FALLBACK_SERVER]:
         if server.exists():
             return server
     return None

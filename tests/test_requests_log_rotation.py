@@ -63,26 +63,26 @@ class TestNormalizeRequestsLog:
         assert cfg2["path"] == ""
 
     def test_env_overrides(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_MAX_BYTES", "65536")
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_RETAIN_DAYS", "1")
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_MAX_BYTES", "65536")
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_RETAIN_DAYS", "1")
         cfg = _effective_requests_log_config()
         assert cfg["max_bytes"] == 65536
         assert cfg["retain_days"] == 1
-        monkeypatch.delenv("HEIMDALL_GATEWAY_REQUESTS_LOG_MAX_BYTES", raising=False)
-        monkeypatch.delenv("HEIMDALL_GATEWAY_REQUESTS_LOG_RETAIN_DAYS", raising=False)
+        monkeypatch.delenv("LLM_SERVER_REQUESTS_LOG_MAX_BYTES", raising=False)
+        monkeypatch.delenv("LLM_SERVER_REQUESTS_LOG_RETAIN_DAYS", raising=False)
         # clamp via env
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_MAX_BYTES", "10")
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_MAX_BYTES", "10")
         cfg2 = _effective_requests_log_config()
         assert cfg2["max_bytes"] == 65536
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_RETAIN_DAYS", "0")
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_RETAIN_DAYS", "0")
         cfg3 = _effective_requests_log_config()
         assert cfg3["retain_days"] == 1
 
 
 class TestDailyRotation:
     def test_creates_dated_file(self, tmp_path, monkeypatch):
-        monkeypatch.delenv("HEIMDALL_GATEWAY_REQUESTS_LOG_PATH", raising=False)
-        monkeypatch.delenv("HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK", raising=False)
+        monkeypatch.delenv("LLM_SERVER_REQUESTS_LOG_PATH", raising=False)
+        monkeypatch.delenv("LLM_SERVER_REQUESTS_LOG_FALLBACK", raising=False)
         base = tmp_path / "api-requests.log"
         log_api_event("rotation_test", {"x": 1}, log_path=base)
         active = _active_for(base)
@@ -100,7 +100,7 @@ class TestDailyRotation:
         assert base.read_text(encoding="utf-8").strip().splitlines()[-1] == lines[-1]
 
     def test_custom_basename(self, tmp_path, monkeypatch):
-        monkeypatch.delenv("HEIMDALL_GATEWAY_REQUESTS_LOG_PATH", raising=False)
+        monkeypatch.delenv("LLM_SERVER_REQUESTS_LOG_PATH", raising=False)
         base = tmp_path / "my-custom.log"
         log_api_event("custom", {"v": 1}, log_path=base)
         active = _active_for(base)
@@ -111,8 +111,8 @@ class TestDailyRotation:
 
 class TestSplitPart:
     def test_split_when_exceeds_max_bytes(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_MAX_BYTES", "65536")
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_RETAIN_DAYS", "3")
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_MAX_BYTES", "65536")
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_RETAIN_DAYS", "3")
         base = tmp_path / "api-requests.log"
         active = _active_for(base)
         # pre-fill active with size ~ 65400
@@ -147,9 +147,9 @@ class TestSplitPart:
 
 class TestPrune:
     def test_prune_keeps_3_days(self, tmp_path, monkeypatch):
-        monkeypatch.delenv("HEIMDALL_GATEWAY_REQUESTS_LOG_PATH", raising=False)
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_RETAIN_DAYS", "3")
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_MAX_BYTES", "10485760")
+        monkeypatch.delenv("LLM_SERVER_REQUESTS_LOG_PATH", raising=False)
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_RETAIN_DAYS", "3")
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_MAX_BYTES", "10485760")
         base = tmp_path / "api-requests.log"
         base.parent.mkdir(parents=True, exist_ok=True)
         now = time.time()
@@ -193,7 +193,7 @@ class TestPrune:
     def test_retain_days_clamp_zero(self, tmp_path, monkeypatch):
         # retain_days=0 should clamp to 1, so prune with 0 should behave like 1
         # If clamp broken, prune would delete everything older than 0 days (all)
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_RETAIN_DAYS", "0")
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_RETAIN_DAYS", "0")
         cfg = _effective_requests_log_config()
         assert cfg["retain_days"] == 1
         # also test normalize directly
@@ -214,7 +214,7 @@ class TestFallbackAndNeverThrows:
     def test_fallback_when_primary_not_writable(self, tmp_path, monkeypatch):
         primary = tmp_path / "primary" / "api-requests.log"
         fallback = tmp_path / "fallback" / "api-requests.log"
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK", str(fallback))
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_FALLBACK", str(fallback))
         original_open = Path.open
 
         def fake_open(self, *args, **kwargs):
@@ -236,16 +236,13 @@ class TestFallbackAndNeverThrows:
     def test_never_throws(self, tmp_path, monkeypatch):
         primary = tmp_path / "p.log"
         fallback = tmp_path / "f.log"
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK", str(fallback))
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_FALLBACK", str(fallback))
         with patch.object(Path, "open", side_effect=OSError("all fail")):
             log_api_event("no_crash", {"z": 1}, log_path=primary)
-        # should not raise, and not create files (or empty)
-        # just ensure no exception propagated
 
     def test_env_path_precedence(self, tmp_path, monkeypatch):
-        # env path should take precedence over conf path
         env_path = tmp_path / "env.log"
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_PATH", str(env_path))
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_PATH", str(env_path))
         # simulate conf path via mocking _load_server_config_payload to return logging path
         fake_conf_path = tmp_path / "conf.log"
         with patch("llamacpp_stack._cli_impl._load_server_config_payload", return_value={"logging": {"requests_log": {"path": str(fake_conf_path), "max_bytes": 10485760, "retain_days": 3, "compress": False}}}):
@@ -256,3 +253,11 @@ class TestFallbackAndNeverThrows:
             assert env_active.exists()
             # conf should not have been written
             assert not conf_active.exists()
+
+    def test_legacy_heimdall_requests_log_env_fallback(self, tmp_path, monkeypatch):
+        legacy_path = tmp_path / "legacy-env.log"
+        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_PATH", str(legacy_path))
+        log_api_event("legacy_fallback", {"a": 1}, log_path=None)
+        legacy_active = _active_for(legacy_path)
+        assert legacy_active.exists()
+        assert "legacy_fallback" in legacy_active.read_text(encoding="utf-8")

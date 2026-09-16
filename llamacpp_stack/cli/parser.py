@@ -313,7 +313,7 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     p_config_keys = sub.add_parser(
         "config-keys",
         help="List valid configuration/catalog keys",
-        description="Print valid Heimdall Gateway catalog/conf keys and explain where raw llama.cpp flags belong.",
+        description="Print valid LLM Server catalog/conf keys and explain where raw llama.cpp flags belong.",
     )
     subparsers["config-keys"] = p_config_keys
     p_config_keys.set_defaults(func=print_config_keys)
@@ -387,7 +387,7 @@ def build_cli_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     p_swap_guard = sub.add_parser(
         "llama-swap-guard",
         help=argparse.SUPPRESS,
-        description="Internal guard proxy for llama-swap.",
+        description="Internal guard proxy for llama-swap (llm-server).",
     )
     subparsers["llama-swap-guard"] = p_swap_guard
     p_swap_guard.set_defaults(func=run_llamaswap_guard)

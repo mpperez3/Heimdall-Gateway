@@ -33,7 +33,7 @@ class TestProxy502ShapeBaseline:
         src = _read_source(Path("llamacpp_stack/_cli_impl.py"))
         assert "proxy_error_with_bundle" in src
         assert "bundle_ref" in src
-        assert "uv run heimdall-gateway logs --lines 200 --journal" in src
+        assert "uv run llm-server logs --lines 200 --journal" in src
         # Ensure upstream unavailable still present
         assert "upstream unavailable" in src
 
@@ -64,7 +64,7 @@ class TestProxy502ShapeBaseline:
         from llamacpp_stack._cli_impl import log_api_event
 
         target = tmp_path / "proxy_error.log"
-        monkeypatch.setenv("HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK", str(tmp_path / "fallback.log"))
+        monkeypatch.setenv("LLM_SERVER_REQUESTS_LOG_FALLBACK", str(tmp_path / "fallback.log"))
         # Simulate what proxy_error currently logs
         exc = RuntimeError("upstream fail")
         log_api_event("proxy_error", {"method": "POST", "path": "/v1/chat/completions", "error": str(exc)}, log_path=target)
@@ -210,4 +210,11 @@ class TestLlamaSwapGuardChildExitBaseline:
 
     def test_no_crash_bundle_module_yet(self):
         assert Path("llamacpp_stack/cli/crash_bundle.py").exists(), "crash_bundle.py should exist after T3"
+
+
+def test_legacy_heimdall_hint_still_documented_as_fallback():
+    src = Path("llamacpp_stack/cli/crash_bundle.py").read_text(encoding="utf-8")
+    assert "llm-server" in src
+    legacy_key = "HEIMDALL_GATEWAY_REQUESTS_LOG_FALLBACK"
+    assert legacy_key in Path("llamacpp_stack/cli/raw_log.py").read_text(encoding="utf-8") or "heimdall-gateway" in src
 

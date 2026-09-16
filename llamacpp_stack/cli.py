@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Heimdall Gateway cli shim - re-exports from cli/* subpackage.
+LLM Server cli shim - re-exports from cli/* subpackage.
 
 All business logic lives in llamacpp_stack/cli/*.py (env, constants, models,
 parser, replica, server_commands, gateway, daemon) and the remaining legacy

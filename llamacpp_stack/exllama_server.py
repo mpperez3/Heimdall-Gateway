@@ -1,7 +1,7 @@
 """Server module code to be embedded in exllama_install.py _write_server_module().
 
 Based on MiaAI-Lab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw serve_openai.py (MIT license).
-Adapted for Heimdall Gateway: --ctx-size alias, default host 127.0.0.1,
+Adapted for LLM Server: --ctx-size alias, default host 127.0.0.1,
 parse_known_args to ignore llama.cpp flags, default draft_model=mtp.
 """
 from __future__ import annotations
