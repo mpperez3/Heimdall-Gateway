@@ -1087,6 +1087,182 @@ def _dedup_should_bypass(args=None) -> str | None:
         return "dedup_bypass_error"
 
 
+def _default_auto_update_config() -> dict[str, object]:
+    return {
+        "deferred_enabled": True,
+    }
+
+
+def _default_affinity_spillover_config() -> dict[str, object]:
+    return {
+        "enabled": True,
+        "idle_threshold_s": 30,
+    }
+
+
+def _normalize_affinity_spillover_config(raw: object) -> tuple[dict[str, object], bool]:
+    defaults = _default_affinity_spillover_config()
+    if not isinstance(raw, dict):
+        return dict(defaults), True
+    normalized: dict[str, object] = {}
+    changed = False
+    if "enabled" not in raw:
+        normalized["enabled"] = defaults["enabled"]
+        changed = True
+    else:
+        parsed = _normalize_bool_flag(raw.get("enabled"))
+        if parsed is None:
+            normalized["enabled"] = defaults["enabled"]
+            changed = True
+        else:
+            normalized["enabled"] = parsed
+            if not isinstance(raw.get("enabled"), bool):
+                changed = True
+    def _clamp_int(key: str, default: int, min_v: int, max_v: int) -> None:
+        nonlocal changed
+        if key not in raw:
+            normalized[key] = default
+            changed = True
+            return
+        raw_val = raw.get(key)
+        try:
+            if isinstance(raw_val, bool):
+                raise ValueError("bool not allowed")
+            if isinstance(raw_val, str):
+                iv = int(raw_val.strip())
+            else:
+                iv = int(raw_val)  # type: ignore[arg-type]
+        except Exception:
+            normalized[key] = default
+            changed = True
+            return
+        clamped = max(min_v, min(max_v, iv))
+        normalized[key] = clamped
+        if clamped != iv:
+            changed = True
+        if not isinstance(raw_val, int) or isinstance(raw_val, bool):
+            changed = True
+        elif raw_val != clamped:
+            changed = True
+    _clamp_int("idle_threshold_s", 30, 5, 600)
+    for k in defaults:
+        if k not in normalized:
+            normalized[k] = defaults[k]
+            changed = True
+    return normalized, changed
+
+
+def _default_model_probe_autoload_config() -> dict[str, object]:
+    return {
+        "enabled": True,
+        "grace_s": 30,
+    }
+
+
+def _normalize_auto_update_config(raw: object) -> tuple[dict[str, object], bool]:
+    defaults = _default_auto_update_config()
+    if not isinstance(raw, dict):
+        return dict(defaults), True
+    normalized: dict[str, object] = {}
+    changed = False
+    if "deferred_enabled" not in raw:
+        normalized["deferred_enabled"] = defaults["deferred_enabled"]
+        changed = True
+    else:
+        parsed = _normalize_bool_flag(raw.get("deferred_enabled"))
+        if parsed is None:
+            normalized["deferred_enabled"] = defaults["deferred_enabled"]
+            changed = True
+        else:
+            normalized["deferred_enabled"] = parsed
+            if not isinstance(raw.get("deferred_enabled"), bool):
+                changed = True
+    for k in defaults:
+        if k not in normalized:
+            normalized[k] = defaults[k]
+            changed = True
+    return normalized, changed
+
+
+def _normalize_model_probe_autoload_config(raw: object) -> tuple[dict[str, object], bool]:
+    defaults = _default_model_probe_autoload_config()
+    if not isinstance(raw, dict):
+        return dict(defaults), True
+    normalized: dict[str, object] = {}
+    changed = False
+    if "enabled" not in raw:
+        normalized["enabled"] = defaults["enabled"]
+        changed = True
+    else:
+        parsed = _normalize_bool_flag(raw.get("enabled"))
+        if parsed is None:
+            normalized["enabled"] = defaults["enabled"]
+            changed = True
+        else:
+            normalized["enabled"] = parsed
+            if not isinstance(raw.get("enabled"), bool):
+                changed = True
+
+    def _clamp_int(key: str, default: int, min_v: int, max_v: int) -> None:
+        nonlocal changed
+        if key not in raw:
+            normalized[key] = default
+            changed = True
+            return
+        raw_val = raw.get(key)
+        try:
+            if isinstance(raw_val, bool):
+                raise ValueError("bool not allowed")
+            if isinstance(raw_val, str):
+                iv = int(raw_val.strip())
+            else:
+                iv = int(raw_val)  # type: ignore[arg-type]
+        except Exception:
+            normalized[key] = default
+            changed = True
+            return
+        clamped = max(min_v, min(max_v, iv))
+        normalized[key] = clamped
+        if clamped != iv:
+            changed = True
+        if not isinstance(raw_val, int) or isinstance(raw_val, bool):
+            changed = True
+        elif raw_val != clamped:
+            changed = True
+
+    _clamp_int("grace_s", 0, 0, 86400)
+    for k in defaults:
+        if k not in normalized:
+            normalized[k] = defaults[k]
+            changed = True
+    return normalized, changed
+
+
+def _resolve_auto_update_deferred_enabled(args=None) -> bool:
+    try:
+        cfg = _load_server_config_payload(args)
+        raw = cfg.get("auto_update")
+        if isinstance(raw, dict):
+            norm, _ = _normalize_auto_update_config(raw)
+            return bool(norm.get("deferred_enabled"))
+        return bool(_default_auto_update_config().get("deferred_enabled", True))
+    except Exception:
+        return bool(_default_auto_update_config().get("deferred_enabled", True))
+
+
+def _resolve_model_probe_autoload_config(args=None) -> dict[str, object]:
+    try:
+        cfg = _load_server_config_payload(args)
+        exp = cfg.get("experimental") if isinstance(cfg.get("experimental"), dict) else {}
+        raw = exp.get("model_probe_autoload") if isinstance(exp, dict) else None
+        if isinstance(raw, dict):
+            norm, _ = _normalize_model_probe_autoload_config(raw)
+            return norm
+        return _default_model_probe_autoload_config()
+    except Exception:
+        return _default_model_probe_autoload_config()
+
+
 def _dedup_extract_principal(handler_self) -> str:
     try:
         headers = getattr(handler_self, "headers", {}) or {}
@@ -1274,6 +1450,8 @@ def _dedup_streaming_finalize(key: str, collected: list[bytes], dedup_cfg: dict,
 def _default_experimental_config() -> dict[str, object]:
     return {
         "dedup_inflight": _default_dedup_inflight_config(),
+        "model_probe_autoload": _default_model_probe_autoload_config(),
+        "affinity_spillover": _default_affinity_spillover_config(),
         "chat_tool_continue_repair": {
             "enabled": False,
             "max_rounds": 1,
@@ -1396,12 +1574,26 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
                 response_log["include_reasoning"] = _as_bool(response_log.get("include_reasoning"), False)
                 response_log["include_tool_calls"] = _as_bool(response_log.get("include_tool_calls"), True)
                 cfg["chat_last_response_log"] = response_log
+            elif key == "model_probe_autoload" and isinstance(value, dict):
+                normalized, _ = _normalize_model_probe_autoload_config(value)
+                cfg["model_probe_autoload"] = normalized
+            elif key == "affinity_spillover" and isinstance(value, dict):
+                normalized, _ = _normalize_affinity_spillover_config(value)
+                cfg["affinity_spillover"] = normalized
             elif key not in cfg:
                 cfg[key] = value
     if "dedup_inflight" not in cfg or not isinstance(cfg.get("dedup_inflight"), dict):
         cfg["dedup_inflight"], _ = _normalize_dedup_inflight_config(None)
     else:
         cfg["dedup_inflight"], _ = _normalize_dedup_inflight_config(cfg.get("dedup_inflight"))
+    if "model_probe_autoload" not in cfg or not isinstance(cfg.get("model_probe_autoload"), dict):
+        cfg["model_probe_autoload"], _ = _normalize_model_probe_autoload_config(None)
+    else:
+        cfg["model_probe_autoload"], _ = _normalize_model_probe_autoload_config(cfg.get("model_probe_autoload"))
+    if "affinity_spillover" not in cfg or not isinstance(cfg.get("affinity_spillover"), dict):
+        cfg["affinity_spillover"], _ = _normalize_affinity_spillover_config(None)
+    else:
+        cfg["affinity_spillover"], _ = _normalize_affinity_spillover_config(cfg.get("affinity_spillover"))
     return cfg
 
 
@@ -1519,6 +1711,13 @@ def normalize_server_config_payload(payload: dict[str, object]) -> tuple[dict[st
     experimental_cfg = _normalize_experimental_config(result.get("experimental"))
     if result.get("experimental") != experimental_cfg:
         result["experimental"] = experimental_cfg
+        changed = True
+    auto_cfg, auto_changed = _normalize_auto_update_config(result.get("auto_update"))
+    if result.get("auto_update") != auto_cfg:
+        result["auto_update"] = auto_cfg
+        changed = True
+    elif auto_changed:
+        result["auto_update"] = auto_cfg
         changed = True
     raw_logging = result.get("logging")
     if not isinstance(raw_logging, dict):
@@ -5788,6 +5987,122 @@ def _placement_fits(model: ManagedModel, cfg: ReplicaConfig, gpu_set: list[int],
     return True, required
 
 
+def _resolve_affinity_spillover_config() -> dict[str, object]:
+    try:
+        payload = _load_server_config_payload(None)
+        exp = payload.get("experimental") if isinstance(payload.get("experimental"), dict) else {}
+        raw = exp.get("affinity_spillover") if isinstance(exp, dict) else None
+        normalized, _ = _normalize_affinity_spillover_config(raw)
+        return normalized
+    except Exception:
+        return _default_affinity_spillover_config()
+
+
+def _find_affinity_spillover_candidate(
+    base_model_id: str,
+    replica_ids: list[str],
+    bound_target: str,
+    now: float,
+    threshold_s: int,
+) -> str | None:
+    """Return idle spillover target if affinity target is stuck/overloaded.
+
+    Rules:
+    - If bound target is loading/error/cold/unhealthy -> spillover immediately
+      when alternative has ready + in_flight==0 (no threshold needed).
+    - If bound target has in_flight>0 (>=1 with parallel=1) -> spillover when
+      alternative idle_time > threshold_s.
+    - Picks the most idle candidate among base + replicas.
+    """
+    try:
+        limit = int(DEFAULT_MAX_CONCURRENT_PER_MODEL)
+    except Exception:
+        limit = 2
+    bound_is_replica = bound_target in replica_ids
+    candidates: list[tuple[str, float, float]] = []  # (target, idle_time, score)
+    # Determine if bound is overloaded/stuck
+    stuck = False
+    busy = False
+    if bound_is_replica:
+        rec = REPLICA_ROUTER_STATE.records.get(bound_target)
+        if rec is None:
+            stuck = True
+        elif rec.status not in {"ready"}:
+            stuck = True
+        elif rec.blacklist_until > now:
+            stuck = True
+        elif rec.in_flight >= max(1, limit):
+            busy = True
+        elif rec.in_flight >= 1:
+            busy = True
+    else:
+        # bound is base
+        base_inflight = int(REPLICA_ROUTER_STATE.base_in_flight.get(bound_target, 0))
+        if base_inflight >= max(1, limit):
+            busy = True
+        elif base_inflight >= 1:
+            busy = True
+        # base has no explicit stuck status; but if there is no backing process, still consider not stuck
+        # only busy matters for base
+
+    must_spill = stuck or busy
+    if not must_spill:
+        return None
+
+    def _idle_for_replica(rec) -> float | None:
+        if rec.status != "ready":
+            return None
+        if rec.in_flight != 0:
+            return None
+        if rec.blacklist_until > now:
+            return None
+        last = float(rec.last_used or 0.0)
+        if last <= 0:
+            return 9999.0  # never used -> treat as infinitely idle
+        return now - last
+
+    def _idle_for_base(bid: str) -> float | None:
+        cnt = int(REPLICA_ROUTER_STATE.base_in_flight.get(bid, 0))
+        if cnt != 0:
+            return None
+        last = float(REPLICA_ROUTER_STATE.base_last_used.get(bid, 0.0))
+        if last <= 0:
+            return 9999.0
+        return now - last
+
+    # Evaluate candidates
+    for rid in replica_ids:
+        if rid == bound_target:
+            continue
+        rec = REPLICA_ROUTER_STATE.records.get(rid)
+        if rec is None:
+            continue
+        idle = _idle_for_replica(rec)
+        if idle is None:
+            continue
+        if stuck:
+            # immediate spillover for stuck target: any ready idle suffices
+            candidates.append((rid, idle, idle))
+        else:
+            if idle > float(threshold_s):
+                candidates.append((rid, idle, idle))
+
+    # Base candidate (unless bound is base)
+    if base_model_id != bound_target:
+        base_idle = _idle_for_base(base_model_id)
+        if base_idle is not None:
+            if stuck:
+                candidates.append((base_model_id, base_idle, base_idle))
+            elif base_idle > float(threshold_s):
+                candidates.append((base_model_id, base_idle, base_idle))
+
+    if not candidates:
+        return None
+    # pick most idle
+    candidates.sort(key=lambda x: -x[1])
+    return candidates[0][0]
+
+
 def select_replica_for_request(
     base_model: ManagedModel,
     payload: dict,
@@ -5844,22 +6159,56 @@ def select_replica_for_request(
             REPLICA_ROUTER_STATE.affinity[affinity_key] = (mapped_response_replica, now + cfg.sticky_ttl_s)
             return mapped_response_replica, affinity_key, True
         if bound and bound[1] > now and bound[0] in replica_ids:
+            spill_cfg = _resolve_affinity_spillover_config()
+            if bool(spill_cfg.get("enabled")):
+                threshold = int(spill_cfg.get("idle_threshold_s", 30))
+                cand = _find_affinity_spillover_candidate(base_model.model_id, replica_ids, bound[0], now, threshold)
+                if cand is not None:
+                    is_replica = cand in replica_ids
+                    REPLICA_ROUTER_STATE.affinity[affinity_key] = (cand, now + cfg.sticky_ttl_s)
+                    log_api_event("affinity_spillover_to_idle_replica", {"model": base_model.model_id, "from": bound[0], "to": cand, "affinity_key": affinity_key, "kv_miss": True, "idle_threshold_s": threshold, "is_replica": is_replica, "reason": "affinity_overloaded_or_stuck"})
+                    return cand, affinity_key, is_replica
             return bound[0], affinity_key, True
         if bound and bound[1] > now and bound[0] == base_model.model_id:
             if dynamic_routes_enabled:
                 pass
             else:
-                return base_model.model_id, affinity_key, False
-        if REPLICA_ROUTER_STATE.base_in_flight.get(base_model.model_id, 0) <= 0:
-            if not dynamic_routes_enabled:
-                REPLICA_ROUTER_STATE.affinity[affinity_key] = (base_model.model_id, now + cfg.sticky_ttl_s)
-                log_api_event("replica_base_selected_idle", {"model": base_model.model_id, "affinity_key": affinity_key})
+                spill_cfg = _resolve_affinity_spillover_config()
+                if bool(spill_cfg.get("enabled")):
+                    threshold = int(spill_cfg.get("idle_threshold_s", 30))
+                    cand = _find_affinity_spillover_candidate(base_model.model_id, replica_ids, bound[0], now, threshold)
+                    if cand is not None:
+                        is_replica = cand in replica_ids
+                        REPLICA_ROUTER_STATE.affinity[affinity_key] = (cand, now + cfg.sticky_ttl_s)
+                        log_api_event("affinity_spillover_to_idle_replica", {"model": base_model.model_id, "from": bound[0], "to": cand, "affinity_key": affinity_key, "kv_miss": True, "idle_threshold_s": threshold, "is_replica": is_replica, "reason": "affinity_overloaded_or_stuck"})
+                        return cand, affinity_key, is_replica
                 return base_model.model_id, affinity_key, False
         candidates = [
             REPLICA_ROUTER_STATE.records[rid]
             for rid in replica_ids
             if REPLICA_ROUTER_STATE.records[rid].blacklist_until <= now
         ]
+        # Spread new conversations across idle upstreams: pick the most-idle
+        # target among base and ready replicas (never-used counts as most
+        # idle). Base wins exact ties so cold-start behavior is unchanged.
+        # Dynamic cold scale-out below is preserved for when no idle
+        # capacity exists.
+        ready_idle = [r for r in candidates if r.status == "ready" and r.in_flight == 0]
+        base_load = int(REPLICA_ROUTER_STATE.base_in_flight.get(base_model.model_id, 0))
+        if base_load <= 0 and ready_idle:
+            best = sorted(ready_idle, key=lambda r: (r.last_used, r.replica_model_id))[0]
+            base_last = float(REPLICA_ROUTER_STATE.base_last_used.get(base_model.model_id, 0.0) or 0.0)
+            if base_last > 0.0 and (best.last_used <= 0.0 or best.last_used < base_last):
+                REPLICA_ROUTER_STATE.affinity[affinity_key] = (best.replica_model_id, now + cfg.sticky_ttl_s)
+                log_api_event("replica_spread_new_conversation", {"model": base_model.model_id, "replica": best.replica_model_id, "affinity_key": affinity_key, "base_last_used_ago_s": now - base_last})
+                return best.replica_model_id, affinity_key, True
+            REPLICA_ROUTER_STATE.affinity[affinity_key] = (base_model.model_id, now + cfg.sticky_ttl_s)
+            log_api_event("replica_base_selected_idle", {"model": base_model.model_id, "affinity_key": affinity_key})
+            return base_model.model_id, affinity_key, False
+        if base_load <= 0 and not dynamic_routes_enabled:
+            REPLICA_ROUTER_STATE.affinity[affinity_key] = (base_model.model_id, now + cfg.sticky_ttl_s)
+            log_api_event("replica_base_selected_idle", {"model": base_model.model_id, "affinity_key": affinity_key})
+            return base_model.model_id, affinity_key, False
         # For a new conversation/agent with no sticky binding, prefer scaling
         # out to a cold replica if placement fits. Reusing an idle ready replica
         # first keeps latency low but prevents the intended multi-server spread
@@ -5919,6 +6268,10 @@ def select_replica_for_request(
             return chosen.replica_model_id, affinity_key, True
         if not candidates:
             log_api_event("replica_no_unblacklisted_routes", {"model": base_model.model_id, "replicas": replica_ids})
+            return base_model.model_id, affinity_key, False
+        if int(REPLICA_ROUTER_STATE.base_in_flight.get(base_model.model_id, 0)) <= 0:
+            REPLICA_ROUTER_STATE.affinity[affinity_key] = (base_model.model_id, now + cfg.sticky_ttl_s)
+            log_api_event("replica_base_selected_idle", {"model": base_model.model_id, "affinity_key": affinity_key})
             return base_model.model_id, affinity_key, False
         chosen = sorted(candidates, key=lambda r: (r.in_flight, 1 if r.status == "loading" else 0, r.last_used))[0]
         REPLICA_ROUTER_STATE.affinity[affinity_key] = (chosen.replica_model_id, now + cfg.sticky_ttl_s)
@@ -6988,6 +7341,9 @@ def _active_download_blocker_summary(catalog: list[ManagedModel] | None = None) 
 def _raise_if_download_unsafe_while_active(catalog: list[ManagedModel], *, force: bool, progress_callback = None) -> None:
     if force:
         return
+    if not _resolve_auto_update_deferred_enabled():
+        # Global flag disabled: allow download/register even while active (user requested).
+        return
     active = _active_download_blocker_summary(catalog)
     if not active:
         return
@@ -7291,7 +7647,7 @@ def ensure_model_available(args, progress_callback = None):
         if not ctx_changed and not config_changed and wait_for_model(existing.model_id, args.public_host, args.public_port, timeout=2):
             _emit_default_ctx_update_hint(existing.model_id, existing.ctx_size, default_ctx, progress_callback)
             return existing.model_id
-        gpu_conflict = get_gpu_conflict_message(existing.model_id, catalog, args.public_host, args.public_port)
+        gpu_conflict = get_gpu_conflict_message(existing.model_id, catalog, args.public_host, args.public_port, args.config)
         if gpu_conflict:
             _emit_message(gpu_conflict, progress_callback)
             raise RuntimeError(gpu_conflict)
@@ -7839,7 +8195,7 @@ def ensure_model_available(args, progress_callback = None):
         if probe_config_replaced:
             restore_catalog_config(args, stable_catalog, progress_callback=progress_callback, restart_service=True)
         return mid
-    gpu_conflict = get_gpu_conflict_message(mid, new_cat, args.public_host, args.public_port)
+    gpu_conflict = get_gpu_conflict_message(mid, new_cat, args.public_host, args.public_port, args.config)
     if gpu_conflict:
         _emit_message(gpu_conflict, progress_callback)
         save_catalog(args.catalog, stable_catalog)
@@ -8849,9 +9205,9 @@ def model_launch_gpu_set(model: ManagedModel, total_gpus: int | None = None) -> 
     return list(range(max(0, count)))
 
 
-def model_has_enough_free_vram_to_load(model: ManagedModel, *, safety_vram_mib: int = 2048) -> tuple[bool, dict[str, object]]:
+def model_has_enough_free_vram_to_load(model: ManagedModel, *, safety_vram_mib: int = 2048, gpu_set: list[int] | None = None) -> tuple[bool, dict[str, object]]:
     """Conservative preflight: allow coexistence only when the target estimate fits current free VRAM."""
-    gpu_set = model_launch_gpu_set(model)
+    gpu_set = list(gpu_set) if gpu_set else model_launch_gpu_set(model)
     if not gpu_set:
         return True, {"reason": "cpu_model", "gpu_set": []}
     required = estimate_model_runtime_mib(model)
@@ -8885,7 +9241,185 @@ def model_has_enough_free_vram_to_load(model: ManagedModel, *, safety_vram_mib: 
     }
 
 
-def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DEFAULT_PUBLIC_HOST, port=DEFAULT_PUBLIC_PORT) -> str | None:
+def model_has_enough_vram_capacity(model: ManagedModel, *, safety_vram_mib: int = 2048, gpu_set: list[int] | None = None) -> tuple[bool, dict[str, object]]:
+    """Preflight against total VRAM, assuming the target becomes the sole owner.
+
+    Used when llama-swap's swap matrix guarantees the running models will be
+    evicted to make room, so current free VRAM is the wrong gate: it says
+    "busy" precisely when a swap is about to happen.
+    """
+    gpu_set = list(gpu_set) if gpu_set else model_launch_gpu_set(model)
+    if not gpu_set:
+        return True, {"reason": "cpu_model", "gpu_set": []}
+    required = estimate_model_runtime_mib(model)
+    if required is None:
+        return False, {"reason": "missing_estimate", "gpu_set": gpu_set}
+    snap = _query_gpu_memory_snapshot_cached()
+    if not snap:
+        return False, {"reason": "missing_gpu_snapshot", "gpu_set": gpu_set, "required_total_mib": required}
+    required_per_gpu = (required / max(1, len(gpu_set))) + 1024.0
+    checks: list[dict[str, float | int | str]] = []
+    for gpu in gpu_set:
+        total = float(snap.get(gpu, {}).get("total_mib", 0.0))
+        need = required_per_gpu + safety_vram_mib
+        checks.append({"gpu": gpu, "total_mib": total, "required_mib": need})
+        if need > total:
+            return False, {
+                "reason": "insufficient_capacity",
+                "gpu_set": gpu_set,
+                "required_total_mib": required,
+                "required_per_gpu_mib": required_per_gpu,
+                "safety_vram_mib": safety_vram_mib,
+                "checks": checks,
+            }
+    return True, {
+        "reason": "fits_capacity",
+        "gpu_set": gpu_set,
+        "required_total_mib": required,
+        "required_per_gpu_mib": required_per_gpu,
+        "safety_vram_mib": safety_vram_mib,
+        "checks": checks,
+    }
+
+
+def _matrix_group_membership(config_path: Path | None = None) -> dict[str, set[str]]:
+    """Map model_id -> swap-matrix set names declared in the generated config.
+
+    The matrix is the authority on which models may stay resident together:
+    a target in a different set than a running model is one llama-swap's
+    solver will evict when swapping. Returns {} when no matrix is declared.
+    """
+    path = config_path or DEFAULT_CONFIG_PATH
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    matrix = data.get("matrix") if isinstance(data, dict) else None
+    if not isinstance(matrix, dict):
+        return {}
+    var_to_model = matrix.get("vars")
+    sets = matrix.get("sets")
+    if not isinstance(var_to_model, dict) or not isinstance(sets, dict):
+        return {}
+    membership: dict[str, set[str]] = {}
+    for set_name, expression in sets.items():
+        if not isinstance(expression, str):
+            continue
+        for token in expression.replace("+", " ").split():
+            model_id = var_to_model.get(token)
+            if model_id:
+                membership.setdefault(str(model_id), set()).add(str(set_name))
+    return membership
+
+
+def _resolve_replica_gpu_set(replica_id: str, base_model: ManagedModel) -> list[int] | None:
+    """Return the physical GPU set assigned to an internal replica id.
+
+    Prefers live router state, falls back to the placement computation.
+    Returns None when the assignment cannot be determined.
+    """
+    try:
+        rec = REPLICA_ROUTER_STATE.records.get(replica_id)
+        if rec is not None and list(getattr(rec, "gpu_set", []) or []):
+            return list(rec.gpu_set)
+    except Exception:
+        pass
+    try:
+        match = re.search(r"__replica_(\d+)$", str(replica_id or ""))
+        index = int(match.group(1)) if match else 0
+        cfg = get_model_replica_config(base_model, resolve_global_replica_config())
+        sets = _replica_gpu_sets(base_model, cfg)
+        if 0 <= index < len(sets) and sets[index]:
+            return list(sets[index])
+    except Exception:
+        pass
+    return None
+
+
+def _ensure_direct_replica_route_for_request(replica_id: str, catalog: list[ManagedModel], args, client_host: str) -> str | None:
+    """Ensure the llama-swap route for an explicitly requested replica id.
+
+    select_replica_for_request only runs for catalog (base) models, so a
+    request naming ``base__replica_N`` directly would reach llama-swap
+    without a route. Creates it on demand like the cold scale-out path.
+    Returns an error message when the route cannot be established, else None.
+    """
+    try:
+        base_id = replica_base_model_id(replica_id)
+        base_model = next((m for m in catalog if m.model_id == base_id), None)
+        if base_model is None:
+            return None
+        try:
+            published = get_published_model_ids(client_host, int(args.public_port))
+        except Exception:
+            published = set()
+        if replica_id in published:
+            return None
+        match = re.search(r"__replica_(\d+)$", str(replica_id or ""))
+        replica_index = int(match.group(1)) if match else 0
+        replica_defaults = resolve_global_replica_config(args)
+        gpu_set: list[int] = []
+        try:
+            sync_replica_runtime_state(catalog, args.config, replica_defaults)
+            rec = REPLICA_ROUTER_STATE.records.get(replica_id)
+            if rec is not None and list(getattr(rec, "gpu_set", []) or []):
+                gpu_set = list(rec.gpu_set)
+        except Exception:
+            pass
+        if not gpu_set:
+            try:
+                cfg = get_model_replica_config(base_model, replica_defaults)
+                sets = _replica_gpu_sets(base_model, cfg)
+                if 0 <= replica_index < len(sets):
+                    gpu_set = list(sets[replica_index])
+            except Exception:
+                pass
+        if not gpu_set:
+            return f"Cannot route request: no GPU set assigned to replica '{replica_id}'."
+        try:
+            ensure_replica_route_in_llamaswap_config(
+                base_model,
+                replica_index,
+                gpu_set,
+                catalog,
+                args.config,
+                args.llama_server,
+                int(resolve_idle_ttl(args)),
+                server_defaults=resolve_llama_server_defaults(args),
+            )
+        except Exception as exc:
+            return f"Cannot route request: failed to create route for replica '{replica_id}': {exc}."
+        try:
+            ok = wait_for_published_model_id(replica_id, client_host, int(args.public_port), timeout_s=30.0)
+        except Exception:
+            ok = False
+        if not ok:
+            return f"Cannot route request: replica '{replica_id}' was not published by llama-swap in time."
+        log_api_event("replica_route_ensured_direct_request", {"model": base_id, "replica": replica_id, "gpu_set": gpu_set})
+        return None
+    except Exception as exc:
+        return f"Cannot route request: {exc}."
+
+
+def _prepare_direct_replica_request(model_name: str, catalog: list[ManagedModel], args, client_host: str) -> tuple[str, bool, str | None]:
+    """Validate an explicitly requested replica id for the request path.
+
+    Applies the replica-aware GPU preflight (never blanket-allows) and
+    ensures the llama-swap route exists. Returns
+    (upstream_model_name, is_replica_request, error_message).
+    """
+    gpu_conflict = get_gpu_conflict_message(model_name, catalog, client_host, int(args.public_port), args.config)
+    if gpu_conflict:
+        log_api_event("model_load_blocked_gpu_busy", {"model": model_name, "message": gpu_conflict, "api_style": "direct-replica"})
+        REPLICA_ROUTER_STATE.release_loading_claim(model_name)
+        return model_name, True, gpu_conflict
+    route_err = _ensure_direct_replica_route_for_request(model_name, catalog, args, client_host)
+    if route_err is not None:
+        return model_name, True, route_err
+    return model_name, True, None
+
+
+def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DEFAULT_PUBLIC_HOST, port=DEFAULT_PUBLIC_PORT, config_path: Path | None = None) -> str | None:
     """Generate a user-friendly error message for GPU conflicts.
     
     Uses only the local LLM Server installation for model management.
@@ -8898,25 +9432,113 @@ def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DE
     if target_process is not None:
         return None
     target_model = next((model for model in catalog if model.model_id == model_id), None)
+    # Internal replicas have no catalog entry: resolve the base model and
+    # evaluate the preflight against the replica's assigned GPU set only.
+    # Without this, a replica bound to a free GPU is rejected because of
+    # conflicts on unrelated GPUs (e.g. the base on GPU0).
+    replica_gpu_set: list[int] | None = None
+    if target_model is None and is_replica_model_id(model_id):
+        base_model = next((model for model in catalog if model.model_id == replica_base_model_id(model_id)), None)
+        if base_model is not None:
+            target_model = base_model
+            replica_gpu_set = _resolve_replica_gpu_set(model_id, base_model)
+    if replica_gpu_set is not None:
+        try:
+            rec = REPLICA_ROUTER_STATE.records.get(model_id)
+            if rec is not None and getattr(rec, "pid", None):
+                if any(proc.get("pid") == rec.pid for proc in processes):
+                    return None
+        except Exception:
+            pass
     gpu_process_map = get_gpu_process_map()
     if not gpu_process_map:
         return None
+    proc_gpus_by_pid: dict[int, set[int]] = {}
+    if replica_gpu_set is not None:
+        try:
+            for pid, per_gpu in (get_gpu_process_memory_by_pid() or {}).items():
+                proc_gpus_by_pid[int(pid)] = set(per_gpu.keys())
+        except Exception:
+            proc_gpus_by_pid = {}
     conflicts: list[str] = []
+    conflict_model_ids: list[str] = []
     for pid, used_mem in sorted(gpu_process_map.items()):
         if _is_ollama_process(pid):
             continue
         process = process_by_pid.get(pid)
         if process is None:
             continue
+        if replica_gpu_set is not None:
+            gpus = proc_gpus_by_pid.get(pid, set())
+            if gpus and gpus.isdisjoint(set(replica_gpu_set)):
+                continue
         running_model = model_by_path.get(process.get("model_path") or "")
         if running_model == model_id:
             continue
         if running_model:
             conflicts.append(f"{running_model} (pid {pid}, {used_mem} MiB)")
+            if running_model not in conflict_model_ids:
+                conflict_model_ids.append(running_model)
     if not conflicts:
+        if replica_gpu_set is not None:
+            if target_model is not None:
+                fits, fit_info = model_has_enough_free_vram_to_load(target_model, gpu_set=replica_gpu_set)
+                if fits:
+                    log_api_event(
+                        "model_load_allowed_replica_gpu_free",
+                        {"model": model_id, "gpu_set": replica_gpu_set, **fit_info},
+                    )
+                    return None
+                log_api_event(
+                    "model_load_vram_preflight_reject",
+                    {"model": model_id, "gpu_set": replica_gpu_set, **fit_info},
+                )
+                return (
+                    f"Cannot load model '{model_id}' on GPU(s) {replica_gpu_set}: insufficient free VRAM "
+                    f"({fit_info.get('reason')}). "
+                    "Use 'llm-server unload <model>' to free resources, or wait for those workloads to finish."
+                )
+            log_api_event(
+                "model_load_allowed_replica_gpu_free",
+                {"model": model_id, "gpu_set": replica_gpu_set},
+            )
         return None
     if target_model is not None:
-        fits, fit_info = model_has_enough_free_vram_to_load(target_model)
+        membership = _matrix_group_membership(config_path)
+        target_groups = membership.get(model_id) or set()
+        matrix_will_evict = bool(target_groups) and all(
+            not (membership.get(conflict_id) or set()) & target_groups for conflict_id in conflict_model_ids
+        )
+        if matrix_will_evict:
+            fits, fit_info = model_has_enough_vram_capacity(target_model, gpu_set=replica_gpu_set)
+            if fits:
+                log_api_event(
+                    "model_load_allowed_matrix_evict",
+                    {
+                        "model": model_id,
+                        "will_evict": conflict_model_ids,
+                        "matrix_groups": sorted(target_groups),
+                        **fit_info,
+                    },
+                )
+                return None
+            log_api_event(
+                "model_load_matrix_evict_insufficient",
+                {
+                    "model": model_id,
+                    "will_evict": conflict_model_ids,
+                    "matrix_groups": sorted(target_groups),
+                    **fit_info,
+                },
+            )
+            joined = "; ".join(conflicts[:4])
+            if len(conflicts) > 4:
+                joined += f"; +{len(conflicts) - 4} more"
+            return (
+                f"Cannot load model '{model_id}' even after unloading {joined}: "
+                f"{fit_info.get('reason')}. Use a smaller context or a quant with less VRAM."
+            )
+        fits, fit_info = model_has_enough_free_vram_to_load(target_model, gpu_set=replica_gpu_set)
         if fits:
             log_api_event(
                 "model_load_allowed_vram_available",
@@ -14114,37 +14736,54 @@ def start_ctx_metadata_server(args):
         def _reject_if_gpu_busy(self, model_name: str, catalog: list[ManagedModel], *, api_style: str, payload: dict | None = None) -> bool:
             target_loaded = get_catalog_model_process(model_name, catalog) is not None
             if (not target_loaded) and request_looks_like_model_probe(payload or {}):
-                activity, _last_activity_model_id = get_model_activity_snapshot()
-                blocker = recent_activity_blocking_model_switch(
-                    model_name,
-                    activity,
-                    now=time.monotonic(),
-                    grace_s=DEFAULT_MODEL_SWITCH_GRACE_S,
-                )
-                if blocker is not None:
-                    active_model, age_s, phase = blocker
-                    message = (
-                        f"Refusing to autoload probe for model '{model_name}' while model "
-                        f"'{active_model}' was active {age_s:.1f}s ago ({phase})."
-                    )
+                probe_cfg = _resolve_model_probe_autoload_config()
+                if not bool(probe_cfg.get("enabled")):
                     log_api_event(
-                        "model_probe_autoload_blocked",
-                        {
-                            "model": model_name,
-                            "active_model": active_model,
-                            "activity_age_seconds": age_s,
-                            "phase": phase,
-                            "grace_s": DEFAULT_MODEL_SWITCH_GRACE_S,
-                            "api_style": api_style,
-                        },
+                        "model_probe_autoload_bypassed",
+                        {"model": model_name, "reason": "disabled_via_config", "api_style": api_style},
                     )
-                    REPLICA_ROUTER_STATE.release_loading_claim(model_name)
-                    if api_style == "openai":
-                        self._send_json({"error": {"message": message, "type": "server_error"}}, status=503)
+                else:
+                    try:
+                        grace_s = int(probe_cfg.get("grace_s", 0))
+                    except Exception:
+                        grace_s = 0
+                    if grace_s <= 0:
+                        log_api_event(
+                            "model_probe_autoload_bypassed",
+                            {"model": model_name, "reason": "grace_0", "api_style": api_style, "grace_s": grace_s},
+                        )
                     else:
-                        self._send_json({"error": message}, status=503)
-                    return True
-            gpu_conflict = get_gpu_conflict_message(model_name, catalog, client_host, int(args.public_port))
+                        activity, _last_activity_model_id = get_model_activity_snapshot()
+                        blocker = recent_activity_blocking_model_switch(
+                            model_name,
+                            activity,
+                            now=time.monotonic(),
+                            grace_s=grace_s,
+                        )
+                        if blocker is not None:
+                            active_model, age_s, phase = blocker
+                            message = (
+                                f"Refusing to autoload probe for model '{model_name}' while model "
+                                f"'{active_model}' was active {age_s:.1f}s ago ({phase})."
+                            )
+                            log_api_event(
+                                "model_probe_autoload_blocked",
+                                {
+                                    "model": model_name,
+                                    "active_model": active_model,
+                                    "activity_age_seconds": age_s,
+                                    "phase": phase,
+                                    "grace_s": grace_s,
+                                    "api_style": api_style,
+                                },
+                            )
+                            REPLICA_ROUTER_STATE.release_loading_claim(model_name)
+                            if api_style == "openai":
+                                self._send_json({"error": {"message": message, "type": "server_error"}}, status=503)
+                            else:
+                                self._send_json({"error": message}, status=503)
+                            return True
+            gpu_conflict = get_gpu_conflict_message(model_name, catalog, client_host, int(args.public_port), args.config)
             if not gpu_conflict:
                 return False
             log_api_event("model_load_blocked_gpu_busy", {"model": model_name, "message": gpu_conflict, "api_style": api_style})
@@ -14186,31 +14825,126 @@ def start_ctx_metadata_server(args):
                 self._send_json({"error": message, "code": "model_loading"}, status=503)
             return True
 
-        def _reject_if_concurrent_limit_exceeded(self, model_name: str, *, api_style: str, upstream_model_name: str | None = None) -> bool:
+        def _reject_if_concurrent_limit_exceeded(self, model_name: str, *, api_style: str, upstream_model_name: str | None = None, affinity_key: str | None = None) -> tuple[bool, str | None]:
             limit = int(DEFAULT_MAX_CONCURRENT_PER_MODEL)
             if limit <= 0:
-                return False
+                return False, None
             target = str(upstream_model_name or model_name or "")
             if not target:
-                return False
+                return False, None
             with REPLICA_ROUTER_STATE.lock:
-                base_count = int(REPLICA_ROUTER_STATE.base_in_flight.get(target, 0))
-                replica_count = sum(
-                    int(rec.in_flight)
-                    for rec in REPLICA_ROUTER_STATE.records.values()
-                    if rec.replica_model_id == target or rec.base_model_id == target
-                )
-                current_total = base_count + replica_count
+                # Per-target limit: each upstream (base or individual replica)
+                # has its own in_flight counter against the limit. Aggregating
+                # base + all replicas here would serialize parallel GPUs
+                # behind a single slot and defeat multi-replica spread.
+                if target in REPLICA_ROUTER_STATE.records:
+                    current_total = int(REPLICA_ROUTER_STATE.records[target].in_flight)
+                else:
+                    current_total = int(REPLICA_ROUTER_STATE.base_in_flight.get(target, 0))
                 if current_total >= limit:
                     overloaded_total = current_total
                 else:
+                    alt = None
+                    if current_total >= 1 and affinity_key:
+                        # Immediate parallel spread: this target is already
+                        # serving another request (parallel=1 upstream would
+                        # queue it). If a fully-idle sibling (ready replica
+                        # or idle base) exists, claim it now instead of
+                        # stacking onto the busy target. KV miss accepted.
+                        try:
+                            spread_on = bool(_resolve_affinity_spillover_config().get("enabled"))
+                        except Exception:
+                            spread_on = False
+                        if spread_on:
+                            now_s = time.monotonic()
+                            alt_base = replica_base_model_id(target) if is_replica_model_id(target) else target
+                            for rid, rec in REPLICA_ROUTER_STATE.records.items():
+                                if rec.base_model_id != alt_base or rid == target:
+                                    continue
+                                if rec.status == "ready" and rec.in_flight == 0 and rec.blacklist_until <= now_s:
+                                    alt = rid
+                                    break
+                            if alt is None and alt_base != target:
+                                if int(REPLICA_ROUTER_STATE.base_in_flight.get(alt_base, 0)) == 0:
+                                    alt = alt_base
+                    if alt is not None:
+                        now_s = time.monotonic()
+                        with REPLICA_ROUTER_STATE.lock:
+                            if alt in REPLICA_ROUTER_STATE.records:
+                                REPLICA_ROUTER_STATE.records[alt].in_flight += 1
+                                REPLICA_ROUTER_STATE.records[alt].last_used = now_s
+                            else:
+                                REPLICA_ROUTER_STATE.base_in_flight[alt] = int(REPLICA_ROUTER_STATE.base_in_flight.get(alt, 0)) + 1
+                                REPLICA_ROUTER_STATE.base_last_used[alt] = now_s
+                            try:
+                                sticky_s = 3600
+                                try:
+                                    alt_base_s = replica_base_model_id(target) if is_replica_model_id(target) else target
+                                    cfg_aff_s = get_model_replica_config(next((m for m in load_catalog(catalog_path) if m.model_id == alt_base_s), ManagedModel(model_id=alt_base_s, local_path="")), resolve_global_replica_config(args))
+                                    sticky_s = int(cfg_aff_s.sticky_ttl_s)
+                                except Exception:
+                                    pass
+                                REPLICA_ROUTER_STATE.affinity[affinity_key] = (alt, now_s + sticky_s)
+                            except Exception:
+                                pass
+                        try:
+                            alt_base_l = replica_base_model_id(target) if is_replica_model_id(target) else target
+                            log_api_event("affinity_spillover_to_idle_replica", {"model": alt_base_l, "from": target, "to": alt, "affinity_key": affinity_key, "kv_miss": True, "is_replica": is_replica_model_id(alt), "reason": "parallel_spread", "target_in_flight": current_total})
+                        except Exception:
+                            pass
+                        return False, alt
                     if target in REPLICA_ROUTER_STATE.records:
                         REPLICA_ROUTER_STATE.records[target].in_flight += 1
                         REPLICA_ROUTER_STATE.records[target].last_used = time.monotonic()
                     else:
-                        REPLICA_ROUTER_STATE.base_in_flight[target] = base_count + 1
+                        REPLICA_ROUTER_STATE.base_in_flight[target] = current_total + 1
                         REPLICA_ROUTER_STATE.base_last_used[target] = time.monotonic()
-                    return False
+                    return False, None
+            # Overloaded path: try affinity spillover to idle replica before 429
+            try:
+                spill_cfg = _resolve_affinity_spillover_config()
+                if bool(spill_cfg.get("enabled")) and affinity_key:
+                    threshold = int(spill_cfg.get("idle_threshold_s", 30))
+                    base_id = replica_base_model_id(target) if is_replica_model_id(target) else target
+                    # Derive replica_ids for this base from router state
+                    replica_ids = [rid for rid, rec in REPLICA_ROUTER_STATE.records.items() if rec.base_model_id == base_id]
+                    if not replica_ids:
+                        # fallback: try to infer from global replica config if no records yet
+                        try:
+                            catalog_tmp = load_catalog(catalog_path)
+                            base_model_tmp = next((m for m in catalog_tmp if m.model_id == base_id), None)
+                            if base_model_tmp is not None:
+                                cfg_tmp = get_model_replica_config(base_model_tmp, resolve_global_replica_config(args))
+                                gpu_sets_tmp = _replica_gpu_sets(base_model_tmp, cfg_tmp)
+                                replica_ids = [replica_model_id(base_id, idx) for idx in range(len(gpu_sets_tmp))]
+                        except Exception:
+                            replica_ids = []
+                    if replica_ids or base_id != target:
+                        now = time.monotonic()
+                        cand = _find_affinity_spillover_candidate(base_id, replica_ids, target, now, threshold)
+                        if cand is not None:
+                            with REPLICA_ROUTER_STATE.lock:
+                                if cand in REPLICA_ROUTER_STATE.records:
+                                    REPLICA_ROUTER_STATE.records[cand].in_flight += 1
+                                    REPLICA_ROUTER_STATE.records[cand].last_used = now
+                                else:
+                                    REPLICA_ROUTER_STATE.base_in_flight[cand] = int(REPLICA_ROUTER_STATE.base_in_flight.get(cand, 0)) + 1
+                                    REPLICA_ROUTER_STATE.base_last_used[cand] = now
+                                if affinity_key:
+                                    try:
+                                        sticky = int(resolve_global_replica_config(args).get("sticky_ttl_s", 3600)) if False else 3600
+                                    except Exception:
+                                        sticky = 3600
+                                    try:
+                                        cfg_aff = get_model_replica_config(next((m for m in load_catalog(catalog_path) if m.model_id == base_id), ManagedModel(model_id=base_id, local_path="")), resolve_global_replica_config(args))
+                                        sticky = int(cfg_aff.sticky_ttl_s)
+                                    except Exception:
+                                        pass
+                                    REPLICA_ROUTER_STATE.affinity[affinity_key] = (cand, now + sticky)
+                            log_api_event("affinity_spillover_to_idle_replica", {"model": base_id, "from": target, "to": cand, "affinity_key": affinity_key, "kv_miss": True, "idle_threshold_s": threshold, "is_replica": cand in replica_ids if replica_ids else is_replica_model_id(cand), "reason": "concurrent_limit_spillover", "overloaded_total": overloaded_total})
+                            return False, cand
+            except Exception:
+                pass
             message = (
                 f"Model '{target}' is overloaded: {overloaded_total} concurrent requests (limit {limit}). "
                 "Server is busy processing other requests for the same model. Please retry shortly."
@@ -14232,7 +14966,7 @@ def start_ctx_metadata_server(args):
                 )
             else:
                 self._send_json({"error": message, "code": "model_overloaded"}, status=429)
-            return True
+            return True, None
 
         def _handle_ollama_chat(self):
             payload = self._read_json_body()
@@ -14363,11 +15097,20 @@ def start_ctx_metadata_server(args):
                     public_host=client_host,
                     public_port=int(args.public_port),
                 )
+            if model_entry is None and is_replica_model_id(model_name):
+                upstream_model_name, is_replica_request, _direct_err = _prepare_direct_replica_request(model_name, catalog, args, client_host)
+                if _direct_err is not None:
+                    self._send_json({"error": _direct_err}, status=503)
+                    return
             if self._reject_if_model_loading(upstream_model_name, catalog, public_model_name=model_name, is_replica=is_replica_request, api_style="ollama"):
                 return
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
                 return
-            if self._reject_if_concurrent_limit_exceeded(model_name, api_style="ollama", upstream_model_name=upstream_model_name):
+            _blocked, _spill = self._reject_if_concurrent_limit_exceeded(model_name, api_style="ollama", upstream_model_name=upstream_model_name, affinity_key=affinity_key)
+            if _spill is not None:
+                upstream_model_name = _spill
+                is_replica_request = is_replica_model_id(upstream_model_name)
+            if _blocked:
                 return
             if int(DEFAULT_MAX_CONCURRENT_PER_MODEL) <= 0 and upstream_model_name:
                 REPLICA_ROUTER_STATE.request_started(upstream_model_name)
@@ -14659,13 +15402,23 @@ def start_ctx_metadata_server(args):
                         "conversation_state": CONVERSATION_SWITCH_STATE.snapshot(conversation_key) if conversation_key else {},
                     },
                 )
+            if model_entry is None and is_replica_model_id(model_name):
+                upstream_model_name, is_replica_request, _direct_err = _prepare_direct_replica_request(model_name, catalog, args, client_host)
+                if _direct_err is not None:
+                    self._send_json({"error": {"message": _direct_err, "type": "server_error"}}, status=503)
+                    CONVERSATION_SWITCH_STATE.finish(conversation_token)
+                    return
             if self._reject_if_model_loading(upstream_model_name, catalog, public_model_name=model_name, is_replica=is_replica_request, api_style="openai"):
                 CONVERSATION_SWITCH_STATE.finish(conversation_token)
                 return
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="openai", payload=payload):
                 CONVERSATION_SWITCH_STATE.finish(conversation_token)
                 return
-            if self._reject_if_concurrent_limit_exceeded(model_name, api_style="openai", upstream_model_name=upstream_model_name):
+            _blocked, _spill = self._reject_if_concurrent_limit_exceeded(model_name, api_style="openai", upstream_model_name=upstream_model_name, affinity_key=affinity_key)
+            if _spill is not None:
+                upstream_model_name = _spill
+                is_replica_request = is_replica_model_id(upstream_model_name)
+            if _blocked:
                 CONVERSATION_SWITCH_STATE.finish(conversation_token)
                 return
             log_api_event(
@@ -14712,6 +15465,8 @@ def start_ctx_metadata_server(args):
                     if _dedup_cached_chat is not None:
                         log_api_event("dedup_hit", {"key_prefix8": _dedup_key_chat[:8], "principal_hash8": _dedup_principal_chat[:8], "stream": _dedup_stream_chat, "path": self.path.split("?", 1)[0]})
                         _dedup_send_cached_response(self, _dedup_cached_chat, "hit")
+                        if upstream_model_name:
+                            REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
                         CONVERSATION_SWITCH_STATE.finish(conversation_token)
                         return
                     if not _dedup_is_leader_chat and _dedup_event_chat is not None:
@@ -14756,6 +15511,8 @@ def start_ctx_metadata_server(args):
                                     except Exception:
                                         break
                                 log_api_event("dedup_shared", {"key_prefix8": _dedup_key_chat[:8], "principal_hash8": _dedup_principal_chat[:8], "stream": True, "path": self.path.split("?", 1)[0]})
+                                if upstream_model_name:
+                                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
                                 CONVERSATION_SWITCH_STATE.finish(conversation_token)
                                 return
                         _max_wait_chat = float(_dedup_cfg_chat.get("max_wait_ms", 2000) or 2000) / 1000.0
@@ -14765,6 +15522,8 @@ def start_ctx_metadata_server(args):
                             if _cached2_chat is not None:
                                 log_api_event("dedup_shared", {"key_prefix8": _dedup_key_chat[:8], "principal_hash8": _dedup_principal_chat[:8], "stream": _dedup_stream_chat, "wait_ms": int(_max_wait_chat * 1000)})
                                 _dedup_send_cached_response(self, _cached2_chat, "shared")
+                                if upstream_model_name:
+                                    REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=True)
                                 CONVERSATION_SWITCH_STATE.finish(conversation_token)
                                 return
                             _entry_chat = DEDUP_STATE._get_entry(_dedup_key_chat)  # type: ignore
@@ -15598,11 +16357,20 @@ def start_ctx_metadata_server(args):
                     public_host=client_host,
                     public_port=int(args.public_port),
                 )
+            if model_entry is None and is_replica_model_id(model_name):
+                upstream_model_name, is_replica_request, _direct_err = _prepare_direct_replica_request(model_name, catalog, args, client_host)
+                if _direct_err is not None:
+                    self._send_json({"error": {"message": _direct_err, "type": "server_error"}}, status=503)
+                    return
             if self._reject_if_model_loading(upstream_model_name, catalog, public_model_name=model_name, is_replica=is_replica_request, api_style="openai"):
                 return
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="openai", payload=payload):
                 return
-            if self._reject_if_concurrent_limit_exceeded(model_name, api_style="openai", upstream_model_name=upstream_model_name):
+            _blocked, _spill = self._reject_if_concurrent_limit_exceeded(model_name, api_style="openai", upstream_model_name=upstream_model_name, affinity_key=affinity_key)
+            if _spill is not None:
+                upstream_model_name = _spill
+                is_replica_request = is_replica_model_id(upstream_model_name)
+            if _blocked:
                 return
             mark_model_activity(model_name, f"openai_responses:{request_id}", "request_start")
             if int(DEFAULT_MAX_CONCURRENT_PER_MODEL) <= 0 and upstream_model_name:
@@ -17061,11 +17829,20 @@ def start_ctx_metadata_server(args):
                     public_host=client_host,
                     public_port=int(args.public_port),
                 )
+            if model_entry is None and is_replica_model_id(model_name):
+                upstream_model_name, is_replica_request, _direct_err = _prepare_direct_replica_request(model_name, catalog, args, client_host)
+                if _direct_err is not None:
+                    self._send_json({"error": _direct_err}, status=503)
+                    return
             if self._reject_if_model_loading(upstream_model_name, catalog, public_model_name=model_name, is_replica=is_replica_request, api_style="ollama"):
                 return
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
                 return
-            if self._reject_if_concurrent_limit_exceeded(model_name, api_style="ollama", upstream_model_name=upstream_model_name):
+            _blocked, _spill = self._reject_if_concurrent_limit_exceeded(model_name, api_style="ollama", upstream_model_name=upstream_model_name, affinity_key=affinity_key)
+            if _spill is not None:
+                upstream_model_name = _spill
+                is_replica_request = is_replica_model_id(upstream_model_name)
+            if _blocked:
                 return
             if int(DEFAULT_MAX_CONCURRENT_PER_MODEL) <= 0 and upstream_model_name:
                 REPLICA_ROUTER_STATE.request_started(upstream_model_name)
@@ -17277,7 +18054,11 @@ def start_ctx_metadata_server(args):
                 return
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
                 return
-            if self._reject_if_concurrent_limit_exceeded(model_name, api_style="ollama", upstream_model_name=upstream_model_name):
+            _blocked, _spill = self._reject_if_concurrent_limit_exceeded(model_name, api_style="ollama", upstream_model_name=upstream_model_name, affinity_key=affinity_key)
+            if _spill is not None:
+                upstream_model_name = _spill
+                is_replica_request = is_replica_model_id(upstream_model_name)
+            if _blocked:
                 return
             if int(DEFAULT_MAX_CONCURRENT_PER_MODEL) <= 0 and upstream_model_name:
                 REPLICA_ROUTER_STATE.request_started(upstream_model_name)
@@ -20265,13 +21046,19 @@ def start_catalog_auto_update_watch(args, *, poll_s: float = 2.0, debounce_s: fl
                     pending_changed.update(changed)
                     log_api_event("auto_update_change_detected", {"paths": changed})
                 if pending_changed:
+                    deferred_enabled = _resolve_auto_update_deferred_enabled(args)
                     active_summary = _active_download_blocker_summary()
-                    if active_summary:
+                    if active_summary and deferred_enabled:
                         log_api_event(
                             "auto_update_deferred_model_active",
                             {"paths": sorted(pending_changed), "active": active_summary},
                         )
                     else:
+                        if active_summary and not deferred_enabled:
+                            log_api_event(
+                                "auto_update_deferred_bypassed_model_active",
+                                {"paths": sorted(pending_changed), "active": active_summary, "deferred_enabled": False},
+                            )
                         if stop_event is not None and stop_event.wait(max(0.1, debounce_s)):
                             break
                         if stop_event is None:

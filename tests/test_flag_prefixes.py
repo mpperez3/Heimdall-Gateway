@@ -68,6 +68,68 @@ def test_build_command_emits_long_context_cache_flags(monkeypatch):
 
     assert "--cache-ram 32768" in joined
     assert "--ctx-checkpoints 32" in joined
+
+
+def test_global_defaults_survive_when_engine_binary_differs_from_probe_path(tmp_path):
+    engine_bin = tmp_path / "llama.cpp" / "build" / "bin" / "buun" / "bin" / "llama-server-buun"
+    engine_bin.parent.mkdir(parents=True)
+    engine_bin.write_text(
+        "#!/bin/sh\n"
+        'echo "usage: llama-server [options]"\n'
+        "cat <<'EOF'\n"
+        "  --swa-full, --top-k N, --top-p F, --min-p F, --repeat-penalty F\n"
+        "  --presence-penalty F, --predict N, --reasoning, --ctx-checkpoints N\n"
+        "  --cache-ram N, --checkpoint-min-step N, --chat-template-kwargs JSON\n"
+        "EOF\n"
+    )
+    engine_bin.chmod(0o755)
+
+    probe_path = tmp_path / "llama.cpp" / "build" / "bin" / "llama-server"
+    assert not probe_path.exists()
+
+    cli._SERVER_FLAG_CACHE.clear()
+    model = cli.ManagedModel(
+        model_id="exl3",
+        repo_id="local/Qwen3.8-27B-EXL3-3.5bpw",
+        quant=None,
+        filename="model.safetensors",
+        local_path="/models/Qwen3.8-27B-EXL3-3.5bpw",
+        ctx_size=262144,
+        tensor_split="1",
+        server_overrides={"engine": "buun", "cache_ram": 16384, "ctx_checkpoints": 4},
+    )
+    server_defaults = {
+        "swa_full": True,
+        "top_k": 20,
+        "top_p": 0.95,
+        "min_p": 0.0,
+        "repeat_penalty": 1.0,
+        "presence_penalty": 0.0,
+        "predict": 1024,
+        "checkpoint_min_step": 1024,
+        "chat_template_kwargs": {"preserve_thinking": True},
+    }
+
+    cmd = cli.build_llama_server_command(
+        model, probe_path, port="12345", server_defaults=server_defaults
+    )
+    joined = " ".join(cmd)
+
+    assert str(engine_bin) in cmd
+    assert cli.get_server_supported_flags(probe_path) == set()
+    assert "--top-k" in cli.get_server_supported_flags(engine_bin)
+
+    assert "--swa-full" in joined
+    assert "--top-k 20" in joined
+    assert "--top-p 0.95" in joined
+    assert "--min-p 0.0" in joined
+    assert "--repeat-penalty 1.0" in joined
+    assert "--presence-penalty 0.0" in joined
+    assert "--predict 1024" in joined
+    assert "--checkpoint-min-step 1024" in joined
+    assert "--chat-template-kwargs" in joined
+    assert "--ctx-checkpoints 4" in joined
+    assert "--cache-ram 16384" in joined
     assert "--checkpoint-min-step 1024" in joined
     assert '--chat-template-kwargs {"preserve_thinking":true}' in joined
 

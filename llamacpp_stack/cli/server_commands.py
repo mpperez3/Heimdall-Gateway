@@ -983,14 +983,14 @@ def build_llama_server_command(model, server_path: Path, *, port: str, host: str
     explicit_keys=set(model_overrides.keys())
     for key in ("split_mode","flash_attn","reasoning_format","batch_size","ubatch_size","threads","threads_batch","main_gpu","numa","fit_target","model_draft","hf_repo_draft","spec_type","spec_draft_n_max","spec_draft_n_min","spec_draft_p_min","use_fitc","draft","draft_min","draft_p_min","ctx_size_draft","n_gpu_layers_draft","draft_mtp","fit","fitt","fitc","keep","mirostat","mirostat_ent","mirostat_lr","cache_type_k","cache_type_v","mmap","mul_mat_q","grp_attn_n","parallel","ctx_checkpoints","cache_ram","cache_prompt","kv_offload","cont_batching","op_offload","direct_io","cpu_moe","n_cpu_moe","device","defrag_threshold","swa_full","top_k","top_p","min_p","repeat_penalty","presence_penalty","predict","reasoning","reasoning_budget","reasoning_budget_message"):
         if key in effective:
-            probe = None if key in explicit_keys else server_path
+            probe = None if key in explicit_keys else effective_server_path
             _append_llama_server_flag(cmd, key, effective[key], probe)
             try:
                 effective.pop(key, None)
             except Exception:
                 pass
     for ek, ev in list(effective.items()):
-        _append_llama_server_flag(cmd, ek, ev, server_path)
+        _append_llama_server_flag(cmd, ek, ev, effective_server_path)
     if include_mmproj and model.mmproj_path:
         cmd.extend(["--mmproj", str(model.mmproj_path)])
     if include_jinja and model.jinja:

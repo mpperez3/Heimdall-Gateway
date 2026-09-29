@@ -127,6 +127,38 @@ def _active_download_blocker_summary(catalog=None):  # type: ignore[no-untyped-d
     return ""
 
 
+def _safe_deferred_enabled_default() -> bool:
+    fn = _fallback_attr("_default_auto_update_config")
+    if fn is not None:
+        try:
+            return bool(fn().get("deferred_enabled", True))  # type: ignore
+        except Exception:
+            pass
+    return True
+
+
+def _resolve_auto_update_deferred_enabled(args=None) -> bool:
+    try:
+        cfg = _load_server_config_payload(args)
+        raw = cfg.get("auto_update")
+        if isinstance(raw, dict):
+            val = raw.get("deferred_enabled")
+            if isinstance(val, bool):
+                return bool(val)
+            if isinstance(val, (int, float)):
+                return bool(val)
+            if isinstance(val, str):
+                v = val.strip().lower()
+                if v in {"1", "true", "yes", "on"}:
+                    return True
+                if v in {"0", "false", "no", "off"}:
+                    return False
+            return _safe_deferred_enabled_default()
+        return _safe_deferred_enabled_default()
+    except Exception:
+        return _safe_deferred_enabled_default()
+
+
 def _args_server_config_path(args) -> Path | None:  # type: ignore[no-untyped-def]
     fn = _fallback_attr("_args_server_config_path")
     if fn is not None:
@@ -382,13 +414,19 @@ def start_catalog_auto_update_watch(args, *, poll_s: float = 2.0, debounce_s: fl
                     pending_changed.update(changed)
                     log_api_event("auto_update_change_detected", {"paths": changed})
                 if pending_changed:
+                    deferred_enabled = _resolve_auto_update_deferred_enabled(args)
                     active_summary = _active_download_blocker_summary()
-                    if active_summary:
+                    if active_summary and deferred_enabled:
                         log_api_event(
                             "auto_update_deferred_model_active",
                             {"paths": sorted(pending_changed), "active": active_summary},
                         )
                     else:
+                        if active_summary and not deferred_enabled:
+                            log_api_event(
+                                "auto_update_deferred_bypassed_model_active",
+                                {"paths": sorted(pending_changed), "active": active_summary, "deferred_enabled": False},
+                            )
                         if stop_event is not None and stop_event.wait(max(0.1, debounce_s)):
                             break
                         if stop_event is None:

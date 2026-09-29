@@ -70,6 +70,7 @@ from llamacpp_stack.cli import (
     select_replica_for_request,
     sync_replica_runtime_state,
     replica_model_id,
+    ReplicaRecord,
     REPLICA_ROUTER_STATE,
     resolve_llama_server_defaults,
     resolve_request_reasoning_budget,
@@ -207,7 +208,10 @@ def _write_minimal_gguf(path: Path, entries: list[tuple[str, int, object]]) -> N
 
 class InstallHelpersTest(unittest.TestCase):
 
-
+    def setUp(self) -> None:
+        patcher = mock.patch("llamacpp_stack._cli_impl.log_api_event")
+        self.addCleanup(patcher.stop)
+        patcher.start()
 
     def test_resolve_public_host_preserves_legacy_exposed_host(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -860,7 +864,7 @@ class InstallHelpersTest(unittest.TestCase):
         )]
         with mock.patch("llamacpp_stack.cli.get_llama_server_processes", return_value=[{
             "pid": 123, "model_path": "/models/model.gguf", "port": 18080, "cmdline": "llama-server"
-        }]):
+        }]), mock.patch("llamacpp_stack._cli_impl._load_server_config_payload", return_value={}):
             with self.assertRaises(RuntimeError) as ctx:
                 _raise_if_download_unsafe_while_active(catalog, force=False)
             self.assertIn("Refusing to download", str(ctx.exception))
@@ -872,7 +876,7 @@ class InstallHelpersTest(unittest.TestCase):
             previous = dict(REPLICA_ROUTER_STATE.base_in_flight)
             REPLICA_ROUTER_STATE.base_in_flight["busy-model"] = 1
         try:
-            with mock.patch("llamacpp_stack.cli.get_llama_server_processes", return_value=[]):
+            with mock.patch("llamacpp_stack.cli.get_llama_server_processes", return_value=[]), mock.patch("llamacpp_stack._cli_impl._load_server_config_payload", return_value={}):
                 with self.assertRaises(RuntimeError) as ctx:
                     _raise_if_download_unsafe_while_active(catalog, force=False)
                 self.assertIn("busy-model(in_flight=1)", str(ctx.exception))
@@ -5629,6 +5633,45 @@ class InstallHelpersTest(unittest.TestCase):
         self.assertEqual(selected_again, selected)
         self.assertIn("t1", affinity)
 
+    def test_select_replica_spreads_new_affinity_to_more_idle_upstream(self) -> None:
+        import time as _time
+
+        REPLICA_ROUTER_STATE.records.clear()
+        REPLICA_ROUTER_STATE.affinity.clear()
+        REPLICA_ROUTER_STATE.base_in_flight.clear()
+        REPLICA_ROUTER_STATE.base_last_used.clear()
+        model = ManagedModel(
+            model_id="spread-q4",
+            repo_id="org/spread",
+            quant="Q4",
+            filename="model.gguf",
+            local_path="/tmp/model.gguf",
+            tensor_split="1",
+            server_overrides={"replicas": {"enabled": True, "max": 1, "gpus_per_replica": 1}},
+        )
+        now = _time.monotonic()
+        with (
+            mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=2),
+            mock.patch("llamacpp_stack.cli.get_published_model_ids", return_value={"spread-q4", "spread-q4__replica_0"}),
+        ):
+            # Cold start tie (nobody ever used) -> base wins.
+            selected, _, is_replica = select_replica_for_request(model, {"messages": [{"role": "user", "content": "a"}]}, {"thread-id": "s1"})
+            self.assertFalse(is_replica)
+            self.assertEqual(selected, "spread-q4")
+            # Base recently used, replica never used -> spread to replica.
+            REPLICA_ROUTER_STATE.base_last_used["spread-q4"] = now
+            REPLICA_ROUTER_STATE.records["spread-q4__replica_0"].status = "ready"
+            REPLICA_ROUTER_STATE.records["spread-q4__replica_0"].in_flight = 0
+            REPLICA_ROUTER_STATE.records["spread-q4__replica_0"].last_used = 0.0
+            selected2, _, is_replica2 = select_replica_for_request(model, {"messages": [{"role": "user", "content": "b"}]}, {"thread-id": "s2"})
+            self.assertTrue(is_replica2)
+            self.assertEqual(selected2, "spread-q4__replica_0")
+            # Replica recently used, base older -> back to base.
+            REPLICA_ROUTER_STATE.records["spread-q4__replica_0"].last_used = _time.monotonic()
+            REPLICA_ROUTER_STATE.base_last_used["spread-q4"] = now - 100.0
+            selected3, _, is_replica3 = select_replica_for_request(model, {"messages": [{"role": "user", "content": "c"}]}, {"thread-id": "s3"})
+            self.assertFalse(is_replica3)
+            self.assertEqual(selected3, "spread-q4")
 
     def test_select_replica_scales_new_affinity_to_cold_before_ready_empty_when_fits(self) -> None:
         REPLICA_ROUTER_STATE.records.clear()
@@ -6582,6 +6625,129 @@ models:
             message = get_gpu_conflict_message("model-b", [model_a, model_b])
         self.assertIn("Cannot load model 'model-b'", message)
         self.assertIn("model-a (pid 123, 4096 MiB)", message)
+
+    @staticmethod
+    def _write_matrix_config(directory: str, same_set: bool = False) -> Path:
+        sets = {"group_0": "m0 & m1 & m2"} if same_set else {"group_0": "m0 & m2", "group_1": "m1 & m2"}
+        path = Path(directory) / "config.yaml"
+        path.write_text(
+            yaml.safe_dump({"models": {}, "matrix": {"vars": {"m0": "model-a", "m1": "model-b", "m2": "model-c"}, "sets": sets}}),
+            encoding="utf-8",
+        )
+        return path
+
+    @staticmethod
+    def _busy_gpu_models() -> tuple[ManagedModel, ManagedModel]:
+        return (
+            ManagedModel(model_id="model-a", repo_id="org/a", quant="Q4", filename="a.gguf", local_path="/tmp/a.gguf", tensor_split="1"),
+            ManagedModel(model_id="model-b", repo_id="org/b", quant="Q4", filename="b.gguf", local_path="/tmp/b.gguf", tensor_split="1"),
+        )
+
+    def test_get_gpu_conflict_message_allows_model_switch_when_matrix_evicts_current(self) -> None:
+        model_a, model_b = self._busy_gpu_models()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = self._write_matrix_config(tmp)
+            with (
+                mock.patch("llamacpp_stack.cli.get_llama_server_processes", return_value=[{"pid": 123, "model_path": "/tmp/a.gguf"}]),
+                mock.patch("llamacpp_stack.cli.get_gpu_process_map", return_value={123: "19000"}),
+                mock.patch("llamacpp_stack.cli.estimate_model_runtime_mib", return_value=9000.0),
+                mock.patch(
+                    "llamacpp_stack.cli._query_gpu_memory_snapshot_cached",
+                    return_value={0: {"free_mib": 1000.0, "used_mib": 19000.0, "total_mib": 24576.0}},
+                ),
+            ):
+                self.assertIsNone(get_gpu_conflict_message("model-b", [model_a, model_b], config_path=config_path))
+
+    def test_get_gpu_conflict_message_blocks_when_target_exceeds_gpu_capacity_after_evict(self) -> None:
+        model_a, model_b = self._busy_gpu_models()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = self._write_matrix_config(tmp)
+            with (
+                mock.patch("llamacpp_stack.cli.get_llama_server_processes", return_value=[{"pid": 123, "model_path": "/tmp/a.gguf"}]),
+                mock.patch("llamacpp_stack.cli.get_gpu_process_map", return_value={123: "19000"}),
+                mock.patch("llamacpp_stack.cli.estimate_model_runtime_mib", return_value=30000.0),
+                mock.patch(
+                    "llamacpp_stack.cli._query_gpu_memory_snapshot_cached",
+                    return_value={0: {"free_mib": 1000.0, "used_mib": 19000.0, "total_mib": 24576.0}},
+                ),
+            ):
+                message = get_gpu_conflict_message("model-b", [model_a, model_b], config_path=config_path)
+        self.assertIn("Cannot load model 'model-b' even after unloading", message)
+        self.assertIn("insufficient_capacity", message)
+
+    def test_get_gpu_conflict_message_still_blocks_same_matrix_set_coexistence(self) -> None:
+        model_a, model_b = self._busy_gpu_models()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = self._write_matrix_config(tmp, same_set=True)
+            with (
+                mock.patch("llamacpp_stack.cli.get_llama_server_processes", return_value=[{"pid": 123, "model_path": "/tmp/a.gguf"}]),
+                mock.patch("llamacpp_stack.cli.get_gpu_process_map", return_value={123: "19000"}),
+                mock.patch("llamacpp_stack.cli.estimate_model_runtime_mib", return_value=9000.0),
+                mock.patch(
+                    "llamacpp_stack.cli._query_gpu_memory_snapshot_cached",
+                    return_value={0: {"free_mib": 1000.0, "used_mib": 19000.0, "total_mib": 24576.0}},
+                ),
+            ):
+                message = get_gpu_conflict_message("model-b", [model_a, model_b], config_path=config_path)
+        self.assertIn("Cannot load model 'model-b'", message)
+        self.assertIn("model-a (pid 123, 19000 MiB)", message)
+
+    def test_get_gpu_conflict_message_allows_replica_when_its_gpu_is_free(self) -> None:
+        REPLICA_ROUTER_STATE.records.clear()
+        REPLICA_ROUTER_STATE.affinity.clear()
+        base = ManagedModel(
+            model_id="base-q4",
+            repo_id="org/base",
+            quant="Q4",
+            filename="base.gguf",
+            local_path="/tmp/base.gguf",
+            tensor_split="1",
+            server_overrides={"replicas": {"enabled": True, "max": 1, "gpus_per_replica": 1, "safety_vram_mib": 1}},
+        )
+        REPLICA_ROUTER_STATE.records["base-q4__replica_0"] = ReplicaRecord(
+            base_model_id="base-q4", replica_model_id="base-q4__replica_0", gpu_set=[1],
+        )
+        try:
+            with (
+                mock.patch("llamacpp_stack.cli.get_llama_server_processes", return_value=[{"pid": 123, "model_path": "/tmp/base.gguf"}]),
+                mock.patch("llamacpp_stack.cli.get_gpu_process_map", return_value={123: "19000"}),
+                mock.patch("llamacpp_stack.cli.get_gpu_process_memory_by_pid", return_value={123: {0: 19000.0}}),
+                mock.patch("llamacpp_stack.cli.estimate_model_runtime_mib", return_value=6000.0),
+                mock.patch("llamacpp_stack.cli._query_gpu_memory_snapshot_cached", return_value={0: {"free_mib": 1000.0, "total_mib": 24576.0}, 1: {"free_mib": 20000.0, "total_mib": 24576.0}}),
+            ):
+                self.assertIsNone(get_gpu_conflict_message("base-q4__replica_0", [base]))
+        finally:
+            REPLICA_ROUTER_STATE.records.clear()
+            REPLICA_ROUTER_STATE.affinity.clear()
+
+    def test_get_gpu_conflict_message_blocks_replica_when_its_gpu_is_busy(self) -> None:
+        REPLICA_ROUTER_STATE.records.clear()
+        REPLICA_ROUTER_STATE.affinity.clear()
+        base = ManagedModel(
+            model_id="base-q4",
+            repo_id="org/base",
+            quant="Q4",
+            filename="base.gguf",
+            local_path="/tmp/base.gguf",
+            tensor_split="1",
+            server_overrides={"replicas": {"enabled": True, "max": 1, "gpus_per_replica": 1, "safety_vram_mib": 1}},
+        )
+        REPLICA_ROUTER_STATE.records["base-q4__replica_0"] = ReplicaRecord(
+            base_model_id="base-q4", replica_model_id="base-q4__replica_0", gpu_set=[1],
+        )
+        try:
+            with (
+                mock.patch("llamacpp_stack.cli.get_llama_server_processes", return_value=[{"pid": 123, "model_path": "/tmp/base.gguf"}, {"pid": 456, "model_path": "/tmp/other.gguf"}]),
+                mock.patch("llamacpp_stack.cli.get_gpu_process_map", return_value={123: "19000", 456: "19000"}),
+                mock.patch("llamacpp_stack.cli.get_gpu_process_memory_by_pid", return_value={123: {0: 19000.0}, 456: {1: 19000.0}}),
+                mock.patch("llamacpp_stack.cli.estimate_model_runtime_mib", return_value=6000.0),
+                mock.patch("llamacpp_stack.cli._query_gpu_memory_snapshot_cached", return_value={0: {"free_mib": 1000.0, "total_mib": 24576.0}, 1: {"free_mib": 1000.0, "total_mib": 24576.0}}),
+            ):
+                message = get_gpu_conflict_message("base-q4__replica_0", [base])
+            self.assertIn("Cannot load model 'base-q4__replica_0'", message)
+        finally:
+            REPLICA_ROUTER_STATE.records.clear()
+            REPLICA_ROUTER_STATE.affinity.clear()
 
     def test_responses_single_message_without_tools_looks_like_model_probe(self) -> None:
         self.assertTrue(request_looks_like_model_probe({

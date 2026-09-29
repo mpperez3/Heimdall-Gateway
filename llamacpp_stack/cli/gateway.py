@@ -267,6 +267,157 @@ def _normalize_dedup_inflight_config(raw: object) -> tuple[dict[str, object], bo
     return normalized, changed
 
 
+def _default_auto_update_config() -> dict[str, object]:
+    return {
+        "deferred_enabled": True,
+    }
+
+
+def _default_affinity_spillover_config() -> dict[str, object]:
+    return {
+        "enabled": True,
+        "idle_threshold_s": 30,
+    }
+
+
+def _normalize_affinity_spillover_config(raw: object) -> tuple[dict[str, object], bool]:
+    defaults = _default_affinity_spillover_config()
+    if not isinstance(raw, dict):
+        return dict(defaults), True
+    normalized: dict[str, object] = {}
+    changed = False
+    if "enabled" not in raw:
+        normalized["enabled"] = defaults["enabled"]
+        changed = True
+    else:
+        parsed = _normalize_bool_flag(raw.get("enabled"))
+        if parsed is None:
+            normalized["enabled"] = defaults["enabled"]
+            changed = True
+        else:
+            normalized["enabled"] = parsed
+            if not isinstance(raw.get("enabled"), bool):
+                changed = True
+    def _clamp_int(key: str, default: int, min_v: int, max_v: int) -> None:
+        nonlocal changed
+        if key not in raw:
+            normalized[key] = default
+            changed = True
+            return
+        raw_val = raw.get(key)
+        try:
+            if isinstance(raw_val, bool):
+                raise ValueError("bool not allowed")
+            if isinstance(raw_val, str):
+                iv = int(raw_val.strip())
+            else:
+                iv = int(raw_val)  # type: ignore[arg-type]
+        except Exception:
+            normalized[key] = default
+            changed = True
+            return
+        clamped = max(min_v, min(max_v, iv))
+        normalized[key] = clamped
+        if clamped != iv:
+            changed = True
+        if not isinstance(raw_val, int) or isinstance(raw_val, bool):
+            changed = True
+        elif raw_val != clamped:
+            changed = True
+    _clamp_int("idle_threshold_s", 30, 5, 600)
+    for k in defaults:
+        if k not in normalized:
+            normalized[k] = defaults[k]
+            changed = True
+    return normalized, changed
+
+
+def _default_model_probe_autoload_config() -> dict[str, object]:
+    return {
+        "enabled": True,
+        "grace_s": 30,
+    }
+
+
+def _normalize_auto_update_config(raw: object) -> tuple[dict[str, object], bool]:
+    defaults = _default_auto_update_config()
+    if not isinstance(raw, dict):
+        return dict(defaults), True
+    normalized: dict[str, object] = {}
+    changed = False
+    if "deferred_enabled" not in raw:
+        normalized["deferred_enabled"] = defaults["deferred_enabled"]
+        changed = True
+    else:
+        parsed = _normalize_bool_flag(raw.get("deferred_enabled"))
+        if parsed is None:
+            normalized["deferred_enabled"] = defaults["deferred_enabled"]
+            changed = True
+        else:
+            normalized["deferred_enabled"] = parsed
+            if not isinstance(raw.get("deferred_enabled"), bool):
+                changed = True
+    for k in defaults:
+        if k not in normalized:
+            normalized[k] = defaults[k]
+            changed = True
+    return normalized, changed
+
+
+def _normalize_model_probe_autoload_config(raw: object) -> tuple[dict[str, object], bool]:
+    defaults = _default_model_probe_autoload_config()
+    if not isinstance(raw, dict):
+        return dict(defaults), True
+    normalized: dict[str, object] = {}
+    changed = False
+    if "enabled" not in raw:
+        normalized["enabled"] = defaults["enabled"]
+        changed = True
+    else:
+        parsed = _normalize_bool_flag(raw.get("enabled"))
+        if parsed is None:
+            normalized["enabled"] = defaults["enabled"]
+            changed = True
+        else:
+            normalized["enabled"] = parsed
+            if not isinstance(raw.get("enabled"), bool):
+                changed = True
+
+    def _clamp_int(key: str, default: int, min_v: int, max_v: int) -> None:
+        nonlocal changed
+        if key not in raw:
+            normalized[key] = default
+            changed = True
+            return
+        raw_val = raw.get(key)
+        try:
+            if isinstance(raw_val, bool):
+                raise ValueError("bool not allowed")
+            if isinstance(raw_val, str):
+                iv = int(raw_val.strip())
+            else:
+                iv = int(raw_val)  # type: ignore[arg-type]
+        except Exception:
+            normalized[key] = default
+            changed = True
+            return
+        clamped = max(min_v, min(max_v, iv))
+        normalized[key] = clamped
+        if clamped != iv:
+            changed = True
+        if not isinstance(raw_val, int) or isinstance(raw_val, bool):
+            changed = True
+        elif raw_val != clamped:
+            changed = True
+
+    _clamp_int("grace_s", 0, 0, 86400)
+    for k in defaults:
+        if k not in normalized:
+            normalized[k] = defaults[k]
+            changed = True
+    return normalized, changed
+
+
 def _dedup_should_bypass(args=None) -> str | None:  # type: ignore[no-untyped-def]
     try:
         cfg = _load_server_config_payload(args)
@@ -594,6 +745,8 @@ def _write_chat_last_response_log(args, *, request_id: str, model: str, upstream
 def _default_experimental_config() -> dict[str, object]:
     return {
         "dedup_inflight": _default_dedup_inflight_config(),
+        "model_probe_autoload": _default_model_probe_autoload_config(),
+        "affinity_spillover": _default_affinity_spillover_config(),
         "chat_tool_continue_repair": {"enabled": False, "max_rounds": 1, "max_tokens": 2048, "stream_keepalive_seconds": 15, "visible_notice_after_seconds": 4, "trigger_prefixes": ["[terminal command", "[terminal_inline", "</terminal_inline>", "Voy a", "Empezando por"], "prompt": "Your previous assistant message ended without any tool_calls.\nYou are in a tool-capable agent environment. If the next step requires reading files, editing files, running commands, searching, inspecting state, or using any external capability, you must call one of the available tools instead of describing the action in text.\nDo not answer with empty visible content. Do not answer with a sentence that only sets up an action and ends with a colon.\nAvailable tool names: {tool_names}.", "truncated_tool_call_prompt": "Your previous assistant message started a tool_call but it was truncated before the JSON arguments were complete.\nRetry now with exactly one complete, valid tool_call. Keep the arguments minimal and valid JSON. Do not stream or repeat partial arguments. Do not include explanatory text before the tool_call.\nAvailable tool names: {tool_names}.", "include_failed_assistant_message": False, "loop_guard": {"enabled": True, "no_tool_call_max_chars": 0, "repeated_tail_min_chars": 3000, "repeated_tail_repetitions": 4}},
         "chat_last_response_log": {"enabled": False, "path": "", "max_chars": 20000, "include_reasoning": False, "include_tool_calls": True},
     }
@@ -674,12 +827,26 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
                 rl["include_reasoning"] = _as_bool(rl.get("include_reasoning"), False)  # type: ignore
                 rl["include_tool_calls"] = _as_bool(rl.get("include_tool_calls"), True)  # type: ignore
                 cfg["chat_last_response_log"] = rl  # type: ignore
+            elif key == "model_probe_autoload" and isinstance(value, dict):
+                normalized, _ = _normalize_model_probe_autoload_config(value)
+                cfg["model_probe_autoload"] = normalized
+            elif key == "affinity_spillover" and isinstance(value, dict):
+                normalized, _ = _normalize_affinity_spillover_config(value)
+                cfg["affinity_spillover"] = normalized
             elif key not in cfg:
                 cfg[key] = value  # type: ignore
     if "dedup_inflight" not in cfg or not isinstance(cfg.get("dedup_inflight"), dict):
         cfg["dedup_inflight"], _ = _normalize_dedup_inflight_config(None)
     else:
         cfg["dedup_inflight"], _ = _normalize_dedup_inflight_config(cfg.get("dedup_inflight"))
+    if "model_probe_autoload" not in cfg or not isinstance(cfg.get("model_probe_autoload"), dict):
+        cfg["model_probe_autoload"], _ = _normalize_model_probe_autoload_config(None)
+    else:
+        cfg["model_probe_autoload"], _ = _normalize_model_probe_autoload_config(cfg.get("model_probe_autoload"))
+    if "affinity_spillover" not in cfg or not isinstance(cfg.get("affinity_spillover"), dict):
+        cfg["affinity_spillover"], _ = _normalize_affinity_spillover_config(None)
+    else:
+        cfg["affinity_spillover"], _ = _normalize_affinity_spillover_config(cfg.get("affinity_spillover"))
     return cfg
 
 # ---------------------------------------------------------------------------

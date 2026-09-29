@@ -200,6 +200,157 @@ def _default_dedup_inflight_config() -> dict[str, object]:
     }
 
 
+def _default_auto_update_config() -> dict[str, object]:
+    return {
+        "deferred_enabled": True,
+    }
+
+
+def _default_affinity_spillover_config() -> dict[str, object]:
+    return {
+        "enabled": True,
+        "idle_threshold_s": 30,
+    }
+
+
+def _normalize_affinity_spillover_config(raw: object) -> tuple[dict[str, object], bool]:
+    defaults = _default_affinity_spillover_config()
+    if not isinstance(raw, dict):
+        return dict(defaults), True
+    normalized: dict[str, object] = {}
+    changed = False
+    if "enabled" not in raw:
+        normalized["enabled"] = defaults["enabled"]
+        changed = True
+    else:
+        parsed = _normalize_bool_flag(raw.get("enabled"))
+        if parsed is None:
+            normalized["enabled"] = defaults["enabled"]
+            changed = True
+        else:
+            normalized["enabled"] = parsed
+            if not isinstance(raw.get("enabled"), bool):
+                changed = True
+    def _clamp_int(key: str, default: int, min_v: int, max_v: int) -> None:
+        nonlocal changed
+        if key not in raw:
+            normalized[key] = default
+            changed = True
+            return
+        raw_val = raw.get(key)
+        try:
+            if isinstance(raw_val, bool):
+                raise ValueError("bool not allowed")
+            if isinstance(raw_val, str):
+                iv = int(raw_val.strip())
+            else:
+                iv = int(raw_val)  # type: ignore[arg-type]
+        except Exception:
+            normalized[key] = default
+            changed = True
+            return
+        clamped = max(min_v, min(max_v, iv))
+        normalized[key] = clamped
+        if clamped != iv:
+            changed = True
+        if not isinstance(raw_val, int) or isinstance(raw_val, bool):
+            changed = True
+        elif raw_val != clamped:
+            changed = True
+    _clamp_int("idle_threshold_s", 30, 5, 600)
+    for k in defaults:
+        if k not in normalized:
+            normalized[k] = defaults[k]
+            changed = True
+    return normalized, changed
+
+
+def _default_model_probe_autoload_config() -> dict[str, object]:
+    return {
+        "enabled": True,
+        "grace_s": 30,
+    }
+
+
+def _normalize_auto_update_config(raw: object) -> tuple[dict[str, object], bool]:
+    defaults = _default_auto_update_config()
+    if not isinstance(raw, dict):
+        return dict(defaults), True
+    normalized: dict[str, object] = {}
+    changed = False
+    if "deferred_enabled" not in raw:
+        normalized["deferred_enabled"] = defaults["deferred_enabled"]
+        changed = True
+    else:
+        parsed = _normalize_bool_flag(raw.get("deferred_enabled"))
+        if parsed is None:
+            normalized["deferred_enabled"] = defaults["deferred_enabled"]
+            changed = True
+        else:
+            normalized["deferred_enabled"] = parsed
+            if not isinstance(raw.get("deferred_enabled"), bool):
+                changed = True
+    for k in defaults:
+        if k not in normalized:
+            normalized[k] = defaults[k]
+            changed = True
+    return normalized, changed
+
+
+def _normalize_model_probe_autoload_config(raw: object) -> tuple[dict[str, object], bool]:
+    defaults = _default_model_probe_autoload_config()
+    if not isinstance(raw, dict):
+        return dict(defaults), True
+    normalized: dict[str, object] = {}
+    changed = False
+    if "enabled" not in raw:
+        normalized["enabled"] = defaults["enabled"]
+        changed = True
+    else:
+        parsed = _normalize_bool_flag(raw.get("enabled"))
+        if parsed is None:
+            normalized["enabled"] = defaults["enabled"]
+            changed = True
+        else:
+            normalized["enabled"] = parsed
+            if not isinstance(raw.get("enabled"), bool):
+                changed = True
+
+    def _clamp_int(key: str, default: int, min_v: int, max_v: int) -> None:
+        nonlocal changed
+        if key not in raw:
+            normalized[key] = default
+            changed = True
+            return
+        raw_val = raw.get(key)
+        try:
+            if isinstance(raw_val, bool):
+                raise ValueError("bool not allowed")
+            if isinstance(raw_val, str):
+                iv = int(raw_val.strip())
+            else:
+                iv = int(raw_val)  # type: ignore[arg-type]
+        except Exception:
+            normalized[key] = default
+            changed = True
+            return
+        clamped = max(min_v, min(max_v, iv))
+        normalized[key] = clamped
+        if clamped != iv:
+            changed = True
+        if not isinstance(raw_val, int) or isinstance(raw_val, bool):
+            changed = True
+        elif raw_val != clamped:
+            changed = True
+
+    _clamp_int("grace_s", 0, 0, 86400)
+    for k in defaults:
+        if k not in normalized:
+            normalized[k] = defaults[k]
+            changed = True
+    return normalized, changed
+
+
 def _normalize_dedup_inflight_config(raw: object) -> tuple[dict[str, object], bool]:
     defaults = _default_dedup_inflight_config()
     if not isinstance(raw, dict):
@@ -273,6 +424,8 @@ def _normalize_dedup_inflight_config(raw: object) -> tuple[dict[str, object], bo
 def _default_experimental_config() -> dict[str, object]:
     return {
         "dedup_inflight": _default_dedup_inflight_config(),
+        "model_probe_autoload": _default_model_probe_autoload_config(),
+        "affinity_spillover": _default_affinity_spillover_config(),
         "chat_tool_continue_repair": {
             "enabled": False,
             "max_rounds": 1,
@@ -394,12 +547,26 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
                 response_log["include_reasoning"] = _as_bool(response_log.get("include_reasoning"), False)
                 response_log["include_tool_calls"] = _as_bool(response_log.get("include_tool_calls", True))
                 cfg["chat_last_response_log"] = response_log
+            elif key == "model_probe_autoload" and isinstance(value, dict):
+                normalized, _ = _normalize_model_probe_autoload_config(value)
+                cfg["model_probe_autoload"] = normalized
+            elif key == "affinity_spillover" and isinstance(value, dict):
+                normalized, _ = _normalize_affinity_spillover_config(value)
+                cfg["affinity_spillover"] = normalized
             elif key not in cfg:
                 cfg[key] = value
     if "dedup_inflight" not in cfg or not isinstance(cfg.get("dedup_inflight"), dict):
         cfg["dedup_inflight"], _ = _normalize_dedup_inflight_config(None)
     else:
         cfg["dedup_inflight"], _ = _normalize_dedup_inflight_config(cfg.get("dedup_inflight"))
+    if "model_probe_autoload" not in cfg or not isinstance(cfg.get("model_probe_autoload"), dict):
+        cfg["model_probe_autoload"], _ = _normalize_model_probe_autoload_config(None)
+    else:
+        cfg["model_probe_autoload"], _ = _normalize_model_probe_autoload_config(cfg.get("model_probe_autoload"))
+    if "affinity_spillover" not in cfg or not isinstance(cfg.get("affinity_spillover"), dict):
+        cfg["affinity_spillover"], _ = _normalize_affinity_spillover_config(None)
+    else:
+        cfg["affinity_spillover"], _ = _normalize_affinity_spillover_config(cfg.get("affinity_spillover"))
     return cfg
 
 
@@ -596,6 +763,8 @@ def _normalize_server_config_payload(payload: dict[str, object]) -> dict[str, ob
     result["experimental"] = _normalize_experimental_config(result.get("experimental"))
     result["api_auth"] = _normalize_api_auth_config(result.get("api_auth"))
     result["api_https"] = _normalize_api_https_config(result.get("api_https"))
+    auto_upd, _ = _normalize_auto_update_config(result.get("auto_update"))
+    result["auto_update"] = auto_upd
     raw_logging = result.get("logging") if isinstance(result.get("logging"), dict) else {}
     raw_req = raw_logging.get("requests_log") if isinstance(raw_logging, dict) else None
     norm_req = _normalize_requests_log_config(raw_req)
@@ -3917,6 +4086,127 @@ def _render_env(
     return ENV_FILE_HEADER + "\n".join(lines) + "\n"
 
 
+def _render_wrapper_self_heal_pre(layout: InstallLayout, wrapper_name: str) -> str:
+    """Build an idempotent ExecStartPre line that regenerates a service wrapper if missing.
+
+    Cheap fast path: when the wrapper already exists and is executable, the shell
+    exits 0 without starting Python. Otherwise it invokes repair_service_wrappers()
+    (which reuses render_manager_wrapper/render_llamaswap_wrapper and only writes
+    when missing or drifted). The trailing ``|| test -x`` keeps startup tolerant:
+    if self-heal fails but the wrapper exists, boot still proceeds; only a still
+    missing wrapper fails clean (no 203/EXEC crash-loop).
+    """
+    env_file = layout.config_dir / ENV_BASENAME
+    wrapper = layout.bin_dir / wrapper_name
+    fallback_python = layout.runtime_venv / "bin" / "python"
+    script = (
+        f"export PYTHONPATH=\"{layout.python_root}${{PYTHONPATH:+:$PYTHONPATH}}\"; "
+        f"[ -f \"{env_file}\" ] && {{ set -a; . \"{env_file}\" 2>/dev/null; set +a; }} || true; "
+        f"PY=\"${{PYTHON_BIN:-{fallback_python}}}\"; "
+        "[ -x \"$PY\" ] || "
+        f"PY=\"{fallback_python}\"; "
+        f"test -x \"{wrapper}\" && exit 0; "
+        "\"$PY\" -c \"from llamacpp_stack.install import repair_service_wrappers; "
+        "raise SystemExit(repair_service_wrappers())\" "
+        f"|| test -x \"{wrapper}\""
+    )
+    return f"ExecStartPre=/bin/bash -c '{script}'"
+
+
+def ensure_service_wrappers(layout: InstallLayout) -> int:
+    """Idempotently (re)write manager+router wrappers. Returns number of files written.
+
+    Cheap by design: no model/engine work, only compares rendered content and writes
+    when the wrapper is missing, differs, or lost its exec bit.
+    """
+    written = 0
+    targets = (
+        (layout.bin_dir / MANAGER_WRAPPER_NAME, render_manager_wrapper),
+        (layout.bin_dir / SWAP_WRAPPER_NAME, render_llamaswap_wrapper),
+    )
+    for path, render in targets:
+        try:
+            desired = render(layout)
+        except Exception:
+            continue
+        try:
+            if path.is_file() and os.access(path, os.X_OK):
+                try:
+                    if path.read_text(encoding="utf-8") == desired:
+                        continue
+                except Exception:
+                    pass
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(desired, encoding="utf-8")
+            path.chmod(0o755)
+            written += 1
+        except Exception:
+            continue
+    return written
+
+
+def repair_service_wrappers(mode: str | None = None) -> int:
+    """Self-heal entrypoint used by systemd ExecStartPre. Never raises.
+
+    Returns 0 when both wrappers exist afterwards (already present or regenerated),
+    1 only when a wrapper is still missing (fails clean instead of 203/EXEC loop).
+    """
+    bin_dir: Path | None = None
+    try:
+        resolved = mode or detect_existing_mode() or ("system" if os.geteuid() == 0 else "user")
+        if resolved == "system":
+            install_root = Path(f"/opt/{PRODUCT_SLUG}")
+            bin_dir = Path("/usr/local/bin")
+            layout = InstallLayout(
+                mode="system",
+                state_dir=Path(f"/var/lib/{PRODUCT_SLUG}"),
+                bin_dir=bin_dir,
+                install_root=install_root,
+                models_dir=Path(f"/var/lib/{PRODUCT_SLUG}/models"),
+                config_dir=Path(f"/etc/{PRODUCT_SLUG}"),
+                run_dir=Path(f"/run/{PRODUCT_SLUG}"),
+                service_user=DEFAULT_SERVICE_USER,
+                service_group=DEFAULT_SERVICE_USER,
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=Path(f"/run/{PRODUCT_SLUG}/manager.sock"),
+                python_root=install_root / "python",
+                runtime_venv=install_root / "venv",
+                cuda_root=install_root / "cuda",
+            )
+        else:
+            install_root = Path.home() / ".local/opt" / PRODUCT_SLUG
+            bin_dir = Path.home() / ".local/bin"
+            run_dir = Path.home() / ".local/run" / PRODUCT_SLUG
+            layout = InstallLayout(
+                mode="user",
+                state_dir=Path.home() / ".local/state" / PRODUCT_SLUG,
+                bin_dir=bin_dir,
+                install_root=install_root,
+                models_dir=Path.home() / ".local/share" / PRODUCT_SLUG / "models",
+                config_dir=Path.home() / ".config" / PRODUCT_SLUG,
+                run_dir=run_dir,
+                service_user=os.environ.get("USER", "unknown"),
+                service_group=os.environ.get("USER", "unknown"),
+                public_host="127.0.0.1",
+                public_port=11436,
+                manager_socket=run_dir / "manager.sock",
+                python_root=install_root / "python",
+                runtime_venv=install_root / "venv",
+                cuda_root=install_root / "cuda",
+            )
+        ensure_service_wrappers(layout)
+    except Exception as exc:
+        print(f"[llm-server] wrapper self-heal failed: {exc}", file=sys.stderr)
+    try:
+        if bin_dir is not None and (bin_dir / MANAGER_WRAPPER_NAME).is_file() and (bin_dir / SWAP_WRAPPER_NAME).is_file():
+            return 0
+    except Exception:
+        pass
+    print("[llm-server] wrapper self-heal: wrapper still missing after repair attempt", file=sys.stderr)
+    return 1
+
+
 def render_manager_service(layout: InstallLayout) -> str:
     wanted_by = "multi-user.target" if layout.mode == "system" else "default.target"
     identity_lines: list[str] = []
@@ -3933,6 +4223,7 @@ def render_manager_service(layout: InstallLayout) -> str:
         "Type=simple",
         *identity_lines,
         *runtime_lines,
+        _render_wrapper_self_heal_pre(layout, MANAGER_WRAPPER_NAME),
         f"ExecStart={layout.bin_dir / MANAGER_WRAPPER_NAME}",
         "Restart=always",
         "RestartSec=2",
@@ -3956,6 +4247,7 @@ def render_llamaswap_service(layout: InstallLayout) -> str:
         "[Service]",
         "Type=simple",
         *identity_lines,
+        _render_wrapper_self_heal_pre(layout, SWAP_WRAPPER_NAME),
         f"ExecStart={layout.bin_dir / SWAP_WRAPPER_NAME}",
         "Restart=always",
         "RestartSec=2",
