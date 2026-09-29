@@ -5510,6 +5510,50 @@ class ReplicaRouterState:
 REPLICA_ROUTER_STATE = ReplicaRouterState()
 
 
+def reject_if_model_loading_request(
+    upstream_model_name: str,
+    catalog: list[ManagedModel],
+    *,
+    is_replica: bool,
+    api_style: str,
+    send_json,
+) -> bool:
+    """Reject a request only when another request already drives the *same*
+    upstream load.
+
+    The claim is scoped to the upstream target, never to the public model name.
+    A base and its replicas are separate llama-swap entries pinned to separate
+    GPUs, so they must be able to load concurrently: keying the claim on the
+    public name made every replica request collide with the base's claim, which
+    returned 503 to the one request that owned the replica load and left that
+    GPU idle until some later request happened to retry.
+    """
+    if not upstream_model_name:
+        return False
+    if REPLICA_ROUTER_STATE.claim_loading(upstream_model_name, catalog, is_replica=is_replica):
+        return False
+    message = (
+        f"Model '{upstream_model_name}' is loading; the first request owns the load. "
+        "Retry this request when that load completes."
+    )
+    log_api_event(
+        "model_request_blocked_while_loading",
+        {
+            "model": upstream_model_name,
+            "api_style": api_style,
+            "reason": "load_in_progress",
+        },
+    )
+    if api_style == "openai":
+        send_json(
+            {"error": {"message": message, "type": "model_loading", "code": "model_loading"}},
+            status=503,
+        )
+    else:
+        send_json({"error": message, "code": "model_loading"}, status=503)
+    return True
+
+
 class ConversationRequestToken:
     def __init__(self, key: str, model: str, generation: int):
         self.key = key
@@ -14794,36 +14838,14 @@ def start_ctx_metadata_server(args):
                 self._send_json({"error": gpu_conflict}, status=503)
             return True
 
-        def _reject_if_model_loading(self, upstream_model_name: str, catalog: list[ManagedModel], *, public_model_name: str, is_replica: bool, api_style: str) -> bool:
-            if not upstream_model_name:
-                return False
-            if REPLICA_ROUTER_STATE.claim_loading(
+        def _reject_if_model_loading(self, upstream_model_name: str, catalog: list[ManagedModel], *, is_replica: bool, api_style: str) -> bool:
+            return reject_if_model_loading_request(
                 upstream_model_name,
                 catalog,
                 is_replica=is_replica,
-                claim_key=public_model_name,
-            ):
-                return False
-            message = (
-                f"Model '{upstream_model_name}' is loading; the first request owns the load. "
-                "Retry this request when that load completes."
+                api_style=api_style,
+                send_json=self._send_json,
             )
-            log_api_event(
-                "model_request_blocked_while_loading",
-                {
-                    "model": upstream_model_name,
-                    "api_style": api_style,
-                    "reason": "load_in_progress",
-                },
-            )
-            if api_style == "openai":
-                self._send_json(
-                    {"error": {"message": message, "type": "model_loading", "code": "model_loading"}},
-                    status=503,
-                )
-            else:
-                self._send_json({"error": message, "code": "model_loading"}, status=503)
-            return True
 
         def _reject_if_concurrent_limit_exceeded(self, model_name: str, *, api_style: str, upstream_model_name: str | None = None, affinity_key: str | None = None) -> tuple[bool, str | None]:
             limit = int(DEFAULT_MAX_CONCURRENT_PER_MODEL)
@@ -15102,7 +15124,7 @@ def start_ctx_metadata_server(args):
                 if _direct_err is not None:
                     self._send_json({"error": _direct_err}, status=503)
                     return
-            if self._reject_if_model_loading(upstream_model_name, catalog, public_model_name=model_name, is_replica=is_replica_request, api_style="ollama"):
+            if self._reject_if_model_loading(upstream_model_name, catalog, is_replica=is_replica_request, api_style="ollama"):
                 return
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
                 return
@@ -15408,7 +15430,7 @@ def start_ctx_metadata_server(args):
                     self._send_json({"error": {"message": _direct_err, "type": "server_error"}}, status=503)
                     CONVERSATION_SWITCH_STATE.finish(conversation_token)
                     return
-            if self._reject_if_model_loading(upstream_model_name, catalog, public_model_name=model_name, is_replica=is_replica_request, api_style="openai"):
+            if self._reject_if_model_loading(upstream_model_name, catalog, is_replica=is_replica_request, api_style="openai"):
                 CONVERSATION_SWITCH_STATE.finish(conversation_token)
                 return
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="openai", payload=payload):
@@ -16362,7 +16384,7 @@ def start_ctx_metadata_server(args):
                 if _direct_err is not None:
                     self._send_json({"error": {"message": _direct_err, "type": "server_error"}}, status=503)
                     return
-            if self._reject_if_model_loading(upstream_model_name, catalog, public_model_name=model_name, is_replica=is_replica_request, api_style="openai"):
+            if self._reject_if_model_loading(upstream_model_name, catalog, is_replica=is_replica_request, api_style="openai"):
                 return
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="openai", payload=payload):
                 return
@@ -17834,7 +17856,7 @@ def start_ctx_metadata_server(args):
                 if _direct_err is not None:
                     self._send_json({"error": _direct_err}, status=503)
                     return
-            if self._reject_if_model_loading(upstream_model_name, catalog, public_model_name=model_name, is_replica=is_replica_request, api_style="ollama"):
+            if self._reject_if_model_loading(upstream_model_name, catalog, is_replica=is_replica_request, api_style="ollama"):
                 return
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
                 return
@@ -18050,7 +18072,7 @@ def start_ctx_metadata_server(args):
                     public_host=client_host,
                     public_port=int(args.public_port),
                 )
-            if self._reject_if_model_loading(upstream_model_name, catalog, public_model_name=model_name, is_replica=is_replica_request, api_style="ollama"):
+            if self._reject_if_model_loading(upstream_model_name, catalog, is_replica=is_replica_request, api_style="ollama"):
                 return
             if (not is_replica_request) and self._reject_if_gpu_busy(model_name, catalog, api_style="ollama", payload=payload):
                 return

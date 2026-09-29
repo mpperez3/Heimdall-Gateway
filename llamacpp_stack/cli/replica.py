@@ -440,20 +440,33 @@ def _calculate_llama_swap_matrix(models_info: list[dict]) -> dict[str, object]:
         mid = m["id"]
         if is_replica_model_id(mid):
             base_to_replicas.setdefault(replica_base_model_id(mid), []).append(mid)
+
+    def _resolve_group_gpus(model_id: str) -> set[int] | None:
+        mi = next((x for x in models_info if x["id"] == model_id), None)
+        if mi is None:
+            return None
+        gpus = set(mi.get("_effective_gpu_set") or set(mi.get("gpu_set") or []))
+        if not gpus and not mi["is_small"] and not mi["is_embedding"]:
+            return set(all_known_gpus)
+        return gpus
+
     for base, rids in base_to_replicas.items():
-        if len(rids) > 1:
-            gpu_sets = []
-            for rid in rids:
-                mi = next((x for x in models_info if x["id"] == rid), None)
-                gs = set(mi.get("_effective_gpu_set") or set(mi.get("gpu_set") or [])) if mi else set()
-                gpu_sets.append(gs)
-            if len(gpu_sets) == len(rids) and all(gpu_sets[i].isdisjoint(gpu_sets[j]) for i in range(len(gpu_sets)) for j in range(i + 1, len(gpu_sets))):
-                for group in large_groups:
-                    for rid in rids:
-                        if rid in group:
-                            group.remove(rid)
-                large_groups = [g for g in large_groups if g]
-                large_groups.append(list(rids))
+        members = [base, *rids]
+        member_gpus = [_resolve_group_gpus(mid) for mid in members]
+        if any(g is None for g in member_gpus):
+            continue
+        if not all(
+            member_gpus[i].isdisjoint(member_gpus[j])  # type: ignore[union-attr]
+            for i in range(len(member_gpus))
+            for j in range(i + 1, len(member_gpus))
+        ):
+            continue
+        for group in large_groups:
+            for mid in members:
+                if mid in group:
+                    group.remove(mid)
+        large_groups = [g for g in large_groups if g]
+        large_groups.append(members)
     matrix_sets = {}
     for idx, group in enumerate(large_groups):
         group_vars = [id_to_var[model_id] for model_id in sorted(group + packables) if model_id in id_to_var]

@@ -5295,6 +5295,51 @@ class InstallHelpersTest(unittest.TestCase):
             self.assertNotIn("repo-q4__replica_0", joined_sets)
             self.assertIn(replica_vars["repo-q4__replica_0"], matrix["evict_costs"])
 
+    def test_matrix_keeps_a_model_together_with_its_own_replica_on_disjoint_gpus(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.yaml"
+            models = []
+            for name in ("big-a", "big-b"):
+                model_path = root / f"{name}.gguf"
+                model_path.write_bytes(b"x" * 1024)
+                models.append(
+                    ManagedModel(
+                        model_id=name,
+                        repo_id=f"org/{name}",
+                        quant="Q4",
+                        filename=f"{name}.gguf",
+                        local_path=str(model_path),
+                        tensor_split="1",
+                    )
+                )
+            big_a, big_b = models
+            with (
+                mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=2),
+                mock.patch("llamacpp_stack.cli.replica._get_model_size_mib", return_value=16000.0),
+            ):
+                render_llamaswap_config(models, config_path, root / "llama-server", 18080, idle_ttl=10)
+                ensure_replica_route_in_llamaswap_config(big_b, 0, [1], models, config_path, root / "llama-server", 10)
+                ensure_replica_route_in_llamaswap_config(big_a, 0, [1], models, config_path, root / "llama-server", 10)
+
+            rendered = yaml.safe_load(
+                "\n".join(line for line in config_path.read_text(encoding="utf-8").splitlines() if not line.startswith("#"))
+            )
+            sets_of: dict[str, set[str]] = {}
+            for name, dsl in rendered["matrix"]["sets"].items():
+                for var in str(dsl).split(" & "):
+                    model_id = rendered["matrix"]["vars"].get(var)
+                    if model_id:
+                        sets_of.setdefault(model_id, set()).add(name)
+            for base in ("big-a", "big-b"):
+                self.assertIn(base, sets_of)
+                self.assertIn(f"{base}__replica_0", sets_of)
+                self.assertEqual(
+                    sets_of[base],
+                    sets_of[f"{base}__replica_0"],
+                    f"{base} and its replica must share a matrix set so both can stay loaded",
+                )
+
     def test_dynamic_replica_tensor_split_is_local_to_visible_devices_on_many_gpu_host(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -8246,6 +8291,44 @@ models:
             self.assertTrue(REPLICA_ROUTER_STATE.claim_loading("qwen", [], claim_key="qwen"))
         REPLICA_ROUTER_STATE.loading_claims.clear()
         REPLICA_ROUTER_STATE.loading_claim_aliases.clear()
+
+    def test_parallel_requests_can_load_the_base_and_its_replica_at_the_same_time(self) -> None:
+        from llamacpp_stack._cli_impl import reject_if_model_loading_request
+
+        REPLICA_ROUTER_STATE.records.clear()
+        REPLICA_ROUTER_STATE.loading_claims.clear()
+        REPLICA_ROUTER_STATE.loading_claim_aliases.clear()
+        REPLICA_ROUTER_STATE.records["base-q4__replica_0"] = ReplicaRecord(
+            base_model_id="base-q4", replica_model_id="base-q4__replica_0", gpu_set=[1],
+        )
+        responses: list[tuple[dict, int]] = []
+
+        def send_json(payload, status=200):
+            responses.append((payload, status))
+
+        try:
+            with mock.patch("llamacpp_stack._cli_impl.get_catalog_model_process", return_value=None):
+                base_blocked = reject_if_model_loading_request(
+                    "base-q4", [], is_replica=False, api_style="openai", send_json=send_json,
+                )
+                replica_blocked = reject_if_model_loading_request(
+                    "base-q4__replica_0", [], is_replica=True, api_style="openai", send_json=send_json,
+                )
+                second_replica_blocked = reject_if_model_loading_request(
+                    "base-q4__replica_0", [], is_replica=True, api_style="openai", send_json=send_json,
+                )
+        finally:
+            REPLICA_ROUTER_STATE.records.clear()
+            REPLICA_ROUTER_STATE.loading_claims.clear()
+            REPLICA_ROUTER_STATE.loading_claim_aliases.clear()
+        self.assertFalse(base_blocked)
+        self.assertFalse(
+            replica_blocked,
+            "a cold replica on a free GPU must be able to load while the base loads on another GPU",
+        )
+        self.assertTrue(second_replica_blocked, "a second request for the same cold replica must still be rejected")
+        self.assertEqual(len(responses), 1, f"only the duplicate replica request may be answered with 503, got {responses}")
+        self.assertEqual(responses[0][1], 503)
 
 if __name__ == "__main__":
     unittest.main()
