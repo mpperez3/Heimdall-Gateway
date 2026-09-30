@@ -396,6 +396,18 @@ def _calculate_llama_swap_matrix(models_info: list[dict]) -> dict[str, object]:
     Calculate the llama-swap matrix configuration to allow maximum concurrency.
     
     models_info is a list of dicts: {id, gpu_set, is_embedding, is_small, size_mib}
+
+    Two extra rules exist on top of the plain "pack what fits" grouping:
+
+    - A base and its own replicas are declared together, so scaling out never
+      forces one of them to be evicted to load the other.
+    - Any two large entries that own disjoint GPUs are also declared together.
+      Without that, a base that spans every GPU makes its replicas incompatible
+      with every other model, and asking for another model evicts the whole
+      family instead of just the spare copy. An idle replica is additionally
+      given half the eviction cost of its base, so the router drops the spare
+      copy and keeps the original; requests for that model then queue on the
+      original instead of paying for a full reload.
     """
     if not models_info:
         return {}
@@ -467,16 +479,31 @@ def _calculate_llama_swap_matrix(models_info: list[dict]) -> dict[str, object]:
                     group.remove(mid)
         large_groups = [g for g in large_groups if g]
         large_groups.append(members)
+    cross_pairs: list[list[str]] = []
+    for idx, first in enumerate(larges):
+        first_gpus = set(first.get("_effective_gpu_set") or all_known_gpus)
+        for second in larges[idx + 1:]:
+            second_gpus = set(second.get("_effective_gpu_set") or all_known_gpus)
+            if first_gpus.isdisjoint(second_gpus) and not any(set((first["id"], second["id"])) <= set(group) for group in large_groups):
+                cross_pairs.append([first["id"], second["id"]])
     matrix_sets = {}
     for idx, group in enumerate(large_groups):
         group_vars = [id_to_var[model_id] for model_id in sorted(group + packables) if model_id in id_to_var]
         if group_vars:
             matrix_sets[f"group_{idx}"] = " & ".join(group_vars)
+    for idx, pair in enumerate(cross_pairs):
+        pair_vars = [id_to_var[model_id] for model_id in sorted(pair + packables) if model_id in id_to_var]
+        if pair_vars:
+            matrix_sets[f"pair_{idx}"] = " & ".join(pair_vars)
     if not large_groups and packables:
         packable_vars = [id_to_var[model_id] for model_id in packables if model_id in id_to_var]
         if packable_vars:
             matrix_sets["packables"] = " & ".join(packable_vars)
-    evict_costs = {id_to_var[m["id"]]: max(1, int(m["size_mib"])) for m in models_info if m["id"] in id_to_var}
+    evict_costs = {
+        id_to_var[m["id"]]: max(1, int(m["size_mib"] * (0.5 if is_replica_model_id(m["id"]) else 1.0)))
+        for m in models_info
+        if m["id"] in id_to_var
+    }
     return {
         "vars": vars_map,
         "sets": matrix_sets,
@@ -539,6 +566,14 @@ def _get_cli_file():
         return m
     except Exception:
         return None
+
+
+def _engine_binary_base(server_path: Path) -> Path:
+    try:
+        from llamacpp_stack.cli.server_commands import _engine_binary_anchor
+    except Exception:
+        return server_path.parent
+    return _engine_binary_anchor(server_path)
 
 
 def shell_quote(v):
@@ -617,17 +652,17 @@ def render_llamaswap_config(
             engine = "buun"
         effective_server_path = server_path
         if engine == "buun":
-            candidate = Path(server_path).parent / "buun" / "bin" / "llama-server-buun"
+            candidate = _engine_binary_base(Path(server_path)) / "buun" / "bin" / "llama-server-buun"
             if candidate.exists():
                 effective_server_path = str(candidate)
                 print(f"[buun] {use_model.model_id} -> {effective_server_path}", flush=True)
         elif engine == "beellama":
-            candidate = Path(server_path).parent / "beellama" / "bin" / "llama-server-beellama"
+            candidate = _engine_binary_base(Path(server_path)) / "beellama" / "bin" / "llama-server-beellama"
             if candidate.exists():
                 effective_server_path = str(candidate)
                 print(f"[beellama] {use_model.model_id} -> {effective_server_path}", flush=True)
         elif engine == "exllama":
-            candidate = Path(server_path).parent / "exllama" / "bin" / "llama-server-exllama"
+            candidate = _engine_binary_base(Path(server_path)) / "exllama" / "bin" / "llama-server-exllama"
             if candidate.exists():
                 effective_server_path = str(candidate)
                 print(f"[exllama] {use_model.model_id} -> {effective_server_path}", flush=True)
@@ -775,16 +810,16 @@ def ensure_replica_route_in_llamaswap_config(
             replica_engine = "buun"
         effective_replica_server_path = Path(server_path)
         if replica_engine == "buun":
-            cand = Path(server_path).parent / "buun" / "bin" / "llama-server-buun"
+            cand = _engine_binary_base(Path(server_path)) / "buun" / "bin" / "llama-server-buun"
             if cand.exists():
                 effective_replica_server_path = cand
                 print(f"[buun] {replica.model_id} -> {effective_replica_server_path}", flush=True)
         elif replica_engine == "beellama":
-            cand = Path(server_path).parent / "beellama" / "bin" / "llama-server-beellama"
+            cand = _engine_binary_base(Path(server_path)) / "beellama" / "bin" / "llama-server-beellama"
             if cand.exists():
                 effective_replica_server_path = cand
         elif replica_engine == "exllama":
-            cand = Path(server_path).parent / "exllama" / "bin" / "llama-server-exllama"
+            cand = _engine_binary_base(Path(server_path)) / "exllama" / "bin" / "llama-server-exllama"
             if cand.exists():
                 effective_replica_server_path = cand
                 print(f"[exllama] {replica.model_id} -> {effective_replica_server_path}", flush=True)

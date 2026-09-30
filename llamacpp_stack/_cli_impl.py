@@ -2233,23 +2233,30 @@ def _normalize_model_backend(value: object, filename: object = "", local_path: o
         return "exllama"
     if str(filename or "").strip().lower() == "hf-native":
         return "vllm"
-    local = Path(str(local_path or ""))
-    if local.is_dir() and not str(filename or "").lower().endswith(".gguf"):
-        # Do not hardcode model names like exl3 here; backend is determined by explicit backend field only
-        # See: keep model-specific names out of generic backend detection to avoid coupling
-        if normalized in {"buun", "buun-beta"}:
-            return "buun"
-        if normalized in {"exllama", "exlama", "exllamav3", "exllama-v3", "exllama-v3", "exllama3"}:
-            return "exllama"
-        return "vllm"
     if normalized in {"vllm", "vllm-beta"}:
         return "vllm"
     if normalized in {"llama.cpp", "llama-cpp", "llamacpp"}:
         return "llama.cpp"
+    local = Path(str(local_path or ""))
+    if local.is_dir() and not str(filename or "").lower().endswith(".gguf"):
+        return "vllm"
     return "llama.cpp"
 
 
 def _model_backend(model: ManagedModel) -> str:
+    overrides = getattr(model, "server_overrides", None)
+    if isinstance(overrides, dict):
+        engine = str(overrides.get("engine") or "").strip().lower()
+        if engine:
+            try:
+                from llamacpp_stack.cli import server_commands as _sc
+
+                engines = tuple(getattr(_sc, "ENGINE_DIR_NAMES", ()))
+            except Exception:
+                engines = ()
+            # An explicit llama.cpp-family engine beats the directory heuristic.
+            if engine in engines:
+                return "llama.cpp"
     return _normalize_model_backend(
         getattr(model, "backend", None),
         getattr(model, "filename", None),
@@ -3468,6 +3475,14 @@ def _calculate_llama_swap_matrix(models_info: list[dict]) -> dict[str, object]:
     }
 
 
+def _engine_binary_base(server_path: Path) -> Path:
+    try:
+        from llamacpp_stack.cli.server_commands import _engine_binary_anchor
+    except Exception:
+        return server_path.parent
+    return _engine_binary_anchor(server_path)
+
+
 def render_llamaswap_config(
     catalog,
     path,
@@ -3525,17 +3540,17 @@ def render_llamaswap_config(
             engine = "buun"
         effective_server_path = server_path
         if engine == "buun":
-            candidate = Path(server_path).parent / "buun" / "bin" / "llama-server-buun"
+            candidate = _engine_binary_base(Path(server_path)) / "buun" / "bin" / "llama-server-buun"
             if candidate.exists():
                 effective_server_path = str(candidate)
                 print(f"[buun] {use_model.model_id} -> {effective_server_path}", flush=True)
         elif engine == "beellama":
-            candidate = Path(server_path).parent / "beellama" / "bin" / "llama-server-beellama"
+            candidate = _engine_binary_base(Path(server_path)) / "beellama" / "bin" / "llama-server-beellama"
             if candidate.exists():
                 effective_server_path = str(candidate)
                 print(f"[beellama] {use_model.model_id} -> {effective_server_path}", flush=True)
         elif engine == "exllama":
-            candidate = Path(server_path).parent / "exllama" / "bin" / "llama-server-exllama"
+            candidate = _engine_binary_base(Path(server_path)) / "exllama" / "bin" / "llama-server-exllama"
             if candidate.exists():
                 effective_server_path = str(candidate)
                 print(f"[exllama] {use_model.model_id} -> {effective_server_path}", flush=True)
@@ -3681,16 +3696,16 @@ def ensure_replica_route_in_llamaswap_config(
             replica_engine = "buun"
         effective_replica_server_path = Path(server_path)
         if replica_engine == "buun":
-            cand = Path(server_path).parent / "buun" / "bin" / "llama-server-buun"
+            cand = _engine_binary_base(Path(server_path)) / "buun" / "bin" / "llama-server-buun"
             if cand.exists():
                 effective_replica_server_path = cand
                 print(f"[buun] {replica.model_id} -> {effective_replica_server_path}", flush=True)
         elif replica_engine == "beellama":
-            cand = Path(server_path).parent / "beellama" / "bin" / "llama-server-beellama"
+            cand = _engine_binary_base(Path(server_path)) / "beellama" / "bin" / "llama-server-beellama"
             if cand.exists():
                 effective_replica_server_path = cand
         elif replica_engine == "exllama":
-            cand = Path(server_path).parent / "exllama" / "bin" / "llama-server-exllama"
+            cand = _engine_binary_base(Path(server_path)) / "exllama" / "bin" / "llama-server-exllama"
             if cand.exists():
                 effective_replica_server_path = cand
                 print(f"[exllama] {replica.model_id} -> {effective_replica_server_path}", flush=True)
@@ -5987,7 +6002,15 @@ def _query_gpu_memory_snapshot_cached(ttl_s: float = 1.0) -> dict[int, dict[str,
 
 def estimate_model_runtime_mib(model: ManagedModel) -> float | None:
     try:
-        size_mib = Path(model.local_path).stat().st_size / (1024 * 1024)
+        model_path = Path(model.local_path)
+        if model_path.is_dir():
+            size_mib = sum(
+                file_path.stat().st_size
+                for file_path in model_path.rglob("*")
+                if file_path.is_file()
+            ) / (1024 * 1024)
+        else:
+            size_mib = model_path.stat().st_size / (1024 * 1024)
     except Exception:
         return None
     overrides = model.server_overrides or {}
@@ -6212,6 +6235,7 @@ def select_replica_for_request(
                     REPLICA_ROUTER_STATE.affinity[affinity_key] = (cand, now + cfg.sticky_ttl_s)
                     log_api_event("affinity_spillover_to_idle_replica", {"model": base_model.model_id, "from": bound[0], "to": cand, "affinity_key": affinity_key, "kv_miss": True, "idle_threshold_s": threshold, "is_replica": is_replica, "reason": "affinity_overloaded_or_stuck"})
                     return cand, affinity_key, is_replica
+            REPLICA_ROUTER_STATE.affinity[affinity_key] = (bound[0], now + cfg.sticky_ttl_s)
             return bound[0], affinity_key, True
         if bound and bound[1] > now and bound[0] == base_model.model_id:
             if dynamic_routes_enabled:
@@ -6226,6 +6250,7 @@ def select_replica_for_request(
                         REPLICA_ROUTER_STATE.affinity[affinity_key] = (cand, now + cfg.sticky_ttl_s)
                         log_api_event("affinity_spillover_to_idle_replica", {"model": base_model.model_id, "from": bound[0], "to": cand, "affinity_key": affinity_key, "kv_miss": True, "idle_threshold_s": threshold, "is_replica": is_replica, "reason": "affinity_overloaded_or_stuck"})
                         return cand, affinity_key, is_replica
+                REPLICA_ROUTER_STATE.affinity[affinity_key] = (base_model.model_id, now + cfg.sticky_ttl_s)
                 return base_model.model_id, affinity_key, False
         candidates = [
             REPLICA_ROUTER_STATE.records[rid]

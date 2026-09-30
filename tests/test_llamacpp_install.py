@@ -42,6 +42,7 @@ from llamacpp_stack.cli import (
     ensure_model_available,
     ensure_catalog_mtp_drafters,
     ensure_replica_route_in_llamaswap_config,
+    estimate_model_runtime_mib,
     get_gpu_conflict_message,
     get_model_replica_config,
     list_models,
@@ -5334,11 +5335,64 @@ class InstallHelpersTest(unittest.TestCase):
             for base in ("big-a", "big-b"):
                 self.assertIn(base, sets_of)
                 self.assertIn(f"{base}__replica_0", sets_of)
-                self.assertEqual(
-                    sets_of[base],
-                    sets_of[f"{base}__replica_0"],
+                self.assertTrue(
+                    sets_of[base] & sets_of[f"{base}__replica_0"],
                     f"{base} and its replica must share a matrix set so both can stay loaded",
                 )
+
+    def test_matrix_allows_an_idle_replica_to_be_displaced_by_another_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.yaml"
+            models = []
+            for name in ("big-a", "big-b"):
+                model_path = root / f"{name}.gguf"
+                model_path.write_bytes(b"x" * 1024)
+                models.append(
+                    ManagedModel(
+                        model_id=name,
+                        repo_id=f"org/{name}",
+                        quant="Q4",
+                        filename=f"{name}.gguf",
+                        local_path=str(model_path),
+                        tensor_split="1",
+                    )
+                )
+            big_a, big_b = models
+            with (
+                mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=2),
+                mock.patch("llamacpp_stack.cli.replica._get_model_size_mib", return_value=16000.0),
+            ):
+                render_llamaswap_config(models, config_path, root / "llama-server", 18080, idle_ttl=10)
+                ensure_replica_route_in_llamaswap_config(big_a, 0, [1], models, config_path, root / "llama-server", 10)
+
+            rendered = yaml.safe_load(
+                "\n".join(line for line in config_path.read_text(encoding="utf-8").splitlines() if not line.startswith("#"))
+            )
+            matrix = rendered["matrix"]
+            vars_map = matrix["vars"]
+            members: list[set[str]] = []
+            for dsl in matrix["sets"].values():
+                members.append({vars_map[var] for var in str(dsl).split(" & ") if var in vars_map})
+            base_together = [
+                m for m in members if {"big-a", "big-a__replica_0"} <= m
+            ]
+            self.assertTrue(base_together, "the base and its replica must still be co-loadable")
+            swap_in = [m for m in members if "big-b" in m and "big-a__replica_0" in m]
+            self.assertTrue(
+                swap_in,
+                "big-b shares GPU0 with big-a, so it must be declared to run while only big-a's replica is loaded",
+            )
+            for group in swap_in:
+                self.assertNotIn("big-a", group, "big-a and big-b share GPU0 and cannot run together")
+            costs = matrix["evict_costs"]
+            replica_var = next(var for var, name in vars_map.items() if name == "big-a__replica_0")
+            base_var = next(var for var, name in vars_map.items() if name == "big-a")
+            self.assertLess(
+                costs[replica_var],
+                costs[base_var],
+                "an idle replica must be cheaper to evict than the primary so the base survives",
+            )
 
     def test_dynamic_replica_tensor_split_is_local_to_visible_devices_on_many_gpu_host(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5517,6 +5571,53 @@ class InstallHelpersTest(unittest.TestCase):
             selected, _, is_replica = select_replica_for_request(model, {"messages": [{"role": "user", "content": "next"}]}, {"thread-id": "next"})
         self.assertFalse(is_replica)
         self.assertEqual(selected, "repo-q4")
+
+    def test_sticky_affinity_is_refreshed_so_a_long_conversation_keeps_its_target(self) -> None:
+        REPLICA_ROUTER_STATE.records.clear()
+        REPLICA_ROUTER_STATE.affinity.clear()
+        REPLICA_ROUTER_STATE.response_to_replica.clear()
+        REPLICA_ROUTER_STATE.base_in_flight.clear()
+        REPLICA_ROUTER_STATE.base_last_used.clear()
+        model = ManagedModel(
+            model_id="sticky-q4",
+            repo_id="org/sticky",
+            quant="Q4",
+            filename="model.gguf",
+            local_path="/tmp/sticky.gguf",
+            tensor_split="1",
+            server_overrides={"replicas": {"enabled": True, "max": 2, "gpus_per_replica": 1}},
+        )
+        cfg = get_model_replica_config(model, {"enabled": True, "max": 2, "gpus_per_replica": 1})
+        clock = [1000.0]
+        headers = {"thread-id": "long-chat", "x-agent-id": "agent-1"}
+        affinity_key = resolve_request_affinity_key("sticky-q4", {"messages": []}, headers)
+        with (
+            mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=3),
+            mock.patch(
+                "llamacpp_stack._cli_impl.get_published_model_ids",
+                return_value={"sticky-q4__replica_0", "sticky-q4__replica_1"},
+            ),
+            mock.patch("llamacpp_stack.cli._query_gpu_memory_snapshot_cached", return_value={}),
+            mock.patch("llamacpp_stack._cli_impl.time.monotonic", side_effect=lambda: clock[0]),
+        ):
+            bound = "sticky-q4__replica_1"
+            for idx, rid in enumerate(("sticky-q4__replica_0", "sticky-q4__replica_1")):
+                rec = REPLICA_ROUTER_STATE.records.setdefault(
+                    rid, ReplicaRecord(base_model_id="sticky-q4", replica_model_id=rid, gpu_set=[idx + 1])
+                )
+                rec.status = "ready"
+                rec.in_flight = 0
+                rec.last_used = 900.0
+            REPLICA_ROUTER_STATE.affinity[affinity_key] = (bound, clock[0] + cfg.sticky_ttl_s)
+            for step in range(6):
+                clock[0] += float(cfg.sticky_ttl_s) / 3.0
+                REPLICA_ROUTER_STATE.request_started(bound)
+                REPLICA_ROUTER_STATE.request_finished(bound)
+                again, _, again_is_replica = select_replica_for_request(
+                    model, {"messages": [{"role": "user", "content": f"turn-{step}"}]}, headers,
+                )
+                self.assertTrue(again_is_replica, f"conversation left its replica on turn {step}")
+                self.assertEqual(again, bound, f"conversation jumped target on turn {step}")
 
     def test_exclusive_replica_gpu_sets_returns_empty_when_base_uses_all_gpus(self) -> None:
         model = ManagedModel(
@@ -6618,6 +6719,41 @@ models:
             message = get_gpu_conflict_message("model-b", [model_a, model_b])
         self.assertIn("Cannot load model 'model-b'", message)
         self.assertIn("model-a (pid 123, 4096 MiB)", message)
+
+    def test_estimate_model_runtime_mib_measures_a_sharded_model_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            single_file = root / "model.gguf"
+            single_file.write_bytes(b"")
+            os.truncate(single_file, 16305 * 1024 * 1024)
+            shard_dir = root / "sharded"
+            shard_dir.mkdir()
+            for part in range(3):
+                shard = shard_dir / f"model-0000{part + 1}-of-00003.safetensors"
+                shard.write_bytes(b"")
+                os.truncate(shard, 5436 * 1024 * 1024)
+            single_model = ManagedModel(
+                model_id="single",
+                repo_id="org/single",
+                quant="Q4",
+                filename="model.gguf",
+                local_path=str(single_file),
+                ctx_size=262144,
+            )
+            sharded_model = ManagedModel(
+                model_id="sharded",
+                repo_id="org/sharded",
+                quant="EXL3",
+                filename="sharded",
+                local_path=str(shard_dir),
+                ctx_size=262144,
+            )
+            single_estimate = estimate_model_runtime_mib(single_model)
+            sharded_estimate = estimate_model_runtime_mib(sharded_model)
+        self.assertIsNotNone(single_estimate)
+        self.assertIsNotNone(sharded_estimate)
+        self.assertGreater(sharded_estimate, 15000.0)
+        self.assertAlmostEqual(single_estimate, sharded_estimate, delta=64.0)
 
     def test_get_gpu_conflict_message_allows_second_model_when_vram_fits(self) -> None:
         model_a = ManagedModel(

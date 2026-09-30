@@ -758,6 +758,22 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
             for v in value: cmd.extend([f, str(v)])
         else: cmd.extend([f, str(value)])
     except: pass
+
+ENGINE_DIR_NAMES = ("beellama", "buun", "exllama")
+
+
+def _engine_binary_anchor(server_path: Path) -> Path:
+    """Root holding the `<engine>/bin/llama-server-<engine>` subtrees.
+
+    Anchoring on `parent` is wrong when `server_path` is already an engine binary:
+    it silently yields a nested path that exists nowhere on disk.
+    """
+    parent = server_path.parent
+    if parent.name == "bin" and parent.parent.name in ENGINE_DIR_NAMES:
+        return parent.parent.parent
+    return parent
+
+
 def build_vllm_server_command(model, *, port: str, host: str | None = None, vllm_defaults: dict[str, object] | None = None) -> list[str]:
     # vLLM TODO: emulate legacy /completion like exllama_server.py legacy_completion so
     # vLLM y exl3 y futuros motores permitan http://127.0.0.1:11436/upstream/<model>/completion
@@ -954,24 +970,12 @@ def build_llama_server_command(model, server_path: Path, *, port: str, host: str
         return vc
     effective_server_path = server_path
     s_path_str = str(server_path)
-    if _engine == "buun":
-        if "llama-server-buun" in s_path_str:
+    if _engine in ENGINE_DIR_NAMES:
+        engine_bin = f"llama-server-{_engine}"
+        if engine_bin in s_path_str:
             effective_server_path = s_path_str
         else:
-            cand = Path(s_path_str).parent / "buun" / "bin" / "llama-server-buun"
-            effective_server_path = str(cand)
-    elif _engine == "beellama":
-        if "llama-server-beellama" in s_path_str:
-            effective_server_path = s_path_str
-        else:
-            cand = Path(s_path_str).parent / "beellama" / "bin" / "llama-server-beellama"
-            effective_server_path = str(cand)
-    elif _engine == "exllama":
-        if "llama-server-exllama" in s_path_str:
-            effective_server_path = s_path_str
-        else:
-            cand = Path(s_path_str).parent / "exllama" / "bin" / "llama-server-exllama"
-            effective_server_path = str(cand)
+            effective_server_path = str(_engine_binary_anchor(server_path) / _engine / "bin" / engine_bin)
     cmd=[str(effective_server_path),"--port",str(port)]
     if include_model_path:
         cmd.extend(["--model", str(model.local_path)])

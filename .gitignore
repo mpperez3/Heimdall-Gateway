@@ -103,7 +103,6 @@ skills-lock.json
 tests/test_thinking_property.py
 tests/test_llama_swap_logging.py
 tests/test_vllm_spec_metrics.py
-llamacpp_stack/cli/__main__.py
 /.omo/
 /.serena/
 /.opencode/
