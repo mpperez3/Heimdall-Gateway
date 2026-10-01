@@ -170,6 +170,9 @@ class ReplicaRecord:
     in_flight: int = 0
     last_used: float = 0.0
     blacklist_until: float = 0.0
+    #: Faults attributed to the *target*, not the request. Only
+    #: FaultKind.TARGET_FATAL may increment it.
+    fatal_faults: int = 0
 
 
 @dataclass

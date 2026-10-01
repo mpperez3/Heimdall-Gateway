@@ -82,6 +82,31 @@ try:
 except Exception:  # pragma: no cover
     log_raw_request = None  # type: ignore
 
+# Replica fault attribution + affinity policy vocabulary
+try:
+    from llamacpp_stack.cli.replica_policy import (  # type: ignore
+        FaultKind as _FaultKind,
+        TargetState as _TargetState,
+        TransferReason as _TransferReason,
+        fault_from_exception as _fault_from_exception,
+        fault_from_status as _fault_from_status,
+        is_target_fatal as _is_target_fatal,
+    )
+except Exception:  # pragma: no cover
+    class _FaultKind:  # type: ignore
+        NONE = "none"
+        CLIENT_ABORT = "client_abort"
+        CLIENT_REQUEST = "client_request"
+        CONTENT = "content"
+        UPSTREAM_TRANSIENT = "upstream_transient"
+        TARGET_FATAL = "target_fatal"
+
+    _TargetState = None  # type: ignore
+    _TransferReason = None  # type: ignore
+    _fault_from_exception = None  # type: ignore
+    _fault_from_status = None  # type: ignore
+    _is_target_fatal = None  # type: ignore
+
 # Gateway shim: prefer canonical impl from llamacpp_stack.cli.gateway (T5)
 try:
     from llamacpp_stack.cli.gateway import (  # type: ignore
@@ -5474,7 +5499,17 @@ class ReplicaRouterState:
                 self.base_in_flight[replica_id] = self.base_in_flight.get(replica_id, 0) + 1
                 self.base_last_used[replica_id] = time.monotonic()
 
-    def request_finished(self, replica_id: str, *, ok: bool = True) -> None:
+    def request_finished(self, replica_id: str, *, ok: bool = True, fault: object = None) -> None:
+        """Release a serving slot and attribute any fault.
+
+        Releasing the slot is not a statement about target health. Only an
+        explicit ``fault=FaultKind.TARGET_FATAL`` -- backed by process evidence
+        -- may demote the target. A malformed request, a client disconnect or a
+        transient 5xx must leave target state untouched: the router reads
+        ``status != "ready"`` as "stuck" and evacuates every conversation bound
+        to it, so a single client abort used to blacklist a healthy replica for
+        120s and push a conversation onto a cold GPU for a full reload.
+        """
         with self.lock:
             self.loading_claims.pop(replica_id, None)
             claim_key = self.loading_claim_aliases.pop(replica_id, None)
@@ -5484,9 +5519,15 @@ class ReplicaRouterState:
             if rec:
                 rec.in_flight = max(0, rec.in_flight - 1)
                 rec.last_used = time.monotonic()
-                rec.status = "ready" if ok else "error"
-                if not ok:
+                if _is_target_fatal is not None and _is_target_fatal(fault):
+                    rec.status = "error"
                     rec.blacklist_until = time.monotonic() + 120.0
+                    rec.fatal_faults = int(getattr(rec, "fatal_faults", 0)) + 1
+                elif ok:
+                    rec.status = "ready"
+                    if rec.blacklist_until:
+                        rec.blacklist_until = 0.0
+                    rec.fatal_faults = 0
             else:
                 self.base_in_flight[replica_id] = max(0, self.base_in_flight.get(replica_id, 0) - 1)
                 self.base_last_used[replica_id] = time.monotonic()
