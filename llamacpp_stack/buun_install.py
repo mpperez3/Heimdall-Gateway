@@ -148,9 +148,17 @@ def _bundled_patches_dir() -> Path:
 
 def _bundled_patch_files() -> list[Path]:
     d = _bundled_patches_dir()
-    if not d.is_dir():
-        return []
-    return sorted(p for p in d.glob("*.patch") if p.is_file())
+    patches = sorted(p for p in d.glob("*.patch") if p.is_file()) if d.is_dir() else []
+    # An empty bundle means the patches were dropped from the sdist/wheel or the checkout,
+    # not that buun needs no patching. Failing here keeps every caller (pending check,
+    # apply, stamp) from treating a missing patch as "nothing to do" and shipping a
+    # silently unpatched engine.
+    if not patches:
+        raise RuntimeError(
+            f"no bundled buun patches found in {d} — the install is incomplete; "
+            "reinstall llamacpp_stack so the patches ship with the package"
+        )
+    return patches
 
 
 def _bundled_patch_fingerprint() -> str:
@@ -171,9 +179,7 @@ def _patch_stamp_path(buun_root: Path) -> Path:
 
 
 def _bundled_patches_pending(buun_root: Path) -> bool:
-    patches = _bundled_patch_files()
-    if not patches:
-        return False
+    _bundled_patch_files()
     try:
         current = _patch_stamp_path(buun_root).read_text(encoding="utf-8").strip()
     except OSError:
@@ -231,8 +237,7 @@ def _apply_bundled_patches(src_dir: Path, dry_run: bool = False) -> list[str]:
 
 
 def _write_patch_stamp(buun_root: Path) -> None:
-    if not _bundled_patch_files():
-        return
+    _bundled_patch_files()
     try:
         buun_root.mkdir(parents=True, exist_ok=True)
         _patch_stamp_path(buun_root).write_text(_bundled_patch_fingerprint() + "\n", encoding="utf-8")
