@@ -18,6 +18,7 @@ reload.
 
 import http.client
 import json
+import os
 import socket
 import time
 import unittest
@@ -26,6 +27,7 @@ from llamacpp_stack import _cli_impl as cli
 from llamacpp_stack.cli.models import ReplicaRecord
 from llamacpp_stack.cli.replica_policy import (
     TRANSFER_REASONS,
+    AffinityDecision,
     FaultKind,
     TargetHealth,
     TargetState,
@@ -33,6 +35,8 @@ from llamacpp_stack.cli.replica_policy import (
     fault_from_exception,
     fault_from_status,
     is_target_fatal,
+    normalize_affinity_config,
+    probe_target_health,
 )
 
 
@@ -278,6 +282,237 @@ class TestSaturatedOwnerDoesNotEvacuate(_RecordFixture):
         rec = self.record()
         self.assertEqual(rec.status, "ready", "a client abort must not rewrite a healthy target's state")
         self.assertEqual(rec.blacklist_until, 0.0)
+
+
+def _always(status):
+    return lambda port, timeout_s: status
+
+
+class PolicyOwnershipTest(unittest.TestCase):
+    """The chokepoint must make "move because busy" inexpressible."""
+
+    def setUp(self) -> None:
+        self.state = cli.ReplicaRouterState()
+        self.cfg = normalize_affinity_config(None)
+        self.key = "qwen3.8-27b-EXL3:fallback:653536f123fc:aef2512b8a6b"
+        self.base = "qwen3.8-27b-EXL3"
+        self.replica = "qwen3.8-27b-EXL3__replica_0"
+
+    def bind_initial(self, target, now=1000.0):
+        return self.state.bind(self.key, target, TransferReason.INITIAL_BIND, ttl_s=3600.0, cfg=self.cfg, now=now)
+
+    def test_initial_bind_records_ownership(self) -> None:
+        self.bind_initial(self.replica)
+        self.assertEqual(self.state.owner_of(self.key, now=1000.0), self.replica)
+
+    def test_sticky_refresh_never_changes_owner(self) -> None:
+        self.bind_initial(self.replica)
+        for step in range(5):
+            self.state.request_started(self.replica)
+            result = self.state.bind(
+                self.key, self.base, TransferReason.STICKY_REFRESH, ttl_s=3600.0, cfg=self.cfg, now=1000.0 + step
+            )
+            self.assertEqual(result.target, self.replica, "a refresh must keep the owner")
+            self.assertEqual(self.state.owner_of(self.key, now=1000.0), self.replica)
+            self.state.request_finished(self.replica)
+
+    def test_saturated_owner_waits_instead_of_moving(self) -> None:
+        self.bind_initial(self.replica)
+        decision, reason = self.state.policy.decide(
+            self.replica,
+            TargetHealth(target=self.replica, state=TargetState.READY, in_flight=1, capacity=1),
+            has_alternatives=True,
+            cfg=self.cfg,
+        )
+        self.assertIs(decision, AffinityDecision.WAIT)
+        self.assertIsNone(reason, "a saturated owner has no transfer reason")
+
+    def test_saturation_can_never_be_expressed_as_a_transfer(self) -> None:
+        self.bind_initial(self.replica)
+        for reason in (TransferReason.STICKY_REFRESH, TransferReason.RESPONSES_CHAIN, TransferReason.INITIAL_BIND):
+            result = self.state.bind(self.key, self.base, reason, ttl_s=3600.0, cfg=self.cfg, now=1001.0)
+            self.assertEqual(result.target, self.replica, f"{reason} must not move ownership")
+            self.assertEqual(result.refused_by, "undeclared_reason")
+        self.assertEqual(self.state.owner_of(self.key, now=1000.0), self.replica)
+
+    def test_suspect_target_is_not_evacuated_by_default(self) -> None:
+        self.bind_initial(self.replica)
+        health = TargetHealth(target=self.replica, state=TargetState.ERROR, blacklist_until=time.monotonic() + 120)
+        decision, _ = self.state.policy.decide(self.replica, health, has_alternatives=True, cfg=self.cfg)
+        self.assertIs(decision, AffinityDecision.STICKY)
+
+    def test_min_dwell_brake_blocks_suspected_transfers(self) -> None:
+        self.bind_initial(self.replica, now=1000.0)
+        result = self.state.bind(
+            self.key, self.base, TransferReason.EVACUATE_NO_ROUTE, ttl_s=3600.0, cfg=self.cfg, now=1010.0
+        )
+        self.assertEqual(result.target, self.replica, "dwell brake should hold the owner")
+        self.assertEqual(result.refused_by, "min_dwell_s")
+
+    def test_confirmed_death_ignores_dwell_and_moves(self) -> None:
+        self.bind_initial(self.replica, now=1000.0)
+        result = self.state.bind(
+            self.key, self.base, TransferReason.EVACUATE_TARGET_DEAD, ttl_s=3600.0, cfg=self.cfg, now=1001.0
+        )
+        self.assertEqual(result.target, self.base)
+        self.assertEqual(self.state.owner_of(self.key, now=1000.0), self.base)
+
+    def test_transfer_budget_is_per_binding_not_per_target(self) -> None:
+        """A ping-pong between two targets must not reset the budget."""
+        self.bind_initial(self.replica, now=1000.0)
+        cfg = normalize_affinity_config({"min_dwell_s": 0, "max_transfers": 1, "evacuate_cooldown_s": 0})
+        first = self.state.bind(self.key, self.base, TransferReason.EVACUATE_NO_ROUTE, ttl_s=3600.0, cfg=cfg, now=2000.0)
+        self.assertEqual(first.target, self.base)
+        second = self.state.bind(self.key, self.replica, TransferReason.EVACUATE_NO_ROUTE, ttl_s=3600.0, cfg=cfg, now=3000.0)
+        self.assertEqual(second.target, self.base, "budget exhaustion must stop the ping-pong")
+        self.assertEqual(second.refused_by, "max_transfers")
+
+    def test_evacuate_cooldown_brake_blocks_returning_to_previous_target(self) -> None:
+        self.bind_initial(self.replica, now=1000.0)
+        cfg = normalize_affinity_config({"min_dwell_s": 0, "evacuate_cooldown_s": 600})
+        self.state.bind(self.key, self.base, TransferReason.EVACUATE_NO_ROUTE, ttl_s=3600.0, cfg=cfg, now=2000.0)
+        back = self.state.bind(self.key, self.replica, TransferReason.EVACUATE_NO_ROUTE, ttl_s=3600.0, cfg=cfg, now=2100.0)
+        self.assertEqual(back.target, self.base)
+        self.assertEqual(back.refused_by, "evacuate_cooldown_s")
+
+    def test_exhausted_hard_budget_degrades_instead_of_deadlocking(self) -> None:
+        self.bind_initial(self.replica, now=1000.0)
+        cfg = normalize_affinity_config({"max_hard_transfers": 1})
+        first = self.state.bind(self.key, self.base, TransferReason.EVACUATE_TARGET_DEAD, ttl_s=3600.0, cfg=cfg, now=1001.0)
+        self.assertEqual(first.target, self.base)
+        dead_again = self.state.bind(self.key, self.replica, TransferReason.EVACUATE_TARGET_DEAD, ttl_s=3600.0, cfg=cfg, now=1002.0)
+        self.assertIsNone(dead_again.target, "must serve unbound rather than pin to a dead target")
+        self.assertIs(dead_again.decision, AffinityDecision.UNBOUND)
+        self.assertIsNone(self.state.owner_of(self.key, now=1000.0))
+
+
+class ProbeTest(unittest.TestCase):
+    def test_dead_pid_is_proof_of_death(self) -> None:
+        health = probe_target_health("t", pid=2**22 - 1, port=0, probe=_always(200))
+        self.assertTrue(health.confirmed_dead)
+        self.assertEqual(health.detail, "pid_not_alive")
+        self.assertFalse(health.servable)
+
+    def test_unreachable_port_is_proof_of_death(self) -> None:
+        health = probe_target_health("t", pid=0, port=1, probe=_always(None))
+        self.assertTrue(health.confirmed_dead)
+        self.assertEqual(health.detail, "health_unreachable")
+
+    def test_503_means_loading_not_broken(self) -> None:
+        health = probe_target_health("t", pid=0, port=1, probe=_always(503))
+        self.assertIs(health.state, TargetState.LOADING)
+        self.assertFalse(health.confirmed_dead)
+        self.assertTrue(health.servable, "a loading target is still the right owner")
+
+    def test_200_is_ready(self) -> None:
+        health = probe_target_health("t", pid=0, port=1, probe=_always(200))
+        self.assertIs(health.state, TargetState.READY)
+        self.assertFalse(health.saturated)
+
+    def test_odd_status_is_suspect_not_dead(self) -> None:
+        health = probe_target_health("t", pid=0, port=1, probe=_always(418))
+        self.assertIs(health.state, TargetState.SUSPECT)
+        self.assertFalse(health.confirmed_dead)
+        self.assertTrue(health.servable, "only a probe may convict; suspicion must not evict")
+
+    def test_saturation_is_reported_separately_from_health(self) -> None:
+        health = probe_target_health("t", pid=0, port=1, in_flight=1, capacity=1, probe=_always(200))
+        self.assertTrue(health.saturated)
+        self.assertTrue(health.servable)
+        self.assertFalse(health.suspected)
+
+
+class IncidentReplayTest(unittest.TestCase):
+    """Deterministic replay of the 18:36 window that caused the flips.
+
+    The owner replica is warm on GPU 1 and the conversation is bound to it. Two
+    client aborts land, a third party keeps the owner loaded, and three
+    sequential requests arrive. Under the old code the aborts marked the replica
+    ``error`` for 120s, which read as "stuck", which evicted every bound
+    conversation onto the cold base. Here nothing may move.
+    """
+
+    BASE = "qwen3.8-27b-EXL3"
+    REPLICA = "qwen3.8-27b-EXL3__replica_0"
+    KEY = "qwen3.8-27b-EXL3:fallback:653536f123fc:aef2512b8a6b"
+
+    def setUp(self) -> None:
+        self.state = cli.ReplicaRouterState()
+        self.cfg = normalize_affinity_config(None)
+        self.state.records[self.REPLICA] = ReplicaRecord(
+            base_model_id=self.BASE,
+            replica_model_id=self.REPLICA,
+            gpu_set=[1],
+            status="ready",
+            pid=os.getpid(),
+            port=1,
+        )
+
+    @staticmethod
+    def alive_probe(port: int, timeout_s: float) -> int:
+        return 200
+
+    def test_the_incident_window_produces_zero_transfers(self) -> None:
+        self.state.bind(self.KEY, self.REPLICA, TransferReason.INITIAL_BIND, ttl_s=3600.0, cfg=self.cfg, now=1000.0)
+        for _ in range(2):
+            self.state.request_started(self.REPLICA)
+            self.state.request_finished(self.REPLICA, ok=False, fault=fault_from_exception(_remote_disconnected()))
+        for _ in range(3):
+            health = self.state.health_of(self.REPLICA, cfg=self.cfg, probe=self.alive_probe)
+            decision, reason = self.state.policy.decide(
+                self.state.owner_of(self.KEY), health, has_alternatives=True, cfg=self.cfg
+            )
+            target = self.state.bind(
+                self.KEY,
+                self.REPLICA if decision is not AffinityDecision.EVACUATE else self.BASE,
+                reason or TransferReason.STICKY_REFRESH,
+                ttl_s=3600.0,
+                cfg=self.cfg,
+                now=1001.0,
+            ).target
+            self.assertEqual(target, self.REPLICA, "a healthy owner must never be abandoned")
+        self.assertEqual(self.state.records[self.REPLICA].status, "ready")
+        self.assertEqual(self.state.records[self.REPLICA].blacklist_until, 0.0)
+
+    def test_only_confirmed_death_moves_the_conversation(self) -> None:
+        self.state.bind(self.KEY, self.REPLICA, TransferReason.INITIAL_BIND, ttl_s=3600.0, cfg=self.cfg, now=1000.0)
+        self.state.records[self.REPLICA].pid = 2**22 - 1
+        health = self.state.health_of(self.REPLICA, cfg=self.cfg, probe=self.alive_probe)
+        self.assertTrue(health.confirmed_dead)
+        decision, reason = self.state.policy.decide(self.REPLICA, health, has_alternatives=True, cfg=self.cfg)
+        self.assertIs(decision, AffinityDecision.EVACUATE)
+        self.assertIs(reason, TransferReason.EVACUATE_TARGET_DEAD)
+
+    def test_health_probe_is_rate_limited(self) -> None:
+        calls: list[int] = []
+
+        def counting_probe(port: int, timeout_s: float) -> int:
+            calls.append(port)
+            return 200
+
+        self.state.health_of(self.REPLICA, cfg=self.cfg, probe=counting_probe)
+        second = self.state.health_of(self.REPLICA, cfg=self.cfg, probe=counting_probe)
+        self.assertIs(second.state, TargetState.READY)
+        self.assertEqual(len(calls), 1, "a warm owner must not be probed on every request")
+
+
+class AffinityConfigNormalisationTest(unittest.TestCase):
+    def test_garbage_falls_back_to_safe_defaults(self) -> None:
+        cfg = normalize_affinity_config(
+            {"min_dwell_s": "nonsense", "max_transfers": None, "saturated_target": "chaos"}
+        )
+        self.assertEqual(cfg.min_dwell_s, normalize_affinity_config(None).min_dwell_s)
+        self.assertEqual(cfg.saturated_target, "retry")
+        self.assertGreaterEqual(cfg.max_transfers, 0)
+
+    def test_negative_values_are_clamped(self) -> None:
+        cfg = normalize_affinity_config({"min_dwell_s": -99, "max_hard_transfers": 0, "queue_max_wait_ms": -5})
+        self.assertEqual(cfg.min_dwell_s, 0.0)
+        self.assertEqual(cfg.max_hard_transfers, 1, "there must always be at least one escape from a dead target")
+        self.assertEqual(cfg.queue_max_wait_ms, 0)
+
+    def test_queue_mode_is_accepted(self) -> None:
+        self.assertEqual(normalize_affinity_config({"saturated_target": "queue"}).saturated_target, "queue")
 
 
 if __name__ == "__main__":

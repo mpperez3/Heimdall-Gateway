@@ -29,7 +29,9 @@ Design rules encoded here:
 from __future__ import annotations
 
 import enum
+import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 
@@ -224,6 +226,11 @@ class TargetHealth:
         return self.blacklist_until > time.monotonic()
 
     @property
+    def suspected(self) -> bool:
+        """Believed unhealthy, but not proven.  Never grounds for eviction alone."""
+        return self.blacklisted or self.state in {TargetState.SUSPECT, TargetState.ERROR}
+
+    @property
     def saturated(self) -> bool:
         """At capacity.  Never a reason to move a conversation."""
         if self.capacity <= 0:
@@ -239,19 +246,276 @@ class TargetHealth:
             "saturated": self.saturated,
             "servable": self.servable,
             "blacklisted": self.blacklisted,
+            "suspected": self.suspected,
             "confirmed_dead": self.confirmed_dead,
             "detail": self.detail,
         }
 
 
+class AffinityDecision(str, enum.Enum):
+    """The single answer to "where does this conversation go?".
+
+    Ordered and mutually exclusive; ``decide()`` returns the first match. There
+    is deliberately no decision that means "move it somewhere else because that
+    would be more convenient".
+    """
+
+    #: No owner yet: pick freely, then record ownership.
+    BIND = "bind"
+    #: Serve on the owner.  Never writes a new target.
+    STICKY = "sticky"
+    #: Owner is healthy but full: wait (queue) or ask the client to retry.
+    WAIT = "wait"
+    #: Owner is impossible or provably dead: move, subject to the brakes.
+    EVACUATE = "evacuate"
+    #: Brakes exhausted: serve wherever, without recording ownership.
+    UNBOUND = "unbound"
+
+
+@dataclass
+class AffinityConfig:
+    """Tunables for conversation ownership (``experimental.affinity_policy``)."""
+
+    #: Minimum dwell on a target before an *unproven* transfer may move it.
+    min_dwell_s: float = 120.0
+    #: Unproven transfers allowed per binding before degrading to UNBOUND.
+    max_transfers: int = 2
+    #: Proven-death transfers allowed per binding.  Higher than the unproven cap
+    #: on purpose: a dead target must always be escapable.
+    max_hard_transfers: int = 5
+    #: Refuse to re-bind to a target we just evacuated away from.
+    evacuate_cooldown_s: float = 300.0
+    #: ``retry`` -> 429 + Retry-After.  ``queue`` -> wait up to queue_max_wait_ms.
+    saturated_target: str = "retry"
+    queue_max_wait_ms: int = 0
+    queue_max_depth: int = 0
+    #: Off by default.  When true, an *unproven* suspect target may still be
+    #: left behind (the legacy ``affinity_spillover.enabled`` behaviour).
+    allow_suspected_transfers: bool = False
+    #: Liveness probe cadence per target and per-attempt timeout.
+    probe_interval_s: float = 10.0
+    probe_timeout_s: float = 1.5
+
+
+def normalize_affinity_config(raw: object) -> AffinityConfig:
+    """Build an :class:`AffinityConfig` from a possibly-wrong config blob."""
+    cfg = AffinityConfig()
+    if not isinstance(raw, dict):
+        return cfg
+
+    def _num(key: str, default: float, minimum: float = 0.0) -> float:
+        try:
+            return max(minimum, float(raw.get(key, default)))
+        except (TypeError, ValueError):
+            return default
+
+    def _int(key: str, default: int, minimum: int = 0) -> int:
+        try:
+            return max(minimum, int(raw.get(key, default)))
+        except (TypeError, ValueError):
+            return default
+
+    cfg.min_dwell_s = _num("min_dwell_s", cfg.min_dwell_s)
+    cfg.max_transfers = _int("max_transfers", cfg.max_transfers)
+    cfg.max_hard_transfers = _int("max_hard_transfers", cfg.max_hard_transfers, minimum=1)
+    cfg.evacuate_cooldown_s = _num("evacuate_cooldown_s", cfg.evacuate_cooldown_s)
+    mode = str(raw.get("saturated_target", cfg.saturated_target) or "").strip().lower()
+    cfg.saturated_target = mode if mode in {"retry", "queue"} else "retry"
+    cfg.queue_max_wait_ms = _int("queue_max_wait_ms", cfg.queue_max_wait_ms)
+    cfg.queue_max_depth = _int("queue_max_depth", cfg.queue_max_depth)
+    cfg.allow_suspected_transfers = bool(raw.get("allow_suspected_transfers", cfg.allow_suspected_transfers))
+    cfg.probe_interval_s = _num("probe_interval_s", cfg.probe_interval_s, minimum=0.1)
+    cfg.probe_timeout_s = _num("probe_timeout_s", cfg.probe_timeout_s, minimum=0.05)
+    return cfg
+
+
+@dataclass
+class TransferBudget:
+    """Per-binding transfer accounting, keyed by affinity key.
+
+    The counters live on the *binding*, not on the target, so a ping-pong
+    between two targets cannot reset the budget by alternating.
+    """
+
+    bound_at: float = 0.0
+    last_transfer_at: float = 0.0
+    last_target: str = ""
+    suspected_transfers: int = 0
+    hard_transfers: int = 0
+
+
+@dataclass
+class BindResult:
+    """Outcome of an affinity write attempt."""
+
+    target: str | None
+    decision: AffinityDecision
+    reason: TransferReason
+    bound: bool
+    #: Name of the brake that refused a transfer, for logging.
+    refused_by: str = ""
+
+
+class AffinityPolicy:
+    """Decides conversation ownership; holds no mutable state of its own.
+
+    All branching lives here so the routing code can only express *what it
+    observed*, never invent a new reason to move a conversation.
+    """
+
+    def decide(
+        self,
+        bound_target: str | None,
+        health: TargetHealth,
+        *,
+        has_alternatives: bool,
+        cfg: AffinityConfig,
+    ) -> tuple[AffinityDecision, TransferReason | None]:
+        """Classify a request against its current owner. First match wins."""
+        if not bound_target:
+            return AffinityDecision.BIND, TransferReason.INITIAL_BIND
+        if health.confirmed_dead:
+            return AffinityDecision.EVACUATE, TransferReason.EVACUATE_TARGET_DEAD
+        if not health.servable:
+            return AffinityDecision.EVACUATE, TransferReason.EVACUATE_NO_ROUTE
+        if health.suspected:
+            # Unproven. A probe decides, not a timer and not a busy counter.
+            if has_alternatives and cfg.allow_suspected_transfers:
+                return AffinityDecision.EVACUATE, TransferReason.EVACUATE_NO_ROUTE
+            return AffinityDecision.STICKY, None
+        if health.saturated:
+            return AffinityDecision.WAIT, None
+        return AffinityDecision.STICKY, None
+
+    def allow_transfer(
+        self,
+        budget: TransferBudget,
+        reason: TransferReason,
+        new_target: str,
+        cfg: AffinityConfig,
+        now: float,
+    ) -> tuple[bool, str]:
+        """Apply the anti-thrash brakes. Returns ``(allowed, brake_name)``."""
+        hard = reason is TransferReason.EVACUATE_TARGET_DEAD
+        if hard:
+            # Death overrides dwell and cooldown: an unusable target must
+            # always be escapable, so only the generous hard budget applies.
+            return (budget.hard_transfers < cfg.max_hard_transfers, "max_hard_transfers")
+        if now - budget.bound_at < cfg.min_dwell_s:
+            return False, "min_dwell_s"
+        if budget.suspected_transfers >= cfg.max_transfers:
+            return False, "max_transfers"
+        if (
+            budget.last_target
+            and new_target == budget.last_target
+            and now - budget.last_transfer_at < cfg.evacuate_cooldown_s
+        ):
+            return False, "evacuate_cooldown_s"
+        return True, ""
+
+    def record_transfer(self, budget: TransferBudget, reason: TransferReason, previous: str, now: float) -> None:
+        budget.last_target = previous
+        budget.last_transfer_at = now
+        if reason is TransferReason.EVACUATE_TARGET_DEAD:
+            budget.hard_transfers += 1
+        else:
+            budget.suspected_transfers += 1
+
+
+def _default_http_probe(port: int, timeout_s: float) -> int | None:
+    """GET /health on *port*; returns the status code or None if unreachable."""
+    import http.client
+
+    conn = http.client.HTTPConnection("127.0.0.1", int(port), timeout=float(timeout_s))
+    try:
+        conn.request("GET", "/health")
+        response = conn.getresponse()
+        response.read()
+        return int(response.status)
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+    return True
+
+
+def probe_target_health(
+    target: str,
+    *,
+    pid: int = 0,
+    port: int = 0,
+    state: TargetState = TargetState.READY,
+    in_flight: int = 0,
+    capacity: int = 1,
+    blacklist_until: float = 0.0,
+    probe: Callable[[int, float], int | None] | None = None,
+    timeout_s: float = 1.5,
+) -> TargetHealth:
+    """Measure a target instead of inferring its health from a request outcome.
+
+    A dead pid or an unreachable port is proof of death.  HTTP 503 from
+    llama-server means "still loading", which is not a fault.  Anything else is
+    reported as :attr:`TargetState.SUSPECT` so the caller decides, never the
+    transport.
+    """
+    probe = probe or _default_http_probe
+    health = TargetHealth(
+        target=target,
+        state=state,
+        in_flight=in_flight,
+        capacity=capacity,
+        blacklist_until=blacklist_until,
+    )
+    if pid > 0 and not _pid_alive(pid):
+        health.state = TargetState.DEAD
+        health.confirmed_dead = True
+        health.detail = "pid_not_alive"
+        return health
+    if port > 0:
+        status = probe(int(port), float(timeout_s))
+        if status is None:
+            health.state = TargetState.DEAD
+            health.confirmed_dead = True
+            health.detail = "health_unreachable"
+        elif status == 200:
+            health.state = TargetState.READY
+        elif status == 503:
+            # llama-server answers 503 while the weights are still loading.
+            health.state = TargetState.LOADING
+        else:
+            health.state = TargetState.SUSPECT
+            health.detail = f"health_status_{status}"
+    return health
+
+
 __all__ = [
+    "AffinityConfig",
+    "AffinityDecision",
+    "AffinityPolicy",
+    "BindResult",
     "FaultKind",
     "TARGET_FATAL_KINDS",
-    "is_target_fatal",
-    "fault_from_status",
-    "fault_from_exception",
-    "TransferReason",
-    "TRANSFER_REASONS",
-    "TargetState",
     "TargetHealth",
+    "TargetState",
+    "TRANSFER_REASONS",
+    "TransferBudget",
+    "TransferReason",
+    "fault_from_exception",
+    "fault_from_status",
+    "is_target_fatal",
+    "normalize_affinity_config",
+    "probe_target_health",
 ]

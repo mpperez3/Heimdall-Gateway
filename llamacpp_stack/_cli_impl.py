@@ -85,12 +85,21 @@ except Exception:  # pragma: no cover
 # Replica fault attribution + affinity policy vocabulary
 try:
     from llamacpp_stack.cli.replica_policy import (  # type: ignore
+        TRANSFER_REASONS as _TRANSFER_REASONS,
+        AffinityConfig as _AffinityConfig,
+        AffinityDecision as _AffinityDecision,
+        AffinityPolicy as _AffinityPolicy,
+        BindResult as _BindResult,
         FaultKind as _FaultKind,
+        TargetHealth as _TargetHealth,
         TargetState as _TargetState,
+        TransferBudget as _TransferBudget,
         TransferReason as _TransferReason,
         fault_from_exception as _fault_from_exception,
         fault_from_status as _fault_from_status,
         is_target_fatal as _is_target_fatal,
+        normalize_affinity_config as _normalize_affinity_config,
+        probe_target_health as _probe_target_health,
     )
 except Exception:  # pragma: no cover
     class _FaultKind:  # type: ignore
@@ -106,6 +115,16 @@ except Exception:  # pragma: no cover
     _fault_from_exception = None  # type: ignore
     _fault_from_status = None  # type: ignore
     _is_target_fatal = None  # type: ignore
+    _AffinityPolicy = None  # type: ignore
+    _AffinityDecision = None  # type: ignore
+    _AffinityConfig = None  # type: ignore
+    _TransferBudget = None  # type: ignore
+    _BindResult = None  # type: ignore
+    _TRANSFER_REASONS = frozenset()  # type: ignore
+    _TargetHealth = None  # type: ignore
+    _normalize_affinity_config = None  # type: ignore
+    _probe_target_health = None  # type: ignore
+
 
 # Gateway shim: prefer canonical impl from llamacpp_stack.cli.gateway (T5)
 try:
@@ -1112,6 +1131,36 @@ def _dedup_should_bypass(args=None) -> str | None:
         return "dedup_bypass_error"
 
 
+def _replica_target_capacity() -> int:
+    """How many requests one upstream may serve at once (``--parallel``)."""
+    try:
+        return max(1, int(DEFAULT_MAX_CONCURRENT_PER_MODEL))
+    except Exception:
+        return 1
+
+
+def _resolve_affinity_policy_config() -> object:
+    """Read ``experimental.affinity_policy``, honouring the legacy spillover key.
+
+    An explicit ``affinity_spillover.enabled: true`` from an existing install is
+    mapped onto ``allow_suspected_transfers`` so that opting in keeps working,
+    while every fresh install gets the safe default.
+    """
+    if _normalize_affinity_config is None:
+        return None
+    try:
+        payload = _load_server_config_payload(None)
+        exp = payload.get("experimental") if isinstance(payload.get("experimental"), dict) else {}
+        raw = exp.get("affinity_policy") if isinstance(exp, dict) else None
+        legacy = exp.get("affinity_spillover") if isinstance(exp, dict) else None
+        if isinstance(legacy, dict) and "allow_suspected_transfers" not in (raw if isinstance(raw, dict) else {}):
+            raw = dict(raw) if isinstance(raw, dict) else {}
+            raw["allow_suspected_transfers"] = bool(legacy.get("enabled"))
+        return _normalize_affinity_config(raw)
+    except Exception:
+        return _normalize_affinity_config(None)
+
+
 def _default_auto_update_config() -> dict[str, object]:
     return {
         "deferred_enabled": True,
@@ -1119,9 +1168,29 @@ def _default_auto_update_config() -> dict[str, object]:
 
 
 def _default_affinity_spillover_config() -> dict[str, object]:
+    # Off by default: the legacy spillover moved conversations whenever the
+    # owner looked busy, which is what caused cold-GPU reloads.
     return {
-        "enabled": True,
+        "enabled": False,
         "idle_threshold_s": 30,
+    }
+
+
+def _default_affinity_policy_config() -> dict[str, object]:
+    if _normalize_affinity_config is None:
+        return {}
+    cfg = _normalize_affinity_config(None)
+    return {
+        "min_dwell_s": cfg.min_dwell_s,
+        "max_transfers": cfg.max_transfers,
+        "max_hard_transfers": cfg.max_hard_transfers,
+        "evacuate_cooldown_s": cfg.evacuate_cooldown_s,
+        "saturated_target": cfg.saturated_target,
+        "queue_max_wait_ms": cfg.queue_max_wait_ms,
+        "queue_max_depth": cfg.queue_max_depth,
+        "allow_suspected_transfers": cfg.allow_suspected_transfers,
+        "probe_interval_s": cfg.probe_interval_s,
+        "probe_timeout_s": cfg.probe_timeout_s,
     }
 
 
@@ -1477,6 +1546,7 @@ def _default_experimental_config() -> dict[str, object]:
         "dedup_inflight": _default_dedup_inflight_config(),
         "model_probe_autoload": _default_model_probe_autoload_config(),
         "affinity_spillover": _default_affinity_spillover_config(),
+        "affinity_policy": _default_affinity_policy_config(),
         "chat_tool_continue_repair": {
             "enabled": False,
             "max_rounds": 1,
@@ -1619,6 +1689,13 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
         cfg["affinity_spillover"], _ = _normalize_affinity_spillover_config(None)
     else:
         cfg["affinity_spillover"], _ = _normalize_affinity_spillover_config(cfg.get("affinity_spillover"))
+    policy_raw = cfg.get("affinity_policy")
+    policy_raw = dict(policy_raw) if isinstance(policy_raw, dict) else {}
+    if "allow_suspected_transfers" not in policy_raw:
+        # Freeze the legacy switch into its modern equivalent exactly once, so
+        # deprecating affinity_spillover later cannot change behaviour silently.
+        policy_raw["allow_suspected_transfers"] = bool(cfg["affinity_spillover"].get("enabled"))
+    cfg["affinity_policy"] = _default_affinity_policy_config() | policy_raw
     return cfg
 
 
@@ -5460,13 +5537,187 @@ class ReplicaRouterState:
         # not all reach llama-swap and make it start/restart the same model.
         self.loading_claims: dict[str, float] = {}
         self.loading_claim_aliases: dict[str, str] = {}
+        self.policy: object = _AffinityPolicy()
+        self.affinity_budget: dict[str, _TransferBudget] = {}
+        self._health_cache: dict[str, tuple[float, _TargetHealth]] = {}
 
+    def affinity_config(self) -> _AffinityConfig:
+        return _resolve_affinity_policy_config()
+
+    def bind(
+        self,
+        affinity_key: str,
+        target: str,
+        reason: object,
+        *,
+        ttl_s: float,
+        cfg: object = None,
+        now: float | None = None,
+    ) -> _BindResult:
+        """The one and only writer of :attr:`affinity`.
+
+        Ownership is expensive to undo (a move usually costs a full model load),
+        so a write that would *change* an unexpired binding must name one of
+        ``TRANSFER_REASONS``.  Anything else is refused and the previous owner is
+        returned unchanged, which is what makes "move it because it is busy"
+        structurally impossible rather than merely discouraged.
+        """
+        now = time.monotonic() if now is None else now
+        cfg = self.affinity_config() if cfg is None else cfg
+        ttl_s = float(ttl_s)
+        with self.lock:
+            previous = self.affinity.get(affinity_key)
+            live = previous if (previous and previous[1] > now and previous[0] != target) else None
+            if live is None:
+                budget = self.affinity_budget.get(affinity_key) or _TransferBudget()
+                budget.bound_at = now
+                budget.suspected_transfers = 0
+                budget.hard_transfers = 0
+                self.affinity_budget[affinity_key] = budget
+                self.affinity[affinity_key] = (target, now + ttl_s)
+                return _BindResult(target=target, decision=_AffinityDecision.BIND, reason=reason, bound=True)
+
+            budget = self.affinity_budget.get(affinity_key) or _TransferBudget()
+            self.affinity_budget[affinity_key] = budget
+            if reason not in _TRANSFER_REASONS:
+                log_api_event(
+                    "affinity_move_rejected",
+                    {
+                        "affinity_key": affinity_key,
+                        "owner": live[0],
+                        "requested": target,
+                        "reason": str(reason),
+                    },
+                )
+                return _BindResult(
+                    target=live[0],
+                    decision=_AffinityDecision.STICKY,
+                    reason=_TransferReason.STICKY_REFRESH,
+                    bound=False,
+                    refused_by="undeclared_reason",
+                )
+            allowed, brake = self.policy.allow_transfer(budget, reason, target, cfg, now)
+            if not allowed:
+                if reason is _TransferReason.EVACUATE_TARGET_DEAD:
+                    # Escaping a dead target outranks every brake: rather than
+                    # pin the conversation to a corpse, serve it unbound.
+                    self.affinity.pop(affinity_key, None)
+                    self.affinity_budget.pop(affinity_key, None)
+                    log_api_event(
+                        "affinity_degraded_unbound",
+                        {
+                            "affinity_key": affinity_key,
+                            "owner": live[0],
+                            "requested": target,
+                            "refused_by": brake,
+                            "hard_transfers": budget.hard_transfers,
+                        },
+                    )
+                    return _BindResult(
+                        target=None,
+                        decision=_AffinityDecision.UNBOUND,
+                        reason=reason,
+                        bound=False,
+                        refused_by=brake,
+                    )
+                log_api_event(
+                    "affinity_transfer_deferred",
+                    {
+                        "affinity_key": affinity_key,
+                        "owner": live[0],
+                        "requested": target,
+                        "refused_by": brake,
+                        "dwell_s": round(now - budget.bound_at, 1),
+                    },
+                )
+                self.affinity[affinity_key] = (live[0], now + ttl_s)
+                return _BindResult(
+                    target=live[0],
+                    decision=_AffinityDecision.STICKY,
+                    reason=_TransferReason.STICKY_REFRESH,
+                    bound=True,
+                    refused_by=brake,
+                )
+            self.policy.record_transfer(budget, reason, live[0], now)
+            self.affinity[affinity_key] = (target, now + ttl_s)
+            return _BindResult(
+                target=target,
+                decision=_AffinityDecision.EVACUATE,
+                reason=reason,
+                bound=True,
+            )
+
+    def owner_of(self, affinity_key: str, now: float | None = None) -> str | None:
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            value = self.affinity.get(affinity_key)
+            if not value or value[1] <= now:
+                return None
+            return value[0]
+
+    def health_of(self, target: str, *, cfg: object = None, probe: object = None, now: float | None = None) -> _TargetHealth:
+        """Measure *target*, consulting the record and a rate-limited liveness probe."""
+        cfg = self.affinity_config() if cfg is None else cfg
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            rec = self.records.get(target)
+            in_flight = rec.in_flight if rec is not None else int(self.base_in_flight.get(target, 0))
+            cached = self._health_cache.get(target)
+            try:
+                pid = int(rec.pid or 0) if rec is not None else 0
+                port = int(rec.port or 0) if rec is not None else 0
+            except (TypeError, ValueError):
+                pid = port = 0
+            if rec is None or pid <= 0 or port <= 0:
+                state = _TargetState.READY if rec is not None else _TargetState.COLD
+                return _TargetHealth(
+                    target=target,
+                    state=_TargetState.READY if rec is not None and rec.status == "ready" else state,
+                    in_flight=in_flight,
+                    capacity=max(1, _replica_target_capacity()),
+                    confirmed_dead=False,
+                    blacklist_until=float(rec.blacklist_until or 0.0) if rec is not None else 0.0,
+                )
+            snapshot = (
+                rec.status,
+                in_flight,
+                float(rec.blacklist_until or 0.0),
+                pid,
+                port,
+            )
+        if cached is not None and cached[0] > now and cached[1].detail != "dead":
+            return cached[1]
+        health = _probe_target_health(
+            target,
+            pid=snapshot[3],
+            port=snapshot[4],
+            state=_TargetState.READY if snapshot[0] == "ready" else _TargetState.COLD,
+            in_flight=snapshot[1],
+            capacity=max(1, _replica_target_capacity()),
+            blacklist_until=snapshot[2],
+            probe=probe,
+            timeout_s=cfg.probe_timeout_s,
+        )
+        with self.lock:
+            if health.confirmed_dead:
+                rec.status = "error"
+                self._health_cache.pop(target, None)
+            else:
+                rec.status = "ready" if health.state is _TargetState.READY else rec.status
+                self._health_cache[target] = (now + cfg.probe_interval_s, health)
+        return health
 
     def prune(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
         with self.lock:
             self.affinity = {k: v for k, v in self.affinity.items() if v[1] > now}
             self.response_to_replica = {k: v for k, v in self.response_to_replica.items() if v[1] > now}
+            live = set(self.affinity)
+            for key in [k for k in self.affinity_budget if k not in live]:
+                self.affinity_budget.pop(key, None)
+            for target, (expires, _) in list(self._health_cache.items()):
+                if expires <= now:
+                    self._health_cache.pop(target, None)
 
     def bind_response(self, response_id: str, replica_id: str, ttl_s: int = 3600) -> None:
         if not response_id or not replica_id:
@@ -6122,103 +6373,54 @@ def _find_affinity_spillover_candidate(
     bound_target: str,
     now: float,
     threshold_s: int,
+    *,
+    policy_cfg: object = None,
 ) -> str | None:
-    """Return idle spillover target if affinity target is stuck/overloaded.
+    """Pick a replacement for *bound_target*, which the policy already condemned.
 
-    Rules:
-    - If bound target is loading/error/cold/unhealthy -> spillover immediately
-      when alternative has ready + in_flight==0 (no threshold needed).
-    - If bound target has in_flight>0 (>=1 with parallel=1) -> spillover when
-      alternative idle_time > threshold_s.
-    - Picks the most idle candidate among base + replicas.
+    Saturation of the bound target is **not** an input here: this runs only
+    after :meth:`AffinityPolicy.decide` returned EVACUATE, i.e. the owner was
+    measured as dead or unservable.  Candidates must be servable and have a free
+    slot, and the least-loaded one wins so a replacement does not immediately
+    saturate in turn.
     """
-    try:
-        limit = int(DEFAULT_MAX_CONCURRENT_PER_MODEL)
-    except Exception:
-        limit = 2
-    bound_is_replica = bound_target in replica_ids
-    candidates: list[tuple[str, float, float]] = []  # (target, idle_time, score)
-    # Determine if bound is overloaded/stuck
-    stuck = False
-    busy = False
-    if bound_is_replica:
-        rec = REPLICA_ROUTER_STATE.records.get(bound_target)
-        if rec is None:
-            stuck = True
-        elif rec.status not in {"ready"}:
-            stuck = True
-        elif rec.blacklist_until > now:
-            stuck = True
-        elif rec.in_flight >= max(1, limit):
-            busy = True
-        elif rec.in_flight >= 1:
-            busy = True
-    else:
-        # bound is base
-        base_inflight = int(REPLICA_ROUTER_STATE.base_in_flight.get(bound_target, 0))
-        if base_inflight >= max(1, limit):
-            busy = True
-        elif base_inflight >= 1:
-            busy = True
-        # base has no explicit stuck status; but if there is no backing process, still consider not stuck
-        # only busy matters for base
+    candidates: list[tuple[str, int, float]] = []  # (target, in_flight, last_used)
 
-    must_spill = stuck or busy
-    if not must_spill:
-        return None
-
-    def _idle_for_replica(rec) -> float | None:
-        if rec.status != "ready":
-            return None
-        if rec.in_flight != 0:
-            return None
-        if rec.blacklist_until > now:
-            return None
-        last = float(rec.last_used or 0.0)
-        if last <= 0:
-            return 9999.0  # never used -> treat as infinitely idle
-        return now - last
-
-    def _idle_for_base(bid: str) -> float | None:
-        cnt = int(REPLICA_ROUTER_STATE.base_in_flight.get(bid, 0))
-        if cnt != 0:
-            return None
-        last = float(REPLICA_ROUTER_STATE.base_last_used.get(bid, 0.0))
-        if last <= 0:
-            return 9999.0
-        return now - last
-
-    # Evaluate candidates
-    for rid in replica_ids:
-        if rid == bound_target:
-            continue
-        rec = REPLICA_ROUTER_STATE.records.get(rid)
-        if rec is None:
-            continue
-        idle = _idle_for_replica(rec)
-        if idle is None:
-            continue
-        if stuck:
-            # immediate spillover for stuck target: any ready idle suffices
-            candidates.append((rid, idle, idle))
-        else:
-            if idle > float(threshold_s):
-                candidates.append((rid, idle, idle))
-
-    # Base candidate (unless bound is base)
+    with REPLICA_ROUTER_STATE.lock:
+        for rid in replica_ids:
+            if rid == bound_target:
+                continue
+            rec = REPLICA_ROUTER_STATE.records.get(rid)
+            if rec is None or rec.blacklist_until > now:
+                continue
+            candidates.append((rid, int(rec.in_flight), float(rec.last_used or 0.0)))
+        base_inflight = int(REPLICA_ROUTER_STATE.base_in_flight.get(base_model_id, 0))
+        base_last = float(REPLICA_ROUTER_STATE.base_last_used.get(base_model_id, 0.0))
     if base_model_id != bound_target:
-        base_idle = _idle_for_base(base_model_id)
-        if base_idle is not None:
-            if stuck:
-                candidates.append((base_model_id, base_idle, base_idle))
-            elif base_idle > float(threshold_s):
-                candidates.append((base_model_id, base_idle, base_idle))
+        candidates.append((base_model_id, base_inflight, base_last))
 
     if not candidates:
         return None
-    # pick most idle
-    candidates.sort(key=lambda x: -x[1])
-    return candidates[0][0]
+    # A replica is only worth moving onto if its route can actually serve; the
+    # base is always available, which is why it is the tie-break winner.
+    def _usable(target: str) -> bool:
+        if target == base_model_id:
+            return True
+        rec = REPLICA_ROUTER_STATE.records.get(target)
+        return rec is not None and rec.status in {"ready", "loading", "cold", "error"}
+
+    usable = [c for c in candidates if _usable(c[0])]
+    if not usable:
+        return None
+    free = [c for c in usable if c[1] <= 0]
+    pool = free or usable
+    if not free:
+        # Everything else is busy too; still prefer a base over a replica,
+        # because replica -> base is cheap and base -> replica costs a reload.
+        pool.sort(key=lambda c: (c[0] != base_model_id, c[1], c[2]))
+    else:
+        pool.sort(key=lambda c: (c[0] != base_model_id, c[2]))
+    return pool[0][0]
 
 
 def select_replica_for_request(
@@ -6254,7 +6456,9 @@ def select_replica_for_request(
     dynamic_routes_enabled = catalog is not None and config_path is not None and server_path is not None
     if not published_replica_ids and not dynamic_routes_enabled:
         with REPLICA_ROUTER_STATE.lock:
-            REPLICA_ROUTER_STATE.affinity[affinity_key] = (base_model.model_id, now + cfg.sticky_ttl_s)
+            REPLICA_ROUTER_STATE.bind(
+                affinity_key, base_model.model_id, _TransferReason.INITIAL_BIND, ttl_s=cfg.sticky_ttl_s, now=now
+            )
         log_api_event(
             "replica_routes_missing",
             {
@@ -6272,37 +6476,86 @@ def select_replica_for_request(
                 ReplicaRecord(base_model_id=base_model.model_id, replica_model_id=rid, gpu_set=gpu_sets[idx]),
             )
             rec.gpu_set = list(gpu_sets[idx])
-        bound = REPLICA_ROUTER_STATE.affinity.get(affinity_key)
+        owner = REPLICA_ROUTER_STATE.owner_of(affinity_key, now)
         if mapped_response_replica and mapped_response_replica in replica_ids:
-            REPLICA_ROUTER_STATE.affinity[affinity_key] = (mapped_response_replica, now + cfg.sticky_ttl_s)
+            REPLICA_ROUTER_STATE.bind(
+                affinity_key,
+                mapped_response_replica,
+                _TransferReason.RESPONSES_CHAIN,
+                ttl_s=cfg.sticky_ttl_s,
+                now=now,
+            )
             return mapped_response_replica, affinity_key, True
-        if bound and bound[1] > now and bound[0] in replica_ids:
-            spill_cfg = _resolve_affinity_spillover_config()
-            if bool(spill_cfg.get("enabled")):
-                threshold = int(spill_cfg.get("idle_threshold_s", 30))
-                cand = _find_affinity_spillover_candidate(base_model.model_id, replica_ids, bound[0], now, threshold)
-                if cand is not None:
-                    is_replica = cand in replica_ids
-                    REPLICA_ROUTER_STATE.affinity[affinity_key] = (cand, now + cfg.sticky_ttl_s)
-                    log_api_event("affinity_spillover_to_idle_replica", {"model": base_model.model_id, "from": bound[0], "to": cand, "affinity_key": affinity_key, "kv_miss": True, "idle_threshold_s": threshold, "is_replica": is_replica, "reason": "affinity_overloaded_or_stuck"})
-                    return cand, affinity_key, is_replica
-            REPLICA_ROUTER_STATE.affinity[affinity_key] = (bound[0], now + cfg.sticky_ttl_s)
-            return bound[0], affinity_key, True
-        if bound and bound[1] > now and bound[0] == base_model.model_id:
-            if dynamic_routes_enabled:
-                pass
-            else:
-                spill_cfg = _resolve_affinity_spillover_config()
-                if bool(spill_cfg.get("enabled")):
-                    threshold = int(spill_cfg.get("idle_threshold_s", 30))
-                    cand = _find_affinity_spillover_candidate(base_model.model_id, replica_ids, bound[0], now, threshold)
-                    if cand is not None:
-                        is_replica = cand in replica_ids
-                        REPLICA_ROUTER_STATE.affinity[affinity_key] = (cand, now + cfg.sticky_ttl_s)
-                        log_api_event("affinity_spillover_to_idle_replica", {"model": base_model.model_id, "from": bound[0], "to": cand, "affinity_key": affinity_key, "kv_miss": True, "idle_threshold_s": threshold, "is_replica": is_replica, "reason": "affinity_overloaded_or_stuck"})
-                        return cand, affinity_key, is_replica
-                REPLICA_ROUTER_STATE.affinity[affinity_key] = (base_model.model_id, now + cfg.sticky_ttl_s)
-                return base_model.model_id, affinity_key, False
+        has_owner = owner is not None
+    if has_owner:
+        # Measured outside the router lock: health_of may issue a /health probe.
+        policy_cfg = REPLICA_ROUTER_STATE.affinity_config()
+        health = REPLICA_ROUTER_STATE.health_of(owner, cfg=policy_cfg)
+        alternatives = [rid for rid in published_replica_ids if rid != owner]
+        if owner != base_model.model_id:
+            alternatives.append(base_model.model_id)
+        decision, transfer_reason = REPLICA_ROUTER_STATE.policy.decide(
+            owner, health, has_alternatives=bool(alternatives), cfg=policy_cfg
+        )
+        if decision is _AffinityDecision.STICKY:
+            REPLICA_ROUTER_STATE.bind(
+                affinity_key, owner, _TransferReason.STICKY_REFRESH, ttl_s=cfg.sticky_ttl_s, now=now
+            )
+            return owner, affinity_key, owner in replica_ids
+        if decision is _AffinityDecision.WAIT:
+            # Saturated owner: hand it back and let admission control answer 429.
+            # Returning a different target here is the bug this policy removes.
+            REPLICA_ROUTER_STATE.bind(
+                affinity_key, owner, _TransferReason.STICKY_REFRESH, ttl_s=cfg.sticky_ttl_s, now=now
+            )
+            log_api_event(
+                "affinity_owner_saturated",
+                {
+                    "model": base_model.model_id,
+                    "owner": owner,
+                    "affinity_key": affinity_key,
+                    **health.describe(),
+                },
+            )
+            return owner, affinity_key, owner in replica_ids
+        spill_cfg = _resolve_affinity_spillover_config()
+        threshold = int(spill_cfg.get("idle_threshold_s", 30))
+        candidate = _find_affinity_spillover_candidate(
+            base_model.model_id, replica_ids, owner, now, threshold, policy_cfg=policy_cfg
+        )
+        if candidate is not None:
+            result = REPLICA_ROUTER_STATE.bind(
+                affinity_key, candidate, transfer_reason, ttl_s=cfg.sticky_ttl_s, now=now
+            )
+            log_api_event(
+                "affinity_evacuated",
+                {
+                    "model": base_model.model_id,
+                    "from": owner,
+                    "to": candidate,
+                    "affinity_key": affinity_key,
+                    "reason": str(transfer_reason),
+                    "refused_by": result.refused_by,
+                    "kv_miss": True,
+                    "from_replica": owner in replica_ids,
+                    "to_replica": candidate in replica_ids,
+                    "owner_health": health.describe(),
+                },
+            )
+            if result.target:
+                return result.target, affinity_key, result.target in replica_ids
+            return base_model.model_id, affinity_key, False
+        result = REPLICA_ROUTER_STATE.bind(
+            affinity_key,
+            base_model.model_id if owner in replica_ids else owner,
+            transfer_reason,
+            ttl_s=cfg.sticky_ttl_s,
+            now=now,
+        )
+        if result.target:
+            return result.target, affinity_key, result.target in replica_ids
+        return base_model.model_id, affinity_key, False
+    with REPLICA_ROUTER_STATE.lock:
         candidates = [
             REPLICA_ROUTER_STATE.records[rid]
             for rid in replica_ids
@@ -6319,14 +6572,20 @@ def select_replica_for_request(
             best = sorted(ready_idle, key=lambda r: (r.last_used, r.replica_model_id))[0]
             base_last = float(REPLICA_ROUTER_STATE.base_last_used.get(base_model.model_id, 0.0) or 0.0)
             if base_last > 0.0 and (best.last_used <= 0.0 or best.last_used < base_last):
-                REPLICA_ROUTER_STATE.affinity[affinity_key] = (best.replica_model_id, now + cfg.sticky_ttl_s)
+                REPLICA_ROUTER_STATE.bind(
+                    affinity_key, best.replica_model_id, _TransferReason.INITIAL_BIND, ttl_s=cfg.sticky_ttl_s, now=now
+                )
                 log_api_event("replica_spread_new_conversation", {"model": base_model.model_id, "replica": best.replica_model_id, "affinity_key": affinity_key, "base_last_used_ago_s": now - base_last})
                 return best.replica_model_id, affinity_key, True
-            REPLICA_ROUTER_STATE.affinity[affinity_key] = (base_model.model_id, now + cfg.sticky_ttl_s)
+            REPLICA_ROUTER_STATE.bind(
+                affinity_key, base_model.model_id, _TransferReason.INITIAL_BIND, ttl_s=cfg.sticky_ttl_s, now=now
+            )
             log_api_event("replica_base_selected_idle", {"model": base_model.model_id, "affinity_key": affinity_key})
             return base_model.model_id, affinity_key, False
         if base_load <= 0 and not dynamic_routes_enabled:
-            REPLICA_ROUTER_STATE.affinity[affinity_key] = (base_model.model_id, now + cfg.sticky_ttl_s)
+            REPLICA_ROUTER_STATE.bind(
+                affinity_key, base_model.model_id, _TransferReason.INITIAL_BIND, ttl_s=cfg.sticky_ttl_s, now=now
+            )
             log_api_event("replica_base_selected_idle", {"model": base_model.model_id, "affinity_key": affinity_key})
             return base_model.model_id, affinity_key, False
         # For a new conversation/agent with no sticky binding, prefer scaling
@@ -6351,7 +6610,13 @@ def select_replica_for_request(
                 continue
             rec.estimated_mib = required
             rec.status = "loading"
-            REPLICA_ROUTER_STATE.affinity[affinity_key] = (rec.replica_model_id, time.monotonic() + cfg.sticky_ttl_s)
+            REPLICA_ROUTER_STATE.bind(
+                affinity_key,
+                rec.replica_model_id,
+                _TransferReason.INITIAL_BIND,
+                ttl_s=cfg.sticky_ttl_s,
+                now=time.monotonic(),
+            )
         if dynamic_routes_enabled and rec.replica_model_id not in published:
             try:
                 replica_index = replica_ids.index(rec.replica_model_id)
@@ -6383,18 +6648,24 @@ def select_replica_for_request(
         ready_empty = [r for r in candidates if r.status == "ready" and r.in_flight == 0]
         if ready_empty:
             chosen = sorted(ready_empty, key=lambda r: r.last_used)[0]
-            REPLICA_ROUTER_STATE.affinity[affinity_key] = (chosen.replica_model_id, now + cfg.sticky_ttl_s)
+            REPLICA_ROUTER_STATE.bind(
+                affinity_key, chosen.replica_model_id, _TransferReason.INITIAL_BIND, ttl_s=cfg.sticky_ttl_s, now=now
+            )
             log_api_event("replica_selected_ready_empty", {"model": base_model.model_id, "replica": chosen.replica_model_id})
             return chosen.replica_model_id, affinity_key, True
         if not candidates:
             log_api_event("replica_no_unblacklisted_routes", {"model": base_model.model_id, "replicas": replica_ids})
             return base_model.model_id, affinity_key, False
         if int(REPLICA_ROUTER_STATE.base_in_flight.get(base_model.model_id, 0)) <= 0:
-            REPLICA_ROUTER_STATE.affinity[affinity_key] = (base_model.model_id, now + cfg.sticky_ttl_s)
+            REPLICA_ROUTER_STATE.bind(
+                affinity_key, base_model.model_id, _TransferReason.INITIAL_BIND, ttl_s=cfg.sticky_ttl_s, now=now
+            )
             log_api_event("replica_base_selected_idle", {"model": base_model.model_id, "affinity_key": affinity_key})
             return base_model.model_id, affinity_key, False
         chosen = sorted(candidates, key=lambda r: (r.in_flight, 1 if r.status == "loading" else 0, r.last_used))[0]
-        REPLICA_ROUTER_STATE.affinity[affinity_key] = (chosen.replica_model_id, now + cfg.sticky_ttl_s)
+        REPLICA_ROUTER_STATE.bind(
+            affinity_key, chosen.replica_model_id, _TransferReason.INITIAL_BIND, ttl_s=cfg.sticky_ttl_s, now=now
+        )
         log_api_event("replica_selected_loaded", {"model": base_model.model_id, "replica": chosen.replica_model_id, "in_flight": chosen.in_flight, "status": chosen.status})
         return chosen.replica_model_id, affinity_key, True
 
@@ -14951,55 +15222,6 @@ def start_ctx_metadata_server(args):
                 if current_total >= limit:
                     overloaded_total = current_total
                 else:
-                    alt = None
-                    if current_total >= 1 and affinity_key:
-                        # Immediate parallel spread: this target is already
-                        # serving another request (parallel=1 upstream would
-                        # queue it). If a fully-idle sibling (ready replica
-                        # or idle base) exists, claim it now instead of
-                        # stacking onto the busy target. KV miss accepted.
-                        try:
-                            spread_on = bool(_resolve_affinity_spillover_config().get("enabled"))
-                        except Exception:
-                            spread_on = False
-                        if spread_on:
-                            now_s = time.monotonic()
-                            alt_base = replica_base_model_id(target) if is_replica_model_id(target) else target
-                            for rid, rec in REPLICA_ROUTER_STATE.records.items():
-                                if rec.base_model_id != alt_base or rid == target:
-                                    continue
-                                if rec.status == "ready" and rec.in_flight == 0 and rec.blacklist_until <= now_s:
-                                    alt = rid
-                                    break
-                            if alt is None and alt_base != target:
-                                if int(REPLICA_ROUTER_STATE.base_in_flight.get(alt_base, 0)) == 0:
-                                    alt = alt_base
-                    if alt is not None:
-                        now_s = time.monotonic()
-                        with REPLICA_ROUTER_STATE.lock:
-                            if alt in REPLICA_ROUTER_STATE.records:
-                                REPLICA_ROUTER_STATE.records[alt].in_flight += 1
-                                REPLICA_ROUTER_STATE.records[alt].last_used = now_s
-                            else:
-                                REPLICA_ROUTER_STATE.base_in_flight[alt] = int(REPLICA_ROUTER_STATE.base_in_flight.get(alt, 0)) + 1
-                                REPLICA_ROUTER_STATE.base_last_used[alt] = now_s
-                            try:
-                                sticky_s = 3600
-                                try:
-                                    alt_base_s = replica_base_model_id(target) if is_replica_model_id(target) else target
-                                    cfg_aff_s = get_model_replica_config(next((m for m in load_catalog(catalog_path) if m.model_id == alt_base_s), ManagedModel(model_id=alt_base_s, local_path="")), resolve_global_replica_config(args))
-                                    sticky_s = int(cfg_aff_s.sticky_ttl_s)
-                                except Exception:
-                                    pass
-                                REPLICA_ROUTER_STATE.affinity[affinity_key] = (alt, now_s + sticky_s)
-                            except Exception:
-                                pass
-                        try:
-                            alt_base_l = replica_base_model_id(target) if is_replica_model_id(target) else target
-                            log_api_event("affinity_spillover_to_idle_replica", {"model": alt_base_l, "from": target, "to": alt, "affinity_key": affinity_key, "kv_miss": True, "is_replica": is_replica_model_id(alt), "reason": "parallel_spread", "target_in_flight": current_total})
-                        except Exception:
-                            pass
-                        return False, alt
                     if target in REPLICA_ROUTER_STATE.records:
                         REPLICA_ROUTER_STATE.records[target].in_flight += 1
                         REPLICA_ROUTER_STATE.records[target].last_used = time.monotonic()
@@ -15007,51 +15229,6 @@ def start_ctx_metadata_server(args):
                         REPLICA_ROUTER_STATE.base_in_flight[target] = current_total + 1
                         REPLICA_ROUTER_STATE.base_last_used[target] = time.monotonic()
                     return False, None
-            # Overloaded path: try affinity spillover to idle replica before 429
-            try:
-                spill_cfg = _resolve_affinity_spillover_config()
-                if bool(spill_cfg.get("enabled")) and affinity_key:
-                    threshold = int(spill_cfg.get("idle_threshold_s", 30))
-                    base_id = replica_base_model_id(target) if is_replica_model_id(target) else target
-                    # Derive replica_ids for this base from router state
-                    replica_ids = [rid for rid, rec in REPLICA_ROUTER_STATE.records.items() if rec.base_model_id == base_id]
-                    if not replica_ids:
-                        # fallback: try to infer from global replica config if no records yet
-                        try:
-                            catalog_tmp = load_catalog(catalog_path)
-                            base_model_tmp = next((m for m in catalog_tmp if m.model_id == base_id), None)
-                            if base_model_tmp is not None:
-                                cfg_tmp = get_model_replica_config(base_model_tmp, resolve_global_replica_config(args))
-                                gpu_sets_tmp = _replica_gpu_sets(base_model_tmp, cfg_tmp)
-                                replica_ids = [replica_model_id(base_id, idx) for idx in range(len(gpu_sets_tmp))]
-                        except Exception:
-                            replica_ids = []
-                    if replica_ids or base_id != target:
-                        now = time.monotonic()
-                        cand = _find_affinity_spillover_candidate(base_id, replica_ids, target, now, threshold)
-                        if cand is not None:
-                            with REPLICA_ROUTER_STATE.lock:
-                                if cand in REPLICA_ROUTER_STATE.records:
-                                    REPLICA_ROUTER_STATE.records[cand].in_flight += 1
-                                    REPLICA_ROUTER_STATE.records[cand].last_used = now
-                                else:
-                                    REPLICA_ROUTER_STATE.base_in_flight[cand] = int(REPLICA_ROUTER_STATE.base_in_flight.get(cand, 0)) + 1
-                                    REPLICA_ROUTER_STATE.base_last_used[cand] = now
-                                if affinity_key:
-                                    try:
-                                        sticky = int(resolve_global_replica_config(args).get("sticky_ttl_s", 3600)) if False else 3600
-                                    except Exception:
-                                        sticky = 3600
-                                    try:
-                                        cfg_aff = get_model_replica_config(next((m for m in load_catalog(catalog_path) if m.model_id == base_id), ManagedModel(model_id=base_id, local_path="")), resolve_global_replica_config(args))
-                                        sticky = int(cfg_aff.sticky_ttl_s)
-                                    except Exception:
-                                        pass
-                                    REPLICA_ROUTER_STATE.affinity[affinity_key] = (cand, now + sticky)
-                            log_api_event("affinity_spillover_to_idle_replica", {"model": base_id, "from": target, "to": cand, "affinity_key": affinity_key, "kv_miss": True, "idle_threshold_s": threshold, "is_replica": cand in replica_ids if replica_ids else is_replica_model_id(cand), "reason": "concurrent_limit_spillover", "overloaded_total": overloaded_total})
-                            return False, cand
-            except Exception:
-                pass
             message = (
                 f"Model '{target}' is overloaded: {overloaded_total} concurrent requests (limit {limit}). "
                 "Server is busy processing other requests for the same model. Please retry shortly."
