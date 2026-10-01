@@ -484,6 +484,60 @@ For a system installation, prepend `sudo` to service and journal commands.
 The request log is intended for diagnosis of upstream 4xx/5xx responses,
 stream interruptions, model-load failures, and tool-call repair decisions.
 
+## Lazy mmproj (vision on demand)
+
+Models with a projector (`mmproj_path`) normally load it on every start, which
+costs VRAM and load time even for text-only traffic. Setting
+`mmproj_mode: lazy` in a model's `server_overrides` splits the model into two
+llama-swap routes:
+
+| Route | Command | Purpose |
+|---|---|---|
+| `<model>` | no `--mmproj` | text-only base |
+| `<model>__vision` | `--mmproj <path>` | sibling that serves image requests |
+
+The base also stops reserving projector headroom in its tensor split. When a
+request carrying an image (`image_url`, `input_image`, or Ollama `images`)
+arrives, the gateway points it at the vision route before replica selection, so
+a text-only replica never receives an image. The vision route is published on
+demand, reused while the conversation stays warm, and evicted by llama-swap
+after its idle TTL, so text-only traffic never pays for the projector.
+
+If the vision route cannot be published and the base is already loaded, the
+loaded process is reloaded in place with the projector pinned on. If neither
+path works, the request returns `503` with a retry message rather than reaching
+a backend that would silently drop the image.
+
+Opt in per model:
+
+```json
+{
+  "model_id": "qwen3.8-27b-EXL3",
+  "mmproj_path": "/var/llamacpp_models/Qwen3.8-27B-EXL3-3.5bpw",
+  "server_overrides": { "engine": "buun", "mmproj_mode": "lazy" }
+}
+```
+
+Or for every projector model via the global `mmproj` block in
+`~/.config/llm-server/conf.json` (or `/etc/llm-server/conf.json`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `mmproj.default_mode` | `always` | `always`, `lazy`, or `off`; per-model `mmproj_mode` wins |
+| `mmproj.prefer_vision_route` | `true` | publish and use the vision sibling instead of reloading the base |
+| `mmproj.allow_co_resident` | `false` | let llama-swap keep base and vision loaded together; default keeps them mutually exclusive to save VRAM |
+| `mmproj.vision_sticky_ttl_s` | `1800` | idle seconds before llama-swap evicts the vision route (rounded to whole minutes, minimum 1) |
+| `mmproj.route_publish_timeout_s` | `90.0` | wait for the vision route to appear |
+| `mmproj.unload_timeout_s` | `45.0` | unload budget for the reload fallback |
+| `mmproj.reload_timeout_s` | `45.0` | reload budget for the reload fallback |
+
+`always` keeps the previous behaviour, `off` drops `--mmproj` entirely, and
+`lazy` is the two-route split above. vLLM and the `exllama` engines are never
+lazy: vLLM has no `--mmproj` and the exllama adapter drops image parts before
+they reach the backend. `llm-server config-migrate` fills the block in without
+overwriting values you set, and `GET /v1/models` reports `mmproj_mode` and
+`vision_route` per model so the wiring is verifiable.
+
 ## Cleanup and model lifecycle
 
 Removing a catalog entry and removing its downloaded files are separate

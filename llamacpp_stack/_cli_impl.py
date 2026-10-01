@@ -127,6 +127,19 @@ except Exception:  # pragma: no cover
     _probe_target_health = None  # type: ignore
     _affinity_policy_defaults = None  # type: ignore
 
+from llamacpp_stack.cli.vision import (  # type: ignore
+    MMPROJ_MODE_ALWAYS,
+    MMPROJ_MODE_LAZY,
+    MMPROJ_MODE_OFF,
+    cached_mmproj_config,
+    default_mmproj_config,
+    get_model_mmproj_mode,
+    model_has_mmproj,
+    model_lazily_loads_mmproj,
+    normalize_mmproj_config,
+    resolve_effective_mmproj_config,
+    resolve_render_include_mmproj,
+)
 
 # Gateway shim: prefer canonical impl from llamacpp_stack.cli.gateway (T5)
 try:
@@ -1797,6 +1810,13 @@ def normalize_server_config_payload(payload: dict[str, object]) -> tuple[dict[st
         if replicas != raw_replicas:
             result["replicas"] = replicas
             changed = True
+    norm_mmproj, mmproj_changed = normalize_mmproj_config(result.get("mmproj"))
+    if result.get("mmproj") != norm_mmproj:
+        result["mmproj"] = norm_mmproj
+        changed = True
+    elif mmproj_changed:
+        result["mmproj"] = norm_mmproj
+        changed = True
     auth_cfg = _normalize_api_auth_config(result.get("api_auth"))
     if result.get("api_auth") != auth_cfg:
         result["api_auth"] = auth_cfg
@@ -2568,7 +2588,7 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
                 if bool_val is not None:
                     normalized[key] = bool_val
             continue
-        if key in {"kv_offload", "cont_batching", "op_offload", "cpu_moe", "kv_unified", "cache_idle_slots", "direct_io", "swa_full", "cache_prompt"}:
+        if key in {"kv_offload", "cont_batching", "op_offload", "cpu_moe", "kv_unified", "cache_idle_slots", "direct_io", "swa_full", "cache_prompt", "logits_all"}:
             bool_val = _normalize_bool_flag(raw_val)
             if bool_val is not None:
                 normalized[key] = bool_val
@@ -2630,6 +2650,10 @@ def preferred_tensor_split(model: ManagedModel | None, value: str | None = None)
     normalized = normalize_tensor_split(value)
     gpu_count = detect_cuda_device_count()
     if gpu_count <= 1 or model is None or not model.mmproj_path:
+        return normalized
+    if get_model_mmproj_mode(model) == MMPROJ_MODE_LAZY:
+        # A lazy base runs without the projector, so the reserved headroom would
+        # only idle away memory the text-only route never uses.
         return normalized
     if not _is_equal_weight_tensor_split(normalized):
         return normalized
@@ -4588,6 +4612,12 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
             cmd.append("--cache-idle-slots")
         elif bool_val is False and _server_supports_or_unknown(server_path, "--no-cache-idle-slots"):
             cmd.append("--no-cache-idle-slots")
+    elif key == "logits_all":
+        bool_val = _normalize_bool_flag(value)
+        if bool_val is True and _server_supports_or_unknown(server_path, "--logits-all"):
+            cmd.append("--logits-all")
+        elif bool_val is False and _server_supports_or_unknown(server_path, "--no-logits-all"):
+            cmd.append("--no-logits-all")
     elif key == "cpu_moe":
         bool_val = _normalize_bool_flag(value)
         if bool_val:
@@ -5026,6 +5056,7 @@ def build_llama_server_command(
         "ctx_checkpoints",
         "cache_ram",
         "cache_prompt",
+        "logits_all",
         "kv_offload",
         "cont_batching",
         "op_offload",
@@ -8658,6 +8689,198 @@ def apply_config_and_wait_absent(
     )
 
 
+def _with_forced_mmproj(model: ManagedModel) -> ManagedModel:
+    overrides = dict(getattr(model, "server_overrides", None) or {})
+    overrides["mmproj_mode"] = MMPROJ_MODE_ALWAYS
+    return replace(model, server_overrides=overrides)
+
+
+def _request_carries_images(payload: dict) -> bool:
+    """True for OpenAI image parts and for Ollama's top-level ``images``."""
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("images"):
+        return True
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if isinstance(part, dict) and str(part.get("type") or "") in {"image_url", "input_image"}:
+                    return True
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return False
+    return bool(_messages_include_images(messages))
+
+
+def _bind_vision_affinity(affinity_key: str, vision_id: str, sticky_ttl_s: float) -> None:
+    if not affinity_key or not vision_id:
+        return
+    try:
+        REPLICA_ROUTER_STATE.affinity[affinity_key] = (vision_id, time.monotonic() + max(60.0, sticky_ttl_s))
+    except Exception:
+        pass
+
+
+def _vision_affinity_target(model_id: str, payload: dict, headers, vision_id: str) -> str:
+    """Return ``vision_id`` when this conversation is already pinned to it."""
+    try:
+        affinity_key = resolve_request_affinity_key(model_id, payload, headers)
+    except Exception:
+        return ""
+    now = time.monotonic()
+    if affinity_key:
+        try:
+            entry = REPLICA_ROUTER_STATE.affinity.get(affinity_key)
+            if entry and entry[0] == vision_id and float(entry[1]) > now:
+                return vision_id
+        except Exception:
+            pass
+    previous = str((payload or {}).get("previous_response_id") or "").strip()
+    if previous:
+        try:
+            if REPLICA_ROUTER_STATE.response_to_replica.get(previous) == vision_id:
+                return vision_id
+        except Exception:
+            pass
+    return ""
+
+
+def route_image_request_to_vision(
+    model_entry: ManagedModel,
+    payload: dict,
+    headers,
+    catalog: list[ManagedModel],
+    args,
+    public_host: str,
+) -> tuple[str | None, str | None]:
+    """Point an image-bearing request at a projector-bearing route.
+
+    Returns ``(upstream_model_id, error_message)``. ``(None, None)`` means lazy
+    mmproj does not apply and the caller should keep its normal routing. An
+    error message means the request cannot be served and should become a 503.
+
+    A model in ``mmproj_mode: lazy`` has a text-only base route and a vision
+    sibling. Reusing an already-published sibling keeps the conversation on one
+    warm process; otherwise the sibling is published on demand. When the sibling
+    cannot be published, an already-loaded base is reloaded in place with the
+    projector pinned on, which is the last resort before failing the request.
+    """
+    if not _request_carries_images(payload):
+        return None, None
+    if not model_lazily_loads_mmproj(model_entry):
+        return None, None
+    mmproj_cfg = cached_mmproj_config()
+    vision_id = vision_model_id(model_entry.model_id)
+    sticky_ttl_s = float(mmproj_cfg.get("vision_sticky_ttl_s") or 1800.0)
+    publish_timeout = float(mmproj_cfg.get("route_publish_timeout_s") or 90.0)
+    try:
+        public_port = int(args.public_port)
+    except Exception:
+        return None, "lazy mmproj: invalid public port"
+    published = set()
+    try:
+        published = set(get_published_model_ids(public_host, public_port))
+    except Exception:
+        published = set()
+    affinity_key = ""
+    try:
+        affinity_key = resolve_request_affinity_key(model_entry.model_id, payload, headers)
+    except Exception:
+        affinity_key = ""
+    pinned = _vision_affinity_target(model_entry.model_id, payload, headers, vision_id)
+    if pinned and pinned in published:
+        _bind_vision_affinity(affinity_key, vision_id, sticky_ttl_s)
+        log_api_event(
+            "lazy_mmproj_route_selected",
+            {"model": model_entry.model_id, "vision": vision_id, "reason": "affinity_hit", "affinity_key_hash": hashlib.sha256(affinity_key.encode("utf-8", "ignore")).hexdigest()[:16] if affinity_key else ""},
+        )
+        return vision_id, None
+    if vision_id in published:
+        _bind_vision_affinity(affinity_key, vision_id, sticky_ttl_s)
+        log_api_event(
+            "lazy_mmproj_route_selected",
+            {"model": model_entry.model_id, "vision": vision_id, "reason": "already_published"},
+        )
+        return vision_id, None
+    if mmproj_cfg.get("prefer_vision_route", True):
+        # Args resolve outside the guard so a config-shape problem is not
+        # misreported as "could not publish"; only the config write is guarded.
+        try:
+            idle_ttl = int(resolve_idle_ttl(args) or 300)
+            server_defaults = resolve_llama_server_defaults(args)
+        except Exception as exc:
+            log_api_event(
+                "lazy_mmproj_route_create_failed",
+                {"model": model_entry.model_id, "vision": vision_id, "error": f"bad config: {exc}"},
+            )
+        else:
+            try:
+                ensure_vision_route_in_llamaswap_config(
+                    model_entry,
+                    catalog,
+                    args.config,
+                    args.llama_server,
+                    idle_ttl,
+                    server_defaults,
+                )
+            except Exception as exc:
+                log_api_event(
+                    "lazy_mmproj_route_create_failed",
+                    {"model": model_entry.model_id, "vision": vision_id, "error": str(exc)},
+                )
+            else:
+                if wait_for_published_model_id(
+                    vision_id, public_host, public_port, timeout_s=min(publish_timeout, 10.0)
+                ):
+                    _bind_vision_affinity(affinity_key, vision_id, sticky_ttl_s)
+                    log_api_event(
+                        "lazy_mmproj_route_selected",
+                        {"model": model_entry.model_id, "vision": vision_id, "reason": "cold_created"},
+                    )
+                    return vision_id, None
+                log_api_event(
+                    "lazy_mmproj_route_publish_timeout",
+                    {"model": model_entry.model_id, "vision": vision_id, "timeout_s": publish_timeout},
+                )
+    loaded = False
+    try:
+        loaded = bool(get_catalog_model_process(model_entry.model_id, catalog))
+    except Exception:
+        loaded = False
+    if loaded:
+        log_api_event(
+            "lazy_mmproj_base_reload_fallback",
+            {"model": model_entry.model_id, "reason": "vision_route_unavailable"},
+        )
+        if reload_model_runtime_from_catalog_config(
+            model_entry,
+            catalog,
+            args,
+            public_host,
+            public_port,
+            unload_timeout=float(mmproj_cfg.get("unload_timeout_s") or 45.0),
+            reload_timeout=float(mmproj_cfg.get("reload_timeout_s") or 45.0),
+            force_mmproj=True,
+            reason="lazy_mmproj_vision_upgrade",
+        ):
+            _bind_vision_affinity(affinity_key, vision_id, sticky_ttl_s)
+            log_api_event("lazy_mmproj_route_selected", {"model": model_entry.model_id, "vision": model_entry.model_id, "reason": "base_reloaded_with_mmproj"})
+            return model_entry.model_id, None
+        return None, (
+            f"Model {model_entry.model_id} has mmproj_mode=lazy but its vision route could not be "
+            "published and reloading the loaded process with the projector failed. Retry shortly."
+        )
+    return None, (
+        f"Model {model_entry.model_id} has mmproj_mode=lazy but its vision route could not be published."
+    )
+
+
 def reload_model_runtime_from_catalog_config(
     model: ManagedModel,
     catalog: list[ManagedModel],
@@ -8668,6 +8891,8 @@ def reload_model_runtime_from_catalog_config(
     progress_callback=None,
     unload_timeout: float = 45.0,
     reload_timeout: float = 45.0,
+    force_mmproj: bool = False,
+    reason: str = "stale_runtime_flags",
 ) -> bool:
     """Force llama-swap to drop a stale live process and publish it again.
 
@@ -8676,6 +8901,10 @@ def reload_model_runtime_from_catalog_config(
     Temporarily removing just this model from the watched config makes
     llama-swap stop the old process; restoring the full catalog makes the next
     request load the model with the current command.
+
+    ``force_mmproj`` publishes the restored entry with the projector pinned on.
+    That is the fallback path for lazy-mmproj models when their vision sibling
+    route could not be created, and it lasts until the next render drops it.
     """
     if model is None or not getattr(model, "model_id", None):
         return False
@@ -8689,8 +8918,10 @@ def reload_model_runtime_from_catalog_config(
     replica_defaults = resolve_global_replica_config(args)
     idle_ttl = resolve_idle_ttl(args)
     reduced_catalog = [item for item in catalog if item.model_id != model_id]
+    if force_mmproj:
+        catalog = [_with_forced_mmproj(item) for item in catalog]
     try:
-        log_api_event("model_runtime_reload_begin", {"model": model_id, "reason": "stale_runtime_flags"})
+        log_api_event("model_runtime_reload_begin", {"model": model_id, "reason": reason, "force_mmproj": force_mmproj})
         render_llamaswap_config(
             reduced_catalog,
             config_path,
@@ -10312,6 +10543,8 @@ def build_ollama_model_payload(model: ManagedModel, loaded: bool = False, proces
         "load_capabilities": load_capabilities,
         "speculative": bool(getattr(model, "speculative", False)),
         "vision": _has_vision_runtime(model),
+        "mmproj_mode": get_model_mmproj_mode(model),
+        "vision_route": vision_model_id(model.model_id) if model_lazily_loads_mmproj(model) else None,
         **probe_metrics,
     }
     payload = {
@@ -15358,7 +15591,18 @@ def start_ctx_metadata_server(args):
             upstream_model_name = model_name
             is_replica_request = False
             affinity_key = ""
+            vision_target: str | None = None
             if model_entry is not None:
+                vision_target, vision_error = route_image_request_to_vision(
+                    model_entry, payload, self.headers, catalog, args, client_host
+                )
+                if vision_error:
+                    self._send_json({"error": vision_error}, status=503)
+                    return
+            if vision_target is not None:
+                upstream_model_name = vision_target
+                is_replica_request = True
+            elif model_entry is not None:
                 replica_defaults = resolve_global_replica_config(args)
                 published_model_ids = get_published_model_ids(client_host, int(args.public_port))
                 sync_replica_runtime_state(catalog, args.config, replica_defaults)
@@ -15651,7 +15895,18 @@ def start_ctx_metadata_server(args):
             upstream_model_name = model_name
             is_replica_request = False
             affinity_key = ""
+            vision_target: str | None = None
             if model_entry is not None:
+                vision_target, vision_error = route_image_request_to_vision(
+                    model_entry, payload, self.headers, catalog, args, client_host
+                )
+                if vision_error:
+                    self._send_json({"error": {"message": vision_error, "type": "server_error"}}, status=503)
+                    return
+            if vision_target is not None:
+                upstream_model_name = vision_target
+                is_replica_request = True
+            elif model_entry is not None:
                 replica_defaults = resolve_global_replica_config(args)
                 published_model_ids = get_published_model_ids(client_host, int(args.public_port))
                 sync_replica_runtime_state(catalog, args.config, replica_defaults)
@@ -16618,7 +16873,18 @@ def start_ctx_metadata_server(args):
             upstream_model_name = model_name
             is_replica_request = False
             affinity_key = ""
+            vision_target: str | None = None
             if model_entry is not None:
+                vision_target, vision_error = route_image_request_to_vision(
+                    model_entry, payload, self.headers, catalog, args, client_host
+                )
+                if vision_error:
+                    self._send_json({"error": {"message": vision_error, "type": "server_error"}}, status=503)
+                    return
+            if vision_target is not None:
+                upstream_model_name = vision_target
+                is_replica_request = True
+            elif model_entry is not None:
                 replica_defaults = resolve_global_replica_config(args)
                 published_model_ids = get_published_model_ids(client_host, int(args.public_port))
                 sync_replica_runtime_state(catalog, args.config, replica_defaults)
@@ -16827,7 +17093,12 @@ def start_ctx_metadata_server(args):
                 if upstream_model_name:
                     REPLICA_ROUTER_STATE.request_finished(upstream_model_name, ok=False)
                 return
-            if messages_have_images and model_entry is not None and _loaded_process_missing_configured_mmproj(model_entry, catalog):
+            if (
+                messages_have_images
+                and model_entry is not None
+                and not model_lazily_loads_mmproj(model_entry)
+                and _loaded_process_missing_configured_mmproj(model_entry, catalog)
+            ):
                 proc = get_catalog_model_process(model_entry.model_id, catalog)
                 log_api_event(
                     "openai_responses_image_stale_mmproj_runtime_reload",
@@ -18090,7 +18361,18 @@ def start_ctx_metadata_server(args):
             upstream_model_name = model_name
             is_replica_request = False
             affinity_key = ""
+            vision_target: str | None = None
             if model_entry is not None:
+                vision_target, vision_error = route_image_request_to_vision(
+                    model_entry, payload, self.headers, catalog, args, client_host
+                )
+                if vision_error:
+                    self._send_json({"error": vision_error}, status=503)
+                    return
+            if vision_target is not None:
+                upstream_model_name = vision_target
+                is_replica_request = True
+            elif model_entry is not None:
                 replica_defaults = resolve_global_replica_config(args)
                 published_model_ids = get_published_model_ids(client_host, int(args.public_port))
                 sync_replica_runtime_state(catalog, args.config, replica_defaults)
@@ -22180,26 +22462,34 @@ try:
         _model_info_for_matrix_entry as _sc_minfo,
         build_replica_model as _sc_build_replica,
         ensure_replica_route_in_llamaswap_config as _sc_ensure,
+        ensure_vision_route_in_llamaswap_config as _sc_ensure_vision,
         get_model_replica_config as _sc_get_replica,
         is_replica_model_id as _sc_is_replica,
+        is_vision_model_id as _sc_is_vision,
         iter_catalog_with_replicas as _sc_iter_replica,
         replica_base_model_id as _sc_base_id,
         replica_model_id as _sc_replica_id,
         render_llamaswap_config as _sc_render,
         resolve_global_replica_config as _sc_resolve_global,
+        vision_base_model_id as _sc_vision_base,
+        vision_model_id as _sc_vision_id,
     )
     _calculate_llama_swap_matrix = _sc_calc  # type: ignore
     _model_info_for_matrix_entry = _sc_minfo  # type: ignore
     build_replica_model = _sc_build_replica  # type: ignore
     ensure_replica_route_in_llamaswap_config = _sc_ensure  # type: ignore
     ensure_replica_route = _sc_ensure  # type: ignore
+    ensure_vision_route_in_llamaswap_config = _sc_ensure_vision  # type: ignore
     get_model_replica_config = _sc_get_replica  # type: ignore
     is_replica_model_id = _sc_is_replica  # type: ignore
+    is_vision_model_id = _sc_is_vision  # type: ignore
     iter_catalog_with_replicas = _sc_iter_replica  # type: ignore
     replica_base_model_id = _sc_base_id  # type: ignore
     replica_model_id = _sc_replica_id  # type: ignore
     render_llamaswap_config = _sc_render  # type: ignore
     resolve_global_replica_config = _sc_resolve_global  # type: ignore
+    vision_base_model_id = _sc_vision_base  # type: ignore
+    vision_model_id = _sc_vision_id  # type: ignore
 except Exception:
     pass
 try:

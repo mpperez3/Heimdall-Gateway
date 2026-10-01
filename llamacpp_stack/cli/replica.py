@@ -14,6 +14,16 @@ from pathlib import Path
 
 from .constants import DEFAULT_IDLE_TTL
 from .models import ManagedModel, ReplicaConfig
+from .vision import (
+    build_vision_model,
+    cached_mmproj_config,
+    is_vision_model_id,
+    model_lazily_loads_mmproj,
+    resolve_render_include_mmproj,
+    vision_base_model_id,
+    vision_model_id,
+    vision_route_ttl,
+)
 
 def _detect_cuda_device_count():
     try:
@@ -391,7 +401,7 @@ def _is_small_model(m: ManagedModel) -> bool:
     return _get_model_size_mib(m) < 4096.0
 
 
-def _calculate_llama_swap_matrix(models_info: list[dict]) -> dict[str, object]:
+def _calculate_llama_swap_matrix(models_info: list[dict], co_resident_variants: bool = False) -> dict[str, object]:
     """
     Calculate the llama-swap matrix configuration to allow maximum concurrency.
     
@@ -408,6 +418,11 @@ def _calculate_llama_swap_matrix(models_info: list[dict]) -> dict[str, object]:
       given half the eviction cost of its base, so the router drops the spare
       copy and keeps the original; requests for that model then queue on the
       original instead of paying for a full reload.
+
+    A lazy-mmproj base and its ``__vision`` sibling normally span the same GPUs,
+    so they stay mutually exclusive and llama-swap evicts the text-only copy to
+    serve an image request. ``co_resident_variants`` declares them together
+    instead, for deployments whose VRAM budget fits both copies.
     """
     if not models_info:
         return {}
@@ -448,10 +463,13 @@ def _calculate_llama_swap_matrix(models_info: list[dict]) -> dict[str, object]:
         if not added:
             large_groups.append([large["id"]])
     base_to_replicas: dict[str, list[str]] = {}
+    base_to_visions: dict[str, list[str]] = {}
     for m in models_info:
         mid = m["id"]
         if is_replica_model_id(mid):
             base_to_replicas.setdefault(replica_base_model_id(mid), []).append(mid)
+        elif is_vision_model_id(mid):
+            base_to_visions.setdefault(vision_base_model_id(mid), []).append(mid)
 
     def _resolve_group_gpus(model_id: str) -> set[int] | None:
         mi = next((x for x in models_info if x["id"] == model_id), None)
@@ -462,23 +480,34 @@ def _calculate_llama_swap_matrix(models_info: list[dict]) -> dict[str, object]:
             return set(all_known_gpus)
         return gpus
 
-    for base, rids in base_to_replicas.items():
-        members = [base, *rids]
-        member_gpus = [_resolve_group_gpus(mid) for mid in members]
-        if any(g is None for g in member_gpus):
-            continue
-        if not all(
-            member_gpus[i].isdisjoint(member_gpus[j])  # type: ignore[union-attr]
-            for i in range(len(member_gpus))
-            for j in range(i + 1, len(member_gpus))
-        ):
-            continue
+    def _merge_group(members: list[str]) -> None:
         for group in large_groups:
             for mid in members:
                 if mid in group:
                     group.remove(mid)
-        large_groups = [g for g in large_groups if g]
-        large_groups.append(members)
+        large_groups[:] = [g for g in large_groups if g]
+        large_groups.append(list(members))
+
+    def _group_fits_disjointly(members: list[str]) -> bool:
+        member_gpus = [_resolve_group_gpus(mid) for mid in members]
+        if any(g is None for g in member_gpus):
+            return False
+        return all(
+            member_gpus[i].isdisjoint(member_gpus[j])  # type: ignore[union-attr]
+            for i in range(len(member_gpus))
+            for j in range(i + 1, len(member_gpus))
+        )
+
+    for base, rids in base_to_replicas.items():
+        members = [base, *rids]
+        if not _group_fits_disjointly(members):
+            continue
+        _merge_group(members)
+    for base, vids in base_to_visions.items():
+        members = [base, *vids]
+        if not co_resident_variants and not _group_fits_disjointly(members):
+            continue
+        _merge_group(members)
     cross_pairs: list[list[str]] = []
     for idx, first in enumerate(larges):
         first_gpus = set(first.get("_effective_gpu_set") or all_known_gpus)
@@ -500,7 +529,7 @@ def _calculate_llama_swap_matrix(models_info: list[dict]) -> dict[str, object]:
         if packable_vars:
             matrix_sets["packables"] = " & ".join(packable_vars)
     evict_costs = {
-        id_to_var[m["id"]]: max(1, int(m["size_mib"] * (0.5 if is_replica_model_id(m["id"]) else 1.0)))
+        id_to_var[m["id"]]: max(1, int(m["size_mib"] * (0.5 if (is_replica_model_id(m["id"]) or is_vision_model_id(m["id"])) else 1.0)))
         for m in models_info
         if m["id"] in id_to_var
     }
@@ -531,14 +560,14 @@ def _model_info_for_matrix_entry(model_id: str, model_entry: dict, catalog_by_id
     }
 
 
-def _recalculate_llamaswap_matrix_from_config(data: dict, catalog: list[ManagedModel]) -> None:
+def _recalculate_llamaswap_matrix_from_config(data: dict, catalog: list[ManagedModel], co_resident_variants: bool = False) -> None:
     models = data.get("models")
     if not isinstance(models, dict):
         data.pop("matrix", None)
         return
     catalog_by_id = {model.model_id: model for model in catalog}
     infos = [_model_info_for_matrix_entry(str(model_id), entry, catalog_by_id) for model_id, entry in models.items() if isinstance(entry, dict)]
-    matrix = _calculate_llama_swap_matrix(infos)
+    matrix = _calculate_llama_swap_matrix(infos, co_resident_variants)
     if matrix:
         data["matrix"] = matrix
     else:
@@ -650,8 +679,13 @@ def render_llamaswap_config(
         resolved_paths[key] = Path(m.local_path) if m.local_path else Path("")
     replica_group_members: list[str] = []
     models_info_for_matrix: list[dict] = []
-    for m, public_base_model_id, replica_gpu_set in sorted(iter_catalog_base_models(catalog), key=lambda item: item[0].model_id):
-        use_model = m
+    mmproj_config = cached_mmproj_config()
+    try:
+        vision_ttl = vision_route_ttl(mmproj_config)
+    except Exception:
+        vision_ttl = None
+
+    def _render_cmd(use_model, include_mmproj: bool) -> list[str]:
         engine = str((getattr(use_model, "server_overrides", {}) or {}).get("engine") or "").strip().lower().replace("_", "-")
         if engine in {"exllamav3", "exllama-v3", "exllama3"}:
             engine = "exllama"
@@ -673,10 +707,11 @@ def render_llamaswap_config(
             if candidate.exists():
                 effective_server_path = str(candidate)
                 print(f"[exllama] {use_model.model_id} -> {effective_server_path}", flush=True)
-        cmd = build_llama_server_command(
+        rendered = build_llama_server_command(
             use_model,
             effective_server_path,
             port="${PORT}",
+            include_mmproj=include_mmproj,
             server_defaults=resolved_defaults,
             vllm_defaults=resolved_vllm_defaults,
         )
@@ -685,19 +720,25 @@ def render_llamaswap_config(
             if engine == "buun" and ct in {"turbo8","turbo4","turbo3","turbo2","turbo3_tcq","turbo2_tcq","turbo1_tcq","vbr"}:
                 filtered: list[str] = []
                 skip = False
-                for idx, part in enumerate(cmd):
+                for idx, part in enumerate(rendered):
                     if skip:
                         skip = False
                         continue
                     if part in {"--cache-type-k","--cache-type-v"}:
-                        nxt = cmd[idx+1] if idx+1 < len(cmd) else ""
+                        nxt = rendered[idx+1] if idx+1 < len(rendered) else ""
                         if nxt.strip().lower() == "f16":
                             skip = True
                             continue
                     filtered.append(part)
-                cmd = filtered
+                rendered = filtered
         except Exception:
             pass
+        return rendered
+
+    for m, public_base_model_id, replica_gpu_set in sorted(iter_catalog_base_models(catalog), key=lambda item: item[0].model_id):
+        use_model = m
+        lazy_mmproj = bool(model_lazily_loads_mmproj(use_model, mmproj_config))
+        cmd = _render_cmd(use_model, bool(resolve_render_include_mmproj(use_model, mmproj_config)))
         if public_base_model_id is not None:
             cmd = _command_with_cuda_visible_devices(cmd, replica_gpu_set)
             replica_group_members.append(m.model_id)
@@ -735,7 +776,28 @@ def render_llamaswap_config(
             data["models"][m.model_id]["aliases"] = m.aliases
         if m.description:
             data["models"][m.model_id]["description"] = m.description
-    matrix_config = _calculate_llama_swap_matrix(models_info_for_matrix)
+        if lazy_mmproj:
+            vision = build_vision_model(m)
+            vision_cmd = _render_cmd(vision, True)
+            vision_gpu_set = list(range(detect_cuda_device_count()))
+            if public_base_model_id is not None and replica_gpu_set:
+                vision_cmd = _command_with_cuda_visible_devices(vision_cmd, replica_gpu_set)
+                vision_gpu_set = list(replica_gpu_set)
+            data["models"][vision.model_id] = {
+                "cmd": " ".join(shell_quote(part) for part in vision_cmd),
+                "checkEndpoint": "/health",
+                "ttl": int(vision_ttl if vision_ttl else idle_ttl),
+                "metadata": {"internal_replica_of": m.model_id, "vision_variant": True},
+                "description": vision.description,
+            }
+            models_info_for_matrix.append({
+                "id": vision.model_id,
+                "gpu_set": vision_gpu_set,
+                "is_embedding": False,
+                "is_small": _is_small_model(m),
+                "size_mib": _get_model_size_mib(m),
+            })
+    matrix_config = _calculate_llama_swap_matrix(models_info_for_matrix, bool(mmproj_config.get("allow_co_resident")))
     if matrix_config:
         data["matrix"] = matrix_config
     tmp = path.with_suffix(".tmp")
@@ -861,29 +923,168 @@ def ensure_replica_route_in_llamaswap_config(
             "metadata": {"internal_replica_of": base_model.model_id},
             "description": replica.description,
         }
-        _recalculate_llamaswap_matrix_from_config(data, catalog)
-        tmp = path.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as file_handle:
-            file_handle.write(LLAMASWAP_CONFIG_HEADER)
-            if yaml is not None:
-                yaml.safe_dump(data, file_handle, sort_keys=False)
-            else:
-                import json as _json
+        _recalculate_llamaswap_matrix_from_config(data, catalog, bool(cached_mmproj_config().get("allow_co_resident")))
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as file_handle:
+        file_handle.write(LLAMASWAP_CONFIG_HEADER)
+        if yaml is not None:
+            yaml.safe_dump(data, file_handle, sort_keys=False)
+        else:
+            import json as _json
 
-                file_handle.write(_json.dumps(data, indent=2))
-        tmp.replace(path)
-        try:
-            cli_file3 = _get_cli_file()
-            _log = getattr(cli_file3, "log_api_event", None)
-            if _log is not None:
-                _log("replica_route_added", {"model": base_model.model_id, "replica": rid, "gpu_set": gpu_set, "config_path": str(path)})
-        except Exception:
-            pass
+            file_handle.write(_json.dumps(data, indent=2))
+    tmp.replace(path)
+    try:
+        cli_file3 = _get_cli_file()
+        _log = getattr(cli_file3, "log_api_event", None)
+        if _log is not None:
+            _log("replica_route_added", {"model": base_model.model_id, "replica": rid, "gpu_set": gpu_set, "config_path": str(path)})
+    except Exception:
+        pass
     return rid
 
 
 # Alias for backwards compat
 ensure_replica_route = ensure_replica_route_in_llamaswap_config
+
+
+def ensure_vision_route_in_llamaswap_config(
+    base_model: ManagedModel,
+    catalog: list[ManagedModel],
+    config_path: Path | str,
+    server_path: Path | str,
+    idle_ttl: int,
+    server_defaults: dict[str, object] | None = None,
+) -> str:
+    """Create the lazy-mmproj ``__vision`` route in config.yaml.
+
+    Idempotent: an already published entry keeps its id and the file is left
+    untouched, so repeated image requests never rewrite the watched config.
+    """
+    try:
+        from llamacpp_stack.cli.server_commands import (
+            build_llama_server_command as _build_cmd,
+            normalize_server_overrides as _norm,
+            resolve_llama_server_defaults as _resolve_defaults,
+            resolve_vllm_defaults as _resolve_vllm,
+        )
+    except Exception:
+        cli_file = _get_cli_file()
+        _build_cmd = getattr(cli_file, "build_llama_server_command")
+        _norm = getattr(cli_file, "normalize_server_overrides")
+        _resolve_defaults = getattr(cli_file, "resolve_llama_server_defaults")
+        _resolve_vllm = getattr(cli_file, "resolve_vllm_defaults")
+
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        yaml = None  # type: ignore
+
+    path = Path(config_path)
+    vid = vision_model_id(base_model.model_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if yaml is not None:
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        else:
+            import json as _json
+
+            data = _json.loads(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    try:
+        _ls2 = _effective_llama_swap_config()
+    except Exception:
+        _ls2 = _default_llama_swap_config()
+    data.setdefault("healthCheckTimeout", 600)
+    data.setdefault("logLevel", str(_ls2.get("logLevel", "info")))
+    data.setdefault("logToStdout", str(_ls2.get("logToStdout", "both")))
+    data.setdefault("sendLoadingState", False)
+    data.setdefault("includeAliasesInList", True)
+    models = data.setdefault("models", {})
+    if not isinstance(models, dict):
+        models = {}
+        data["models"] = models
+    if vid in models:
+        return vid
+    vision = build_vision_model(base_model)
+    resolved_defaults = _norm(server_defaults or _resolve_defaults())
+    vision_engine = str((getattr(vision, "server_overrides", {}) or {}).get("engine") or "").strip().lower().replace("_", "-")
+    if vision_engine in {"exllamav3", "exllama-v3", "exllama3"}:
+        vision_engine = "exllama"
+    if vision_engine in {"buun-beta"}:
+        vision_engine = "buun"
+    effective_vision_server_path = Path(server_path)
+    if vision_engine == "buun":
+        cand = _engine_binary_base(Path(server_path)) / "buun" / "bin" / "llama-server-buun"
+        if cand.exists():
+            effective_vision_server_path = cand
+            print(f"[buun] {vid} -> {effective_vision_server_path}", flush=True)
+    elif vision_engine == "beellama":
+        cand = _engine_binary_base(Path(server_path)) / "beellama" / "bin" / "llama-server-beellama"
+        if cand.exists():
+            effective_vision_server_path = cand
+    elif vision_engine == "exllama":
+        cand = _engine_binary_base(Path(server_path)) / "exllama" / "bin" / "llama-server-exllama"
+        if cand.exists():
+            effective_vision_server_path = cand
+            print(f"[exllama] {vid} -> {effective_vision_server_path}", flush=True)
+    cmd = _build_cmd(
+        vision,
+        Path(effective_vision_server_path),
+        port="${PORT}",
+        include_mmproj=True,
+        server_defaults=resolved_defaults,
+        vllm_defaults=_resolve_vllm(),
+    )
+    try:
+        ct2 = str((getattr(vision, "server_overrides", {}) or {}).get("cache_type") or "").strip().lower()
+        if vision_engine == "buun" and ct2 in {"turbo8","turbo4","turbo3","turbo2","turbo3_tcq","turbo2_tcq","turbo1_tcq","vbr"}:
+            filtered2: list[str] = []
+            skip2 = False
+            for j, part in enumerate(cmd):
+                if skip2:
+                    skip2 = False
+                    continue
+                if part in {"--cache-type-k","--cache-type-v"} and j+1 < len(cmd) and cmd[j+1].strip().lower() == "f16":
+                    skip2 = True
+                    continue
+                filtered2.append(part)
+            cmd = filtered2
+    except Exception:
+        pass
+    try:
+        vision_ttl = vision_route_ttl(cached_mmproj_config())
+    except Exception:
+        vision_ttl = None
+    models[vid] = {
+        "cmd": " ".join(shell_quote(part) for part in cmd),
+        "checkEndpoint": "/health",
+        "ttl": int(vision_ttl if vision_ttl else idle_ttl),
+        "metadata": {"internal_replica_of": base_model.model_id, "vision_variant": True},
+        "description": vision.description,
+    }
+    _recalculate_llamaswap_matrix_from_config(data, catalog, bool(cached_mmproj_config().get("allow_co_resident")))
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as file_handle:
+        file_handle.write(LLAMASWAP_CONFIG_HEADER)
+        if yaml is not None:
+            yaml.safe_dump(data, file_handle, sort_keys=False)
+        else:
+            import json as _json
+
+            file_handle.write(_json.dumps(data, indent=2))
+    tmp.replace(path)
+    try:
+        cli_file3 = _get_cli_file()
+        _log = getattr(cli_file3, "log_api_event", None)
+        if _log is not None:
+            _log("vision_route_added", {"model": base_model.model_id, "vision": vid, "config_path": str(path)})
+    except Exception:
+        pass
+    return vid
 
 
 __all__ = [
@@ -905,5 +1106,10 @@ __all__ = [
     "_model_info_for_matrix_entry",
     "ensure_replica_route_in_llamaswap_config",
     "ensure_replica_route",
+    "build_vision_model",
+    "is_vision_model_id",
+    "vision_base_model_id",
+    "vision_model_id",
+    "ensure_vision_route_in_llamaswap_config",
     "shell_quote",
 ]

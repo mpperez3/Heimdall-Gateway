@@ -82,7 +82,27 @@ _REPLICA_EXPORTS = (
     "render_llamaswap_config",
     "ensure_replica_route_in_llamaswap_config",
     "ensure_replica_route",
+    "ensure_vision_route_in_llamaswap_config",
     "shell_quote",
+)
+_VISION_EXPORTS = (
+    "MMPROJ_MODE_ALWAYS",
+    "MMPROJ_MODE_LAZY",
+    "MMPROJ_MODE_OFF",
+    "default_mmproj_config",
+    "normalize_mmproj_config",
+    "normalize_mmproj_mode",
+    "get_model_mmproj_mode",
+    "resolve_effective_mmproj_config",
+    "cached_mmproj_config",
+    "model_has_mmproj",
+    "model_lazily_loads_mmproj",
+    "resolve_render_include_mmproj",
+    "build_vision_model",
+    "is_vision_model_id",
+    "vision_base_model_id",
+    "vision_model_id",
+    "vision_route_ttl",
 )
 _SERVER_EXPORTS = (
     "get_server_supported_flags",
@@ -114,6 +134,7 @@ _DAEMON_EXPORTS = (
     "get_api_endpoint_status",
 )
 _replica_mod_cache = None
+_vision_mod_cache = None
 _server_mod_cache = None
 _daemon_mod_cache = None
 
@@ -126,6 +147,19 @@ def _get_gateway_mod():
         import importlib
         mod = importlib.import_module("llamacpp_stack.cli.gateway")
         _gateway_mod_cache = mod
+        return mod
+    except Exception:
+        return None
+
+
+def _get_vision_mod():
+    global _vision_mod_cache
+    if _vision_mod_cache is not None:
+        return _vision_mod_cache
+    try:
+        import importlib
+        mod = importlib.import_module("llamacpp_stack.cli.vision")
+        _vision_mod_cache = mod
         return mod
     except Exception:
         return None
@@ -527,6 +561,7 @@ try:
         (_PARSER_EXPORTS, _get_parser_mod),
         (_GATEWAY_EXPORTS, _get_gateway_mod),
         (_REPLICA_EXPORTS, _get_replica_mod),
+        (_VISION_EXPORTS, _get_vision_mod),
         (_SERVER_EXPORTS, _get_server_mod),
         (_DAEMON_EXPORTS, _get_daemon_mod),
     ):

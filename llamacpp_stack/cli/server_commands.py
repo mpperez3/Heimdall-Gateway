@@ -258,7 +258,7 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
                 if bv is not None:
                     normalized[key] = bv
             continue
-        if key in {"kv_offload","cont_batching","op_offload","cpu_moe","kv_unified","cache_idle_slots","direct_io","swa_full","cache_prompt"}:
+        if key in {"kv_offload","cont_batching","op_offload","cpu_moe","kv_unified","cache_idle_slots","direct_io","swa_full","cache_prompt","logits_all"}:
             bv = _normalize_bool_flag(raw_val)
             if bv is not None:
                 normalized[key] = bv
@@ -695,7 +695,7 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
     if key in _bool_flags:
         if _normalize_bool_flag(value) and _server_supports_or_unknown(server_path, _bool_flags[key]): cmd.append(_bool_flags[key])
         return
-    _bool_pair={"kv_offload":("--kv-offload","--no-kv-offload"),"cont_batching":("--cont-batching","--no-cont-batching"),"op_offload":("--op-offload","--no-op-offload"),"direct_io":("--direct-io","--no-direct-io"),"kv_unified":("--kv-unified","--no-kv-unified"),"cache_idle_slots":("--cache-idle-slots","--no-cache-idle-slots"),"swa_full":("--swa-full","--no-swa-full")}
+    _bool_pair={"kv_offload":("--kv-offload","--no-kv-offload"),"cont_batching":("--cont-batching","--no-cont-batching"),"op_offload":("--op-offload","--no-op-offload"),"direct_io":("--direct-io","--no-direct-io"),"kv_unified":("--kv-unified","--no-kv-unified"),"cache_idle_slots":("--cache-idle-slots","--no-cache-idle-slots"),"swa_full":("--swa-full","--no-swa-full"),"logits_all":("--logits-all","--no-logits-all")}
     if key in _bool_pair:
         bv=_normalize_bool_flag(value)
         on,off=_bool_pair[key]
@@ -807,6 +807,24 @@ def build_vllm_server_command(model, *, port: str, host: str | None = None, vllm
             continue
         command.extend([flag, _vllm_flag_value(val)])
     return command
+
+
+def _mmproj_enabled_for(model) -> bool:
+    """False when the model declares ``mmproj_mode: off``.
+
+    Resolution is delegated to the vision policy module so the command builder
+    and the renderer can never disagree about whether a projector is wanted.
+    The import is guarded because this module is loaded during bootstrap, before
+    the policy helpers are guaranteed importable.
+    """
+    try:
+        from llamacpp_stack.cli.vision import MMPROJ_MODE_OFF, get_model_mmproj_mode
+
+        return get_model_mmproj_mode(model) != MMPROJ_MODE_OFF
+    except Exception:
+        return True
+
+
 def build_llama_server_command(model, server_path: Path, *, port: str, host: str | None = None, include_model_path: bool = True, include_mmproj: bool = True, include_jinja: bool = True, server_defaults: dict[str, object] | None = None, vllm_defaults: dict[str, object] | None = None, extra_flags: list[str] | None = None) -> list[str]:
     try:
         cf = _get_cli_file()
@@ -847,6 +865,7 @@ def build_llama_server_command(model, server_path: Path, *, port: str, host: str
     if is_gemma4 and "swa_full" not in model_overrides:
         effective.pop("swa_full", None)
     effective.pop("replicas", None); effective.pop("placement", None)
+    effective.pop("mmproj_mode", None)
     _engine = str(effective.pop("engine", None) or "").strip().lower().replace("_","-")
     if _engine in {"buun-beta"}:
         _engine = "buun"
@@ -989,7 +1008,7 @@ def build_llama_server_command(model, server_path: Path, *, port: str, host: str
     cmd.extend(["--tensor-split", tensor_split])
     cmd.extend(["--host", resolved_host])
     explicit_keys=set(model_overrides.keys())
-    for key in ("split_mode","flash_attn","reasoning_format","batch_size","ubatch_size","threads","threads_batch","main_gpu","numa","fit_target","model_draft","hf_repo_draft","spec_type","spec_draft_n_max","spec_draft_n_min","spec_draft_p_min","use_fitc","draft","draft_min","draft_p_min","ctx_size_draft","n_gpu_layers_draft","draft_mtp","fit","fitt","fitc","keep","mirostat","mirostat_ent","mirostat_lr","cache_type_k","cache_type_v","mmap","mul_mat_q","grp_attn_n","parallel","ctx_checkpoints","cache_ram","cache_prompt","kv_offload","cont_batching","op_offload","direct_io","cpu_moe","n_cpu_moe","device","defrag_threshold","swa_full","top_k","top_p","min_p","repeat_penalty","presence_penalty","predict","reasoning","reasoning_budget","reasoning_budget_message"):
+    for key in ("split_mode","flash_attn","reasoning_format","batch_size","ubatch_size","threads","threads_batch","main_gpu","numa","fit_target","model_draft","hf_repo_draft","spec_type","spec_draft_n_max","spec_draft_n_min","spec_draft_p_min","use_fitc","draft","draft_min","draft_p_min","ctx_size_draft","n_gpu_layers_draft","draft_mtp","fit","fitt","fitc","keep","mirostat","mirostat_ent","mirostat_lr","cache_type_k","cache_type_v","mmap","mul_mat_q","grp_attn_n","parallel","ctx_checkpoints","cache_ram","cache_prompt","logits_all","kv_offload","cont_batching","op_offload","direct_io","cpu_moe","n_cpu_moe","device","defrag_threshold","swa_full","top_k","top_p","min_p","repeat_penalty","presence_penalty","predict","reasoning","reasoning_budget","reasoning_budget_message"):
         if key in effective:
             probe = None if key in explicit_keys else effective_server_path
             _append_llama_server_flag(cmd, key, effective[key], probe)
@@ -999,7 +1018,7 @@ def build_llama_server_command(model, server_path: Path, *, port: str, host: str
                 pass
     for ek, ev in list(effective.items()):
         _append_llama_server_flag(cmd, ek, ev, effective_server_path)
-    if include_mmproj and model.mmproj_path:
+    if include_mmproj and model.mmproj_path and _mmproj_enabled_for(model):
         cmd.extend(["--mmproj", str(model.mmproj_path)])
     if include_jinja and model.jinja:
         cmd.append("--jinja")
@@ -1020,4 +1039,4 @@ def build_llama_server_command(model, server_path: Path, *, port: str, host: str
             except Exception:
                 cmd = ["/usr/bin/env", f"CUDA_VISIBLE_DEVICES={','.join(str(g) for g in cuda_visible_devices)}", *cmd]
     return cmd
-__all__=["get_server_supported_flags","server_supports_flag","get_vllm_supported_flags","vllm_server_supports_flag","get_vllm_help_text","normalize_server_overrides","normalize_tensor_split","_normalize_bool_flag","resolve_api_ctx_factor","resolve_llama_server_defaults","resolve_vllm_defaults","resolve_vllm_options","resolve_request_reasoning_budget","_append_llama_server_flag","build_vllm_server_command","build_llama_server_command"]
+__all__=["get_server_supported_flags","server_supports_flag","get_vllm_supported_flags","vllm_server_supports_flag","get_vllm_help_text","normalize_server_overrides","normalize_tensor_split","_normalize_bool_flag","resolve_api_ctx_factor","resolve_llama_server_defaults","resolve_vllm_defaults","resolve_vllm_options","resolve_request_reasoning_budget","_append_llama_server_flag","build_vllm_server_command","build_llama_server_command","_mmproj_enabled_for"]
