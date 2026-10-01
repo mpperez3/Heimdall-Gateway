@@ -12767,9 +12767,18 @@ def _force_tool_choice_for_chat_repair(payload: dict[str, object]) -> dict[str, 
     if current in (None, "", "none", "auto"):
         repaired["tool_choice"] = "required"
     # The model already thought on the failed attempt; repair rounds only need
-    # to emit the corrected call, not re-enter a full reasoning phase.
-    if repaired.get("thinking_budget_tokens") is None and repaired.get("reasoning_budget_tokens") is None:
-        repaired["thinking_budget_tokens"] = CHAT_TOOL_CONTINUE_REPAIR_THINKING_BUDGET_TOKENS
+    # to emit the corrected call, not re-enter a full reasoning phase.  Clamp
+    # instead of defaulting: an inherited request budget (a half_context
+    # policy resolves to thousands of tokens) would otherwise consume the whole
+    # max_tokens allowance on reasoning, ending the round with
+    # finish_reason=length, no visible content and no tool call.
+    cap = CHAT_TOOL_CONTINUE_REPAIR_THINKING_BUDGET_TOKENS
+    for key in ("thinking_budget_tokens", "reasoning_budget_tokens"):
+        inherited = _positive_int(repaired.get(key))
+        if inherited is not None:
+            cap = min(cap, inherited)
+    repaired["thinking_budget_tokens"] = cap
+    repaired.pop("reasoning_budget_tokens", None)
     return repaired
 
 def _apply_chat_tool_continue_repair_token_cap(payload: dict, fallback_max_tokens: object) -> dict:

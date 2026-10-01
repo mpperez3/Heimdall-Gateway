@@ -1,0 +1,46 @@
+diff --git a/tools/mtmd/clip-safetensors.cpp b/tools/mtmd/clip-safetensors.cpp
+index c4debb6..c6f476c 100644
+--- a/tools/mtmd/clip-safetensors.cpp
++++ b/tools/mtmd/clip-safetensors.cpp
+@@ -21,6 +21,20 @@ namespace {
+ 
+ constexpr const char * QWEN4_VISUAL_PREFIX = "model.visual.";
+ 
++// HF `model_type` values whose checkpoints carry the vision tower under
++// `model.visual.` in the Qwen3-VL merger layout add_source() expects:
++// qwen4_exp = Qwen3.8-Flash-Next, qwen3_5 = Qwen3.5/3.8 (e.g. Qwen3.8-27B-EXL3).
++constexpr const char * QWEN_VISION_MODEL_TYPES[] = { "qwen4_exp", "qwen3_5" };
++
++bool is_supported_vision_model_type(const std::string & model_type) {
++    for (const char * candidate : QWEN_VISION_MODEL_TYPES) {
++        if (model_type == candidate) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ ggml_type source_type(llama_safetensors_dtype dtype) {
+     switch (dtype) {
+         case llama_safetensors_dtype::BF16: return GGML_TYPE_BF16;
+@@ -68,8 +82,8 @@ struct clip_safetensors_source::impl {
+         preprocessor(llama_safetensors_read_json(path / "preprocessor_config.json")),
+         registry(llama_safetensors_registry::load(path)) {
+         const std::string model_type = config.value("model_type", std::string());
+-        if (model_type != "qwen4_exp" || !config.contains("vision_config")) {
+-            throw std::runtime_error("native mmproj directory is not a multimodal Qwen4 source");
++        if (!is_supported_vision_model_type(model_type) || !config.contains("vision_config")) {
++            throw std::runtime_error("native mmproj directory is not a multimodal Qwen source");
+         }
+ 
+         for (const llama_safetensors_tensor & tensor : registry.tensors()) {
+@@ -201,7 +215,8 @@ bool clip_safetensors_source::supports(const std::string & path) {
+     }
+     try {
+         const llama_safetensors_json config = llama_safetensors_read_model_config(dir);
+-        return config.value("model_type", std::string()) == "qwen4_exp" && config.contains("vision_config");
++        return is_supported_vision_model_type(config.value("model_type", std::string())) &&
++               config.contains("vision_config");
+     } catch (...) {
+         return false;
+     }

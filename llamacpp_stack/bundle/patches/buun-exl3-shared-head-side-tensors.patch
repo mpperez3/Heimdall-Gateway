@@ -1,0 +1,64 @@
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 29f62fe..57211f9 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3738,6 +3738,17 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
+         }
+         if (share_out) {
+             dst->output = src->output;
++            // Formats with static side tensors (EXL3 svh/suh, NVFP4 scale2, ...) carry
++            // them as extra MUL_MAT sources rather than inside the weight itself:
++            // output_s -> src[2] (output scale), output_in_s -> src[3] (input signs).
++            // A full-vocab drafter never creates its own optional head, so these
++            // companions have to travel with the borrowed tensor or the backend asserts.
++            if (dst->output_s == nullptr) {
++                dst->output_s = src->output_s;
++            }
++            if (dst->output_in_s == nullptr) {
++                dst->output_in_s = src->output_in_s;
++            }
+         }
+         return;
+     }
+@@ -3806,6 +3817,12 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
+     }
+     if (share_out) {
+         dst->output = out_cp != nullptr ? out_cp : src->output;
++        if (dst->output_s == nullptr) {
++            dst->output_s = src->output_s;
++        }
++        if (dst->output_in_s == nullptr) {
++            dst->output_in_s = src->output_in_s;
++        }
+     }
+ 
+     dst->adopt_buffer(std::move(ctx_ptr), ggml_backend_buffer_ptr(buf));
+diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
+index 4c7d6ef..0bc2233 100644
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -1190,17 +1190,19 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
+ 
+     // lm_head from the target model — see the tok_embd note above (share_tensors
+     // provides a drafter-schedulable model.output; the fallback is not device-safe)
+-    auto * output   = model.output;
+-    auto * output_s = model.output_s;
++    auto * output     = model.output;
++    auto * output_s   = model.output_s;
++    auto * output_in_s = model.output_in_s;
+     if (output == nullptr) {
+         GGML_ASSERT(cparams.ctx_other != nullptr);
+         const auto * model_other = llama_get_model(cparams.ctx_other);
+         GGML_ASSERT(model_other->output != nullptr && "DFlash decoder requires the target model's output projection");
+-        output   = model_other->output;
+-        output_s = model_other->output_s;
++        output      = model_other->output;
++        output_s    = model_other->output_s;
++        output_in_s = model_other->output_in_s;
+     }
+ 
+-    cur = build_lora_mm(output, cur, output_s);
++    cur = build_lora_mm(output, cur, output_s, output_in_s);
+ 
+     // reduced-draft-vocab exports: scatter the draft logits to the target vocabulary via d2t
+     if (model.d2t) {

@@ -7368,7 +7368,23 @@ models:
 
         explicit = _force_tool_choice_for_chat_repair({"thinking_budget_tokens": 2048})
         self.assertEqual(explicit["tool_choice"], "required")
-        self.assertEqual(explicit["thinking_budget_tokens"], 2048)
+        self.assertEqual(explicit["thinking_budget_tokens"], CHAT_TOOL_CONTINUE_REPAIR_THINKING_BUDGET_TOKENS)
+
+        # A half_context reasoning policy resolves to thousands of tokens. The repair
+        # round also runs under the repair max_tokens, so an inherited budget larger
+        # than that cap spends the whole allowance on reasoning and the round ends with
+        # finish_reason=length, no visible content and no tool call.
+        inherited = _force_tool_choice_for_chat_repair({"thinking_budget_tokens": 15360})
+        self.assertEqual(inherited["thinking_budget_tokens"], CHAT_TOOL_CONTINUE_REPAIR_THINKING_BUDGET_TOKENS)
+
+        # An explicit client budget below the cap is still honored.
+        smaller = _force_tool_choice_for_chat_repair({"thinking_budget_tokens": 128})
+        self.assertEqual(smaller["thinking_budget_tokens"], 128)
+
+        # reasoning_budget_tokens is the alternate key and must be clamped, not left behind.
+        alternate = _force_tool_choice_for_chat_repair({"reasoning_budget_tokens": 15360})
+        self.assertEqual(alternate["thinking_budget_tokens"], CHAT_TOOL_CONTINUE_REPAIR_THINKING_BUDGET_TOKENS)
+        self.assertNotIn("reasoning_budget_tokens", alternate)
 
         client_choice = _force_tool_choice_for_chat_repair({"tool_choice": {"type": "function", "function": {"name": "f"}}})
         self.assertEqual(client_choice["tool_choice"], {"type": "function", "function": {"name": "f"}})
