@@ -49,6 +49,7 @@ from .constants import (
     CHAT_TOOL_CONTINUE_REPAIR_THINKING_BUDGET_TOKENS,
 )
 from .env import _env_value
+from .replica_policy import affinity_policy_defaults
 
 try:
     from .raw_log import log_raw_request  # type: ignore
@@ -274,10 +275,21 @@ def _default_auto_update_config() -> dict[str, object]:
 
 
 def _default_affinity_spillover_config() -> dict[str, object]:
+    # Off by default, and kept False in the installer too: the legacy spillover
+    # moved conversations whenever the owner merely looked busy, which caused
+    # cold-GPU reloads. See llamacpp_stack/cli/replica_policy.py.
     return {
-        "enabled": True,
+        "enabled": False,
         "idle_threshold_s": 30,
     }
+
+
+def _default_affinity_policy_config() -> dict[str, object]:
+    """Mirror of the server defaults; must stay in sync with the shared source."""
+    try:
+        return dict(affinity_policy_defaults())
+    except Exception:  # pragma: no cover
+        return {}
 
 
 def _normalize_affinity_spillover_config(raw: object) -> tuple[dict[str, object], bool]:
@@ -747,6 +759,7 @@ def _default_experimental_config() -> dict[str, object]:
         "dedup_inflight": _default_dedup_inflight_config(),
         "model_probe_autoload": _default_model_probe_autoload_config(),
         "affinity_spillover": _default_affinity_spillover_config(),
+        "affinity_policy": _default_affinity_policy_config(),
         "chat_tool_continue_repair": {"enabled": False, "max_rounds": 1, "max_tokens": 2048, "stream_keepalive_seconds": 15, "visible_notice_after_seconds": 4, "trigger_prefixes": ["[terminal command", "[terminal_inline", "</terminal_inline>", "Voy a", "Empezando por"], "prompt": "Your previous assistant message ended without any tool_calls.\nYou are in a tool-capable agent environment. If the next step requires reading files, editing files, running commands, searching, inspecting state, or using any external capability, you must call one of the available tools instead of describing the action in text.\nDo not answer with empty visible content. Do not answer with a sentence that only sets up an action and ends with a colon.\nAvailable tool names: {tool_names}.", "truncated_tool_call_prompt": "Your previous assistant message started a tool_call but it was truncated before the JSON arguments were complete.\nRetry now with exactly one complete, valid tool_call. Keep the arguments minimal and valid JSON. Do not stream or repeat partial arguments. Do not include explanatory text before the tool_call.\nAvailable tool names: {tool_names}.", "include_failed_assistant_message": False, "loop_guard": {"enabled": True, "no_tool_call_max_chars": 0, "repeated_tail_min_chars": 3000, "repeated_tail_repetitions": 4}},
         "chat_last_response_log": {"enabled": False, "path": "", "max_chars": 20000, "include_reasoning": False, "include_tool_calls": True},
     }
@@ -765,6 +778,7 @@ def _normalize_chat_tool_continue_trigger_prefixes(value: object) -> list[str]:
 
 def _normalize_experimental_config(raw: object) -> dict[str, object]:
     cfg = _default_experimental_config()
+    policy_override: dict[str, object] = {}
     if isinstance(raw, dict):
         for key, value in raw.items():
             if key == "dedup_inflight":
@@ -833,6 +847,8 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
             elif key == "affinity_spillover" and isinstance(value, dict):
                 normalized, _ = _normalize_affinity_spillover_config(value)
                 cfg["affinity_spillover"] = normalized
+            elif key == "affinity_policy" and isinstance(value, dict):
+                policy_override = dict(value)
             elif key not in cfg:
                 cfg[key] = value  # type: ignore
     if "dedup_inflight" not in cfg or not isinstance(cfg.get("dedup_inflight"), dict):
@@ -847,6 +863,12 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
         cfg["affinity_spillover"], _ = _normalize_affinity_spillover_config(None)
     else:
         cfg["affinity_spillover"], _ = _normalize_affinity_spillover_config(cfg.get("affinity_spillover"))
+    policy_raw = dict(policy_override)
+    if "allow_suspected_transfers" not in policy_raw:
+        # Freeze the legacy switch into its modern equivalent exactly once, so
+        # deprecating affinity_spillover cannot change behaviour silently.
+        policy_raw["allow_suspected_transfers"] = bool(cfg["affinity_spillover"].get("enabled"))
+    cfg["affinity_policy"] = _default_affinity_policy_config() | policy_raw
     return cfg
 
 # ---------------------------------------------------------------------------

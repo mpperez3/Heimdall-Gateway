@@ -32,6 +32,7 @@ from llamacpp_stack.cli.replica_policy import (
     TargetHealth,
     TargetState,
     TransferReason,
+    affinity_policy_defaults,
     fault_from_exception,
     fault_from_status,
     is_target_fatal,
@@ -513,6 +514,87 @@ class AffinityConfigNormalisationTest(unittest.TestCase):
 
     def test_queue_mode_is_accepted(self) -> None:
         self.assertEqual(normalize_affinity_config({"saturated_target": "queue"}).saturated_target, "queue")
+
+
+class ConfigSourcesAgreeTest(unittest.TestCase):
+    """The three config producers must not drift apart.
+
+    ``config-migrate`` and the installer write ``experimental.affinity_policy``
+    to disk while the server reads it at runtime. If they disagree, an install
+    migrates a config the running server does not honour, which is silent and
+    only shows up as policy that mysteriously does not apply.
+    """
+
+    def test_defaults_match_across_all_three_sources(self) -> None:
+        from llamacpp_stack import install
+        from llamacpp_stack.cli import gateway
+
+        canonical = affinity_policy_defaults()
+        self.assertEqual(install._default_affinity_policy_config(), canonical)
+        self.assertEqual(gateway._default_affinity_policy_config(), canonical)
+        self.assertEqual(cli._default_affinity_policy_config(), canonical)
+
+    def test_legacy_spillover_is_off_by_default_everywhere(self) -> None:
+        from llamacpp_stack import install
+        from llamacpp_stack.cli import gateway
+
+        for name, defaults in (
+            ("install", install._default_affinity_spillover_config),
+            ("gateway", gateway._default_affinity_spillover_config),
+            ("cli", cli._default_affinity_spillover_config),
+        ):
+            with self.subTest(source=name):
+                self.assertFalse(defaults()["enabled"])
+
+    def test_migration_freezes_legacy_switch_once_and_is_idempotent(self) -> None:
+        from llamacpp_stack import install
+        from llamacpp_stack.cli import gateway
+
+        for name, normalize in (
+            ("install", install._normalize_experimental_config),
+            ("gateway", gateway._normalize_experimental_config),
+        ):
+            with self.subTest(source=name):
+                legacy_on = normalize({"affinity_spillover": {"enabled": True}})
+                self.assertTrue(
+                    legacy_on["affinity_policy"]["allow_suspected_transfers"],
+                    "an explicit legacy opt-in must keep working after migration",
+                )
+
+                once = normalize(legacy_on)
+                self.assertEqual(
+                    normalize(once),
+                    once,
+                    "migration must be idempotent, or every run rewrites conf.json",
+                )
+                self.assertTrue(
+                    once["affinity_policy"]["allow_suspected_transfers"],
+                    "the frozen value must survive a second pass",
+                )
+
+                fresh = normalize({})
+                self.assertFalse(
+                    fresh["affinity_policy"]["allow_suspected_transfers"],
+                    "a fresh install must not inherit the legacy opt-in",
+                )
+
+    def test_user_supplied_policy_overrides_survive(self) -> None:
+        from llamacpp_stack import install
+        from llamacpp_stack.cli import gateway
+
+        for name, normalize in (
+            ("install", install._normalize_experimental_config),
+            ("gateway", gateway._normalize_experimental_config),
+            ("cli", cli._normalize_experimental_config),
+        ):
+            with self.subTest(source=name):
+                cfg = normalize(
+                    {"affinity_policy": {"min_dwell_s": 7.5, "saturated_target": "queue"}}
+                )
+                policy = cfg["affinity_policy"]
+                self.assertEqual(policy["min_dwell_s"], 7.5)
+                self.assertEqual(policy["saturated_target"], "queue")
+                self.assertIn("max_hard_transfers", policy, "unspecified keys must still get defaults")
 
 
 if __name__ == "__main__":

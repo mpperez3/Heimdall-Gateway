@@ -207,9 +207,30 @@ def _default_auto_update_config() -> dict[str, object]:
 
 
 def _default_affinity_spillover_config() -> dict[str, object]:
+    # Off by default, and must stay False here too: the legacy spillover moved
+    # conversations whenever the owner merely looked busy, causing cold-GPU
+    # reloads. See llamacpp_stack/cli/replica_policy.py for the policy it feeds.
     return {
-        "enabled": True,
+        "enabled": False,
         "idle_threshold_s": 30,
+    }
+
+
+def _default_affinity_policy_config() -> dict[str, object]:
+    # Kept in sync with AffinityConfig in llamacpp_stack/cli/replica_policy.py.
+    # Duplicated rather than imported because this installer runs standalone from
+    # the bundle script, before the package is guaranteed importable.
+    return {
+        "min_dwell_s": 120.0,
+        "max_transfers": 2,
+        "max_hard_transfers": 5,
+        "evacuate_cooldown_s": 300.0,
+        "saturated_target": "retry",
+        "queue_max_wait_ms": 0,
+        "queue_max_depth": 0,
+        "allow_suspected_transfers": False,
+        "probe_interval_s": 10.0,
+        "probe_timeout_s": 1.5,
     }
 
 
@@ -426,6 +447,7 @@ def _default_experimental_config() -> dict[str, object]:
         "dedup_inflight": _default_dedup_inflight_config(),
         "model_probe_autoload": _default_model_probe_autoload_config(),
         "affinity_spillover": _default_affinity_spillover_config(),
+        "affinity_policy": _default_affinity_policy_config(),
         "chat_tool_continue_repair": {
             "enabled": False,
             "max_rounds": 1,
@@ -481,6 +503,7 @@ def _normalize_chat_tool_continue_trigger_prefixes(value: object) -> list[str]:
 
 def _normalize_experimental_config(raw: object) -> dict[str, object]:
     cfg = _default_experimental_config()
+    policy_override: dict[str, object] = {}
     if isinstance(raw, dict):
         for key, value in raw.items():
             if key == "dedup_inflight":
@@ -553,6 +576,8 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
             elif key == "affinity_spillover" and isinstance(value, dict):
                 normalized, _ = _normalize_affinity_spillover_config(value)
                 cfg["affinity_spillover"] = normalized
+            elif key == "affinity_policy" and isinstance(value, dict):
+                policy_override = dict(value)
             elif key not in cfg:
                 cfg[key] = value
     if "dedup_inflight" not in cfg or not isinstance(cfg.get("dedup_inflight"), dict):
@@ -567,6 +592,12 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
         cfg["affinity_spillover"], _ = _normalize_affinity_spillover_config(None)
     else:
         cfg["affinity_spillover"], _ = _normalize_affinity_spillover_config(cfg.get("affinity_spillover"))
+    policy_raw = dict(policy_override)
+    if "allow_suspected_transfers" not in policy_raw:
+        # Freeze the legacy switch into its modern equivalent exactly once, so
+        # deprecating affinity_spillover cannot change behaviour silently.
+        policy_raw["allow_suspected_transfers"] = bool(cfg["affinity_spillover"].get("enabled"))
+    cfg["affinity_policy"] = _default_affinity_policy_config() | policy_raw
     return cfg
 
 

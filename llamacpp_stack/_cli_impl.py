@@ -95,6 +95,7 @@ try:
         TargetState as _TargetState,
         TransferBudget as _TransferBudget,
         TransferReason as _TransferReason,
+        affinity_policy_defaults as _affinity_policy_defaults,
         fault_from_exception as _fault_from_exception,
         fault_from_status as _fault_from_status,
         is_target_fatal as _is_target_fatal,
@@ -124,6 +125,7 @@ except Exception:  # pragma: no cover
     _TargetHealth = None  # type: ignore
     _normalize_affinity_config = None  # type: ignore
     _probe_target_health = None  # type: ignore
+    _affinity_policy_defaults = None  # type: ignore
 
 
 # Gateway shim: prefer canonical impl from llamacpp_stack.cli.gateway (T5)
@@ -1177,21 +1179,12 @@ def _default_affinity_spillover_config() -> dict[str, object]:
 
 
 def _default_affinity_policy_config() -> dict[str, object]:
-    if _normalize_affinity_config is None:
+    if _affinity_policy_defaults is None:
         return {}
-    cfg = _normalize_affinity_config(None)
-    return {
-        "min_dwell_s": cfg.min_dwell_s,
-        "max_transfers": cfg.max_transfers,
-        "max_hard_transfers": cfg.max_hard_transfers,
-        "evacuate_cooldown_s": cfg.evacuate_cooldown_s,
-        "saturated_target": cfg.saturated_target,
-        "queue_max_wait_ms": cfg.queue_max_wait_ms,
-        "queue_max_depth": cfg.queue_max_depth,
-        "allow_suspected_transfers": cfg.allow_suspected_transfers,
-        "probe_interval_s": cfg.probe_interval_s,
-        "probe_timeout_s": cfg.probe_timeout_s,
-    }
+    try:
+        return dict(_affinity_policy_defaults())
+    except Exception:
+        return {}
 
 
 def _normalize_affinity_spillover_config(raw: object) -> tuple[dict[str, object], bool]:
@@ -1603,6 +1596,7 @@ def _normalize_chat_tool_continue_trigger_prefixes(value: object) -> list[str]:
 
 def _normalize_experimental_config(raw: object) -> dict[str, object]:
     cfg = _default_experimental_config()
+    policy_override: dict[str, object] = {}
     if isinstance(raw, dict):
         for key, value in raw.items():
             if key == "dedup_inflight":
@@ -1675,6 +1669,8 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
             elif key == "affinity_spillover" and isinstance(value, dict):
                 normalized, _ = _normalize_affinity_spillover_config(value)
                 cfg["affinity_spillover"] = normalized
+            elif key == "affinity_policy" and isinstance(value, dict):
+                policy_override = dict(value)
             elif key not in cfg:
                 cfg[key] = value
     if "dedup_inflight" not in cfg or not isinstance(cfg.get("dedup_inflight"), dict):
@@ -1689,8 +1685,7 @@ def _normalize_experimental_config(raw: object) -> dict[str, object]:
         cfg["affinity_spillover"], _ = _normalize_affinity_spillover_config(None)
     else:
         cfg["affinity_spillover"], _ = _normalize_affinity_spillover_config(cfg.get("affinity_spillover"))
-    policy_raw = cfg.get("affinity_policy")
-    policy_raw = dict(policy_raw) if isinstance(policy_raw, dict) else {}
+    policy_raw = dict(policy_override)
     if "allow_suspected_transfers" not in policy_raw:
         # Freeze the legacy switch into its modern equivalent exactly once, so
         # deprecating affinity_spillover later cannot change behaviour silently.

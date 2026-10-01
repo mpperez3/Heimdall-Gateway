@@ -297,6 +297,30 @@ class AffinityConfig:
     probe_timeout_s: float = 1.5
 
 
+def affinity_policy_defaults() -> dict[str, object]:
+    """JSON-shaped defaults for ``experimental.affinity_policy``.
+
+    Single source of truth on purpose: the server config, the ``config-migrate``
+    normalizer in :mod:`llamacpp_stack.cli.gateway` and the standalone installer
+    all have to agree on these numbers.  When they do not, an install migrates a
+    config into a policy the running server does not use, which is exactly the
+    kind of silent drift this module exists to prevent.
+    """
+    cfg = AffinityConfig()
+    return {
+        "min_dwell_s": cfg.min_dwell_s,
+        "max_transfers": cfg.max_transfers,
+        "max_hard_transfers": cfg.max_hard_transfers,
+        "evacuate_cooldown_s": cfg.evacuate_cooldown_s,
+        "saturated_target": cfg.saturated_target,
+        "queue_max_wait_ms": cfg.queue_max_wait_ms,
+        "queue_max_depth": cfg.queue_max_depth,
+        "allow_suspected_transfers": cfg.allow_suspected_transfers,
+        "probe_interval_s": cfg.probe_interval_s,
+        "probe_timeout_s": cfg.probe_timeout_s,
+    }
+
+
 def normalize_affinity_config(raw: object) -> AffinityConfig:
     """Build an :class:`AffinityConfig` from a possibly-wrong config blob."""
     cfg = AffinityConfig()
@@ -513,6 +537,7 @@ __all__ = [
     "TRANSFER_REASONS",
     "TransferBudget",
     "TransferReason",
+    "affinity_policy_defaults",
     "fault_from_exception",
     "fault_from_status",
     "is_target_fatal",
