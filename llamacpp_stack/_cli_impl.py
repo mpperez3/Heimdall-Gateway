@@ -2436,6 +2436,7 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
             "top_k",
             "predict",
             "image_min_tokens",
+            "image_max_tokens",
         }:
             try:
                 normalized[key] = int(raw_val)
@@ -3479,7 +3480,11 @@ def _engine_binary_base(server_path: Path) -> Path:
     try:
         from llamacpp_stack.cli.server_commands import _engine_binary_anchor
     except Exception:
-        return server_path.parent
+        # Same <root>/<engine>/bin climb as the helper: bare `parent` nests one level too deep.
+        parent = server_path.parent
+        if parent.name == "bin" and parent.parent.name in ("beellama", "buun", "exllama"):
+            return parent.parent.parent
+        return parent
     return _engine_binary_anchor(server_path)
 
 
@@ -4257,6 +4262,11 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
     elif key == "image_min_tokens":
         try:
             cmd.extend(["--image-min-tokens", str(int(value))])
+        except (TypeError, ValueError):
+            pass
+    elif key == "image_max_tokens":
+        try:
+            cmd.extend(["--image-max-tokens", str(int(value))])
         except (TypeError, ValueError):
             pass
     elif key == "model_draft":
@@ -5063,9 +5073,9 @@ def _is_buun_available(args=None) -> bool:
     ]
     try:
         if args is not None and getattr(args, "llama_server", None):
-            base = Path(str(getattr(args, "llama_server")))
+            base = _engine_binary_base(Path(str(getattr(args, "llama_server"))))
+            candidates.append(base / "buun" / "bin" / "llama-server-buun")
             candidates.append(base.parent / "buun" / "bin" / "llama-server-buun")
-            candidates.append(base.parent.parent / "buun" / "bin" / "llama-server-buun")
     except Exception:
         pass
     for cand in candidates:
@@ -18552,7 +18562,16 @@ def show_hacks(args):
     print("llamacpp-stack llama.cpp modifications / risky knobs")
     print()
     print("Source patches applied during source builds:")
-    print("  - none")
+    try:
+        from llamacpp_stack.buun_install import _bundled_patch_files
+        _patches = _bundled_patch_files()
+    except Exception:
+        _patches = []
+    if _patches:
+        for _p in _patches:
+            print(f"  - buun: {_p.name}")
+    else:
+        print("  - none")
     print()
     print("Potentially aggressive CUDA CMake flags when supported by source/config:")
     print("  - GGML_CUDA_FORCE_MMQ")

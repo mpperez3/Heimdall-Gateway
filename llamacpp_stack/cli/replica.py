@@ -568,11 +568,18 @@ def _get_cli_file():
         return None
 
 
+_ENGINE_DIR_NAMES = ("beellama", "buun", "exllama")
+
+
 def _engine_binary_base(server_path: Path) -> Path:
     try:
         from llamacpp_stack.cli.server_commands import _engine_binary_anchor
     except Exception:
-        return server_path.parent
+        # Same <root>/<engine>/bin climb as the helper: bare `parent` nests one level too deep.
+        parent = server_path.parent
+        if parent.name == "bin" and parent.parent.name in _ENGINE_DIR_NAMES:
+            return parent.parent.parent
+        return parent
     return _engine_binary_anchor(server_path)
 
 

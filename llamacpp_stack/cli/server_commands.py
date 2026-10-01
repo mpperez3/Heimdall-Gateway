@@ -229,7 +229,7 @@ def normalize_server_overrides(value: object) -> dict[str, object]:
             except (TypeError, ValueError):
                 continue
             continue
-        if key in {"ctx_size","n_gpu_layers","batch_size","ubatch_size","threads","threads_batch","fit_target","keep","mirostat","draft","draft_min","ctx_size_draft","grp_attn_n","parallel","main_gpu","ctx_checkpoints","checkpoint_min_step","checkpoint_every_n_tokens","cache_ram","n_cpu_moe","top_k","predict","image_min_tokens"}:
+        if key in {"ctx_size","n_gpu_layers","batch_size","ubatch_size","threads","threads_batch","fit_target","keep","mirostat","draft","draft_min","ctx_size_draft","grp_attn_n","parallel","main_gpu","ctx_checkpoints","checkpoint_min_step","checkpoint_every_n_tokens","cache_ram","n_cpu_moe","top_k","predict","image_min_tokens","image_max_tokens"}:
             try:
                 normalized[key] = int(raw_val)
             except (TypeError, ValueError):
@@ -585,6 +585,10 @@ def _append_llama_server_flag(cmd: list[str], key: str, value: object, server_pa
     if key == "fit_target": cmd.extend(["--fit-target", str(int(value))]); return
     if key == "image_min_tokens":
         try: cmd.extend(["--image-min-tokens", str(int(value))])
+        except: pass
+        return
+    if key == "image_max_tokens":
+        try: cmd.extend(["--image-max-tokens", str(int(value))])
         except: pass
         return
     if key == "model_draft":

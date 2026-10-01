@@ -6587,8 +6587,8 @@ def _is_engine_reusable(layout: InstallLayout, engine: str) -> bool:
             bin_path = layout.install_root / "beellama/bin/llama-server-beellama"
             return bin_path.exists() and os.access(str(bin_path), os.X_OK)
         if engine == "buun":
-            bin_path = layout.install_root / "buun/bin/llama-server-buun"
-            return bin_path.exists() and os.access(str(bin_path), os.X_OK)
+            from llamacpp_stack.buun_install import _is_buun_reusable
+            return _is_buun_reusable(layout.install_root / "buun")
     except Exception:
         return False
     return False

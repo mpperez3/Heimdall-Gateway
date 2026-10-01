@@ -10,6 +10,7 @@ Binary: buun/bin/llama-server-buun
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -129,7 +130,114 @@ def _resolve_cuda_arch() -> str:
 
 def _is_buun_reusable(buun_root: Path) -> bool:
     bin_path = buun_root / "bin/llama-server-buun"
-    return bin_path.exists() and os.access(str(bin_path), os.X_OK)
+    if not (bin_path.exists() and os.access(str(bin_path), os.X_OK)):
+        return False
+    return not _bundled_patches_pending(buun_root)
+
+
+# Bundled patches in llamacpp_stack/bundle/patches/*.patch are applied to the buun
+# source tree after clone/update. The stamp written after a successful build records
+# the sha256 of the patch set; a missing or stale stamp makes _is_buun_reusable()
+# return False so upgrades rebuild instead of silently reusing an unpatched binary.
+_PATCH_STAMP_NAME = ".bundled-patches.stamp"
+
+
+def _bundled_patches_dir() -> Path:
+    return Path(__file__).resolve().parent / "bundle" / "patches"
+
+
+def _bundled_patch_files() -> list[Path]:
+    d = _bundled_patches_dir()
+    if not d.is_dir():
+        return []
+    return sorted(p for p in d.glob("*.patch") if p.is_file())
+
+
+def _bundled_patch_fingerprint() -> str:
+    h = hashlib.sha256()
+    for p in _bundled_patch_files():
+        h.update(p.name.encode("utf-8"))
+        h.update(b"\0")
+        try:
+            h.update(p.read_bytes())
+        except OSError:
+            h.update(b"<unreadable>")
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _patch_stamp_path(buun_root: Path) -> Path:
+    return buun_root / _PATCH_STAMP_NAME
+
+
+def _bundled_patches_pending(buun_root: Path) -> bool:
+    patches = _bundled_patch_files()
+    if not patches:
+        return False
+    try:
+        current = _patch_stamp_path(buun_root).read_text(encoding="utf-8").strip()
+    except OSError:
+        return True
+    return current != _bundled_patch_fingerprint()
+
+
+def _apply_bundled_patches(src_dir: Path, dry_run: bool = False) -> list[str]:
+    """Apply every bundled patch to src_dir, skipping ones already present.
+
+    Raises RuntimeError on failure so a broken patch fails the install loudly
+    instead of shipping an unpatched binary.
+    """
+    applied: list[str] = []
+    for patch in _bundled_patch_files():
+        name = patch.name
+        if dry_run:
+            print(f"[dry-run] would apply bundled patch {name} -> {src_dir}")
+            applied.append(name)
+            continue
+        if not src_dir.is_dir():
+            raise RuntimeError(f"cannot apply {name}: buun source tree missing at {src_dir}")
+        reverse = subprocess.run(
+            ["git", "-C", str(src_dir), "apply", "--reverse", "--check", str(patch)],
+            capture_output=True,
+            text=True,
+        )
+        if reverse.returncode == 0:
+            print(f"[*] bundled patch already applied: {name}")
+            applied.append(name)
+            continue
+        probe = subprocess.run(
+            ["git", "-C", str(src_dir), "apply", "--check", str(patch)],
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode != 0:
+            raise RuntimeError(
+                f"bundled patch {name} does not apply to {src_dir}: "
+                f"{(probe.stderr or probe.stdout or '').strip()}"
+            )
+        result = subprocess.run(
+            ["git", "-C", str(src_dir), "apply", "--whitespace=nowarn", str(patch)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"failed to apply bundled patch {name} to {src_dir}: "
+                f"{(result.stderr or result.stdout or '').strip()}"
+            )
+        print(f"[*] applied bundled patch: {name}")
+        applied.append(name)
+    return applied
+
+
+def _write_patch_stamp(buun_root: Path) -> None:
+    if not _bundled_patch_files():
+        return
+    try:
+        buun_root.mkdir(parents=True, exist_ok=True)
+        _patch_stamp_path(buun_root).write_text(_bundled_patch_fingerprint() + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"[!] could not write patch stamp {buun_root / _PATCH_STAMP_NAME}: {exc}")
 
 
 def build_buun(
@@ -169,6 +277,7 @@ def build_buun(
             return bin_path
         print(f"[dry-run] would install buun via build_buun(install_root={install_root}, python_exec={python_exec or sys.executable}) with HEIMDALL_GATEWAY_PYTHONPATH={os.environ.get('HEIMDALL_GATEWAY_PYTHONPATH','')}")
         print(f"[dry-run] would clone {repo}@{ref} -> {src_dir}")
+        _apply_bundled_patches(src_dir, dry_run=True)
         print(f"[dry-run] would cmake -B {build_dir} -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native && cmake --build {build_dir} -j && cmake --install {build_dir} --prefix {buun_root}")
         print(f"[dry-run] would install binary at {bin_path} with rpath lib")
         return bin_path
@@ -234,6 +343,8 @@ def build_buun(
             subprocess.run(["git", "-C", str(src_dir), "checkout", ref], check=False, timeout=10)
         except Exception:
             pass
+
+    _apply_bundled_patches(src_dir)
 
     # Lazy imports to avoid circular deps (only constants at top level)
     try:
@@ -490,5 +601,6 @@ def build_buun(
                 print(f"[*] Installed {bin_path} with rpath {buun_lib_dir} (--help rc={r.returncode})")
         except Exception:
             print(f"[*] Installed {bin_path} with rpath {buun_lib_dir}")
+        _write_patch_stamp(buun_root)
         return bin_path
     raise FileNotFoundError(f"Built binary not found at {src_bin}")

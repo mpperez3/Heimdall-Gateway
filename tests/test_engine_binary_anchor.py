@@ -1,7 +1,9 @@
+import builtins
 import contextlib
 import io
 import shlex
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -216,3 +218,62 @@ def test_engine_binary_base_shims_delegate_to_shared_helper(tmp_path):
         assert shim(engine_specific) == root
         assert shim(top_level) == root
         assert shim(engine_specific) == _engine_binary_anchor(engine_specific)
+
+
+@pytest.fixture
+def no_server_commands(monkeypatch):
+    """Simulate a runtime copy whose cli/server_commands.py cannot be imported."""
+    real_import = builtins.__import__
+
+    def guarded(name, *args, **kwargs):
+        if name == "llamacpp_stack.cli.server_commands":
+            raise ImportError("stale runtime copy: no _engine_binary_anchor")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+def test_site_anchors_engine_binary_when_server_commands_unavailable(
+    shape, tmp_path, no_server_commands
+):
+    """Regression: the shim's ImportError fallback nested the engine dir one level too deep.
+
+    This is the live deployed-host shape: `llm-server install` copies the package to
+    `install_root/python/llamacpp_stack`, so the rendering process can run against a copy
+    that predates `_engine_binary_anchor`. The fallback returned bare `server_path.parent`,
+    producing `<root>/beellama/bin/buun/bin/llama-server-buun` in config.yaml even though
+    `cli/server_commands.py` itself was already fixed.
+    """
+    root = tmp_path / "llm-server"
+    _install_tree(root)
+    cmd, out = _run_site(
+        replica_mod, "render", "llamacpp_stack.cli.detect_cuda_device_count",
+        tmp_path, _server_path_for(root, shape),
+    )
+    exe = _executable_token(cmd)
+    assert exe == str(root / "buun" / "bin" / "llama-server-buun")
+    assert "beellama/bin/buun" not in exe
+    assert "[buun]" in out
+    assert str(root / "buun" / "bin" / "llama-server-buun") in out
+    assert "beellama/bin/buun" not in out
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+def test_engine_binary_base_fallback_matches_anchor(shape, tmp_path, no_server_commands):
+    root = tmp_path / "llm-server"
+    server_path = _server_path_for(root, shape)
+    for shim in (_cli_impl._engine_binary_base, replica_mod._engine_binary_base):
+        assert shim(server_path) == root
+        assert shim(server_path) == _engine_binary_anchor(server_path)
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+def test_buun_availability_probe_converges_on_anchor(shape, tmp_path, monkeypatch):
+    """The probe must resolve buun for both server_path shapes, not just the top-level one."""
+    root = tmp_path / "llm-server"
+    _install_tree(root)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path / "no-such-home"))
+    monkeypatch.setattr(_cli_impl, "PRODUCT_SLUG", "llm-server-absent")
+    args = SimpleNamespace(llama_server=str(_server_path_for(root, shape)))
+    assert _cli_impl._is_buun_available(args) is True
