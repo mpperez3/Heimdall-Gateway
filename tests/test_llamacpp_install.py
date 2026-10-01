@@ -6755,6 +6755,31 @@ models:
         self.assertGreater(sharded_estimate, 15000.0)
         self.assertAlmostEqual(single_estimate, sharded_estimate, delta=64.0)
 
+    def test_touch_model_via_llamaswap_normalizes_wildcard_bind_host(self) -> None:
+        from llamacpp_stack.cli import _touch_model_via_llamaswap
+
+        seen: list[str] = []
+
+        class _Resp:
+            status_code = 200
+
+        def _fake_get(url, timeout=None):
+            seen.append(url)
+            return _Resp()
+
+        with mock.patch("llamacpp_stack._cli_impl.requests.get", _fake_get):
+            self.assertTrue(_touch_model_via_llamaswap("m1", "0.0.0.0", 11436))
+            self.assertTrue(_touch_model_via_llamaswap("m2", "::", 11436))
+            self.assertTrue(_touch_model_via_llamaswap("m3", "127.0.0.1", 11436))
+        self.assertEqual(
+            seen,
+            [
+                "http://127.0.0.1:11436/upstream/m1/health",
+                "http://127.0.0.1:11436/upstream/m2/health",
+                "http://127.0.0.1:11436/upstream/m3/health",
+            ],
+        )
+
     def test_get_gpu_conflict_message_allows_second_model_when_vram_fits(self) -> None:
         model_a = ManagedModel(
             model_id="model-a",

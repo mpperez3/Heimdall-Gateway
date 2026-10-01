@@ -13567,7 +13567,7 @@ def run_llamaswap_guard(args) -> int:
 
 
 def _touch_model_via_llamaswap(model_id: str, host: str, port: int, *, timeout: float = 30.0) -> bool:
-    upstream_health = f"http://{host}:{port}/upstream/{quote(model_id, safe='')}/health"
+    upstream_health = f"http://{_normalize_client_host(host)}:{port}/upstream/{quote(model_id, safe='')}/health"
     try:
         response = requests.get(upstream_health, timeout=(3, timeout))
         log_api_event(
