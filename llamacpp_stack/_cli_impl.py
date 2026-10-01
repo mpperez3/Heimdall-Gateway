@@ -10381,6 +10381,8 @@ def build_openai_model_list_payload(model: ManagedModel) -> dict:
         "max_completion_tokens": api_context_length,
         "metadata": {
             "vision": _has_vision_runtime(model),
+            "mmproj_mode": get_model_mmproj_mode(model),
+            "vision_route": vision_model_id(model.model_id) if model_lazily_loads_mmproj(model) else None,
             "load_capabilities": load_capabilities,
             "context_length": context_length,
             "context_window": context_length,
@@ -10416,6 +10418,8 @@ def build_openai_model_payload(model: ManagedModel) -> dict:
             "gguf_context_length": gguf_ctx,
             "load_capabilities": load_capabilities,
             "vision": _has_vision_runtime(model),
+            "mmproj_mode": get_model_mmproj_mode(model),
+            "vision_route": vision_model_id(model.model_id) if model_lazily_loads_mmproj(model) else None,
             "speculative": bool(getattr(model, "speculative", False)),
             "spec_variant_of": getattr(model, "spec_variant_of", None),
             **probe_metrics,

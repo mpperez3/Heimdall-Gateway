@@ -499,14 +499,15 @@ llama-swap routes:
 The base also stops reserving projector headroom in its tensor split. When a
 request carrying an image (`image_url`, `input_image`, or Ollama `images`)
 arrives, the gateway points it at the vision route before replica selection, so
-a text-only replica never receives an image. The vision route is published on
-demand, reused while the conversation stays warm, and evicted by llama-swap
-after its idle TTL, so text-only traffic never pays for the projector.
+a text-only replica never receives an image. The vision route is declared
+alongside the base but only loaded when an image arrives, reused while the
+conversation stays warm, and evicted by llama-swap after its idle TTL, so
+text-only traffic never pays for the projector.
 
-If the vision route cannot be published and the base is already loaded, the
-loaded process is reloaded in place with the projector pinned on. If neither
-path works, the request returns `503` with a retry message rather than reaching
-a backend that would silently drop the image.
+If the vision route is missing or cannot be loaded and the base is already
+loaded, the loaded process is reloaded in place with the projector pinned
+on. If neither path works, the request returns `503` with a retry message
+rather than reaching a backend that would silently drop the image.
 
 Opt in per model:
 

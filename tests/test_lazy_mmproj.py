@@ -808,6 +808,26 @@ class SurfaceTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertTrue(hasattr(_cli_impl, name))
 
+    def test_every_model_payload_reports_the_lazy_mmproj_state(self):
+        # Both OpenAI builders serve GET /v1/models, so both must carry the keys.
+        lazy = _make_model("exl3-qwen", server_overrides={"mmproj_mode": "lazy"})
+        always = _make_model("plain-qwen")
+        builders = (
+            "build_openai_model_payload",
+            "build_openai_model_list_payload",
+            "build_ollama_model_payload",
+        )
+        for builder in builders:
+            for label, model, expected_mode, expected_route in (
+                ("lazy", lazy, "lazy", "exl3-qwen__vision"),
+                ("always", always, "always", None),
+            ):
+                with self.subTest(builder=builder, model=label):
+                    payload = getattr(_cli_impl, builder)(model)
+                    details = payload.get("metadata") or payload.get("details") or {}
+                    self.assertEqual(details.get("mmproj_mode"), expected_mode)
+                    self.assertEqual(details.get("vision_route"), expected_route)
+
     def test_config_migrate_adds_the_mmproj_block_idempotently(self):
         first, changed_first = _cli_impl.normalize_server_config_payload({})
         self.assertIn("mmproj", first)
