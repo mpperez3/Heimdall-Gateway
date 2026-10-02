@@ -12,6 +12,9 @@ dependencies = [
     "optuna>=4.0.0",
 ]
 
+[project.optional-dependencies]
+test = ["hypothesis>=6.0", "pytest>=8.0"]
+
 [project.scripts]
 llm-server = "llamacpp_stack.llamacpp_api_install:main"
 heimdall-gateway = "llamacpp_stack.llamacpp_api_install:main"
