@@ -441,7 +441,12 @@ def iter_catalog_with_replicas(catalog: list[ManagedModel], global_replica_confi
         if not cfg.enabled:
             continue
         assigned = cached_model_gpu_sets(catalog).get(model.model_id)
-        for idx, gpu_set in enumerate(_replica_gpu_sets(model, cfg, base_gpu_set=assigned)):
+        for idx, gpu_set in enumerate(
+            _replica_gpu_sets(
+                model, cfg, base_gpu_set=assigned,
+                reserved_gpu_set=reserved_base_gpus(catalog, model.model_id),
+            )
+        ):
             result.append((build_replica_model(model, idx, gpu_set), model.model_id, gpu_set))
     return result
 
@@ -459,7 +464,10 @@ def summarize_configured_replicas(catalog: list[ManagedModel], global_replica_co
         if not cfg.enabled:
             continue
         assigned = cached_model_gpu_sets(catalog, total_gpus).get(model.model_id)
-        gpu_sets = _replica_gpu_sets(model, cfg, total_gpus=total_gpus, base_gpu_set=assigned)
+        gpu_sets = _replica_gpu_sets(
+            model, cfg, total_gpus=total_gpus, base_gpu_set=assigned,
+            reserved_gpu_set=reserved_base_gpus(catalog, model.model_id, total_gpus),
+        )
         if gpu_sets:
             lines.append(
                 f"{model.model_id}: {len(gpu_sets)} replica(s), gpus_per_replica={cfg.gpus_per_replica}, gpu_sets={gpu_sets}"
