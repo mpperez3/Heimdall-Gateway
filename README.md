@@ -372,10 +372,22 @@ choice for large models:
     "enabled": true,
     "max": "auto",
     "placement": "exclusive_gpus",
-    "safety_vram_mib": 2048
+    "safety_vram_mib": 2048,
+    "prefer_base_over_replica": false,
+    "idle_grace_s": 600,
+    "max_idle_s": 1800
   }
 }
 ```
+
+| key | default | effect |
+| --- | --- | --- |
+| `prefer_base_over_replica` | `false` | Serve a fresh, unaffinitised request from the base even when a replica is more idle, so replicas are only used for real concurrency. |
+| `idle_grace_s` | `600` | A replica may only be created once the base has been idle this long, so a burst of traffic does not leave a replica behind. A base that has never run is exempt. |
+| `max_idle_s` | `1800` | A replica with zero in-flight requests retires itself after this, freeing its GPU. |
+
+Absent keys are filled in on the next `llm-server config-migrate`, and existing
+values are never overwritten.
 
 The router keeps conversation/session/agent affinity so a continuing
 conversation stays on the same replica. It uses cached GPU telemetry and
@@ -469,6 +481,57 @@ for the same cold model are held/retried instead of launching competing loads.
 A model process can use several GPUs; `nvidia-smi` therefore shows one PID on
 each selected GPU for that process. Replica processes, when created, have
 different PIDs and internal IDs.
+
+### Which GPU each model gets
+
+`build_llama_server_command` derives `CUDA_VISIBLE_DEVICES` from `tensor_split`,
+and a single-GPU `tensor_split` of `"1"` maps to GPU 0 — so every large model
+used to land on the same card and two of them could never stay loaded together.
+Placement is therefore decided once per render, largest model first, round
+robin:
+
+```console
+$ python3 -c "
+import yaml, re
+d = yaml.safe_load(open('$HOME/.local/state/llm-server/config.yaml'))
+for mid, e in sorted(d['models'].items()):
+    m = re.search(r'CUDA_VISIBLE_DEVICES=([0-9,]*)', str(e.get('cmd', '')))
+    print(f\"{mid:44s} {m.group(1) if m else '-'}\")"
+```
+
+Only single-GPU large models are assigned. Multi-GPU, small and embedding
+models keep the prefix their own `tensor_split` produced, and a replica is only
+ever placed on a GPU that no assigned base owns. The result also drives the
+llama-swap matrix, so two models that now sit on different cards are declared
+co-loadable and stop evicting each other.
+
+Placement is baked into `config.yaml`, so changing it takes an
+`llm-server update` plus a service restart — it cannot be changed at runtime,
+because rewriting `config.yaml` makes llama-swap tear down every loaded model
+and lose all KV caches.
+
+### When a load is refused
+
+A load is only admitted if it will not destroy work in progress. Both checks
+return `503` and name the model responsible:
+
+| situation | response |
+| --- | --- |
+| The load would evict an instance with requests in flight | `503` naming the streaming model and its in-flight count |
+| Another model is already loading on a conflicting GPU set | `503 model_loading` — the first load wins and is not interrupted |
+
+A refused load still registers GPU demand for 120 s, so an idle replica squatting
+the card that model needs is retired within one reaper tick instead of waiting
+out `max_idle_s`. Retirement goes through llama-swap's
+`POST /api/models/unload/<model>`, which frees the VRAM without rewriting
+`config.yaml`; `llm-server unload` does rewrite it and therefore costs every
+loaded model its cache.
+
+Relevant request-log events: `model_load_allowed_matrix_evict` (admitted, with
+the `will_evict` list plus `busy_victims`/`idle_victims`),
+`model_load_blocked_busy_victim`, `model_load_blocked_by_concurrent_load`,
+`replica_scale_out_deferred`, and `replica_placement_reject` with its `reason`
+of `vram`, `pack_fraction` or `max_models_per_gpu`.
 
 Useful operator commands:
 
@@ -749,6 +812,24 @@ Inspect the effective model command with `ps`/`logs` and compare its
 placement change in the model override, regenerate the config, and restart
 the services. A single llama-server PID appearing on multiple GPUs is normal
 when tensor parallelism is configured.
+
+### Two models keep evicting each other in a loop
+
+Symptom: the request log shows a model being unloaded seconds after it started
+serving (`model_lifecycle_unload` with `reason: eviction_or_oom` and an
+`activity_age_seconds` in single digits), alternating between two models. Check
+which card each is pinned to:
+
+```console
+$ nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+$ grep -o 'CUDA_VISIBLE_DEVICES=[0-9,]*' ~/.local/state/llm-server/config.yaml | sort | uniq -c
+```
+
+Two models of similar size that both need nearly the whole card cannot coexist,
+so exactly one must always lose. See [Which GPU each model gets](#which-gpu-each-model-gets)
+for the automatic split, and note that once they sit on different cards the
+matrix declares them co-loadable and the loop stops. If a load is being refused
+instead, the message names the model holding the card.
 
 ### Context shown by a client is too small
 
