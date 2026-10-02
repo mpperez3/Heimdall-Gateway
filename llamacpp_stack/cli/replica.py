@@ -286,6 +286,7 @@ def _replica_gpu_sets(
     total_gpus: int | None = None,
     *,
     base_gpu_set: list[int] | None = None,
+    reserved_gpu_set: set[int] | None = None,
 ) -> list[list[int]]:
     if not cfg.enabled or cfg.max <= 0:
         return []
@@ -304,6 +305,10 @@ def _replica_gpu_sets(
             if base_gpu_set
             else set(range(base_gpu_count))
         )
+        # They must also avoid the cards other models' bases were assigned, or a
+        # replica lands on a neighbour's only card and the two evict each other
+        # forever: the replica is cheaper, so it wins, then the base takes it back.
+        owned |= {int(g) for g in (reserved_gpu_set or set())}
         available = [g for g in range(total) if g not in owned]
         for start in range(0, len(available), gpr):
             gpu_set = available[start:start + gpr]
@@ -414,6 +419,17 @@ def cached_model_gpu_sets(
     _MODEL_GPU_ASSIGNMENT_MEMO["key"] = key
     _MODEL_GPU_ASSIGNMENT_MEMO["value"] = value
     return dict(value)
+
+
+def reserved_base_gpus(catalog: list[ManagedModel], model_id: str, total_gpus: int | None = None) -> set[int]:
+    """GPUs assigned to some *other* model's base; off-limits for this model's replicas."""
+    assignment = cached_model_gpu_sets(catalog, total_gpus)
+    return {
+        int(gpu)
+        for other_id, gpus in assignment.items()
+        if other_id != model_id
+        for gpu in gpus
+    }
 
 
 def iter_catalog_with_replicas(catalog: list[ManagedModel], global_replica_config: dict[str, object] | None = None) -> list[tuple[ManagedModel, str | None, list[int] | None]]:

@@ -1147,6 +1147,69 @@ class CrossModelPlacementTest(unittest.TestCase):
         self.assertEqual(R.cached_model_gpu_sets(catalog, 2)["heavy-a"], [0])
 
 
+class ReplicaStaysOffReservedGpusTest(unittest.TestCase):
+    """A replica must not take the only card another model's base was assigned.
+
+    Replicas are cheaper to evict (0.5x), so one landing on a neighbour's card
+    wins the eviction, then the neighbour's request takes the card back: the two
+    trade the GPU on every turn.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.cfg = ReplicaConfig(enabled=True, max=2, gpus_per_replica=1, placement="exclusive_gpus")
+        self.catalog = [
+            replace(_make_model("heavy-a", tensor_split="1"), local_path=self._sparse("a.safetensors", 16304)),
+            replace(_make_model("heavy-b", tensor_split="1"), local_path=self._sparse("b.safetensors", 14650)),
+        ]
+        self.assignment = R.assign_model_gpu_sets(self.catalog, 2)
+
+    def _sparse(self, name: str, mib: int) -> str:
+        path = self.root / name
+        with open(path, "wb") as handle:
+            handle.truncate(mib * 1024 * 1024)
+        return str(path)
+
+    def _model(self, model_id: str):
+        return next(m for m in self.catalog if m.model_id == model_id)
+
+    def _sets(self, model_id: str) -> list[list[int]]:
+        return R._replica_gpu_sets(
+            self._model(model_id), self.cfg, 2,
+            base_gpu_set=self.assignment.get(model_id),
+            reserved_gpu_set=R.reserved_base_gpus(self.catalog, model_id, 2),
+        )
+
+    def test_no_replica_is_offered_when_every_card_is_a_base(self):
+        self.assertEqual(self._sets("heavy-a"), [])
+        self.assertEqual(self._sets("heavy-b"), [])
+
+    def test_reserved_base_gpus_exclude_only_the_other_models(self):
+        self.assertEqual(R.reserved_base_gpus(self.catalog, "heavy-a", 2), {1})
+        self.assertEqual(R.reserved_base_gpus(self.catalog, "heavy-b", 2), {0})
+
+    def test_a_third_gpu_would_still_host_a_replica(self):
+        self.assertEqual(
+            R._replica_gpu_sets(
+                self._model("heavy-a"), self.cfg, 3,
+                base_gpu_set=self.assignment["heavy-a"],
+                reserved_gpu_set=R.reserved_base_gpus(self.catalog, "heavy-a", 3),
+            ),
+            [[2]],
+        )
+
+    def test_reserved_gpus_never_shrink_the_pool_below_the_base_own_set(self):
+        sets = R._replica_gpu_sets(
+            self._model("heavy-a"), self.cfg, 4,
+            base_gpu_set=[0, 1],
+            reserved_gpu_set=R.reserved_base_gpus(self.catalog, "heavy-a", 4),
+        )
+        for gpu_set in sets:
+            self.assertFalse({0, 1} & set(gpu_set))
+
+
 class GpuDemandTest(unittest.TestCase, _RouterStateMixin):
     """A refused load must be able to reclaim the card an idle replica holds."""
 

@@ -6607,7 +6607,9 @@ def select_replica_for_request(
     mapped_response_replica = REPLICA_ROUTER_STATE.response_replica(previous_response_id) if previous_response_id else None
     affinity_key = resolve_request_affinity_key(base_model.model_id, payload, headers)
     gpu_sets = _replica_gpu_sets(
-        base_model, cfg, base_gpu_set=cached_model_gpu_sets(catalog or []).get(base_model.model_id)
+        base_model, cfg,
+        base_gpu_set=cached_model_gpu_sets(catalog or []).get(base_model.model_id),
+        reserved_gpu_set=reserved_base_gpus(catalog or [], base_model.model_id),
     )
     if not gpu_sets:
         log_api_event("replica_no_gpu_sets", {"model": base_model.model_id, "replicas_max": cfg.max, "gpus_per_replica": cfg.gpus_per_replica})
@@ -10374,7 +10376,10 @@ def _resolve_replica_gpu_set(
         index = int(match.group(1)) if match else 0
         cfg = get_model_replica_config(base_model, resolve_global_replica_config())
         assigned = cached_model_gpu_sets(catalog or []).get(base_model.model_id)
-        sets = _replica_gpu_sets(base_model, cfg, base_gpu_set=assigned)
+        sets = _replica_gpu_sets(
+            base_model, cfg, base_gpu_set=assigned,
+            reserved_gpu_set=reserved_base_gpus(catalog or [], base_model.model_id),
+        )
         if 0 <= index < len(sets) and sets[index]:
             return list(sets[index])
     except Exception:
@@ -10418,6 +10423,7 @@ def _ensure_direct_replica_route_for_request(replica_id: str, catalog: list[Mana
                 sets = _replica_gpu_sets(
                     base_model, cfg,
                     base_gpu_set=cached_model_gpu_sets(catalog or []).get(base_model.model_id),
+                    reserved_gpu_set=reserved_base_gpus(catalog or [], base_model.model_id),
                 )
                 if 0 <= replica_index < len(sets):
                     gpu_set = list(sets[replica_index])
@@ -15029,7 +15035,10 @@ def sync_replica_runtime_state(
                 continue
             assigned = cached_model_gpu_sets(catalog, total_gpus).get(model.model_id)
             for idx, gpu_set in enumerate(
-                _replica_gpu_sets(model, cfg, total_gpus=total_gpus, base_gpu_set=assigned)
+                _replica_gpu_sets(
+                    model, cfg, total_gpus=total_gpus, base_gpu_set=assigned,
+                    reserved_gpu_set=reserved_base_gpus(catalog, model.model_id, total_gpus),
+                )
             ):
                 rid = replica_model_id(model.model_id, idx)
                 rec = REPLICA_ROUTER_STATE.records.setdefault(
@@ -15084,7 +15093,10 @@ def replica_router_snapshot(catalog: list[ManagedModel], config_path: Path | str
             skipped.append({"model": model.model_id, "reason": "replicas_disabled", "tensor_split": model.tensor_split})
             continue
         assigned = cached_model_gpu_sets(catalog, total_gpus).get(model.model_id)
-        gpu_sets = _replica_gpu_sets(model, cfg, total_gpus=total_gpus, base_gpu_set=assigned)
+        gpu_sets = _replica_gpu_sets(
+            model, cfg, total_gpus=total_gpus, base_gpu_set=assigned,
+            reserved_gpu_set=reserved_base_gpus(catalog, model.model_id, total_gpus),
+        )
         if not gpu_sets:
             skipped.append({
                 "model": model.model_id,
@@ -23042,6 +23054,7 @@ try:
         route_carries_mmproj as _sc_route_carries_mmproj,
         set_instance_mmproj_in_llamaswap_config as _sc_set_instance_mmproj,
         cached_model_gpu_sets as _sc_cached_model_gpu_sets,
+        reserved_base_gpus as _sc_reserved_base_gpus,
         _replica_gpu_sets as _sc_replica_gpu_sets,
         _infer_base_gpu_count as _sc_infer_base_gpu_count,
         iter_catalog_base_models as _sc_iter_base_models,
@@ -23053,6 +23066,7 @@ try:
     ensure_replica_route_in_llamaswap_config = _sc_ensure  # type: ignore
     ensure_replica_route = _sc_ensure  # type: ignore
     cached_model_gpu_sets = _sc_cached_model_gpu_sets  # type: ignore
+    reserved_base_gpus = _sc_reserved_base_gpus  # type: ignore
     _replica_gpu_sets = _sc_replica_gpu_sets  # type: ignore
     _infer_base_gpu_count = _sc_infer_base_gpu_count  # type: ignore
     iter_catalog_base_models = _sc_iter_base_models  # type: ignore
