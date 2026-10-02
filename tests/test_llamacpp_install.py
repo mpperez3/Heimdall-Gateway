@@ -207,6 +207,26 @@ def _write_minimal_gguf(path: Path, entries: list[tuple[str, int, object]]) -> N
                 raise AssertionError(f"unsupported test GGUF value type {value_type}")
 
 
+def _route_gpu_set(config_path: Path, model_id: str) -> list[int]:
+    """GPUs a rendered route was actually pinned to, read from its own command.
+
+    Read back from the file instead of re-deriving the assignment: the point of
+    these tests is what llama-swap ends up holding, not how the split was chosen.
+    """
+    rendered = yaml.safe_load(
+        "\n".join(
+            line
+            for line in config_path.read_text(encoding="utf-8").splitlines()
+            if not line.startswith("#")
+        )
+    )
+    cmd = str(rendered["models"][model_id]["cmd"])
+    for token in cmd.split():
+        if token.startswith("CUDA_VISIBLE_DEVICES="):
+            return [int(part) for part in token.split("=", 1)[1].split(",") if part]
+    return []
+
+
 class InstallHelpersTest(unittest.TestCase):
 
     def setUp(self) -> None:
@@ -5320,8 +5340,15 @@ class InstallHelpersTest(unittest.TestCase):
                 mock.patch("llamacpp_stack.cli.replica._get_model_size_mib", return_value=16000.0),
             ):
                 render_llamaswap_config(models, config_path, root / "llama-server", 18080, idle_ttl=10)
-                ensure_replica_route_in_llamaswap_config(big_b, 0, [1], models, config_path, root / "llama-server", 10)
-                ensure_replica_route_in_llamaswap_config(big_a, 0, [1], models, config_path, root / "llama-server", 10)
+                # Cross-model placement now splits these two big models across both
+                # GPUs, so a replica only shares a matrix set with its base when the
+                # caller gives it the GPU the base does not own.
+                for base in (big_a, big_b):
+                    base_gpus = _route_gpu_set(config_path, base.model_id)
+                    replica_gpus = [gpu for gpu in range(2) if gpu not in base_gpus]
+                    ensure_replica_route_in_llamaswap_config(
+                        base, 0, replica_gpus, models, config_path, root / "llama-server", 10
+                    )
 
             rendered = yaml.safe_load(
                 "\n".join(line for line in config_path.read_text(encoding="utf-8").splitlines() if not line.startswith("#"))
@@ -5344,8 +5371,10 @@ class InstallHelpersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config_path = root / "config.yaml"
+            # Four big models over two GPUs, so cross-model placement still leaves two
+            # models sharing a card and the "another model needs this GPU" case alive.
             models = []
-            for name in ("big-a", "big-b"):
+            for name in ("big-a", "big-b", "big-c", "big-d"):
                 model_path = root / f"{name}.gguf"
                 model_path.write_bytes(b"x" * 1024)
                 models.append(
@@ -5358,13 +5387,18 @@ class InstallHelpersTest(unittest.TestCase):
                         tensor_split="1",
                     )
                 )
-            big_a, big_b = models
+            big_a = next(model for model in models if model.model_id == "big-a")
             with (
                 mock.patch("llamacpp_stack.cli.detect_cuda_device_count", return_value=2),
                 mock.patch("llamacpp_stack.cli.replica._get_model_size_mib", return_value=16000.0),
             ):
                 render_llamaswap_config(models, config_path, root / "llama-server", 18080, idle_ttl=10)
-                ensure_replica_route_in_llamaswap_config(big_a, 0, [1], models, config_path, root / "llama-server", 10)
+                # big-c is the peer cross-model placement puts on big-a's card.
+                self.assertEqual(_route_gpu_set(config_path, "big-a"), _route_gpu_set(config_path, "big-c"))
+                replica_gpus = [gpu for gpu in range(2) if gpu not in _route_gpu_set(config_path, "big-a")]
+                ensure_replica_route_in_llamaswap_config(
+                    big_a, 0, replica_gpus, models, config_path, root / "llama-server", 10
+                )
 
             rendered = yaml.safe_load(
                 "\n".join(line for line in config_path.read_text(encoding="utf-8").splitlines() if not line.startswith("#"))
@@ -5378,13 +5412,13 @@ class InstallHelpersTest(unittest.TestCase):
                 m for m in members if {"big-a", "big-a__replica_0"} <= m
             ]
             self.assertTrue(base_together, "the base and its replica must still be co-loadable")
-            swap_in = [m for m in members if "big-b" in m and "big-a__replica_0" in m]
+            swap_in = [m for m in members if "big-c" in m and "big-a__replica_0" in m]
             self.assertTrue(
                 swap_in,
-                "big-b shares GPU0 with big-a, so it must be declared to run while only big-a's replica is loaded",
+                "big-c shares big-a's GPU, so it must be declared to run while only big-a's replica is loaded",
             )
             for group in swap_in:
-                self.assertNotIn("big-a", group, "big-a and big-b share GPU0 and cannot run together")
+                self.assertNotIn("big-a", group, "big-a and big-c share a GPU and cannot run together")
             costs = matrix["evict_costs"]
             replica_var = next(var for var, name in vars_map.items() if name == "big-a__replica_0")
             base_var = next(var for var, name in vars_map.items() if name == "big-a")

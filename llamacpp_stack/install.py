@@ -185,6 +185,9 @@ def _default_global_replicas_config() -> dict[str, object]:
         "max": "auto",
         "placement": "exclusive_gpus",
         "safety_vram_mib": 2048,
+        "prefer_base_over_replica": False,
+        "idle_grace_s": 600,
+        "max_idle_s": 1800,
     }
 
 

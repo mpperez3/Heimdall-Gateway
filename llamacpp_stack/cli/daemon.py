@@ -463,6 +463,186 @@ def start_catalog_auto_update_watch(args, *, poll_s: float = 2.0, debounce_s: fl
     return thread
 
 
+# ---------------------------------------------------------------------------
+# Replica reaper
+# ---------------------------------------------------------------------------
+
+#: ``TargetState`` is a ``str`` enum, so the READY verdict is matched as a plain
+#: string rather than importing the policy vocabulary from the legacy impl module.
+_TARGET_READY = "ready"
+
+
+def _get_replica_router_state():
+    """Lazy handle on the global replica router state.
+
+    Imported lazily because ``_cli_impl`` imports this module's symbols at the
+    bottom of its own import; a top-level import here would be circular. Same
+    pattern as ``cli/crash_bundle.py`` and ``cli/raw_log.py``.
+    """
+    try:
+        from llamacpp_stack._cli_impl import REPLICA_ROUTER_STATE
+
+        return REPLICA_ROUTER_STATE
+    except Exception:
+        return None
+
+
+def unload_replica_via_llamaswap(replica_id: str, host: str, port: int, *, timeout: float = 15.0) -> bool:
+    """Retire one llama-swap route through its unload API.
+
+    This is the only retirement mechanism that is safe here. llama-swap runs
+    ``--watch-config``, so ANY ``config.yaml`` write tears down every loaded
+    model and destroys every KV cache -- a reaper that rewrote the config would
+    manufacture the very ping-pong it exists to stop. The unload endpoint frees
+    the VRAM and leaves the rendered config, and every other resident model,
+    untouched.
+    """
+    from urllib.parse import quote
+
+    url = f"http://{host}:{port}/api/models/unload/{quote(str(replica_id or ''), safe='')}"
+    if requests is None:
+        log_api_event("replica_unload_failed", {"replica": replica_id, "url": url, "error": "requests is not installed"})
+        return False
+    try:
+        response = requests.post(url, timeout=(3, timeout))
+        status = int(getattr(response, "status_code", 0) or 0)
+    except Exception as exc:
+        log_api_event("replica_unload_failed", {"replica": replica_id, "url": url, "error": str(exc)})
+        return False
+    if status >= 400:
+        log_api_event("replica_unload_failed", {"replica": replica_id, "url": url, "status": status})
+        return False
+    return True
+
+
+def _mid_load_conflicting_with(base_id: str, config_path, *, now: float | None = None):
+    """The base model currently loading that overlaps *base_id*'s GPU sets, if any."""
+    try:
+        from llamacpp_stack._cli_impl import blocking_conflicting_load
+
+        return blocking_conflicting_load(base_id, [], config_path, now=now)
+    except Exception as exc:
+        log_api_event("replica_reaper_conflict_check_failed", {"model": base_id, "error": str(exc)})
+        return None
+
+
+def _replica_retire_reason(state, base_id: str, replica_id: str, cfg, config_path, *, now: float):
+    """Return ``(reason, idle_s)`` to retire *replica_id*, or ``("", 0.0)`` to keep it."""
+    # Only ever unload something measured as loaded: announcing an absent route as
+    # retired would be noise, and health_of is the only check that knows whether a
+    # process is actually there.
+    health = state.health_of(replica_id)
+    if getattr(health, "state", None) != _TARGET_READY:
+        return "", 0.0
+    with state.lock:
+        rec = state.records.get(replica_id)
+        idle_s = max(0.0, now - float(getattr(rec, "last_used", 0.0) or 0.0)) if rec is not None else 0.0
+    max_idle_s = int(cfg.max_idle_s)
+    if max_idle_s > 0 and idle_s >= max_idle_s:
+        return "idle", idle_s
+    if _mid_load_conflicting_with(base_id, config_path, now=now) is not None:
+        return "gpu_needed", idle_s
+    return "", 0.0
+
+
+def _replica_reap_plan(args, *, now: float | None = None) -> list[tuple[str, str, float]]:
+    """Decide which loaded replicas this tick would retire.
+
+    Returns ``[(replica_id, reason, idle_s)]``. Reads router state and the
+    rendered matrix only -- never the catalog, the replica config or
+    ``config.yaml``.
+    """
+    state = _get_replica_router_state()
+    if state is None:
+        return []
+    now = time.monotonic() if now is None else now
+    config_path = getattr(args, "config", None)
+    replica_defaults = resolve_global_replica_config(args)
+    try:
+        from .replica import get_model_replica_config
+
+        catalog, _diag = load_catalog_with_diagnostics(
+            Path(getattr(args, "catalog", DEFAULT_CATALOG_PATH)),
+            _args_server_config_path(args),
+        )
+    except Exception as exc:
+        log_api_event("replica_reaper_unavailable", {"error": str(exc)})
+        return []
+    plans: list[tuple[str, str, float]] = []
+    for model in catalog or []:
+        base_id = str(getattr(model, "model_id", "") or "")
+        if not base_id:
+            continue
+        try:
+            cfg = get_model_replica_config(model, replica_defaults)
+        except Exception as exc:
+            log_api_event("replica_reaper_config_error", {"model": base_id, "error": str(exc)})
+            continue
+        # Unconfigured means the reaper costs nothing: no polling of records, no
+        # matrix read, no log lines.
+        if int(cfg.max_idle_s) <= 0:
+            continue
+        try:
+            with state.lock:
+                idle_replica_ids = sorted(
+                    replica_id
+                    for replica_id, rec in state.records.items()
+                    if rec.base_model_id == base_id and int(rec.in_flight or 0) == 0
+                )
+        except Exception as exc:
+            log_api_event("replica_reaper_state_error", {"model": base_id, "error": str(exc)})
+            continue
+        for replica_id in idle_replica_ids:
+            try:
+                reason, idle_s = _replica_retire_reason(state, base_id, replica_id, cfg, config_path, now=now)
+            except Exception as exc:
+                log_api_event("replica_reaper_probe_error", {"replica": replica_id, "error": str(exc)})
+                continue
+            if reason:
+                plans.append((replica_id, reason, idle_s))
+    return plans
+
+
+def run_replica_reaper_tick(args, *, now: float | None = None) -> list[str]:
+    """Retire the replicas selected by :func:`_replica_reap_plan`; returns their ids."""
+    host = str(getattr(args, "public_host", DEFAULT_PUBLIC_HOST) or DEFAULT_PUBLIC_HOST)
+    try:
+        port = int(getattr(args, "public_port", DEFAULT_PUBLIC_PORT) or DEFAULT_PUBLIC_PORT)
+    except (TypeError, ValueError):
+        port = int(DEFAULT_PUBLIC_PORT)
+    retired: list[str] = []
+    for replica_id, reason, idle_s in _replica_reap_plan(args, now=now):
+        if not unload_replica_via_llamaswap(replica_id, host, port):
+            continue
+        retired.append(replica_id)
+        log_api_event("replica_retired", {"replica": replica_id, "reason": reason, "idle_s": round(idle_s, 1)})
+    return retired
+
+
+def start_replica_reaper(args, *, poll_s: float = 30.0, stop_event: threading.Event | None = None):
+    """Retire loaded replicas that are holding VRAM nothing needs.
+
+    Retirement is an HTTP unload, never a config write: llama-swap watches the
+    config, so rewriting it would evict every loaded model and destroy every KV
+    cache -- the same churn this thread exists to prevent.
+    """
+
+    def loop():
+        while stop_event is None or not stop_event.is_set():
+            try:
+                run_replica_reaper_tick(args)
+            except Exception as exc:
+                log_api_event("replica_reaper_error", {"error": str(exc)})
+            if stop_event is not None:
+                stop_event.wait(max(0.01, poll_s))
+            else:
+                time.sleep(max(0.01, poll_s))
+
+    thread = threading.Thread(target=loop, daemon=True)
+    thread.start()
+    return thread
+
+
 def _prepare_manager_socket_path(socket_path: str) -> None:
     if not os.path.exists(socket_path):
         return
@@ -727,6 +907,7 @@ def daemon_mode(args):
         raise RuntimeError(f"Could not start LLM Server API on {args.public_host}:{api_p}")
     unload_guard_thread = guard_fn(args) if guard_fn is not None else None  # type: ignore
     auto_update_thread = start_catalog_auto_update_watch(args)
+    reaper_thread = start_replica_reaper(args)
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -855,6 +1036,8 @@ __all__ = [  # type: ignore
     "_file_signature",
     "sync_config_from_server_config_for_startup",
     "start_catalog_auto_update_watch",
+    "start_replica_reaper",
+    "unload_replica_via_llamaswap",
     "_prepare_manager_socket_path",
     "read_install_manifest",
     "get_heimdall_gateway_version",

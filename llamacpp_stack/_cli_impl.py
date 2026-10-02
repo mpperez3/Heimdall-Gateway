@@ -1021,6 +1021,9 @@ def _default_global_replicas_config() -> dict[str, object]:
         "max": "auto",
         "placement": "exclusive_gpus",
         "safety_vram_mib": 2048,
+        "prefer_base_over_replica": False,
+        "idle_grace_s": 600,
+        "max_idle_s": 1800,
     }
 
 
@@ -1803,6 +1806,11 @@ def normalize_server_config_payload(payload: dict[str, object]) -> tuple[dict[st
         if placement not in {"exclusive_gpus", "pack_small_models"}:
             placement = "exclusive_gpus"
         replicas["placement"] = placement
+        for key in ("idle_grace_s", "max_idle_s"):
+            try:
+                replicas[key] = max(0, int(replicas[key]))
+            except Exception:
+                replicas[key] = _default_global_replicas_config()[key]
         if replicas != raw_replicas:
             result["replicas"] = replicas
             changed = True
@@ -2265,6 +2273,21 @@ class ReplicaConfig:
     max_models_per_gpu: int = 2
     max_pack_fraction: float = 0.35
     sticky_ttl_s: int = 3600
+    #: Policy knob, not a tuning knob. Serve a request with no live affinity on
+    #: the base instead of spreading it to, or cold-starting, a second instance.
+    #: Off by default: while another model is mid-load the same redirect already
+    #: happens on its own, and that window is the only time it pays. Turning this
+    #: on makes the redirect permanent, which costs genuine request parallelism
+    #: whenever a base and a replica could both have served a conversation.
+    prefer_base_over_replica: bool = False
+    #: Policy knob. How long the base must have been idle before a replica may be
+    #: spread to or created. ``0`` disables the gate. Raising it keeps a warm base
+    #: warm; lowering it trades a cold load for parallelism sooner.
+    idle_grace_s: int = 600
+    #: Policy knob, reaper backstop. Retire a replica idle at least this long even
+    #: when nothing else wants its GPU, so VRAM is handed back without waiting for
+    #: llama-swap's own TTL. ``0`` disables the idle backstop entirely.
+    max_idle_s: int = 1800
 
 
 @dataclass
@@ -5545,6 +5568,13 @@ def _elapsed_ms(started_at: float) -> int:
 
 
 
+#: Lifetime of a loading claim, in seconds. ``claim_loading`` stores a *deadline*
+#: (``time.monotonic() + TTL``) rather than a timestamp, so every reader has to
+#: agree on this number: a second one turns a live claim into a free slot (two
+#: concurrent loads) or an expired one into a permanent block.
+LOADING_CLAIM_TTL_S = 900.0
+
+
 class ReplicaRouterState:
     def __init__(self):
         self.lock = threading.RLock()
@@ -5845,7 +5875,7 @@ class ReplicaRouterState:
             deadline = self.loading_claims.get(claim_key)
             if deadline is not None and deadline > now:
                 return False
-            self.loading_claims[claim_key] = now + 900.0
+            self.loading_claims[claim_key] = now + LOADING_CLAIM_TTL_S
             self.loading_claim_aliases[model_id] = claim_key
             return True
 
@@ -5858,6 +5888,74 @@ class ReplicaRouterState:
 
 
 REPLICA_ROUTER_STATE = ReplicaRouterState()
+
+
+def _matrix_models_conflict(base_a: str, base_b: str, config_path: Path | str | None = None) -> bool:
+    """True when two models cannot be resident together.
+
+    Degrades conservatively. ``_matrix_group_membership`` returns ``{}`` for a
+    missing/unreadable ``config.yaml``, and a model the matrix does not mention
+    has no entry either, so "unprovable" and "provably disjoint" are different:
+    only an explicitly disjoint pair of set-name sets is allowed to load
+    concurrently. First-come-first-served is the contract -- a caller that
+    cannot prove concurrency is safe must block rather than gamble an eviction.
+    """
+    try:
+        membership = _matrix_group_membership(Path(config_path) if config_path else None)
+        sets_a = membership.get(base_a)
+        sets_b = membership.get(base_b)
+        if not sets_a or not sets_b:
+            return True
+        return bool(sets_a & sets_b)
+    except Exception:
+        return True
+
+
+def blocking_conflicting_load(
+    model_id: str,
+    catalog: list[ManagedModel],
+    config_path: Path | str | None = None,
+    *,
+    now: float | None = None,
+) -> tuple[str, float] | None:
+    """Return ``(blocker_base_model_id, claim_age_seconds)`` blocking this load, else ``None``.
+
+    The first load wins. While a *different* model whose llama-swap matrix sets
+    overlap this one's is mid-load, a second load is refused: letting it through
+    hands llama-swap's solver a reason to evict the first, which costs a 2-5
+    minute cold reload plus a full KV re-prefill on every alternation.
+
+    Claims are keyed per upstream target, so ``A`` and ``A__replica_0`` are two
+    keys for one unit; mapping every key through ``replica_base_model_id`` keeps a
+    model from blocking its own replica's reload. ``catalog`` is accepted for
+    call-site symmetry with the other admission helpers and is not read: the
+    gate consults router state and the rendered matrix only.
+
+    Pure by construction -- no logging, no I/O beyond reading the matrix -- so the
+    decision is testable in isolation and the call sites own the log line.
+    """
+    now = time.monotonic() if now is None else now
+    self_base = replica_base_model_id(model_id)
+    try:
+        with REPLICA_ROUTER_STATE.lock:
+            live = []
+            for key, deadline in REPLICA_ROUTER_STATE.loading_claims.items():
+                # claim_loading stores a deadline, so the stamp is deadline - TTL.
+                stamp = float(deadline) - LOADING_CLAIM_TTL_S
+                if now - stamp < LOADING_CLAIM_TTL_S:
+                    live.append((replica_base_model_id(key), now - stamp))
+    except Exception:
+        return None
+    blocking = [
+        (base, age_s)
+        for base, age_s in live
+        if base != self_base and _matrix_models_conflict(base, self_base, config_path)
+    ]
+    if not blocking:
+        return None
+    # Oldest wins: it has the least TTL left, so naming it is the most useful
+    # line in the refusal log and it is the claim that ends the conflict first.
+    return max(blocking, key=lambda item: item[1])
 
 
 def reject_if_model_loading_request(
@@ -6479,7 +6577,9 @@ def select_replica_for_request(
     previous_response_id = str(payload.get("previous_response_id") or "").strip()
     mapped_response_replica = REPLICA_ROUTER_STATE.response_replica(previous_response_id) if previous_response_id else None
     affinity_key = resolve_request_affinity_key(base_model.model_id, payload, headers)
-    gpu_sets = _replica_gpu_sets(base_model, cfg)
+    gpu_sets = _replica_gpu_sets(
+        base_model, cfg, base_gpu_set=cached_model_gpu_sets(catalog or []).get(base_model.model_id)
+    )
     if not gpu_sets:
         log_api_event("replica_no_gpu_sets", {"model": base_model.model_id, "replicas_max": cfg.max, "gpus_per_replica": cfg.gpus_per_replica})
         return base_model.model_id, affinity_key, False
@@ -6492,16 +6592,22 @@ def select_replica_for_request(
             REPLICA_ROUTER_STATE.bind(
                 affinity_key, base_model.model_id, _TransferReason.INITIAL_BIND, ttl_s=cfg.sticky_ttl_s, now=now
             )
-        log_api_event(
-            "replica_routes_missing",
-            {
-                "model": base_model.model_id,
-                "replicas_max": cfg.max,
-                "expected_replicas": replica_ids,
-                "published_sample": sorted(list(published))[:20],
-            },
-        )
+            log_api_event(
+                "replica_routes_missing",
+                {
+                    "model": base_model.model_id,
+                    "replicas_max": cfg.max,
+                    "expected_replicas": replica_ids,
+                    "published_sample": sorted(list(published))[:20],
+                },
+            )
         return base_model.model_id, affinity_key, False
+    # Resolved once, here, because it reads the rendered matrix file and must stay
+    # outside the router lock (health_of probes and _placement_fits shells out to
+    # nvidia-smi below). Only consulted for requests with no live affinity: a
+    # conversation already bound to an instance keeps it, which is what the
+    # branches above already decided.
+    load_blocker = blocking_conflicting_load(base_model.model_id, catalog, config_path, now=now)
     with REPLICA_ROUTER_STATE.lock:
         for idx, rid in enumerate(replica_ids):
             rec = REPLICA_ROUTER_STATE.records.setdefault(
@@ -6601,10 +6707,17 @@ def select_replica_for_request(
         # capacity exists.
         ready_idle = [r for r in candidates if r.status == "ready" and r.in_flight == 0]
         base_load = int(REPLICA_ROUTER_STATE.base_in_flight.get(base_model.model_id, 0))
+        base_last = float(REPLICA_ROUTER_STATE.base_last_used.get(base_model.model_id, 0.0) or 0.0)
+        # A second instance for a request with nowhere to be is pure cost: it
+        # steals VRAM from whatever else is loading, and during a conflicting load
+        # it would evict that load. Gating only the spread -- not the whole branch
+        # -- keeps the base branch below reachable, so the request lands on the
+        # instance that is already loaded instead of falling through to
+        # ready_empty and picking a replica anyway.
+        spread_blocked = load_blocker is not None or cfg.prefer_base_over_replica
         if base_load <= 0 and ready_idle:
             best = sorted(ready_idle, key=lambda r: (r.last_used, r.replica_model_id))[0]
-            base_last = float(REPLICA_ROUTER_STATE.base_last_used.get(base_model.model_id, 0.0) or 0.0)
-            if base_last > 0.0 and (best.last_used <= 0.0 or best.last_used < base_last):
+            if base_last > 0.0 and (best.last_used <= 0.0 or best.last_used < base_last) and not spread_blocked:
                 REPLICA_ROUTER_STATE.bind(
                     affinity_key, best.replica_model_id, _TransferReason.INITIAL_BIND, ttl_s=cfg.sticky_ttl_s, now=now
                 )
@@ -6631,6 +6744,25 @@ def select_replica_for_request(
                 for gpu in rec.gpu_set:
                     used_by_records[gpu] = used_by_records.get(gpu, 0) + 1
         cold = [r for r in candidates if r.status in {"cold", "error"}]
+        # Cold scale-out pays a full model load, so it is gated twice: never
+        # while a conflicting model is loading, and never while the base is still
+        # inside its idle grace window. A base that has never been used is exempt
+        # from the grace window, otherwise a brand-new model could never start.
+        idle_grace_s = int(cfg.idle_grace_s)
+        defer_scale_out = load_blocker is not None or (
+            idle_grace_s > 0 and base_last > 0.0 and (now - base_last) < idle_grace_s
+        )
+    if defer_scale_out:
+        log_api_event(
+            "replica_scale_out_deferred",
+            {
+                "model": base_model.model_id,
+                "blocker": load_blocker[0] if load_blocker else None,
+                "grace_s": idle_grace_s,
+                "base_last_used": base_last,
+            },
+        )
+        cold = []
     # Potentially slow VRAM checks happen outside the lock.
     for rec in sorted(cold, key=lambda r: r.replica_model_id):
         fits, required = _placement_fits(base_model, cfg, rec.gpu_set, used_by_records)
@@ -10192,7 +10324,11 @@ def _matrix_group_membership(config_path: Path | None = None) -> dict[str, set[s
     return membership
 
 
-def _resolve_replica_gpu_set(replica_id: str, base_model: ManagedModel) -> list[int] | None:
+def _resolve_replica_gpu_set(
+    replica_id: str,
+    base_model: ManagedModel,
+    catalog: list[ManagedModel] | None = None,
+) -> list[int] | None:
     """Return the physical GPU set assigned to an internal replica id.
 
     Prefers live router state, falls back to the placement computation.
@@ -10208,7 +10344,8 @@ def _resolve_replica_gpu_set(replica_id: str, base_model: ManagedModel) -> list[
         match = re.search(r"__replica_(\d+)$", str(replica_id or ""))
         index = int(match.group(1)) if match else 0
         cfg = get_model_replica_config(base_model, resolve_global_replica_config())
-        sets = _replica_gpu_sets(base_model, cfg)
+        assigned = cached_model_gpu_sets(catalog or []).get(base_model.model_id)
+        sets = _replica_gpu_sets(base_model, cfg, base_gpu_set=assigned)
         if 0 <= index < len(sets) and sets[index]:
             return list(sets[index])
     except Exception:
@@ -10249,7 +10386,10 @@ def _ensure_direct_replica_route_for_request(replica_id: str, catalog: list[Mana
         if not gpu_set:
             try:
                 cfg = get_model_replica_config(base_model, replica_defaults)
-                sets = _replica_gpu_sets(base_model, cfg)
+                sets = _replica_gpu_sets(
+                    base_model, cfg,
+                    base_gpu_set=cached_model_gpu_sets(catalog or []).get(base_model.model_id),
+                )
                 if 0 <= replica_index < len(sets):
                     gpu_set = list(sets[replica_index])
             except Exception:
@@ -10299,6 +10439,25 @@ def _prepare_direct_replica_request(model_name: str, catalog: list[ManagedModel]
     return model_name, True, None
 
 
+def instance_in_flight(instance_id: str) -> int:
+    """Requests currently streaming on one instance, base id or ``__replica_N``.
+
+    Replicas carry their own counter on the record; bases are tracked in
+    ``base_in_flight``. Returns 0 for anything unknown so callers can treat an
+    unrecognised instance as idle rather than blocking on stale state.
+    """
+    try:
+        target = str(instance_id or "")
+        if not target:
+            return 0
+        rec = REPLICA_ROUTER_STATE.records.get(target)
+        if rec is not None:
+            return max(0, int(getattr(rec, "in_flight", 0) or 0))
+        return max(0, int(REPLICA_ROUTER_STATE.base_in_flight.get(target, 0) or 0))
+    except Exception:
+        return 0
+
+
 def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DEFAULT_PUBLIC_HOST, port=DEFAULT_PUBLIC_PORT, config_path: Path | None = None) -> str | None:
     """Generate a user-friendly error message for GPU conflicts.
     
@@ -10340,8 +10499,26 @@ def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DE
                 proc_gpus_by_pid[int(pid)] = set(per_gpu.keys())
         except Exception:
             proc_gpus_by_pid = {}
+    # A base and its replicas run the SAME weights file, so a path->id map
+    # collapses every instance of a model onto a single id and the replicas can
+    # never be named as eviction victims (only the base ever shows up in
+    # `will_evict`, so an idle replica is invisible to the decision that
+    # actually destroys it). The router state knows which pid is which route,
+    # so resolve by pid first and fall back to the weights path only for
+    # processes with no router record.
+    instance_id_by_pid: dict[int, str] = {}
+    try:
+        for rid, rec in REPLICA_ROUTER_STATE.records.items():
+            pid = int(getattr(rec, "pid", 0) or 0)
+            if pid > 0:
+                instance_id_by_pid[pid] = str(rid)
+    except Exception:
+        instance_id_by_pid = {}
+    target_base_id = replica_base_model_id(model_id) if is_replica_model_id(model_id) else str(model_id)
     conflicts: list[str] = []
     conflict_model_ids: list[str] = []
+    # (instance_id, pid, used_mib) for every conflict, replicas kept distinct.
+    conflict_instances: list[tuple[str, int, int]] = []
     for pid, used_mem in sorted(gpu_process_map.items()):
         if _is_ollama_process(pid):
             continue
@@ -10352,13 +10529,18 @@ def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DE
             gpus = proc_gpus_by_pid.get(pid, set())
             if gpus and gpus.isdisjoint(set(replica_gpu_set)):
                 continue
-        running_model = model_by_path.get(process.get("model_path") or "")
-        if running_model == model_id:
+        running_model = instance_id_by_pid.get(pid) or model_by_path.get(process.get("model_path") or "")
+        if not running_model or running_model == model_id:
             continue
-        if running_model:
-            conflicts.append(f"{running_model} (pid {pid}, {used_mem} MiB)")
-            if running_model not in conflict_model_ids:
-                conflict_model_ids.append(running_model)
+        # Never treat our own family as a conflict: reloading a model must not
+        # look like a clash with the copy it is replacing.
+        running_base = replica_base_model_id(running_model) if is_replica_model_id(running_model) else running_model
+        if running_base == target_base_id:
+            continue
+        conflicts.append(f"{running_model} (pid {pid}, {used_mem} MiB)")
+        conflict_instances.append((running_model, pid, int(used_mem or 0)))
+        if running_model not in conflict_model_ids:
+            conflict_model_ids.append(running_model)
     if not conflicts:
         if replica_gpu_set is not None:
             if target_model is not None:
@@ -10390,6 +10572,36 @@ def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DE
             not (membership.get(conflict_id) or set()) & target_groups for conflict_id in conflict_model_ids
         )
         if matrix_will_evict:
+            busy_victims = [
+                (inst, pid)
+                for inst, pid, _ in conflict_instances
+                if instance_in_flight(inst) > 0
+            ]
+            if busy_victims:
+                idle_victims = [
+                    inst for inst, _, _ in conflict_instances if instance_in_flight(inst) <= 0
+                ]
+                log_api_event(
+                    "model_load_blocked_busy_victim",
+                    {
+                        "model": model_id,
+                        "busy_victims": [
+                            {"instance": inst, "pid": pid, "in_flight": instance_in_flight(inst)}
+                            for inst, pid in busy_victims
+                        ],
+                        "idle_victims": idle_victims,
+                        "matrix_groups": sorted(target_groups),
+                    },
+                )
+                named = ", ".join(
+                    f"'{inst}' ({instance_in_flight(inst)} request(s) in flight)"
+                    for inst, _ in busy_victims[:3]
+                )
+                return (
+                    f"Cannot load model '{model_id}' right now: loading it would cancel a request "
+                    f"already streaming on {named}. Retry when it finishes, or run "
+                    "'llm-server unload <model>' to force it."
+                )
             fits, fit_info = model_has_enough_vram_capacity(target_model, gpu_set=replica_gpu_set)
             if fits:
                 log_api_event(
@@ -14786,7 +14998,10 @@ def sync_replica_runtime_state(
             cfg = get_model_replica_config(model, global_replica_config, total_gpus=total_gpus)
             if not cfg.enabled:
                 continue
-            for idx, gpu_set in enumerate(_replica_gpu_sets(model, cfg, total_gpus=total_gpus)):
+            assigned = cached_model_gpu_sets(catalog, total_gpus).get(model.model_id)
+            for idx, gpu_set in enumerate(
+                _replica_gpu_sets(model, cfg, total_gpus=total_gpus, base_gpu_set=assigned)
+            ):
                 rid = replica_model_id(model.model_id, idx)
                 rec = REPLICA_ROUTER_STATE.records.setdefault(
                     rid,
@@ -14839,7 +15054,8 @@ def replica_router_snapshot(catalog: list[ManagedModel], config_path: Path | str
         if not cfg.enabled:
             skipped.append({"model": model.model_id, "reason": "replicas_disabled", "tensor_split": model.tensor_split})
             continue
-        gpu_sets = _replica_gpu_sets(model, cfg, total_gpus=total_gpus)
+        assigned = cached_model_gpu_sets(catalog, total_gpus).get(model.model_id)
+        gpu_sets = _replica_gpu_sets(model, cfg, total_gpus=total_gpus, base_gpu_set=assigned)
         if not gpu_sets:
             skipped.append({
                 "model": model.model_id,
@@ -15640,6 +15856,35 @@ def start_ctx_metadata_server(args):
             self.wfile.write(content)
 
         def _reject_if_gpu_busy(self, model_name: str, catalog: list[ManagedModel], *, api_style: str, payload: dict | None = None) -> bool:
+            # Admission gate: get_gpu_conflict_message only asks "does it fit if
+            # it is alone on the GPU". It never asks the question that matters
+            # when two ~20GB models share a 24GB card: does it fit without
+            # destroying the load already in flight. Note this request already
+            # owns its own claim here (_reject_if_model_loading ran first), so
+            # the helper drops same-base claims rather than trusting the order.
+            conflicting = blocking_conflicting_load(model_name, catalog, args.config)
+            if conflicting is not None:
+                blocker_model, waited_s = conflicting
+                message = (
+                    f"Model '{model_name}' is not loading: '{blocker_model}' is already loading "
+                    f"({waited_s:.0f}s in) and shares its GPU set. The first load wins so it is not "
+                    "interrupted. Retry this request when that load completes."
+                )
+                log_api_event(
+                    "model_load_blocked_by_concurrent_load",
+                    {
+                        "model": model_name,
+                        "blocker": blocker_model,
+                        "waited_s": round(waited_s, 1),
+                        "api_style": api_style,
+                    },
+                )
+                REPLICA_ROUTER_STATE.release_loading_claim(model_name)
+                if api_style == "openai":
+                    self._send_json({"error": {"message": message, "type": "model_loading", "code": "model_loading"}}, status=503)
+                else:
+                    self._send_json({"error": message, "code": "model_loading"}, status=503)
+                return True
             target_loaded = get_catalog_model_process(model_name, catalog) is not None
             if (not target_loaded) and request_looks_like_model_probe(payload or {}):
                 probe_cfg = _resolve_model_probe_autoload_config()
@@ -22758,12 +23003,22 @@ try:
         drop_internal_route_from_llamaswap_config as _sc_drop_internal_route,
         route_carries_mmproj as _sc_route_carries_mmproj,
         set_instance_mmproj_in_llamaswap_config as _sc_set_instance_mmproj,
+        cached_model_gpu_sets as _sc_cached_model_gpu_sets,
+        _replica_gpu_sets as _sc_replica_gpu_sets,
+        _infer_base_gpu_count as _sc_infer_base_gpu_count,
+        iter_catalog_base_models as _sc_iter_base_models,
+        summarize_configured_replicas as _sc_summarize_replicas,
     )
     _calculate_llama_swap_matrix = _sc_calc  # type: ignore
     _model_info_for_matrix_entry = _sc_minfo  # type: ignore
     build_replica_model = _sc_build_replica  # type: ignore
     ensure_replica_route_in_llamaswap_config = _sc_ensure  # type: ignore
     ensure_replica_route = _sc_ensure  # type: ignore
+    cached_model_gpu_sets = _sc_cached_model_gpu_sets  # type: ignore
+    _replica_gpu_sets = _sc_replica_gpu_sets  # type: ignore
+    _infer_base_gpu_count = _sc_infer_base_gpu_count  # type: ignore
+    iter_catalog_base_models = _sc_iter_base_models  # type: ignore
+    summarize_configured_replicas = _sc_summarize_replicas  # type: ignore
     get_model_replica_config = _sc_get_replica  # type: ignore
     is_replica_model_id = _sc_is_replica  # type: ignore
     iter_catalog_with_replicas = _sc_iter_replica  # type: ignore

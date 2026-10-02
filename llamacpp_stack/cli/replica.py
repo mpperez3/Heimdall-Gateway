@@ -239,6 +239,17 @@ def get_model_replica_config(model: ManagedModel, global_raw: dict[str, object] 
         cfg.sticky_ttl_s = max(60, int(raw.get("sticky_ttl_s", cfg.sticky_ttl_s)))
     except Exception:
         pass
+    cfg.prefer_base_over_replica = _as_bool(
+        raw.get("prefer_base_over_replica", cfg.prefer_base_over_replica), cfg.prefer_base_over_replica
+    )
+    try:
+        cfg.idle_grace_s = max(0, int(raw.get("idle_grace_s", cfg.idle_grace_s)))
+    except Exception:
+        pass
+    try:
+        cfg.max_idle_s = max(0, int(raw.get("max_idle_s", cfg.max_idle_s)))
+    except Exception:
+        pass
     return cfg
 
 
@@ -269,7 +280,13 @@ def _infer_base_gpu_count(model: ManagedModel) -> int:
         return 1
 
 
-def _replica_gpu_sets(model: ManagedModel, cfg: ReplicaConfig, total_gpus: int | None = None) -> list[list[int]]:
+def _replica_gpu_sets(
+    model: ManagedModel,
+    cfg: ReplicaConfig,
+    total_gpus: int | None = None,
+    *,
+    base_gpu_set: list[int] | None = None,
+) -> list[list[int]]:
     if not cfg.enabled or cfg.max <= 0:
         return []
     total = total_gpus if total_gpus is not None else detect_cuda_device_count()
@@ -279,10 +296,17 @@ def _replica_gpu_sets(model: ManagedModel, cfg: ReplicaConfig, total_gpus: int |
     sets: list[list[int]] = []
     if cfg.placement == "exclusive_gpus":
         base_gpu_count = max(0, _infer_base_gpu_count(model))
-        if total <= base_gpu_count:
-            return []
-        for start in range(base_gpu_count, total, gpr):
-            gpu_set = list(range(start, min(start + gpr, total)))
+        # Replicas must avoid every GPU their base owns, or a base pinned to GPU1
+        # would hand its own replica GPU1 and the pair could never coexist. An
+        # explicit assignment replaces the "base owns the first N" default.
+        owned = (
+            {int(g) for g in base_gpu_set}
+            if base_gpu_set
+            else set(range(base_gpu_count))
+        )
+        available = [g for g in range(total) if g not in owned]
+        for start in range(0, len(available), gpr):
+            gpu_set = available[start:start + gpr]
             if len(gpu_set) == gpr:
                 sets.append(gpu_set)
             if len(sets) >= cfg.max:
@@ -326,6 +350,72 @@ def _command_with_cuda_visible_devices(cmd: list[str], gpu_set: list[int]) -> li
     return ["/usr/bin/env", f"CUDA_VISIBLE_DEVICES={','.join(str(g) for g in gpu_set)}", *cmd]
 
 
+def _strip_cuda_visible_devices(cmd: list[str]) -> list[str]:
+    out = list(cmd)
+    while len(out) >= 2 and out[0] == "/usr/bin/env" and str(out[1]).startswith("CUDA_VISIBLE_DEVICES="):
+        out = out[2:]
+    return out
+
+
+def _set_cuda_visible_devices(cmd: list[str], gpu_set: list[int] | None) -> list[str]:
+    """Pin the route to `gpu_set`, replacing any prefix the builder already added.
+
+    `build_llama_server_command` derives CUDA_VISIBLE_DEVICES from `tensor_split`,
+    and a single-GPU `tensor_split` of "1" maps to GPU 0 for every model, so the
+    prefix has to be rewritten rather than added.
+    """
+    bare = _strip_cuda_visible_devices(cmd)
+    if not gpu_set:
+        return bare
+    return _command_with_cuda_visible_devices(bare, gpu_set)
+
+
+def assign_model_gpu_sets(
+    catalog: list[ManagedModel],
+    total_gpus: int | None = None,
+    global_replica_config: dict[str, object] | None = None,
+) -> dict[str, list[int]]:
+    """Give each single-GPU large model a stable, distinct GPU round-robin.
+
+    Only models that take most of a card are placed: packable ones share anyway,
+    and multi-GPU models already declare the span they need. Largest first, so the
+    two heaviest models land on different cards instead of fighting over GPU 0.
+    """
+    total = total_gpus if total_gpus is not None else detect_cuda_device_count()
+    if total <= 1:
+        return {}
+    placed = [
+        m for m in catalog
+        if _infer_base_gpu_count(m) == 1 and not _is_small_model(m) and not _is_embedding_model(m)
+    ]
+    placed.sort(key=lambda m: (-_get_model_size_mib(m), str(m.model_id)))
+    return {
+        m.model_id: [idx % total]
+        for idx, m in enumerate(placed)
+    }
+
+
+_MODEL_GPU_ASSIGNMENT_MEMO: dict[str, object] = {"key": None, "value": {}}
+
+
+def cached_model_gpu_sets(
+    catalog: list[ManagedModel],
+    total_gpus: int | None = None,
+) -> dict[str, list[int]]:
+    """`assign_model_gpu_sets` memoised on catalog identity, to avoid re-stat'ing.
+
+    Called on the request path, and ranking needs every model's on-disk size.
+    """
+    total = total_gpus if total_gpus is not None else detect_cuda_device_count()
+    key = (total, tuple(sorted((str(m.model_id), str(m.local_path)) for m in catalog)))
+    if _MODEL_GPU_ASSIGNMENT_MEMO.get("key") == key:
+        return dict(_MODEL_GPU_ASSIGNMENT_MEMO["value"])  # type: ignore[arg-type]
+    value = assign_model_gpu_sets(catalog, total)
+    _MODEL_GPU_ASSIGNMENT_MEMO["key"] = key
+    _MODEL_GPU_ASSIGNMENT_MEMO["value"] = value
+    return dict(value)
+
+
 def iter_catalog_with_replicas(catalog: list[ManagedModel], global_replica_config: dict[str, object] | None = None) -> list[tuple[ManagedModel, str | None, list[int] | None]]:
     """Return (model, public_base_model_id, gpu_set). public_base_model_id is set for internal replicas."""
     result: list[tuple[ManagedModel, str | None, list[int]]] = []
@@ -334,7 +424,8 @@ def iter_catalog_with_replicas(catalog: list[ManagedModel], global_replica_confi
         cfg = get_model_replica_config(model, global_replica_config)
         if not cfg.enabled:
             continue
-        for idx, gpu_set in enumerate(_replica_gpu_sets(model, cfg)):
+        assigned = cached_model_gpu_sets(catalog).get(model.model_id)
+        for idx, gpu_set in enumerate(_replica_gpu_sets(model, cfg, base_gpu_set=assigned)):
             result.append((build_replica_model(model, idx, gpu_set), model.model_id, gpu_set))
     return result
 
@@ -351,7 +442,8 @@ def summarize_configured_replicas(catalog: list[ManagedModel], global_replica_co
         cfg = get_model_replica_config(model, global_replica_config, total_gpus=total_gpus)
         if not cfg.enabled:
             continue
-        gpu_sets = _replica_gpu_sets(model, cfg, total_gpus=total_gpus)
+        assigned = cached_model_gpu_sets(catalog, total_gpus).get(model.model_id)
+        gpu_sets = _replica_gpu_sets(model, cfg, total_gpus=total_gpus, base_gpu_set=assigned)
         if gpu_sets:
             lines.append(
                 f"{model.model_id}: {len(gpu_sets)} replica(s), gpus_per_replica={cfg.gpus_per_replica}, gpu_sets={gpu_sets}"
@@ -713,15 +805,23 @@ def render_llamaswap_config(
             pass
         return rendered
 
+    total_gpus = detect_cuda_device_count()
+    gpu_assignment = cached_model_gpu_sets(catalog, total_gpus)
     for m, public_base_model_id, replica_gpu_set in sorted(iter_catalog_base_models(catalog), key=lambda item: item[0].model_id):
         use_model = m
         cmd = _render_cmd(use_model, bool(resolve_render_include_mmproj(use_model, mmproj_config)))
+        base_gpu_set: list[int] | None = None
         if public_base_model_id is not None:
             cmd = _command_with_cuda_visible_devices(cmd, replica_gpu_set)
             replica_group_members.append(m.model_id)
+        else:
+            base_gpu_set = gpu_assignment.get(m.model_id)
+            cmd = _set_cuda_visible_devices(cmd, base_gpu_set)
         models_info_for_matrix.append({
             "id": m.model_id,
-            "gpu_set": replica_gpu_set if replica_gpu_set is not None else list(range(detect_cuda_device_count())),
+            "gpu_set": replica_gpu_set if replica_gpu_set is not None else (
+                list(base_gpu_set) if base_gpu_set else list(range(total_gpus))
+            ),
             "is_embedding": _is_embedding_model(m),
             "is_small": _is_small_model(m),
             "size_mib": _get_model_size_mib(m)
@@ -1141,6 +1241,6 @@ __all__ = [
     "ensure_internal_route_in_llamaswap_config",
     "set_instance_mmproj_in_llamaswap_config",
     "route_carries_mmproj",
-    "route_capabilities",
+    "route_capabilities","assign_model_gpu_sets","cached_model_gpu_sets","_set_cuda_visible_devices",
     "shell_quote",
 ]

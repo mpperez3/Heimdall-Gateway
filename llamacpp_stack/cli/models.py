@@ -154,6 +154,21 @@ class ReplicaConfig:
     max_models_per_gpu: int = 2
     max_pack_fraction: float = 0.35
     sticky_ttl_s: int = 3600
+    #: Policy knob, not a tuning knob. Serve a request with no live affinity on
+    #: the base instead of spreading it to, or cold-starting, a second instance.
+    #: Off by default: while another model is mid-load the same redirect already
+    #: happens on its own, and that window is the only time it pays. Turning this
+    #: on makes the redirect permanent, which costs genuine request parallelism
+    #: whenever a base and a replica could both have served a conversation.
+    prefer_base_over_replica: bool = False
+    #: Policy knob. How long the base must have been idle before a replica may be
+    #: spread to or created. ``0`` disables the gate. Raising it keeps a warm base
+    #: warm; lowering it trades a cold load for parallelism sooner.
+    idle_grace_s: int = 600
+    #: Policy knob, reaper backstop. Retire a replica idle at least this long even
+    #: when nothing else wants its GPU, so VRAM is handed back without waiting for
+    #: llama-swap's own TTL. ``0`` disables the idle backstop entirely.
+    max_idle_s: int = 1800
 
 
 @dataclass
