@@ -335,7 +335,13 @@ def cached_mmproj_config(args: object | None = None) -> dict[str, object]:
 
 
 def vision_route_ttl(mmproj_config: dict[str, object] | None = None) -> int | None:
-    """llama-swap ttl for the projector-bearing instance (idle minutes, or None)."""
+    """llama-swap ttl for the projector-bearing instance, in SECONDS (or None).
+
+    llama-swap reads ``models.*.ttl`` as seconds and logs "TTL of Ns reached", so
+    the sticky window is passed through untouched. Converting it to minutes here
+    silently turned a 1h window into 60s, which evicted the projector a minute
+    after every image turn and charged a cold reload plus a full re-prefill.
+    """
     cfg = mmproj_config if isinstance(mmproj_config, dict) else resolve_effective_mmproj_config()
     # Fall back to the packaged default rather than a literal, so a config block
     # missing the key cannot drift away from `default_mmproj_config`.
@@ -346,4 +352,4 @@ def vision_route_ttl(mmproj_config: dict[str, object] | None = None) -> int | No
         return None
     if sticky <= 0:
         return None
-    return max(1, int(round(sticky / 60.0)))
+    return max(1, sticky)

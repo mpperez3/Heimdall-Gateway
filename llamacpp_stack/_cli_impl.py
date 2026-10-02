@@ -8909,6 +8909,18 @@ def reconcile_text_instance_mmproj(
     flagged = instance_id in ((REPLICA_ROUTER_STATE.vision_until or {}).get(base_id) or {})
     if not flagged:
         return
+    swap_host = str(getattr(args, "public_host", "") or DEFAULT_PUBLIC_HOST)
+    try:
+        swap_port = int(getattr(args, "public_port", 0) or DEFAULT_PUBLIC_PORT)
+    except Exception:
+        swap_port = DEFAULT_PUBLIC_PORT
+    if _vision_instance_loaded(instance_id, base_id, catalog,
+                               get_loaded_model_ids(swap_host, swap_port)):
+        # Rewriting a live route's cmd makes llama-swap restart it, discarding the
+        # KV cache this very conversation is still using. Leave the flag on and
+        # let the sticky ttl unload the instance instead: the strip then costs
+        # nothing, because the next load reads a config without --mmproj.
+        return
     try:
         idle_ttl, server_defaults = _vision_route_args(args)
     except Exception as exc:

@@ -513,14 +513,29 @@ loading one, and because image turns pin only a *separate* vision affinity, the
 next text turn goes back to the instance the conversation was following.
 
 The chosen route's command is rewritten to add `--mmproj` and it gets a `ttl` of
-`mmproj.vision_sticky_ttl_s` (1 hour by default). llama-swap applies a rewritten
-`cmd` only the *next* time that route loads, so an instance that is already
-running is dropped from the config and awaited as absent before the flag is
-attached. Once the TTL lapses llama-swap evicts the process, and the flag is
-stripped again the next time a text request needs that instance — or at the next
-`llm-server update`, which always re-renders text-only. If the projector cannot
-be attached the request returns `503` with a retry message rather than reaching a
-backend that would silently drop the image.
+`mmproj.vision_sticky_ttl_s` (1 hour by default, passed to llama-swap as
+seconds). llama-swap applies a rewritten `cmd` only the *next* time that route
+loads, so an instance that is already running is dropped from the config and
+awaited as absent before the flag is attached. Once the TTL lapses llama-swap
+evicts the process, and the flag is stripped the next time a text request needs
+that instance *while it is unloaded* — rewriting a live route's command would
+make llama-swap restart it and throw away the KV cache the conversation is
+still using. Stripping a dead route is free: the next load reads a config with
+no `--mmproj` anyway. An `llm-server update` also always re-renders text-only.
+If the projector cannot be attached the request returns `503` with a retry
+message rather than reaching a backend that would silently drop the image.
+
+Every route also declares its own `capabilities.vision` in `config.yaml`, derived
+from whether that route's command carries `--mmproj`, so llama-swap's `/v1/models`
+and its web UI badges show which instance currently has a projector loaded:
+
+```json
+"qwen3.8-27b-EXL3": { "capabilities": { "vision": false } },
+"qwen3.8-27b-q4_1": { "capabilities": { "vision": true } }
+```
+
+llama-swap treats `capabilities` as listing metadata only; it does not change
+routing, so the gateway still decides which instance gets the projector.
 
 A lazy base also stops reserving projector headroom in its tensor split.
 
@@ -540,7 +555,7 @@ Or for every projector model via the global `mmproj` block in
 | Key | Default | Meaning |
 |---|---|---|
 | `mmproj.default_mode` | `always` | `always`, `lazy`, or `off`; per-model `mmproj_mode` wins |
-| `mmproj.vision_sticky_ttl_s` | `3600` | idle seconds before llama-swap evicts the projector-bearing route (rounded to whole minutes, minimum 1) |
+| `mmproj.vision_sticky_ttl_s` | `3600` | idle seconds before llama-swap evicts the projector-bearing route; llama-swap reads `ttl` in seconds, so this is passed through untouched |
 | `mmproj.route_publish_timeout_s` | `90.0` | wait for the rewritten route to appear in `/v1/models` |
 | `mmproj.unload_timeout_s` | `45.0` | unload budget |
 | `mmproj.reload_timeout_s` | `45.0` | reload budget |

@@ -600,8 +600,8 @@ class SetInstanceMmprojTest(
         self._set(BASE_ID, True)
         self.assertEqual(
             self._read()["models"][BASE_ID]["ttl"],
-            60,
-            "3600s sticky becomes a 60 minute ttl so llama-swap unloads it",
+            3600,
+            "llama-swap reads ttl in seconds, so the sticky window passes through untouched",
         )
         self._set(BASE_ID, False)
         self.assertEqual(self._read()["models"][BASE_ID]["ttl"], 300)
@@ -719,15 +719,15 @@ class ConfigBlockTest(unittest.TestCase):
         self.assertTrue(changed)
         self.assertGreaterEqual(cfg["vision_sticky_ttl_s"], 60)
 
-    def test_ttl_is_rendered_in_whole_minutes(self):
-        self.assertEqual(vision_route_ttl({"vision_sticky_ttl_s": 600}), 10)
-        self.assertEqual(vision_route_ttl({"vision_sticky_ttl_s": 45}), 1)
-        self.assertEqual(vision_route_ttl({"vision_sticky_ttl_s": 90}), 2)
-        self.assertEqual(vision_route_ttl(default_mmproj_config()), 60)
+    def test_ttl_is_passed_through_in_seconds(self):
+        self.assertEqual(vision_route_ttl({"vision_sticky_ttl_s": 600}), 600)
+        self.assertEqual(vision_route_ttl({"vision_sticky_ttl_s": 45}), 45)
+        self.assertEqual(vision_route_ttl({"vision_sticky_ttl_s": 90}), 90)
+        self.assertEqual(vision_route_ttl(default_mmproj_config()), 3600)
 
     def test_a_block_missing_the_key_still_falls_back_to_the_packaged_default(self):
-        self.assertEqual(vision_route_ttl({}), 60)
-        self.assertEqual(vision_route_ttl({"default_mode": "lazy"}), 60)
+        self.assertEqual(vision_route_ttl({}), 3600)
+        self.assertEqual(vision_route_ttl({"default_mode": "lazy"}), 3600)
 
     def test_the_conf_block_is_written_once_and_then_stable(self):
         payload, changed = _cli_impl.normalize_server_config_payload({})
@@ -1030,10 +1030,41 @@ class ReconcileTextTest(
         patcher = mock.patch.object(_cli_impl, "log_api_event")
         self.log_api_event_mock = patcher.start()
         self.addCleanup(patcher.stop)
+        loaded = mock.patch.object(_cli_impl, "get_loaded_model_ids", return_value=set())
+        self.get_loaded_model_ids_mock = loaded.start()
+        self.addCleanup(loaded.stop)
 
     def _reconcile(self, instance_id):
         return _cli_impl.reconcile_text_instance_mmproj(
             self.model, instance_id, self.catalog, self.args
+        )
+
+    def test_a_loaded_instance_keeps_the_projector_until_its_ttl_expires(self):
+        self.use_conf()
+        _cli_impl._vision_mark_instance(BASE_ID, BASE_ID, 3600.0)
+        self.get_loaded_model_ids_mock.return_value = {BASE_ID}
+        with mock.patch.object(
+            _cli_impl, "set_instance_mmproj_in_llamaswap_config"
+        ) as attach:
+            self._reconcile(BASE_ID)
+            attach.assert_not_called()
+        self.assertIn(
+            BASE_ID, _cli_impl.REPLICA_ROUTER_STATE.vision_until.get(BASE_ID, {})
+        )
+
+    def test_an_idle_flagged_instance_loses_the_projector(self):
+        self.use_conf()
+        _cli_impl._vision_mark_instance(BASE_ID, BASE_ID, 3600.0)
+        self.get_loaded_model_ids_mock.return_value = set()
+        with mock.patch.object(
+            _cli_impl,
+            "set_instance_mmproj_in_llamaswap_config",
+            return_value=self.config_path,
+        ) as attach:
+            self._reconcile(BASE_ID)
+            attach.assert_called_once()
+        self.assertNotIn(
+            BASE_ID, _cli_impl.REPLICA_ROUTER_STATE.vision_until.get(BASE_ID, {})
         )
 
     def test_an_unflagged_instance_is_left_alone(self):
@@ -1489,6 +1520,60 @@ class DropInternalRouteTest(unittest.TestCase):
     def test_a_blank_route_id_is_rejected(self):
         self._write({BASE_ID: {"cmd": "srv --model a"}})
         self.assertFalse(self._drop(""))
+
+
+class CapabilitiesTest(unittest.TestCase, _ConfigEnvMixin):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.config_path = self.root / "config.yaml"
+        self.model = _lazy_model()
+        self.catalog = [self.model]
+        self.use_conf()
+
+    def _read(self):
+        return yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+
+    def test_a_lazy_base_renders_without_the_vision_capability(self):
+        render_llamaswap_config(
+            self.catalog, self.config_path, SERVER, 11436, 300, {}, {}
+        )
+        entry = self._read()["models"][BASE_ID]
+        self.assertNotIn("--mmproj", entry["cmd"])
+        self.assertEqual(entry["capabilities"], {"vision": False})
+
+    def test_an_always_model_renders_with_the_vision_capability(self):
+        self.use_conf()
+        eager = _make_model(
+            model_id="eager-qwen",
+            local_path="/models/big2/big2.safetensors",
+            mmproj_path="/models/proj2",
+        )
+        render_llamaswap_config(
+            [eager], self.config_path, SERVER, 11436, 300, {}, {}
+        )
+        entry = self._read()["models"]["eager-qwen"]
+        self.assertIn("--mmproj", entry["cmd"])
+        self.assertEqual(entry["capabilities"], {"vision": True})
+
+    def test_attaching_the_projector_flips_the_capability_on_that_route(self):
+        render_llamaswap_config(
+            self.catalog, self.config_path, SERVER, 11436, 300, {}, {}
+        )
+        set_instance_mmproj_in_llamaswap_config(
+            self.model,
+            BASE_ID,
+            self.catalog,
+            self.config_path,
+            SERVER,
+            300,
+            {},
+            enable=True,
+        )
+        entry = self._read()["models"][BASE_ID]
+        self.assertIn("--mmproj", entry["cmd"])
+        self.assertEqual(entry["capabilities"], {"vision": True})
 
 
 if __name__ == "__main__":

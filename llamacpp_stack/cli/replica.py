@@ -742,11 +742,13 @@ def render_llamaswap_config(
                     cmd.extend([chosen_flag, safe_name])
         except Exception:
             pass
-        data["models"][m.model_id] = {
+        entry = {
             "cmd": " ".join(shell_quote(part) for part in cmd),
             "checkEndpoint": "/health",
             "ttl": int(idle_ttl),
         }
+        entry["capabilities"] = route_capabilities(entry)
+        data["models"][m.model_id] = entry
         if public_base_model_id is not None:
             data["models"][m.model_id]["metadata"] = {"internal_replica_of": public_base_model_id}
         if public_base_model_id is None and m.aliases:
@@ -844,6 +846,18 @@ def route_carries_mmproj(entry: object) -> bool:
         return False
 
 
+def route_capabilities(entry: object) -> dict[str, object]:
+    """llama-swap listing capabilities for a rendered route entry.
+
+    llama-swap publishes this through ``/v1/models`` and badges it in the v255
+    web UI, so deriving ``vision`` from the route's own command makes a lazy
+    model report ``vision: false`` until the projector is attached to that
+    instance and ``vision: true`` only on the one that actually carries it.
+    Listing metadata only: llama-swap never routes on it.
+    """
+    return {"vision": route_carries_mmproj(entry)}
+
+
 def _replica_index_for_model_id(model_id: str) -> int:
     match = re.search(r"__replica_(\d+)$", str(model_id or ""))
     try:
@@ -923,13 +937,15 @@ def ensure_internal_route_in_llamaswap_config(
     cmd = _render_instance_command(model_for_route, server_path, server_defaults, want_mmproj)
     if route_gpu_set:
         cmd = _command_with_cuda_visible_devices(cmd, route_gpu_set)
-    models[route_id] = {
+    entry = {
         "cmd": " ".join(shell_quote(part) for part in cmd),
         "checkEndpoint": "/health",
         "ttl": int(ttl if ttl else idle_ttl),
         "metadata": dict(metadata or {"internal_replica_of": base_model.model_id}),
         "description": description or getattr(model_for_route, "description", "") or route_id,
     }
+    entry["capabilities"] = route_capabilities(entry)
+    models[route_id] = entry
     _recalculate_llamaswap_matrix_from_config(data, catalog)
     tmp = path.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as file_handle:
@@ -1125,5 +1141,6 @@ __all__ = [
     "ensure_internal_route_in_llamaswap_config",
     "set_instance_mmproj_in_llamaswap_config",
     "route_carries_mmproj",
+    "route_capabilities",
     "shell_quote",
 ]
