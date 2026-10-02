@@ -10894,8 +10894,12 @@ def build_openai_model_list_payload(model: ManagedModel, capabilities: dict | No
         "max_context_length": context_length,
         "max_model_len": context_length,
         "max_input_tokens": context_length,
-        "max_output_tokens": api_context_length,
-        "max_completion_tokens": api_context_length,
+        # Output-limit aliases carry the raw window, never `api_ctx`. API_CTX is an
+        # operator-facing display value (configured ctx x api_ctx_factor), so
+        # reusing it here advertised half the real budget under a field name OpenAI
+        # defines as an output cap -- and clients reserve against it.
+        "max_output_tokens": context_length,
+        "max_completion_tokens": context_length,
         "metadata": {
             "vision": _has_vision_runtime(model),
             "mmproj_mode": get_model_mmproj_mode(model),
@@ -10910,8 +10914,8 @@ def build_openai_model_list_payload(model: ManagedModel, capabilities: dict | No
             "max_input_tokens": context_length,
             "configured_context_length": context_length,
             "api_context_length": api_context_length,
-            "max_output_tokens": api_context_length,
-            "max_completion_tokens": api_context_length,
+            "max_output_tokens": context_length,
+            "max_completion_tokens": context_length,
             "api_context_status": ctx_status,
             },
     }

@@ -7925,8 +7925,15 @@ models:
         self.assertEqual(payload["metadata"]["max_input_tokens"], 262144)
         self.assertEqual(payload["metadata"]["configured_context_length"], 262144)
         self.assertGreater(payload["metadata"]["api_context_length"], 0)
-        self.assertEqual(payload["max_output_tokens"], payload["metadata"]["api_context_length"])
-        self.assertEqual(payload["max_completion_tokens"], payload["metadata"]["api_context_length"])
+        self.assertEqual(payload["max_output_tokens"], 262144)
+        self.assertEqual(payload["max_completion_tokens"], 262144)
+        self.assertEqual(payload["metadata"]["max_output_tokens"], 262144)
+        self.assertEqual(payload["metadata"]["max_completion_tokens"], 262144)
+        # API_CTX halves the window for the operator-facing table, but an output
+        # cap must not inherit that reduction or clients reserve against half.
+        self.assertNotEqual(
+            payload["max_output_tokens"], payload["metadata"]["api_context_length"]
+        )
         self.assertNotIn("max_tokens", payload["metadata"])
         self.assertNotIn("limit", payload["metadata"])
         self.assertNotIn("input", payload["metadata"])
