@@ -954,6 +954,76 @@ def ensure_internal_route_in_llamaswap_config(
     return route_id
 
 
+def drop_internal_route_from_llamaswap_config(
+    base_model: ManagedModel,
+    route_id: str,
+    catalog: list[ManagedModel],
+    config_path: Path | str,
+    *,
+    allow_base: bool = False,
+) -> bool:
+    """Remove one internal route so llama-swap stops the process serving it.
+
+    Returns ``True`` when the config was rewritten. This exists because
+    llama-swap applies a changed ``cmd`` only the *next* time a route is loaded:
+    it does not restart an already-running process. So bolting the projector onto
+    an instance that is currently serving means the running copy keeps its old,
+    projector-less argv. Dropping the route and then re-adding it (see
+    ``ensure_internal_route_in_llamaswap_config``) is what forces the reload, so
+    the caller MUST re-add the route afterwards or the model goes unpublished.
+
+    The base route needs ``allow_base=True`` because it is the one route that is
+    not recreated on demand; the default keeps it safe against accidental loss.
+    """
+    route_id = str(route_id or "")
+    if not route_id:
+        return False
+    if route_id == getattr(base_model, "model_id", "") and not allow_base:
+        return False
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        yaml = None  # type: ignore
+
+    path = Path(config_path)
+    try:
+        if yaml is not None:
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        else:
+            import json as _json
+
+            data = _json.loads(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return False
+    models = (data or {}).get("models") if isinstance(data, dict) else None
+    if not isinstance(models, dict) or route_id not in models:
+        return False
+
+    models.pop(route_id, None)
+    _recalculate_llamaswap_matrix_from_config(data, catalog)
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as file_handle:
+        file_handle.write(LLAMASWAP_CONFIG_HEADER)
+        if yaml is not None:
+            yaml.safe_dump(data, file_handle, sort_keys=False)
+        else:
+            import json as _json
+
+            file_handle.write(_json.dumps(data, indent=2))
+    tmp.replace(path)
+    try:
+        cli_file3 = _get_cli_file()
+        _log = getattr(cli_file3, "log_api_event", None)
+        if _log is not None:
+            _log(
+                "internal_route_dropped",
+                {"model": base_model.model_id, "route": route_id, "config_path": str(path)},
+            )
+    except Exception:
+        pass
+    return True
+
+
 def ensure_replica_route_in_llamaswap_config(
     base_model: ManagedModel,
     replica_index: int,
@@ -1051,6 +1121,7 @@ __all__ = [
     "_model_info_for_matrix_entry",
     "ensure_replica_route_in_llamaswap_config",
     "ensure_replica_route",
+    "drop_internal_route_from_llamaswap_config",
     "ensure_internal_route_in_llamaswap_config",
     "set_instance_mmproj_in_llamaswap_config",
     "route_carries_mmproj",

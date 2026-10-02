@@ -8780,7 +8780,12 @@ def _vision_live_instances(base_id: str, now: float | None = None) -> set[str]:
     return out
 
 
-def _vision_instance_loaded(instance_id: str, base_id: str, catalog: list[ManagedModel]) -> bool:
+def _vision_instance_loaded(instance_id: str, base_id: str, catalog: list[ManagedModel],
+                            swap_loaded: set[str] | None = None) -> bool:
+    # llama-swap's own view wins: the router's record.pid is only a hint and is
+    # routinely null while a process is still serving that route.
+    if swap_loaded is not None and instance_id in swap_loaded:
+        return True
     if instance_id == base_id:
         try:
             return bool(get_catalog_model_process(base_id, catalog))
@@ -8847,6 +8852,42 @@ def _attach_projector(
         enable=bool(enable),
         gpu_set=_vision_candidate_gpu_set(instance_id, model_entry.model_id),
     )
+
+
+def _evict_instance_for_projector(
+    model_entry: ManagedModel,
+    instance_id: str,
+    catalog: list[ManagedModel],
+    args,
+    public_host: str,
+    public_port: int,
+    unload_timeout: float,
+) -> bool:
+    """Force a running instance to reload so its new ``cmd`` actually takes effect.
+
+    llama-swap applies a changed ``cmd`` only the *next* time a route is loaded; it
+    does not restart the process that is already serving that route. Bolting the
+    projector onto a loaded instance would therefore be a no-op and the very next
+    request would be answered by a projector-less process ("image input is not
+    supported"). Dropping the route stops the process, and re-adding it afterwards
+    makes the next load pick up the new argv.
+
+    Returns ``True`` when the instance is (now) guaranteed to be unloaded, so the
+    caller can attach the projector and let the request trigger a fresh load.
+    """
+    base_id = model_entry.model_id
+    try:
+        drop_internal_route_from_llamaswap_config(
+            model_entry, instance_id, catalog, args.config, allow_base=True
+        )
+    except Exception as exc:
+        log_api_event(
+            "lazy_mmproj_projector_reload_failed",
+            {"model": base_id, "instance": instance_id, "error": str(exc)},
+        )
+        return False
+    _vision_forget_instance(base_id, instance_id)
+    return wait_for_model_absent(instance_id, public_host, public_port, timeout=unload_timeout)
 
 
 def reconcile_text_instance_mmproj(
@@ -8950,7 +8991,11 @@ def route_image_request_to_vision(
         if rid != base_id and str(getattr(record, "base_model_id", "") or "") == base_id
     ]
     candidates = candidate_instance_ids(base_id, sorted(replica_ids))
-    loaded = {item for item in candidates if _vision_instance_loaded(item, base_id, catalog)}
+    swap_loaded = get_loaded_model_ids(public_host, public_port)
+    loaded = {
+        item for item in candidates
+        if _vision_instance_loaded(item, base_id, catalog, swap_loaded)
+    }
     last_used = {item: _vision_instance_last_used(item) for item in candidates}
     target = choose_vision_instance(
         candidates,
@@ -8978,19 +9023,40 @@ def route_image_request_to_vision(
             "(invalid server configuration). Retry shortly."
         )
     already = target in _vision_live_instances(base_id)
-    try:
-        _attach_projector(model_entry, target, catalog, args, idle_ttl, server_defaults, enable=True)
-    except Exception as exc:
-        log_api_event(
-            "lazy_mmproj_route_create_failed",
-            {"model": base_id, "instance": target, "error": str(exc)},
-        )
-        return None, (
-            f"Model {base_id} has mmproj_mode=lazy but the projector could not be attached to "
-            f"instance '{target}'. Retry shortly."
-        )
+    if not already and target in loaded:
+        # A loaded instance keeps its current argv: llama-swap only applies a
+        # changed cmd on the next load, so attaching the projector to a running
+        # copy would be ignored and the image would be rejected. Restart it.
+        if not _evict_instance_for_projector(
+            model_entry,
+            target,
+            catalog,
+            args,
+            public_host,
+            public_port,
+            float(mmproj_cfg.get("unload_timeout_s") or 45.0),
+        ):
+            return None, (
+                f"Model {base_id} has mmproj_mode=lazy but instance '{target}' could not be "
+                "reloaded with the projector. Retry shortly."
+            )
     if not already:
-        wait_for_published_model_id(target, public_host, public_port, timeout_s=min(publish_timeout, 10.0))
+        # A warm process keeps its argv even if `update` reset the route, so skipping
+        # the rewrite here is safe and keeps follow-up turns off the config file.
+        try:
+            _attach_projector(model_entry, target, catalog, args, idle_ttl, server_defaults, enable=True)
+        except Exception as exc:
+            log_api_event(
+                "lazy_mmproj_route_create_failed",
+                {"model": base_id, "instance": target, "error": str(exc)},
+            )
+            return None, (
+                f"Model {base_id} has mmproj_mode=lazy but the projector could not be attached to "
+                f"instance '{target}'. Retry shortly."
+            )
+        wait_for_published_model_id(
+            target, public_host, public_port, timeout_s=min(publish_timeout, 10.0)
+        )
     _vision_mark_instance(base_id, target, sticky_ttl_s)
     _bind_vision_affinity(affinity_key, target, sticky_ttl_s)
     log_api_event(
@@ -9690,6 +9756,30 @@ def get_published_model_ids(host=DEFAULT_PUBLIC_HOST, port=DEFAULT_PUBLIC_PORT) 
         if r.status_code != 200:
             return set()
         return {item.get("id") for item in r.json().get("data", []) if item.get("id")}
+    except Exception:
+        return set()
+
+
+def get_loaded_model_ids(host=DEFAULT_PUBLIC_HOST, port=DEFAULT_PUBLIC_PORT) -> set[str]:
+    """Route ids llama-swap currently has a live process for.
+
+    Unlike ``/upstream/<model>/health`` this never triggers a load, so it is
+    safe to call while deciding whether an instance has to be restarted.
+    """
+    try:
+        host = _normalize_client_host(host)
+        r = requests.get(f"http://{host}:{port}/v1/models", timeout=1.5)
+        if r.status_code != 200:
+            return set()
+        loaded = set()
+        for item in r.json().get("data", []):
+            if not isinstance(item, dict):
+                continue
+            status = item.get("status")
+            value = status.get("value") if isinstance(status, dict) else status
+            if item.get("id") and str(value or "").lower() == "loaded":
+                loaded.add(str(item["id"]))
+        return loaded
     except Exception:
         return set()
 
@@ -22597,6 +22687,7 @@ try:
         replica_model_id as _sc_replica_id,
         render_llamaswap_config as _sc_render,
         resolve_global_replica_config as _sc_resolve_global,
+        drop_internal_route_from_llamaswap_config as _sc_drop_internal_route,
         route_carries_mmproj as _sc_route_carries_mmproj,
         set_instance_mmproj_in_llamaswap_config as _sc_set_instance_mmproj,
     )
@@ -22614,6 +22705,7 @@ try:
     resolve_global_replica_config = _sc_resolve_global  # type: ignore
     route_carries_mmproj = _sc_route_carries_mmproj  # type: ignore
     set_instance_mmproj_in_llamaswap_config = _sc_set_instance_mmproj  # type: ignore
+    drop_internal_route_from_llamaswap_config = _sc_drop_internal_route  # type: ignore
 except Exception:
     pass
 try:

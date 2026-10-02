@@ -502,17 +502,25 @@ instance never receives an image:
 
 | State of the candidates | Chosen |
 |---|---|
-| some unloaded, others loaded | an **unloaded** one, so busy instances keep serving |
+| one is **loaded with the projector** | that one, even if another instance is free — no projector load, no disruption |
+| all loaded, none carries it, some are idle | an **unloaded** one, so busy instances keep serving |
 | all idle, one already carries the projector | that one, to avoid a projector reload |
 | all idle, none carries it | the one **idle longest** |
 
-The chosen route's command is rewritten to add `--mmproj`, the conversation is
-pinned to it so follow-up turns reuse the warm projector, and it gets a `ttl` of
-`mmproj.vision_sticky_ttl_s` (1 hour by default). Once that lapses llama-swap
-evicts the process, and the flag is stripped again the next time a text request
-needs that instance — or at the next `llm-server update`, which always re-renders
-text-only. If the projector cannot be attached the request returns `503` with a
-retry message rather than reaching a backend that would silently drop the image.
+The first row is what keeps vision cheap inside a long conversation: a one-off
+image question borrows the instance whose projector is already warm instead of
+loading one, and because image turns pin only a *separate* vision affinity, the
+next text turn goes back to the instance the conversation was following.
+
+The chosen route's command is rewritten to add `--mmproj` and it gets a `ttl` of
+`mmproj.vision_sticky_ttl_s` (1 hour by default). llama-swap applies a rewritten
+`cmd` only the *next* time that route loads, so an instance that is already
+running is dropped from the config and awaited as absent before the flag is
+attached. Once the TTL lapses llama-swap evicts the process, and the flag is
+stripped again the next time a text request needs that instance — or at the next
+`llm-server update`, which always re-renders text-only. If the projector cannot
+be attached the request returns `503` with a retry message rather than reaching a
+backend that would silently drop the image.
 
 A lazy base also stops reserving projector headroom in its tensor split.
 
@@ -542,8 +550,16 @@ Or for every projector model via the global `mmproj` block in
 engines are never lazy: vLLM has no `--mmproj` and the exllama adapter drops
 image parts before they reach the backend. `llm-server config-migrate` fills the
 block in without overwriting values you set, and `GET /v1/models` reports
-`mmproj_mode` and `vision_instances` per model — the instances currently
-carrying the projector — so the wiring is verifiable.
+`mmproj_mode` and `vision_instances` per model — the instances the gateway
+believes are carrying the projector — so the wiring is verifiable.
+
+Two caveats when reading that field: it is gateway state, so a leftover process
+whose command line still shows `--mmproj` can outlive the flag that created it
+until its TTL expires, and it survives a unit restart in the same way. For the
+authoritative view of what is actually running, use `pgrep -af mmproj` and
+`nvidia-smi`. A genuinely cold start needs the units stopped and any leftover
+listeners and GPU compute processes killed before starting them again; a plain
+`systemctl --user restart` can leave the previous process holding the port.
 
 ## Cleanup and model lifecycle
 

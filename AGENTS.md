@@ -121,6 +121,7 @@ llm-server info 2>&1 | head -n 80 || echo "gateway no instalado"
 ├── configs/history/         # Snapshots de autotuning
 ├── docs/
 │   ├── LLM_INSTALL.md       # Guía canónica para LLMs (Q1-Q8, matriz, comandos)
+│   ├── DFLASH-SPEC.md       # MTP vs DFlash2, VRAM medido, ctx_size_draft, logits
 │   ├── VLLM-BETA.md
 │   ├── LOCAL_OLLAMA_SETUP.md
 │   ├── arg-hyphen-conventions.md
@@ -309,6 +310,7 @@ Ver `README.md#Troubleshooting` y `docs/LLM_INSTALL.md#8`.
 - `README.md` — overview, arquitectura, API, troubleshooting.
 - `docs/LLM_INSTALL.md` — checklist canónico para agentes (pre-checks, Q1–Q8, matriz, comandos, verificación).
 - `llamacpp_stack/install.py` — fuente de verdad de prompts/flags (`prompt_bool`, `prompt_choice`, `resolve_*`, `build_cli_parser`).
+- `docs/DFLASH-SPEC.md` — MTP vs DFlash2: presupuesto de VRAM medido, trampa `ctx_size_draft:0`, coste de `--logits-all`, compat EXL3+DFlash2, patch requerido, y **la nota de que el servicio corre un snapshot (§8)**.
 - `docs/VLLM-BETA.md`, `docs/LOCAL_OLLAMA_SETUP.md`, `docs/arg-hyphen-conventions.md`, `docs/flags_llamacpp`, `docs/lllamacpp_flags_API.md`.
 - `skills/llm-server-autotune/SKILL.md` — loop de autotuning.
 

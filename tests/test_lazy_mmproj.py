@@ -27,6 +27,7 @@ from llamacpp_stack.cli import vision as vision_mod
 from llamacpp_stack.cli.models import ReplicaRecord
 from llamacpp_stack.cli.replica import (
     _calculate_llama_swap_matrix,
+    drop_internal_route_from_llamaswap_config,
     ensure_internal_route_in_llamaswap_config,
     ensure_replica_route_in_llamaswap_config,
     render_llamaswap_config,
@@ -270,9 +271,17 @@ class InstanceRuleTest(unittest.TestCase):
         self.assertEqual(candidate_instance_ids("", []), [])
 
     def test_unloaded_instance_beats_a_loaded_one(self):
+        # The loaded instance here has NO projector, so paying a load for the
+        # free instance still wins: warmth only breaks ties once it is loaded.
+        self.assertEqual(
+            choose_vision_instance([BASE_ID, REPLICA_ID], loaded={BASE_ID}, has_mmproj=set()),
+            REPLICA_ID,
+        )
+
+    def test_a_warm_loaded_projector_beats_a_free_instance(self):
         self.assertEqual(
             choose_vision_instance([BASE_ID, REPLICA_ID], loaded={BASE_ID}, has_mmproj={BASE_ID}),
-            REPLICA_ID,
+            BASE_ID,
         )
 
     def test_among_idle_instances_the_warm_projector_wins(self):
@@ -304,9 +313,20 @@ class InstanceRuleTest(unittest.TestCase):
             BASE_ID,
         )
 
-    def test_liveness_outranks_projector_warmth(self):
+    def test_a_warm_loaded_replica_beats_a_free_base(self):
+        # Top tier: a one-off image question may divert away from the base even
+        # though the base is free, because reusing the already-warm projector
+        # costs nothing while loading the base would.
         self.assertEqual(
             choose_vision_instance([BASE_ID, REPLICA_ID], loaded={REPLICA_ID}, has_mmproj={REPLICA_ID}),
+            REPLICA_ID,
+        )
+
+    def test_a_loaded_instance_without_a_projector_still_loses_to_a_free_one(self):
+        # Same shapes as above but the loaded instance is not warm, so the
+        # divert tier does not apply and the free instance wins again.
+        self.assertEqual(
+            choose_vision_instance([BASE_ID, REPLICA_ID], loaded={REPLICA_ID}, has_mmproj=set()),
             BASE_ID,
         )
 
@@ -705,6 +725,10 @@ class ConfigBlockTest(unittest.TestCase):
         self.assertEqual(vision_route_ttl({"vision_sticky_ttl_s": 90}), 2)
         self.assertEqual(vision_route_ttl(default_mmproj_config()), 60)
 
+    def test_a_block_missing_the_key_still_falls_back_to_the_packaged_default(self):
+        self.assertEqual(vision_route_ttl({}), 60)
+        self.assertEqual(vision_route_ttl({"default_mode": "lazy"}), 60)
+
     def test_the_conf_block_is_written_once_and_then_stable(self):
         payload, changed = _cli_impl.normalize_server_config_payload({})
         self.assertTrue(changed)
@@ -742,6 +766,7 @@ class RouteRequestTest(
         )
         for name in (
             "get_catalog_model_process",
+            "get_loaded_model_ids",
             "wait_for_published_model_id",
             "log_api_event",
             "set_instance_mmproj_in_llamaswap_config",
@@ -750,6 +775,7 @@ class RouteRequestTest(
             setattr(self, f"{name}_mock", patcher.start())
             self.addCleanup(patcher.stop)
         self.get_catalog_model_process_mock.return_value = None
+        self.get_loaded_model_ids_mock.return_value = set()
         self.wait_for_published_model_id_mock.return_value = True
         self.set_instance_mmproj_in_llamaswap_config_mock.return_value = self.config_path
         self.now = 1000.0
@@ -850,17 +876,25 @@ class RouteRequestTest(
         self.assertIsNone(error)
         self.assertEqual(target, BASE_ID)
 
-    def test_a_warm_projector_does_not_outrank_an_idle_instance(self):
+    def test_a_one_off_image_diverts_to_a_warm_loaded_projector(self):
         self.use_conf()
-        self.get_catalog_model_process_mock.return_value = {"pid": 111}
-        _cli_impl._vision_mark_instance(BASE_ID, BASE_ID, 3600.0)
         replica = self._add_replica()
+        pinned = (replica, self.now + 900.0)
+        _cli_impl.REPLICA_ROUTER_STATE.affinity["conv"] = pinned
+        self.get_catalog_model_process_mock.return_value = {"pid": 111}
+        self.get_loaded_model_ids_mock.return_value = {BASE_ID}
+        _cli_impl._vision_mark_instance(BASE_ID, BASE_ID, 3600.0)
         target, error = self._route(self.IMAGE_PAYLOAD)
         self.assertIsNone(error)
         self.assertEqual(
             target,
-            replica,
-            "a warm projector on a busy instance is useless; the free one wins",
+            BASE_ID,
+            "a loaded projector is reused even though the replica is free",
+        )
+        self.assertEqual(
+            _cli_impl.REPLICA_ROUTER_STATE.affinity["conv"],
+            pinned,
+            "the conversation must stay pinned to the model it was following",
         )
 
     def test_among_two_idle_instances_the_warm_projector_wins(self):
@@ -1234,6 +1268,227 @@ class SurfaceTest(unittest.TestCase):
             plain_details = _cli_impl.build_openai_model_payload(plain)["metadata"]
         self.assertEqual(plain_details["vision_instances"], [])
         self.assertEqual(plain_details["mmproj_mode"], MMPROJ_MODE_ALWAYS)
+
+
+class ProjectorReloadTest(unittest.TestCase, _ConfigEnvMixin, _RouterStateMixin):
+    """A loaded instance must be restarted, or its new ``cmd`` is ignored.
+
+    llama-swap applies a changed command only the next time a route is loaded, so
+    attaching the projector to a running copy is a no-op and the image request is
+    answered by a projector-less process.
+    """
+
+    def setUp(self):
+        self.reset_router_state()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.config_path = self.root / "config.yaml"
+        self.model = _lazy_model()
+        self.catalog = [self.model]
+        self.args = argparse.Namespace(
+            public_port=11436,
+            config=str(self.config_path),
+            llama_server=str(SERVER),
+            idle_ttl=300,
+            llama_server_defaults={},
+            mode="user",
+            state_dir=str(self.root),
+            public_host="127.0.0.1",
+        )
+        for name in (
+            "get_catalog_model_process",
+            "wait_for_published_model_id",
+            "wait_for_model_absent",
+            "log_api_event",
+            "set_instance_mmproj_in_llamaswap_config",
+        ):
+            patcher = mock.patch.object(_cli_impl, name)
+            setattr(self, f"{name}_mock", patcher.start())
+            self.addCleanup(patcher.stop)
+        self.get_catalog_model_process_mock.return_value = None
+        self.wait_for_published_model_id_mock.return_value = True
+        self.wait_for_model_absent_mock.return_value = True
+        self.set_instance_mmproj_in_llamaswap_config_mock.return_value = self.config_path
+        self.evict = mock.patch.object(
+            _cli_impl, "_evict_instance_for_projector", return_value=True
+        )
+        self.evict_mock = self.evict.start()
+        self.addCleanup(self.evict.stop)
+        self.now = 1000.0
+        clock = mock.patch.object(_cli_impl.time, "monotonic", return_value=self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    IMAGE_PAYLOAD = {
+        "model": BASE_ID,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                ],
+            }
+        ],
+    }
+    HEADERS = {"thread-id": "conv-1"}
+
+    def _route(self):
+        return _cli_impl.route_image_request_to_vision(
+            self.model, self.IMAGE_PAYLOAD, self.HEADERS, self.catalog, self.args, "127.0.0.1"
+        )
+
+    def _mark_loaded_replica(self, status="ready", pid=4242):
+        _cli_impl.REPLICA_ROUTER_STATE.records[REPLICA_ID] = ReplicaRecord(
+            base_model_id=BASE_ID,
+            replica_model_id=REPLICA_ID,
+            gpu_set=[1],
+            status=status,
+            pid=pid,
+            last_used=0.0,
+        )
+
+    def _mark_loaded_base(self):
+        """The base is busy with text right now, so a replica is the better victim.
+
+        Both instances end up loaded in the tests that expect a restart, so the
+        tie-break on idle time is what actually picks the replica here.
+        """
+        self.get_catalog_model_process_mock.return_value = {"pid": 111}
+        _cli_impl.REPLICA_ROUTER_STATE.base_last_used[BASE_ID] = self.now
+
+    def test_a_loaded_target_is_restarted_before_the_projector_is_attached(self):
+        self.use_conf()
+        self._mark_loaded_base()
+        self._mark_loaded_replica()
+        target, error = self._route()
+        self.assertIsNone(error)
+        self.assertEqual(target, REPLICA_ID)
+        self.evict_mock.assert_called_once()
+        self.assertEqual(self.evict_mock.call_args.args[1], REPLICA_ID)
+        # The projector is only attached once the stale process is gone.
+        self.assertTrue(
+            self.set_instance_mmproj_in_llamaswap_config_mock.call_args.kwargs["enable"]
+        )
+
+    def test_an_idle_target_is_loaded_afresh_and_needs_no_restart(self):
+        self.use_conf()
+        self._mark_loaded_base()
+        self._mark_loaded_replica(status="cold", pid=None)
+        target, error = self._route()
+        self.assertIsNone(error)
+        self.assertEqual(target, REPLICA_ID)
+        self.evict_mock.assert_not_called()
+        self.set_instance_mmproj_in_llamaswap_config_mock.assert_called_once()
+
+    def test_an_already_warm_target_is_neither_restarted_nor_rewritten(self):
+        self.use_conf()
+        self._mark_loaded_base()
+        self._mark_loaded_replica()
+        _cli_impl._vision_mark_instance(BASE_ID, REPLICA_ID, 3600.0)
+        target, error = self._route()
+        self.assertIsNone(error)
+        self.assertEqual(target, REPLICA_ID)
+        self.evict_mock.assert_not_called()
+        self.set_instance_mmproj_in_llamaswap_config_mock.assert_not_called()
+
+    def test_a_failed_restart_becomes_a_503_instead_of_a_silent_image_drop(self):
+        self.use_conf()
+        self._mark_loaded_base()
+        self._mark_loaded_replica()
+        self.evict_mock.return_value = False
+        target, error = self._route()
+        self.assertIsNone(target)
+        self.assertIn(REPLICA_ID, error)
+        self.assertIn("reloaded", error)
+        self.set_instance_mmproj_in_llamaswap_config_mock.assert_not_called()
+
+    def test_restart_drops_the_route_and_waits_for_the_process_to_go(self):
+        self.evict.stop()
+        dropper = mock.patch.object(
+            _cli_impl, "drop_internal_route_from_llamaswap_config", return_value=True
+        )
+        dropper.start()
+        self.addCleanup(dropper.stop)
+        _cli_impl._vision_mark_instance(BASE_ID, REPLICA_ID, 3600.0)
+        ok = _cli_impl._evict_instance_for_projector(
+            self.model, REPLICA_ID, self.catalog, self.args, "127.0.0.1", 11436, 45.0
+        )
+        self.assertTrue(ok)
+        self.assertEqual(_cli_impl.drop_internal_route_from_llamaswap_config.call_args.kwargs["allow_base"], True)
+        self.wait_for_model_absent_mock.assert_called_once_with(
+            REPLICA_ID, "127.0.0.1", 11436, timeout=45.0
+        )
+        # The stale projector flag must not survive, or the next text request
+        # would believe the route is already in its vision state.
+        self.assertNotIn(BASE_ID, _cli_impl.REPLICA_ROUTER_STATE.vision_until)
+
+    def test_a_route_that_never_unloads_is_reported_as_a_failure(self):
+        self.evict.stop()
+        dropper = mock.patch.object(
+            _cli_impl, "drop_internal_route_from_llamaswap_config", return_value=True
+        )
+        dropper.start()
+        self.addCleanup(dropper.stop)
+        self.wait_for_model_absent_mock.return_value = False
+        self.assertFalse(
+            _cli_impl._evict_instance_for_projector(
+                self.model, REPLICA_ID, self.catalog, self.args, "127.0.0.1", 11436, 45.0
+            )
+        )
+
+
+class DropInternalRouteTest(unittest.TestCase):
+    """``drop_internal_route_from_llamaswap_config`` stops one route's process."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config_path = Path(self.tmp.name) / "config.yaml"
+        self.model = _lazy_model()
+        self.catalog = [self.model]
+
+    def _write(self, routes):
+        self.config_path.write_text(
+            yaml.safe_dump({"models": routes}, sort_keys=False), encoding="utf-8"
+        )
+
+    def _routes(self):
+        return (yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {})["models"]
+
+    def _drop(self, route_id, **kwargs):
+        return drop_internal_route_from_llamaswap_config(
+            self.model, route_id, self.catalog, self.config_path, **kwargs
+        )
+
+    def test_it_removes_only_the_named_route(self):
+        self._write({
+            BASE_ID: {"cmd": "srv --model a"},
+            REPLICA_ID: {"cmd": "srv --model a"},
+            "other": {"cmd": "srv --model b"},
+        })
+        self.assertTrue(self._drop(REPLICA_ID))
+        self.assertEqual(sorted(self._routes()), sorted([BASE_ID, "other"]))
+
+    def test_the_base_route_is_refused_unless_explicitly_allowed(self):
+        self._write({BASE_ID: {"cmd": "srv --model a"}})
+        self.assertFalse(self._drop(BASE_ID))
+        self.assertIn(BASE_ID, self._routes())
+
+    def test_the_base_route_can_be_dropped_on_purpose(self):
+        self._write({BASE_ID: {"cmd": "srv --model a"}})
+        self.assertTrue(self._drop(BASE_ID, allow_base=True))
+        self.assertEqual(self._routes(), {})
+
+    def test_dropping_an_absent_route_reports_that_it_changed_nothing(self):
+        self._write({BASE_ID: {"cmd": "srv --model a"}})
+        self.assertFalse(self._drop("missing"))
+        self.assertIn(BASE_ID, self._routes())
+
+    def test_a_blank_route_id_is_rejected(self):
+        self._write({BASE_ID: {"cmd": "srv --model a"}})
+        self.assertFalse(self._drop(""))
 
 
 if __name__ == "__main__":

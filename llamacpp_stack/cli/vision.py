@@ -162,11 +162,15 @@ def choose_vision_instance(
 
     The operator's rule, in order:
 
-    1. An unloaded instance always beats a loaded one, so serving an image
+    1. An instance that is *already serving with the projector loaded* wins
+       outright. A long conversation bound to one instance can therefore
+       borrow a warm projector for a single image question without paying a
+       load, and the conversation's own affinity is left untouched.
+    2. Otherwise an unloaded instance beats a loaded one, so serving an image
        never disturbs an instance that is currently serving text.
-    2. Among instances of equal liveness, one that *already* has ``--mmproj``
+    3. Among instances of equal liveness, one that *already* has ``--mmproj``
        wins, which avoids reloading the projector.
-    3. Remaining ties go to the instance idle the longest.
+    4. Remaining ties go to the instance idle the longest.
 
     Pure, so the rule is unit-testable without touching llama-swap.
     """
@@ -185,8 +189,9 @@ def choose_vision_instance(
         except (TypeError, ValueError):
             return default_used
 
-    def _key(item: str) -> tuple[int, int, float]:
+    def _key(item: str) -> tuple[int, int, int, float]:
         return (
+            0 if (item in loaded_set and item in mmproj_set) else 1,
             1 if item in loaded_set else 0,
             0 if item in mmproj_set else 1,
             _idle(item),
@@ -330,10 +335,13 @@ def cached_mmproj_config(args: object | None = None) -> dict[str, object]:
 
 
 def vision_route_ttl(mmproj_config: dict[str, object] | None = None) -> int | None:
-    """llama-swap ttl for the vision sibling route (idle minutes, or None)."""
+    """llama-swap ttl for the projector-bearing instance (idle minutes, or None)."""
     cfg = mmproj_config if isinstance(mmproj_config, dict) else resolve_effective_mmproj_config()
+    # Fall back to the packaged default rather than a literal, so a config block
+    # missing the key cannot drift away from `default_mmproj_config`.
+    fallback = int(default_mmproj_config()["vision_sticky_ttl_s"])
     try:
-        sticky = int((cfg or {}).get("vision_sticky_ttl_s", 1800))
+        sticky = int((cfg or {}).get("vision_sticky_ttl_s", fallback))
     except Exception:
         return None
     if sticky <= 0:
