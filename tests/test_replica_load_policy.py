@@ -1147,6 +1147,62 @@ class CrossModelPlacementTest(unittest.TestCase):
         self.assertEqual(R.cached_model_gpu_sets(catalog, 2)["heavy-a"], [0])
 
 
+class PreflightUsesTheAssignedCardTest(unittest.TestCase):
+    """The VRAM preflight must measure the card the model will launch on.
+
+    `model_launch_gpu_set` answers [0] for every single-GPU model, so measuring
+    against it refuses a model assigned to an idle GPU1 while GPU0 is full.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.catalog = [
+            replace(_make_model("on-gpu-0", tensor_split="1"), local_path=self._sparse("a.safetensors", 14650)),
+            replace(_make_model("on-gpu-1", tensor_split="1"), local_path=self._sparse("b.safetensors", 14650)),
+        ]
+        self.assignment = R.assign_model_gpu_sets(self.catalog, 2)
+        self.addCleanup(R._MODEL_GPU_ASSIGNMENT_MEMO.clear)
+
+    def _sparse(self, name: str, mib: int) -> str:
+        path = self.root / name
+        with open(path, "wb") as handle:
+            handle.truncate(mib * 1024 * 1024)
+        return str(path)
+
+    def _model(self, model_id: str):
+        return next(m for m in self.catalog if m.model_id == model_id)
+
+    def test_the_two_models_are_assigned_different_cards(self):
+        self.assertEqual(self.assignment, {"on-gpu-0": [0], "on-gpu-1": [1]})
+
+    def test_it_measures_the_assigned_card_not_the_launch_default(self):
+        self.assertEqual(_cli_impl.model_launch_gpu_set(self._model("on-gpu-1")), [0])
+        snapshot = {0: {"free_mib": 100.0}, 1: {"free_mib": 24000.0}}
+        with (
+            mock.patch.object(_cli_impl, "_query_gpu_memory_snapshot_cached", return_value=snapshot),
+            mock.patch.object(_cli_impl, "estimate_model_runtime_mib", return_value=18000.0),
+        ):
+            fits, info = _cli_impl.model_has_enough_free_vram_to_load(
+                self._model("on-gpu-1"), gpu_set=self.assignment["on-gpu-1"]
+            )
+        self.assertTrue(fits, info)
+        self.assertEqual(info["checks"][0]["gpu"], 1)
+
+    def test_a_full_assigned_card_is_still_refused(self):
+        snapshot = {0: {"free_mib": 24000.0}, 1: {"free_mib": 100.0}}
+        with (
+            mock.patch.object(_cli_impl, "_query_gpu_memory_snapshot_cached", return_value=snapshot),
+            mock.patch.object(_cli_impl, "estimate_model_runtime_mib", return_value=18000.0),
+        ):
+            fits, info = _cli_impl.model_has_enough_free_vram_to_load(
+                self._model("on-gpu-1"), gpu_set=self.assignment["on-gpu-1"]
+            )
+        self.assertFalse(fits)
+        self.assertEqual(info["reason"], "insufficient_vram")
+
+
 class ReplicaStaysOffReservedGpusTest(unittest.TestCase):
     """A replica must not take the only card another model's base was assigned.
 

@@ -10516,6 +10516,13 @@ def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DE
         if base_model is not None:
             target_model = base_model
             replica_gpu_set = _resolve_replica_gpu_set(model_id, base_model)
+    # The VRAM preflight has to look at the card this model will actually be
+    # launched on: `model_launch_gpu_set` answers [0] for every single-GPU model,
+    # so without this a model assigned to GPU1 is measured against GPU0 and
+    # refused while its own card sits empty.
+    target_gpu_set = replica_gpu_set
+    if target_gpu_set is None and target_model is not None:
+        target_gpu_set = cached_model_gpu_sets(catalog or []).get(target_model.model_id) or None
     if replica_gpu_set is not None:
         try:
             rec = REPLICA_ROUTER_STATE.records.get(model_id)
@@ -10579,7 +10586,7 @@ def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DE
     if not conflicts:
         if replica_gpu_set is not None:
             if target_model is not None:
-                fits, fit_info = model_has_enough_free_vram_to_load(target_model, gpu_set=replica_gpu_set)
+                fits, fit_info = model_has_enough_free_vram_to_load(target_model, gpu_set=target_gpu_set)
                 if fits:
                     log_api_event(
                         "model_load_allowed_replica_gpu_free",
@@ -10665,7 +10672,7 @@ def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DE
                 f"Cannot load model '{model_id}' even after unloading {joined}: "
                 f"{fit_info.get('reason')}. Use a smaller context or a quant with less VRAM."
             )
-        fits, fit_info = model_has_enough_free_vram_to_load(target_model, gpu_set=replica_gpu_set)
+        fits, fit_info = model_has_enough_free_vram_to_load(target_model, gpu_set=target_gpu_set)
         if fits:
             log_api_event(
                 "model_load_allowed_vram_available",
