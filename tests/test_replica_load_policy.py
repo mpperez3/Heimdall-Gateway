@@ -1121,6 +1121,24 @@ class CrossModelPlacementTest(unittest.TestCase):
         self.assertEqual(seen["heavy-a"], "0")
         self.assertEqual(seen["heavy-b"], "1")
 
+    def test_render_keeps_the_builder_prefix_on_a_model_placement_does_not_cover(self):
+        # A model spanning both GPUs is excluded from the assignment (only
+        # single-GPU models get one), so render must leave the tensor_split-derived
+        # prefix alone instead of stripping it.
+        wide = replace(
+            _make_model("wide", tensor_split="1,1"),
+            local_path=self._sparse("wide.safetensors", 16304),
+        )
+        out = self.root / "config.yaml"
+        with mock.patch("llamacpp_stack.cli.replica.detect_cuda_device_count", return_value=2):
+            R.render_llamaswap_config(
+                [wide], out, SERVER, 18097, 18000,
+                server_defaults={}, replica_defaults={},
+            )
+        cmd = str(yaml.safe_load(out.read_text())["models"]["wide"]["cmd"])
+        self.assertEqual(cmd.count("CUDA_VISIBLE_DEVICES="), 1)
+        self.assertEqual(cmd.split("CUDA_VISIBLE_DEVICES=")[1].split()[0], "0,1")
+
     def test_render_declares_two_disjoint_gpu_models_as_co_loadable(self):
         catalog = self._models()
         out = self.root / "config.yaml"

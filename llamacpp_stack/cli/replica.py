@@ -840,7 +840,11 @@ def render_llamaswap_config(
             replica_group_members.append(m.model_id)
         else:
             base_gpu_set = gpu_assignment.get(m.model_id)
-            cmd = _set_cuda_visible_devices(cmd, base_gpu_set)
+            if base_gpu_set:
+                # `_set_cuda_visible_devices(cmd, None)` strips the prefix, so the
+                # guard is load-bearing: it keeps unassigned models (multi-GPU,
+                # small, embedding) pinned as their tensor_split dictated.
+                cmd = _set_cuda_visible_devices(cmd, base_gpu_set)
         models_info_for_matrix.append({
             "id": m.model_id,
             "gpu_set": replica_gpu_set if replica_gpu_set is not None else (
