@@ -898,6 +898,9 @@ def ensure_replica_route_in_llamaswap_config(
             port="${PORT}",
             server_defaults=resolved_defaults,
             vllm_defaults=_resolve_vllm(),
+            include_mmproj=bool(
+                resolve_render_include_mmproj(replica, cached_mmproj_config())
+            ),
         )
         try:
             ct2 = str((getattr(replica, "server_overrides", {}) or {}).get("cache_type") or "").strip().lower()

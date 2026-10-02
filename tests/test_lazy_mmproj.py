@@ -479,6 +479,30 @@ class EnsureVisionRouteTest(unittest.TestCase, _ConfigEnvMixin):
         self.assertEqual(self._ensure(catalog), VISION_ID)
         self.assertEqual(after_first, self.config_path.read_bytes())
 
+    def test_dynamic_replica_route_of_a_lazy_model_stays_text_only(self):
+        self.use_conf()
+        base = self._model(server_overrides={"engine": "buun", "mmproj_mode": "lazy"})
+        from llamacpp_stack.cli.replica import ensure_replica_route_in_llamaswap_config
+
+        with mock.patch(
+            "llamacpp_stack.cli.replica._engine_binary_base",
+            return_value=Path("/nonexistent"),
+        ):
+            ensure_replica_route_in_llamaswap_config(
+                base,
+                0,
+                [1],
+                [base],
+                self.config_path,
+                Path("/usr/bin/llama-server"),
+                300,
+                {},
+            )
+        data = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        replica_id = f"{base.model_id}__replica_0"
+        self.assertIn(replica_id, data["models"])
+        self.assertNotIn("--mmproj", data["models"][replica_id]["cmd"])
+
 
 class RouteRequestTest(unittest.TestCase, _ConfigEnvMixin):
     """``route_image_request_to_vision`` decides where an image request goes."""
