@@ -1576,5 +1576,54 @@ class CapabilitiesTest(unittest.TestCase, _ConfigEnvMixin):
         self.assertEqual(entry["capabilities"], {"vision": True})
 
 
+class RuntimeCapabilitiesTest(unittest.TestCase):
+    """`metadata.capabilities.vision` must reflect the live route, not the intent."""
+
+    def _write_config(self, tmpdir, cmd):
+        path = Path(tmpdir) / "config.yaml"
+        path.write_text(
+            "# header comment\n"
+            "models:\n"
+            f"  exl3-qwen:\n    cmd: {cmd}\n    ttl: 18000\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def test_a_loaded_route_carrying_a_projector_reports_vision(self):
+        from llamacpp_stack import _cli_impl
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = self._write_config(tmpdir, "llama-server -m model --mmproj /proj --port ${PORT}")
+            caps = _cli_impl.model_runtime_capabilities("exl3-qwen", cfg, {"exl3-qwen"})
+            self.assertEqual(caps, {"vision": True})
+
+    def test_a_configured_but_unloaded_route_does_not_report_vision(self):
+        from llamacpp_stack import _cli_impl
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = self._write_config(tmpdir, "llama-server -m model --mmproj /proj --port ${PORT}")
+            caps = _cli_impl.model_runtime_capabilities("exl3-qwen", cfg, set())
+            self.assertEqual(caps, {"vision": False})
+
+    def test_a_loaded_route_without_a_projector_does_not_report_vision(self):
+        from llamacpp_stack import _cli_impl
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = self._write_config(tmpdir, "llama-server -m model --port ${PORT}")
+            caps = _cli_impl.model_runtime_capabilities("exl3-qwen", cfg, {"exl3-qwen"})
+            self.assertEqual(caps, {"vision": False})
+
+    def test_a_stray_mmproj_mode_flag_is_not_mistaken_for_a_projector(self):
+        from llamacpp_stack import _cli_impl
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = self._write_config(tmpdir, "llama-server -m model --mmproj-mode lazy --port ${PORT}")
+            caps = _cli_impl.model_runtime_capabilities("exl3-qwen", cfg, {"exl3-qwen"})
+            self.assertEqual(caps, {"vision": False})
+
+    def test_an_unknown_or_unreadable_config_reports_no_vision(self):
+        from llamacpp_stack import _cli_impl
+        self.assertEqual(
+            _cli_impl.model_runtime_capabilities("nope", Path("/nonexistent/cfg.yaml"), {"nope"}),
+            {"vision": False},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

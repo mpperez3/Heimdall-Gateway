@@ -526,15 +526,29 @@ If the projector cannot be attached the request returns `503` with a retry
 message rather than reaching a backend that would silently drop the image.
 
 Every route also declares its own `capabilities.vision` in `config.yaml`, derived
-from whether that route's command carries `--mmproj`, so llama-swap's `/v1/models`
-and its web UI badges show which instance currently has a projector loaded:
+from whether that route's command carries `--mmproj`:
 
 ```json
 "qwen3.8-27b-EXL3": { "capabilities": { "vision": false } },
 "qwen3.8-27b-q4_1": { "capabilities": { "vision": true } }
 ```
 
-llama-swap treats `capabilities` as listing metadata only; it does not change
+**llama-swap v255 does not echo this field back.** Its `/v1/models` returns only
+`id, object, created, owned_by, description, meta.llamaswap{aliases,type,internal_replica_of}`
+and `status.value`; `capabilities` appears under no endpoint (`/v1/models`,
+`/api/models`, `/api/config` were all probed). The key is accepted without a parse
+error, it is simply not surfaced by that build.
+
+So the authoritative live answer is the **gateway's** `/v1/models`, which resolves
+the route's own command and llama-swap's load state together — `vision` is true
+only when the route currently has a projector **and** llama-swap has it loaded:
+
+```bash
+curl -sk https://127.0.0.1:11435/v1/models -H "Authorization: Bearer $LLM_API_KEY" \
+  | jq '.data[] | select(.metadata.mmproj_mode=="lazy") | {id, vision: .metadata.capabilities.vision}'
+```
+
+llama-swap treats `capabilities` as listing metadata only; it never changes
 routing, so the gateway still decides which instance gets the projector.
 
 A lazy base also stops reserving projector headroom in its tensor split.

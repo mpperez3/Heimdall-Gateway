@@ -8780,6 +8780,51 @@ def _vision_live_instances(base_id: str, now: float | None = None) -> set[str]:
     return out
 
 
+_ROUTE_CMD_CACHE: dict[str, object] = {"key": None, "cmds": {}}
+
+
+def _llamaswap_route_commands(config_path: Path) -> dict[str, str]:
+    """`{model_id: cmd}` from the rendered config, cached on path+mtime.
+
+    A `/v1/models` sweep would otherwise re-parse a hundred-plus route YAML once
+    per model, and the file only changes when something rewrites it.
+    """
+    try:
+        stat = Path(config_path).stat()
+        key = (str(config_path), stat.st_mtime_ns, stat.st_size)
+    except Exception:
+        return {}
+    if _ROUTE_CMD_CACHE.get("key") == key:
+        return dict(_ROUTE_CMD_CACHE.get("cmds") or {})
+    try:
+        payload = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
+        cmds = {
+            str(model_id): str((entry or {}).get("cmd") or "")
+            for model_id, entry in (payload.get("models") or {}).items()
+        }
+    except Exception:
+        return {}
+    _ROUTE_CMD_CACHE["key"] = key
+    _ROUTE_CMD_CACHE["cmds"] = cmds
+    return dict(cmds)
+
+
+def model_runtime_capabilities(model_id: str, config_path: Path | None = None,
+                              swap_loaded: set[str] | None = None) -> dict[str, bool]:
+    """What one model id can accept right now, read from its own live route.
+
+    The rendered command only says what the route *would* do on its next load, and
+    llama-swap keeps a projector's process alive past the config edit that added
+    it, so neither signal is enough alone: `vision` is true only when llama-swap
+    currently has that route loaded *and* its command carries a projector. That is
+    the question an operator is actually asking after seeing a vision answer land
+    in the logs.
+    """
+    cfg_path = Path(config_path) if config_path is not None else DEFAULT_CONFIG_PATH
+    configured = _cmdline_mmproj_path(_llamaswap_route_commands(cfg_path).get(str(model_id), "")) is not None
+    return {"vision": bool(configured and str(model_id) in (swap_loaded or set()))}
+
+
 def _vision_instance_loaded(instance_id: str, base_id: str, catalog: list[ManagedModel],
                             swap_loaded: set[str] | None = None) -> bool:
     # llama-swap's own view wins: the router's record.pid is only a hint and is
@@ -10563,7 +10608,7 @@ def build_model_ctx_payload(model: ManagedModel) -> dict:
 
 
 
-def build_openai_model_list_payload(model: ManagedModel) -> dict:
+def build_openai_model_list_payload(model: ManagedModel, capabilities: dict | None = None) -> dict:
     # Keep /v1/models fast and side-effect free. Some clients call this during
     # startup and expect a quick OpenAI-compatible list; detailed metadata is
     # available through /api/show and /api/ctx.  Include lightweight capability
@@ -10601,6 +10646,7 @@ def build_openai_model_list_payload(model: ManagedModel) -> dict:
             "vision": _has_vision_runtime(model),
             "mmproj_mode": get_model_mmproj_mode(model),
             "vision_instances": sorted(_vision_live_instances(model.model_id)) if model_lazily_loads_mmproj(model) else [],
+            "capabilities": dict(capabilities) if capabilities is not None else {"vision": _has_vision_runtime(model)},
             "load_capabilities": load_capabilities,
             "context_length": context_length,
             "context_window": context_length,
@@ -10616,7 +10662,7 @@ def build_openai_model_list_payload(model: ManagedModel) -> dict:
             },
     }
 
-def build_openai_model_payload(model: ManagedModel) -> dict:
+def build_openai_model_payload(model: ManagedModel, capabilities: dict | None = None) -> dict:
     load_capabilities = refresh_model_load_capabilities(model)
     gguf_ctx = get_model_context_size(model)
     cfg_ctx = displayed_configured_ctx(model)
@@ -10638,6 +10684,7 @@ def build_openai_model_payload(model: ManagedModel) -> dict:
             "vision": _has_vision_runtime(model),
             "mmproj_mode": get_model_mmproj_mode(model),
             "vision_instances": sorted(_vision_live_instances(model.model_id)) if model_lazily_loads_mmproj(model) else [],
+            "capabilities": dict(capabilities) if capabilities is not None else {"vision": _has_vision_runtime(model)},
             "speculative": bool(getattr(model, "speculative", False)),
             "spec_variant_of": getattr(model, "spec_variant_of", None),
             **probe_metrics,
@@ -10736,7 +10783,7 @@ def _model_digest(model: ManagedModel) -> str:
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
 
-def build_ollama_model_payload(model: ManagedModel, loaded: bool = False, process: dict | None = None, gpu_process_map: dict[int, str] | None = None) -> dict:
+def build_ollama_model_payload(model: ManagedModel, loaded: bool = False, process: dict | None = None, gpu_process_map: dict[int, str] | None = None, capabilities: dict | None = None) -> dict:
     load_capabilities = refresh_model_load_capabilities(model)
     storage = get_model_storage_info(model)
     gguf_ctx = get_model_context_size(model)
@@ -10767,6 +10814,7 @@ def build_ollama_model_payload(model: ManagedModel, loaded: bool = False, proces
         "vision": _has_vision_runtime(model),
         "mmproj_mode": get_model_mmproj_mode(model),
         "vision_instances": sorted(_vision_live_instances(model.model_id)) if model_lazily_loads_mmproj(model) else [],
+        "capabilities": dict(capabilities) if capabilities is not None else {"vision": _has_vision_runtime(model)},
         **probe_metrics,
     }
     payload = {
@@ -15126,9 +15174,15 @@ def start_ctx_metadata_server(args):
             if parsed.path in {"", "/"}:
                 return self._handle_root(catalog)
             if parsed.path in {"/v1/models", "/models"}:
-                self._send_json({"object": "list", "data": [build_openai_model_list_payload(model) for model in catalog]})
+                swap_loaded = get_loaded_model_ids(client_host, int(args.public_port))
+                self._send_json({"object": "list", "data": [
+                    build_openai_model_list_payload(
+                        model, capabilities=model_runtime_capabilities(
+                            model.model_id, getattr(args, "config", None), swap_loaded))
+                    for model in catalog]})
                 return
             model_lookup_id = None
+            swap_loaded = get_loaded_model_ids(client_host, int(args.public_port))
             for prefix in ("/v1/models/", "/models/"):
                 if parsed.path.startswith(prefix):
                     model_lookup_id = unquote(parsed.path[len(prefix):]).strip()
@@ -15140,7 +15194,9 @@ def start_ctx_metadata_server(args):
                     mid = str(getattr(model, "model_id", "") or "")
                     folded = mid.casefold()
                     if folded == wanted or folded.rsplit("/", 1)[-1] == wanted_bare:
-                        self._send_json(build_openai_model_list_payload(model))
+                        self._send_json(build_openai_model_list_payload(
+                            model, capabilities=model_runtime_capabilities(
+                                model.model_id, getattr(args, "config", None), swap_loaded)))
                         return
                 self._send_json({"error": {"message": f"model not found: {model_lookup_id}", "type": "not_found_error"}}, status=404)
                 return
@@ -15153,7 +15209,7 @@ def start_ctx_metadata_server(args):
                 for model in catalog:
                     process = process_by_model.get(_safe_realpath(model.local_path))
                     loaded = process is not None and model.model_id in published_models
-                    models.append(build_ollama_model_payload(model, loaded=loaded, process=process, gpu_process_map=gpu_process_map))
+                    models.append(build_ollama_model_payload(model, loaded=loaded, process=process, gpu_process_map=gpu_process_map, capabilities=model_runtime_capabilities(model.model_id, getattr(args, "config", None), get_loaded_model_ids(client_host, int(args.public_port)))))
                 self._send_json({"models": models})
                 return
             if parsed.path == "/api/ps":
@@ -15166,7 +15222,7 @@ def start_ctx_metadata_server(args):
                     process = process_by_model.get(_safe_realpath(model.local_path))
                     if process is None or model.model_id not in published_models:
                         continue
-                    running.append(build_ollama_model_payload(model, loaded=True, process=process, gpu_process_map=gpu_process_map))
+                    running.append(build_ollama_model_payload(model, loaded=True, process=process, gpu_process_map=gpu_process_map, capabilities=model_runtime_capabilities(model.model_id, getattr(args, "config", None), get_loaded_model_ids(client_host, int(args.public_port)))))
                 self._send_json({"models": running})
                 return
             if parsed.path == "/api/version":
