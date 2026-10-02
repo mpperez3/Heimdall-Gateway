@@ -5574,6 +5574,12 @@ def _elapsed_ms(started_at: float) -> int:
 #: concurrent loads) or an expired one into a permanent block.
 LOADING_CLAIM_TTL_S = 900.0
 
+#: Lifetime of a "this model wants that GPU but was refused" note, in seconds. It
+#: to outlive a couple of reaper polls so an idle replica sitting on a wanted card
+#: gets reclaimed, but not linger: the next request re-registers the demand if the
+#: card is still blocked.
+GPU_DEMAND_TTL_S = 120.0
+
 
 class ReplicaRouterState:
     def __init__(self):
@@ -5589,6 +5595,7 @@ class ReplicaRouterState:
         # not all reach llama-swap and make it start/restart the same model.
         self.loading_claims: dict[str, float] = {}
         self.loading_claim_aliases: dict[str, str] = {}
+        self.gpu_demand: dict[int, float] = {}
         self.policy: object = _AffinityPolicy()
         self.affinity_budget: dict[str, _TransferBudget] = {}
         self._health_cache: dict[str, tuple[float, _TargetHealth]] = {}
@@ -5781,6 +5788,28 @@ class ReplicaRouterState:
             for target, (expires, _) in list(self._health_cache.items()):
                 if expires <= now:
                     self._health_cache.pop(target, None)
+            for gpu, expires in list(self.gpu_demand.items()):
+                if expires <= now:
+                    self.gpu_demand.pop(gpu, None)
+
+    def note_gpu_demand(self, gpu_set, *, ttl_s: float = GPU_DEMAND_TTL_S, now: float | None = None) -> None:
+        """Record that a model was refused a load and wants these GPUs back."""
+        try:
+            gpus = [int(gpu) for gpu in (gpu_set or [])]
+        except (TypeError, ValueError):
+            return
+        if not gpus:
+            return
+        deadline = (time.monotonic() if now is None else now) + max(1.0, float(ttl_s))
+        with self.lock:
+            for gpu in gpus:
+                self.gpu_demand[gpu] = max(self.gpu_demand.get(gpu, 0.0), deadline)
+
+    def demanded_gpus(self, now: float | None = None) -> set[int]:
+        """GPUs some model asked for and was refused, within the demand window."""
+        moment = time.monotonic() if now is None else now
+        with self.lock:
+            return {gpu for gpu, expires in self.gpu_demand.items() if expires > moment}
 
     def bind_response(self, response_id: str, replica_id: str, ttl_s: int = 3600) -> None:
         if not response_id or not replica_id:
@@ -15938,6 +15967,15 @@ def start_ctx_metadata_server(args):
             if not gpu_conflict:
                 return False
             log_api_event("model_load_blocked_gpu_busy", {"model": model_name, "message": gpu_conflict, "api_style": api_style})
+            # A refusal is the only durable signal that this model needs the card an
+            # idle replica is holding: the claim is released below, so the reaper would
+            # otherwise wait out max_idle_s before reclaiming it.
+            try:
+                REPLICA_ROUTER_STATE.note_gpu_demand(
+                    cached_model_gpu_sets(catalog).get(model_name)
+                )
+            except Exception:
+                pass
             REPLICA_ROUTER_STATE.release_loading_claim(model_name)
             if api_style == "openai":
                 self._send_json({"error": {"message": gpu_conflict, "type": "server_error"}}, status=503)

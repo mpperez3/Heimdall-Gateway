@@ -134,13 +134,15 @@ class _RouterStateMixin:
 
     def reset_router_state(self):
         state = _cli_impl.REPLICA_ROUTER_STATE
-        for attr in ("records", "affinity", "response_to_replica", "loading_claims", "loading_claim_aliases"):
+        for attr in ("records", "affinity", "response_to_replica", "loading_claims",
+                     "loading_claim_aliases", "gpu_demand"):
             getattr(state, attr).clear()
         state.base_in_flight.clear()
         state.base_last_used.clear()
         state._health_cache.clear()
         for clear in (state.records.clear, state.affinity.clear, state.response_to_replica.clear,
                       state.loading_claims.clear, state.loading_claim_aliases.clear,
+                      state.gpu_demand.clear,
                       state._health_cache.clear, state.base_in_flight.clear, state.base_last_used.clear):
             self.addCleanup(clear)
 
@@ -316,6 +318,29 @@ class RejectIfGpuBusyTest(unittest.TestCase, _RouterStateMixin):
         self.log_mock = mock.Mock(
             side_effect=lambda event, data=None: self.events.append((event, data or {}))
         )
+
+    def setUp(self):
+        self.reset_router_state()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.config = self.root / "config.yaml"
+        _write_matrix(self.config, {"pair_0": [OTHER_ID, BASE_ID]})
+        self.state = _cli_impl.REPLICA_ROUTER_STATE
+        self.args = argparse.Namespace(config=self.config, public_port=11436)
+        self.sent: list[tuple[dict, int]] = []
+        self.events: list[tuple[str, dict]] = []
+        stub = mock.Mock()
+        stub._send_json = lambda payload, status=200: self.sent.append((payload, status))
+        self.stub = stub
+        self.log_mock = mock.Mock(
+            side_effect=lambda event, data=None: self.events.append((event, data or {}))
+        )
+        self.handler_source = inspect.getsource(_cli_impl.start_ctx_metadata_server)
+
+    def _call(self, model_name: str = "wants-gpu-1", *, api_style: str = "openai"):
+        with mock.patch.object(_cli_impl.time, "monotonic", return_value=self.NOW):
+            return self._method()(self.stub, model_name, [], api_style=api_style)
 
     def _method(self):
         namespace = {
@@ -1120,6 +1145,160 @@ class CrossModelPlacementTest(unittest.TestCase):
         first = R.cached_model_gpu_sets(catalog, 2)
         first["heavy-a"] = [1]
         self.assertEqual(R.cached_model_gpu_sets(catalog, 2)["heavy-a"], [0])
+
+
+class GpuDemandTest(unittest.TestCase, _RouterStateMixin):
+    """A refused load must be able to reclaim the card an idle replica holds."""
+
+    def setUp(self):
+        self.reset_router_state()
+        self.state = _cli_impl.REPLICA_ROUTER_STATE
+
+    def test_a_note_marks_exactly_the_given_gpus(self):
+        self.state.note_gpu_demand([2], now=100.0)
+        self.assertEqual(self.state.demanded_gpus(now=100.0), {2})
+
+    def test_a_note_expires(self):
+        self.state.note_gpu_demand([2], ttl_s=30.0, now=100.0)
+        self.assertEqual(self.state.demanded_gpus(now=129.0), {2})
+        self.assertEqual(self.state.demanded_gpus(now=131.0), set())
+
+    def test_repeated_notes_take_the_later_deadline(self):
+        self.state.note_gpu_demand([1], ttl_s=10.0, now=100.0)
+        self.state.note_gpu_demand([1], ttl_s=100.0, now=110.0)
+        self.assertEqual(self.state.demanded_gpus(now=150.0), {1})
+
+    def test_a_demanded_gpu_is_only_kept_if_it_was_already_wanted(self):
+        self.state.note_gpu_demand([1], ttl_s=100.0, now=100.0)
+        self.state.note_gpu_demand([0], ttl_s=10.0, now=100.0)
+        self.assertEqual(self.state.demanded_gpus(now=105.0), {0, 1})
+
+    def test_an_empty_or_broken_gpu_set_is_ignored(self):
+        self.state.note_gpu_demand([], now=100.0)
+        self.state.note_gpu_demand(None, now=100.0)
+        self.state.note_gpu_demand(["not-a-gpu"], now=100.0)
+        self.assertEqual(self.state.demanded_gpus(now=100.0), set())
+
+    def test_prune_drops_expired_demands(self):
+        self.state.note_gpu_demand([3], ttl_s=5.0, now=100.0)
+        self.state.prune(now=200.0)
+        self.assertEqual(self.state.gpu_demand, {})
+
+
+class DemandDrivenRetirementTest(ReplicaReaperTest):
+    """An idle replica on a GPU somebody was refused must be retired."""
+
+    def setUp(self):
+        super().setUp()
+        self.plan_args = self.args
+
+    def test_it_retires_the_squatter_without_waiting_for_max_idle_s(self):
+        self._ready(replica_id=REPLICA_ID, gpu_set=(1,), last_used=self.NOW - 5.0)
+        self.state.note_gpu_demand([1], now=self.NOW)
+        retired = daemon_mod.run_replica_reaper_tick(self.plan_args, now=self.NOW)
+        self.assertEqual(retired, [REPLICA_ID])
+        self.assertEqual(self.unloads, [(REPLICA_ID, "127.0.0.1", 11436)])
+        reasons = [data.get("reason") for event, data in self.events if event == "replica_retired"]
+        self.assertEqual(reasons, ["gpu_needed"])
+
+    def test_a_demand_on_another_gpu_leaves_the_replica_alone(self):
+        self._ready(replica_id=REPLICA_ID, gpu_set=(1,), last_used=self.NOW - 5.0)
+        self.state.note_gpu_demand([0], now=self.NOW)
+        self.assertEqual(daemon_mod.run_replica_reaper_tick(self.plan_args, now=self.NOW), [])
+        self.assertEqual(self.unloads, [])
+
+    def test_an_expired_demand_leaves_the_replica_alone(self):
+        self._ready(replica_id=REPLICA_ID, gpu_set=(1,), last_used=self.NOW - 5.0)
+        self.state.note_gpu_demand([1], ttl_s=_cli_impl.GPU_DEMAND_TTL_S, now=self.NOW)
+        late = self.NOW + _cli_impl.GPU_DEMAND_TTL_S + 1.0
+        self.assertEqual(daemon_mod.run_replica_reaper_tick(self.plan_args, now=late), [])
+        self.assertEqual(self.unloads, [])
+
+    def test_a_replica_serving_a_request_is_never_reclaimed(self):
+        self._ready(replica_id=REPLICA_ID, gpu_set=(1,), last_used=self.NOW - 5.0, in_flight=1)
+        self.state.note_gpu_demand([1], now=self.NOW)
+        self.assertEqual(daemon_mod.run_replica_reaper_tick(self.plan_args, now=self.NOW), [])
+        self.assertEqual(self.unloads, [])
+
+    def test_an_absent_replica_is_not_announced_as_retired(self):
+        self._ready(health_state="cold", replica_id=REPLICA_ID, gpu_set=(1,))
+        self.state.note_gpu_demand([1], now=self.NOW)
+        self.assertEqual(daemon_mod.run_replica_reaper_tick(self.plan_args, now=self.NOW), [])
+        self.assertEqual(self.unloads, [])
+
+
+class RefusalRegistersDemandTest(unittest.TestCase, _RouterStateMixin):
+    """A refused load must advertise the GPUs it needs, so the reaper can act."""
+
+    CONFLICT = "the GPU is already in use: something else"
+    NOW = 10_000.0
+
+    _bind = RejectIfGpuBusyTest._bind
+    NOW = 10_000.0
+
+    _bind = RejectIfGpuBusyTest._bind
+
+    def setUp(self):
+        self.reset_router_state()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.config = self.root / "config.yaml"
+        _write_matrix(self.config, {"pair_0": [OTHER_ID, BASE_ID]})
+        self.state = _cli_impl.REPLICA_ROUTER_STATE
+        self.args = argparse.Namespace(config=self.config, public_port=11436)
+        self.sent: list[tuple[dict, int]] = []
+        self.events: list[tuple[str, dict]] = []
+        stub = mock.Mock()
+        stub._send_json = lambda payload, status=200: self.sent.append((payload, status))
+        self.stub = stub
+        self.log_mock = mock.Mock(
+            side_effect=lambda event, data=None: self.events.append((event, data or {}))
+        )
+        self.handler_source = inspect.getsource(_cli_impl.start_ctx_metadata_server)
+
+    def _call(self, model_name: str = "wants-gpu-1", *, api_style: str = "openai"):
+        with mock.patch.object(_cli_impl.time, "monotonic", return_value=self.NOW):
+            return self._method()(self.stub, model_name, [], api_style=api_style)
+
+    def _method(self):
+        namespace = {
+            "args": self.args,
+            "client_host": "127.0.0.1",
+            "ManagedModel": ManagedModel,
+            "log_api_event": self.log_mock,
+            "REPLICA_ROUTER_STATE": self.state,
+            "blocking_conflicting_load": _cli_impl.blocking_conflicting_load,
+            "get_catalog_model_process": mock.Mock(return_value=None),
+            "get_gpu_conflict_message": mock.Mock(return_value=self.CONFLICT),
+            "cached_model_gpu_sets": mock.Mock(return_value={"wants-gpu-1": [1]}),
+            "get_model_activity_snapshot": mock.Mock(return_value=({}, None)),
+            "recent_activity_blocking_model_switch": mock.Mock(return_value=None),
+            "request_looks_like_model_probe": mock.Mock(return_value=False),
+            "time": _cli_impl.time,
+            "_resolve_model_probe_autoload_config": mock.Mock(return_value={"enabled": False}),
+        }
+        self.gpu_sets_mock = namespace["cached_model_gpu_sets"]
+        return self._bind(namespace)
+
+    def test_a_refused_load_marks_the_requested_gpu(self):
+        self.assertTrue(self._call("wants-gpu-1"))
+        self.assertEqual(self.state.demanded_gpus(now=self.NOW), {1})
+
+    def test_the_demand_uses_the_assigned_gpu_not_the_occupied_one(self):
+        self.assertTrue(self._call("wants-gpu-1"))
+        self.gpu_sets_mock.assert_called_once()
+
+    def test_an_allowed_load_marks_nothing(self):
+        method = self._method()
+        method.__globals__["get_gpu_conflict_message"] = mock.Mock(return_value=None)
+        with mock.patch.object(_cli_impl.time, "monotonic", return_value=self.NOW):
+            self.assertFalse(method(self.stub, "wants-gpu-1", [], api_style="openai"))
+        self.assertEqual(self.state.demanded_gpus(now=self.NOW), set())
+
+    def test_an_unknown_model_marks_nothing_but_is_still_refused(self):
+        self.assertTrue(self._call("never-heard-of-it"))
+        self.assertEqual(self.state.demanded_gpus(now=self.NOW), set())
 
 
 if __name__ == "__main__":

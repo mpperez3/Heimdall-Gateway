@@ -542,15 +542,19 @@ def _replica_retire_reason(state, base_id: str, replica_id: str, cfg, config_pat
         return "idle", idle_s
     if _mid_load_conflicting_with(base_id, config_path, now=now) is not None:
         return "gpu_needed", idle_s
+    with state.lock:
+        rec = state.records.get(replica_id)
+        replica_gpus = {int(gpu) for gpu in (getattr(rec, "gpu_set", None) or [])}
+    if replica_gpus & state.demanded_gpus(now=now):
+        return "gpu_needed", idle_s
     return "", 0.0
 
 
 def _replica_reap_plan(args, *, now: float | None = None) -> list[tuple[str, str, float]]:
     """Decide which loaded replicas this tick would retire.
 
-    Returns ``[(replica_id, reason, idle_s)]``. Reads router state and the
-    rendered matrix only -- never the catalog, the replica config or
-    ``config.yaml``.
+    Returns ``[(replica_id, reason, idle_s)]``. Reads router state, the replica
+    config and the rendered matrix -- it never writes ``config.yaml``.
     """
     state = _get_replica_router_state()
     if state is None:
