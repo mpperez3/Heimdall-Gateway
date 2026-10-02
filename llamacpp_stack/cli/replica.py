@@ -15,13 +15,8 @@ from pathlib import Path
 from .constants import DEFAULT_IDLE_TTL
 from .models import ManagedModel, ReplicaConfig
 from .vision import (
-    build_vision_model,
     cached_mmproj_config,
-    is_vision_model_id,
-    model_lazily_loads_mmproj,
     resolve_render_include_mmproj,
-    vision_base_model_id,
-    vision_model_id,
     vision_route_ttl,
 )
 
@@ -401,7 +396,7 @@ def _is_small_model(m: ManagedModel) -> bool:
     return _get_model_size_mib(m) < 4096.0
 
 
-def _calculate_llama_swap_matrix(models_info: list[dict], co_resident_variants: bool = False) -> dict[str, object]:
+def _calculate_llama_swap_matrix(models_info: list[dict]) -> dict[str, object]:
     """
     Calculate the llama-swap matrix configuration to allow maximum concurrency.
     
@@ -418,11 +413,6 @@ def _calculate_llama_swap_matrix(models_info: list[dict], co_resident_variants: 
       given half the eviction cost of its base, so the router drops the spare
       copy and keeps the original; requests for that model then queue on the
       original instead of paying for a full reload.
-
-    A lazy-mmproj base and its ``__vision`` sibling normally span the same GPUs,
-    so they stay mutually exclusive and llama-swap evicts the text-only copy to
-    serve an image request. ``co_resident_variants`` declares them together
-    instead, for deployments whose VRAM budget fits both copies.
     """
     if not models_info:
         return {}
@@ -463,13 +453,10 @@ def _calculate_llama_swap_matrix(models_info: list[dict], co_resident_variants: 
         if not added:
             large_groups.append([large["id"]])
     base_to_replicas: dict[str, list[str]] = {}
-    base_to_visions: dict[str, list[str]] = {}
     for m in models_info:
         mid = m["id"]
         if is_replica_model_id(mid):
             base_to_replicas.setdefault(replica_base_model_id(mid), []).append(mid)
-        elif is_vision_model_id(mid):
-            base_to_visions.setdefault(vision_base_model_id(mid), []).append(mid)
 
     def _resolve_group_gpus(model_id: str) -> set[int] | None:
         mi = next((x for x in models_info if x["id"] == model_id), None)
@@ -503,11 +490,6 @@ def _calculate_llama_swap_matrix(models_info: list[dict], co_resident_variants: 
         if not _group_fits_disjointly(members):
             continue
         _merge_group(members)
-    for base, vids in base_to_visions.items():
-        members = [base, *vids]
-        if not co_resident_variants and not _group_fits_disjointly(members):
-            continue
-        _merge_group(members)
     cross_pairs: list[list[str]] = []
     for idx, first in enumerate(larges):
         first_gpus = set(first.get("_effective_gpu_set") or all_known_gpus)
@@ -529,7 +511,7 @@ def _calculate_llama_swap_matrix(models_info: list[dict], co_resident_variants: 
         if packable_vars:
             matrix_sets["packables"] = " & ".join(packable_vars)
     evict_costs = {
-        id_to_var[m["id"]]: max(1, int(m["size_mib"] * (0.5 if (is_replica_model_id(m["id"]) or is_vision_model_id(m["id"])) else 1.0)))
+        id_to_var[m["id"]]: max(1, int(m["size_mib"] * (0.5 if is_replica_model_id(m["id"]) else 1.0)))
         for m in models_info
         if m["id"] in id_to_var
     }
@@ -560,14 +542,14 @@ def _model_info_for_matrix_entry(model_id: str, model_entry: dict, catalog_by_id
     }
 
 
-def _recalculate_llamaswap_matrix_from_config(data: dict, catalog: list[ManagedModel], co_resident_variants: bool = False) -> None:
+def _recalculate_llamaswap_matrix_from_config(data: dict, catalog: list[ManagedModel]) -> None:
     models = data.get("models")
     if not isinstance(models, dict):
         data.pop("matrix", None)
         return
     catalog_by_id = {model.model_id: model for model in catalog}
     infos = [_model_info_for_matrix_entry(str(model_id), entry, catalog_by_id) for model_id, entry in models.items() if isinstance(entry, dict)]
-    matrix = _calculate_llama_swap_matrix(infos, co_resident_variants)
+    matrix = _calculate_llama_swap_matrix(infos)
     if matrix:
         data["matrix"] = matrix
     else:
@@ -680,10 +662,6 @@ def render_llamaswap_config(
     replica_group_members: list[str] = []
     models_info_for_matrix: list[dict] = []
     mmproj_config = cached_mmproj_config()
-    try:
-        vision_ttl = vision_route_ttl(mmproj_config)
-    except Exception:
-        vision_ttl = None
 
     def _render_cmd(use_model, include_mmproj: bool) -> list[str]:
         engine = str((getattr(use_model, "server_overrides", {}) or {}).get("engine") or "").strip().lower().replace("_", "-")
@@ -737,7 +715,6 @@ def render_llamaswap_config(
 
     for m, public_base_model_id, replica_gpu_set in sorted(iter_catalog_base_models(catalog), key=lambda item: item[0].model_id):
         use_model = m
-        lazy_mmproj = bool(model_lazily_loads_mmproj(use_model, mmproj_config))
         cmd = _render_cmd(use_model, bool(resolve_render_include_mmproj(use_model, mmproj_config)))
         if public_base_model_id is not None:
             cmd = _command_with_cuda_visible_devices(cmd, replica_gpu_set)
@@ -776,28 +753,7 @@ def render_llamaswap_config(
             data["models"][m.model_id]["aliases"] = m.aliases
         if m.description:
             data["models"][m.model_id]["description"] = m.description
-        if lazy_mmproj:
-            vision = build_vision_model(m)
-            vision_cmd = _render_cmd(vision, True)
-            vision_gpu_set = list(range(detect_cuda_device_count()))
-            if public_base_model_id is not None and replica_gpu_set:
-                vision_cmd = _command_with_cuda_visible_devices(vision_cmd, replica_gpu_set)
-                vision_gpu_set = list(replica_gpu_set)
-            data["models"][vision.model_id] = {
-                "cmd": " ".join(shell_quote(part) for part in vision_cmd),
-                "checkEndpoint": "/health",
-                "ttl": int(vision_ttl if vision_ttl else idle_ttl),
-                "metadata": {"internal_replica_of": m.model_id, "vision_variant": True},
-                "description": vision.description,
-            }
-            models_info_for_matrix.append({
-                "id": vision.model_id,
-                "gpu_set": vision_gpu_set,
-                "is_embedding": False,
-                "is_small": _is_small_model(m),
-                "size_mib": _get_model_size_mib(m),
-            })
-    matrix_config = _calculate_llama_swap_matrix(models_info_for_matrix, bool(mmproj_config.get("allow_co_resident")))
+    matrix_config = _calculate_llama_swap_matrix(models_info_for_matrix)
     if matrix_config:
         data["matrix"] = matrix_config
     tmp = path.with_suffix(".tmp")
@@ -812,6 +768,192 @@ def render_llamaswap_config(
     tmp.replace(path)
 
 
+def _render_instance_command(
+    model: ManagedModel,
+    server_path: Path | str,
+    server_defaults: dict[str, object] | None = None,
+    include_mmproj: bool = False,
+) -> list[str]:
+    """Build the llama-swap ``cmd`` for one base-or-replica route."""
+    try:
+        from llamacpp_stack.cli.server_commands import (
+            build_llama_server_command as _build_cmd,
+            normalize_server_overrides as _norm,
+            resolve_llama_server_defaults as _resolve_defaults,
+            resolve_vllm_defaults as _resolve_vllm,
+        )
+    except Exception:
+        cli_file = _get_cli_file()
+        _build_cmd = getattr(cli_file, "build_llama_server_command")
+        _norm = getattr(cli_file, "normalize_server_overrides")
+        _resolve_defaults = getattr(cli_file, "resolve_llama_server_defaults")
+        _resolve_vllm = getattr(cli_file, "resolve_vllm_defaults")
+
+    engine = str((getattr(model, "server_overrides", {}) or {}).get("engine") or "").strip().lower().replace("_", "-")
+    if engine in {"exllamav3", "exllama-v3", "exllama3"}:
+        engine = "exllama"
+    if engine in {"buun-beta"}:
+        engine = "buun"
+    effective_server_path = Path(server_path)
+    if engine == "buun":
+        cand = _engine_binary_base(Path(server_path)) / "buun" / "bin" / "llama-server-buun"
+        if cand.exists():
+            effective_server_path = cand
+            print(f"[buun] {model.model_id} -> {effective_server_path}", flush=True)
+    elif engine == "beellama":
+        cand = _engine_binary_base(Path(server_path)) / "beellama" / "bin" / "llama-server-beellama"
+        if cand.exists():
+            effective_server_path = cand
+    elif engine == "exllama":
+        cand = _engine_binary_base(Path(server_path)) / "exllama" / "bin" / "llama-server-exllama"
+        if cand.exists():
+            effective_server_path = cand
+            print(f"[exllama] {model.model_id} -> {effective_server_path}", flush=True)
+    cmd = _build_cmd(
+        model,
+        Path(effective_server_path),
+        port="${PORT}",
+        server_defaults=_norm(server_defaults or _resolve_defaults()),
+        vllm_defaults=_resolve_vllm(),
+        include_mmproj=bool(include_mmproj),
+    )
+    try:
+        cache_type = str((getattr(model, "server_overrides", {}) or {}).get("cache_type") or "").strip().lower()
+        if engine == "buun" and cache_type in {"turbo8","turbo4","turbo3","turbo2","turbo3_tcq","turbo2_tcq","turbo1_tcq","vbr"}:
+            filtered: list[str] = []
+            skip = False
+            for j, part in enumerate(cmd):
+                if skip:
+                    skip = False
+                    continue
+                if part in {"--cache-type-k", "--cache-type-v"} and j + 1 < len(cmd) and cmd[j + 1].strip().lower() == "f16":
+                    skip = True
+                    continue
+                filtered.append(part)
+            cmd = filtered
+    except Exception:
+        pass
+    return cmd
+
+
+def route_carries_mmproj(entry: object) -> bool:
+    """True when a rendered route entry's command carries ``--mmproj``."""
+    try:
+        return "--mmproj" in str((entry or {}).get("cmd") or "")
+    except Exception:
+        return False
+
+
+def _replica_index_for_model_id(model_id: str) -> int:
+    match = re.search(r"__replica_(\d+)$", str(model_id or ""))
+    try:
+        return int(match.group(1)) if match else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def ensure_internal_route_in_llamaswap_config(
+    base_model: ManagedModel,
+    route_id: str,
+    catalog: list[ManagedModel],
+    config_path: Path | str,
+    server_path: Path | str,
+    idle_ttl: int,
+    server_defaults: dict[str, object] | None = None,
+    *,
+    gpu_set: list[int] | None = None,
+    include_mmproj: bool = False,
+    metadata: dict[str, object] | None = None,
+    description: str | None = None,
+    ttl: int | None = None,
+) -> str:
+    """Create or refresh one internal route, which may be a replica or the base.
+
+    Returns ``route_id``. An entry that already exists with the requested
+    projector state is left untouched, so ordinary traffic never rewrites the
+    watched config. The base route is rendered from ``base_model`` itself, which
+    is what makes it possible to bolt the projector onto whichever instance is
+    idle at request time.
+    """
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        yaml = None  # type: ignore
+
+    path = Path(config_path)
+    route_id = str(route_id or "")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if yaml is not None:
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        else:
+            import json as _json
+
+            data = _json.loads(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    try:
+        _ls2 = _effective_llama_swap_config()
+    except Exception:
+        _ls2 = _default_llama_swap_config()
+    data.setdefault("healthCheckTimeout", 600)
+    data.setdefault("logLevel", str(_ls2.get("logLevel", "info")))
+    data.setdefault("logToStdout", str(_ls2.get("logToStdout", "both")))
+    data.setdefault("sendLoadingState", False)
+    data.setdefault("includeAliasesInList", True)
+    models = data.setdefault("models", {})
+    if not isinstance(models, dict):
+        models = {}
+        data["models"] = models
+
+    want_mmproj = bool(include_mmproj)
+    existing = models.get(route_id)
+    if isinstance(existing, dict) and route_carries_mmproj(existing) == want_mmproj:
+        return route_id
+
+    route_gpu_set: list[int] = []
+    if route_id == base_model.model_id:
+        model_for_route = base_model
+    else:
+        route_gpu_set = list(gpu_set or [])
+        model_for_route = build_replica_model(base_model, _replica_index_for_model_id(route_id), route_gpu_set)
+
+    cmd = _render_instance_command(model_for_route, server_path, server_defaults, want_mmproj)
+    if route_gpu_set:
+        cmd = _command_with_cuda_visible_devices(cmd, route_gpu_set)
+    models[route_id] = {
+        "cmd": " ".join(shell_quote(part) for part in cmd),
+        "checkEndpoint": "/health",
+        "ttl": int(ttl if ttl else idle_ttl),
+        "metadata": dict(metadata or {"internal_replica_of": base_model.model_id}),
+        "description": description or getattr(model_for_route, "description", "") or route_id,
+    }
+    _recalculate_llamaswap_matrix_from_config(data, catalog)
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as file_handle:
+        file_handle.write(LLAMASWAP_CONFIG_HEADER)
+        if yaml is not None:
+            yaml.safe_dump(data, file_handle, sort_keys=False)
+        else:
+            import json as _json
+
+            file_handle.write(_json.dumps(data, indent=2))
+    tmp.replace(path)
+    try:
+        cli_file3 = _get_cli_file()
+        _log = getattr(cli_file3, "log_api_event", None)
+        if _log is not None:
+            _log(
+                "internal_route_refreshed",
+                {"model": base_model.model_id, "route": route_id, "mmproj": want_mmproj, "config_path": str(path)},
+            )
+    except Exception:
+        pass
+    return route_id
+
+
 def ensure_replica_route_in_llamaswap_config(
     base_model: ManagedModel,
     replica_index: int,
@@ -821,273 +963,73 @@ def ensure_replica_route_in_llamaswap_config(
     server_path: Path | str,
     idle_ttl: int,
     server_defaults: dict[str, object] | None = None,
+    *,
+    include_mmproj: bool | None = None,
 ) -> str:
     """Create one internal replica route in config.yaml and let llama-swap --watch-config reload it."""
-    try:
-        from llamacpp_stack.cli.server_commands import (
-            build_llama_server_command as _build_cmd,
-            normalize_server_overrides as _norm,
-            resolve_llama_server_defaults as _resolve_defaults,
-            resolve_vllm_defaults as _resolve_vllm,
-        )
-    except Exception:
-        cli_file = _get_cli_file()
-        _build_cmd = getattr(cli_file, "build_llama_server_command")
-        _norm = getattr(cli_file, "normalize_server_overrides")
-        _resolve_defaults = getattr(cli_file, "resolve_llama_server_defaults")
-        _resolve_vllm = getattr(cli_file, "resolve_vllm_defaults")
-
-    try:
-        import yaml  # type: ignore
-    except Exception:
-        yaml = None  # type: ignore
-
-    path = Path(config_path)
     rid = replica_model_id(base_model.model_id, replica_index)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        if yaml is not None:
-            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        else:
-            import json as _json
-
-            data = _json.loads(path.read_text(encoding="utf-8")) or {}
-    except Exception:
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    try:
-        _ls2 = _effective_llama_swap_config()
-    except Exception:
-        _ls2 = _default_llama_swap_config()
-    data.setdefault("healthCheckTimeout", 600)
-    data.setdefault("logLevel", str(_ls2.get("logLevel", "info")))
-    data.setdefault("logToStdout", str(_ls2.get("logToStdout", "both")))
-    data.setdefault("sendLoadingState", False)
-    data.setdefault("includeAliasesInList", True)
-    models = data.setdefault("models", {})
-    if not isinstance(models, dict):
-        models = {}
-        data["models"] = models
-    if rid not in models:
-        replica = build_replica_model(base_model, replica_index, gpu_set)
-        resolved_defaults = _norm(server_defaults or _resolve_defaults())
-        replica_engine = str((getattr(replica, "server_overrides", {}) or {}).get("engine") or "").strip().lower().replace("_", "-")
-        if replica_engine in {"exllamav3", "exllama-v3", "exllama3"}:
-            replica_engine = "exllama"
-        if replica_engine in {"buun-beta"}:
-            replica_engine = "buun"
-        effective_replica_server_path = Path(server_path)
-        if replica_engine == "buun":
-            cand = _engine_binary_base(Path(server_path)) / "buun" / "bin" / "llama-server-buun"
-            if cand.exists():
-                effective_replica_server_path = cand
-                print(f"[buun] {replica.model_id} -> {effective_replica_server_path}", flush=True)
-        elif replica_engine == "beellama":
-            cand = _engine_binary_base(Path(server_path)) / "beellama" / "bin" / "llama-server-beellama"
-            if cand.exists():
-                effective_replica_server_path = cand
-        elif replica_engine == "exllama":
-            cand = _engine_binary_base(Path(server_path)) / "exllama" / "bin" / "llama-server-exllama"
-            if cand.exists():
-                effective_replica_server_path = cand
-                print(f"[exllama] {replica.model_id} -> {effective_replica_server_path}", flush=True)
-        cmd = _build_cmd(
-            replica,
-            Path(effective_replica_server_path),
-            port="${PORT}",
-            server_defaults=resolved_defaults,
-            vllm_defaults=_resolve_vllm(),
-            include_mmproj=bool(
-                resolve_render_include_mmproj(replica, cached_mmproj_config())
-            ),
-        )
-        try:
-            ct2 = str((getattr(replica, "server_overrides", {}) or {}).get("cache_type") or "").strip().lower()
-            if replica_engine == "buun" and ct2 in {"turbo8","turbo4","turbo3","turbo2","turbo3_tcq","turbo2_tcq","turbo1_tcq","vbr"}:
-                filtered2: list[str] = []
-                skip2 = False
-                for j, part in enumerate(cmd):
-                    if skip2:
-                        skip2 = False
-                        continue
-                    if part in {"--cache-type-k","--cache-type-v"} and j+1 < len(cmd) and cmd[j+1].strip().lower() == "f16":
-                        skip2 = True
-                        continue
-                    filtered2.append(part)
-                cmd = filtered2
-        except Exception:
-            pass
-        cmd = _command_with_cuda_visible_devices(cmd, gpu_set)
-        models[rid] = {
-            "cmd": " ".join(shell_quote(part) for part in cmd),
-            "checkEndpoint": "/health",
-            "ttl": int(idle_ttl),
-            "metadata": {"internal_replica_of": base_model.model_id},
-            "description": replica.description,
-        }
-        _recalculate_llamaswap_matrix_from_config(data, catalog, bool(cached_mmproj_config().get("allow_co_resident")))
-    tmp = path.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as file_handle:
-        file_handle.write(LLAMASWAP_CONFIG_HEADER)
-        if yaml is not None:
-            yaml.safe_dump(data, file_handle, sort_keys=False)
-        else:
-            import json as _json
-
-            file_handle.write(_json.dumps(data, indent=2))
-    tmp.replace(path)
-    try:
-        cli_file3 = _get_cli_file()
-        _log = getattr(cli_file3, "log_api_event", None)
-        if _log is not None:
-            _log("replica_route_added", {"model": base_model.model_id, "replica": rid, "gpu_set": gpu_set, "config_path": str(path)})
-    except Exception:
-        pass
-    return rid
+    if include_mmproj is None:
+        include_mmproj = bool(resolve_render_include_mmproj(base_model, cached_mmproj_config()))
+    return ensure_internal_route_in_llamaswap_config(
+        base_model,
+        rid,
+        catalog,
+        config_path,
+        server_path,
+        idle_ttl,
+        server_defaults,
+        gpu_set=list(gpu_set or []),
+        include_mmproj=bool(include_mmproj),
+    )
 
 
 # Alias for backwards compat
 ensure_replica_route = ensure_replica_route_in_llamaswap_config
 
 
-def ensure_vision_route_in_llamaswap_config(
+def set_instance_mmproj_in_llamaswap_config(
     base_model: ManagedModel,
+    instance_id: str,
     catalog: list[ManagedModel],
     config_path: Path | str,
     server_path: Path | str,
     idle_ttl: int,
     server_defaults: dict[str, object] | None = None,
+    *,
+    enable: bool,
+    gpu_set: list[int] | None = None,
 ) -> str:
-    """Create the lazy-mmproj ``__vision`` route in config.yaml.
+    """Attach (or detach) ``--mmproj`` on exactly one route of ``base_model``.
 
-    Idempotent: an already published entry keeps its id and the file is left
-    untouched, so repeated image requests never rewrite the watched config.
+    ``instance_id`` is the base id or one of its ``__replica_N`` ids. While the
+    projector is attached the route also gets the vision TTL, so llama-swap
+    unloads it once the image path has been idle long enough; the caller then
+    calls this again with ``enable=False`` to hand the instance back to text.
     """
-    try:
-        from llamacpp_stack.cli.server_commands import (
-            build_llama_server_command as _build_cmd,
-            normalize_server_overrides as _norm,
-            resolve_llama_server_defaults as _resolve_defaults,
-            resolve_vllm_defaults as _resolve_vllm,
-        )
-    except Exception:
-        cli_file = _get_cli_file()
-        _build_cmd = getattr(cli_file, "build_llama_server_command")
-        _norm = getattr(cli_file, "normalize_server_overrides")
-        _resolve_defaults = getattr(cli_file, "resolve_llama_server_defaults")
-        _resolve_vllm = getattr(cli_file, "resolve_vllm_defaults")
-
-    try:
-        import yaml  # type: ignore
-    except Exception:
-        yaml = None  # type: ignore
-
-    path = Path(config_path)
-    vid = vision_model_id(base_model.model_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        if yaml is not None:
-            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        else:
-            import json as _json
-
-            data = _json.loads(path.read_text(encoding="utf-8")) or {}
-    except Exception:
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    try:
-        _ls2 = _effective_llama_swap_config()
-    except Exception:
-        _ls2 = _default_llama_swap_config()
-    data.setdefault("healthCheckTimeout", 600)
-    data.setdefault("logLevel", str(_ls2.get("logLevel", "info")))
-    data.setdefault("logToStdout", str(_ls2.get("logToStdout", "both")))
-    data.setdefault("sendLoadingState", False)
-    data.setdefault("includeAliasesInList", True)
-    models = data.setdefault("models", {})
-    if not isinstance(models, dict):
-        models = {}
-        data["models"] = models
-    if vid in models:
-        return vid
-    vision = build_vision_model(base_model)
-    resolved_defaults = _norm(server_defaults or _resolve_defaults())
-    vision_engine = str((getattr(vision, "server_overrides", {}) or {}).get("engine") or "").strip().lower().replace("_", "-")
-    if vision_engine in {"exllamav3", "exllama-v3", "exllama3"}:
-        vision_engine = "exllama"
-    if vision_engine in {"buun-beta"}:
-        vision_engine = "buun"
-    effective_vision_server_path = Path(server_path)
-    if vision_engine == "buun":
-        cand = _engine_binary_base(Path(server_path)) / "buun" / "bin" / "llama-server-buun"
-        if cand.exists():
-            effective_vision_server_path = cand
-            print(f"[buun] {vid} -> {effective_vision_server_path}", flush=True)
-    elif vision_engine == "beellama":
-        cand = _engine_binary_base(Path(server_path)) / "beellama" / "bin" / "llama-server-beellama"
-        if cand.exists():
-            effective_vision_server_path = cand
-    elif vision_engine == "exllama":
-        cand = _engine_binary_base(Path(server_path)) / "exllama" / "bin" / "llama-server-exllama"
-        if cand.exists():
-            effective_vision_server_path = cand
-            print(f"[exllama] {vid} -> {effective_vision_server_path}", flush=True)
-    cmd = _build_cmd(
-        vision,
-        Path(effective_vision_server_path),
-        port="${PORT}",
-        include_mmproj=True,
-        server_defaults=resolved_defaults,
-        vllm_defaults=_resolve_vllm(),
+    ttl = int(idle_ttl)
+    if enable:
+        try:
+            vision_ttl = vision_route_ttl(cached_mmproj_config())
+        except Exception:
+            vision_ttl = None
+        if vision_ttl:
+            ttl = int(vision_ttl)
+    metadata = {"internal_replica_of": base_model.model_id}
+    if enable:
+        metadata["vision_variant"] = True
+    return ensure_internal_route_in_llamaswap_config(
+        base_model,
+        instance_id,
+        catalog,
+        config_path,
+        server_path,
+        int(idle_ttl),
+        server_defaults,
+        gpu_set=list(gpu_set or []),
+        include_mmproj=bool(enable),
+        metadata=metadata,
+        ttl=ttl,
     )
-    try:
-        ct2 = str((getattr(vision, "server_overrides", {}) or {}).get("cache_type") or "").strip().lower()
-        if vision_engine == "buun" and ct2 in {"turbo8","turbo4","turbo3","turbo2","turbo3_tcq","turbo2_tcq","turbo1_tcq","vbr"}:
-            filtered2: list[str] = []
-            skip2 = False
-            for j, part in enumerate(cmd):
-                if skip2:
-                    skip2 = False
-                    continue
-                if part in {"--cache-type-k","--cache-type-v"} and j+1 < len(cmd) and cmd[j+1].strip().lower() == "f16":
-                    skip2 = True
-                    continue
-                filtered2.append(part)
-            cmd = filtered2
-    except Exception:
-        pass
-    try:
-        vision_ttl = vision_route_ttl(cached_mmproj_config())
-    except Exception:
-        vision_ttl = None
-    models[vid] = {
-        "cmd": " ".join(shell_quote(part) for part in cmd),
-        "checkEndpoint": "/health",
-        "ttl": int(vision_ttl if vision_ttl else idle_ttl),
-        "metadata": {"internal_replica_of": base_model.model_id, "vision_variant": True},
-        "description": vision.description,
-    }
-    _recalculate_llamaswap_matrix_from_config(data, catalog, bool(cached_mmproj_config().get("allow_co_resident")))
-    tmp = path.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as file_handle:
-        file_handle.write(LLAMASWAP_CONFIG_HEADER)
-        if yaml is not None:
-            yaml.safe_dump(data, file_handle, sort_keys=False)
-        else:
-            import json as _json
-
-            file_handle.write(_json.dumps(data, indent=2))
-    tmp.replace(path)
-    try:
-        cli_file3 = _get_cli_file()
-        _log = getattr(cli_file3, "log_api_event", None)
-        if _log is not None:
-            _log("vision_route_added", {"model": base_model.model_id, "vision": vid, "config_path": str(path)})
-    except Exception:
-        pass
-    return vid
 
 
 __all__ = [
@@ -1109,10 +1051,8 @@ __all__ = [
     "_model_info_for_matrix_entry",
     "ensure_replica_route_in_llamaswap_config",
     "ensure_replica_route",
-    "build_vision_model",
-    "is_vision_model_id",
-    "vision_base_model_id",
-    "vision_model_id",
-    "ensure_vision_route_in_llamaswap_config",
+    "ensure_internal_route_in_llamaswap_config",
+    "set_instance_mmproj_in_llamaswap_config",
+    "route_carries_mmproj",
     "shell_quote",
 ]

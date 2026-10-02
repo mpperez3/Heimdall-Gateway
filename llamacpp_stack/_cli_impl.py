@@ -128,17 +128,13 @@ except Exception:  # pragma: no cover
     _affinity_policy_defaults = None  # type: ignore
 
 from llamacpp_stack.cli.vision import (  # type: ignore
-    MMPROJ_MODE_ALWAYS,
     MMPROJ_MODE_LAZY,
-    MMPROJ_MODE_OFF,
     cached_mmproj_config,
-    default_mmproj_config,
+    candidate_instance_ids,
+    choose_vision_instance,
     get_model_mmproj_mode,
-    model_has_mmproj,
     model_lazily_loads_mmproj,
     normalize_mmproj_config,
-    resolve_effective_mmproj_config,
-    resolve_render_include_mmproj,
 )
 
 # Gateway shim: prefer canonical impl from llamacpp_stack.cli.gateway (T5)
@@ -5566,6 +5562,17 @@ class ReplicaRouterState:
         self.policy: object = _AffinityPolicy()
         self.affinity_budget: dict[str, _TransferBudget] = {}
         self._health_cache: dict[str, tuple[float, _TargetHealth]] = {}
+        # Lazy mmproj. ``vision_until[base_id][instance_id]`` is the monotonic
+        # deadline until which that instance's rendered route carries
+        # ``--mmproj``. Entries are kept after they lapse so plain text traffic
+        # can still see that the route needs the projector stripped.
+        self.vision_until: dict[str, dict[str, float]] = {}
+        # Conversations currently pinned to a projector-bearing instance, keyed
+        # by the same affinity key the replica router uses. Kept apart from
+        # ``affinity`` on purpose: "this chat needs vision" is orthogonal to
+        # "which replica should serve it", and moving a replica binding is a
+        # deliberate, budgeted operation.
+        self.vision_affinity: dict[str, tuple[str, float]] = {}
 
     def affinity_config(self) -> _AffinityConfig:
         return _resolve_affinity_policy_config()
@@ -8689,12 +8696,6 @@ def apply_config_and_wait_absent(
     )
 
 
-def _with_forced_mmproj(model: ManagedModel) -> ManagedModel:
-    overrides = dict(getattr(model, "server_overrides", None) or {})
-    overrides["mmproj_mode"] = MMPROJ_MODE_ALWAYS
-    return replace(model, server_overrides=overrides)
-
-
 def _request_carries_images(payload: dict) -> bool:
     """True for OpenAI image parts and for Ollama's top-level ``images``."""
     if not isinstance(payload, dict):
@@ -8702,53 +8703,194 @@ def _request_carries_images(payload: dict) -> bool:
     if payload.get("images"):
         return True
     messages = payload.get("messages")
-    if isinstance(messages, list):
-        for message in messages:
-            if not isinstance(message, dict):
-                continue
-            content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                if isinstance(part, dict) and str(part.get("type") or "") in {"image_url", "input_image"}:
-                    return True
-    messages = payload.get("messages")
+    # `_messages_include_images` walks message dicts, so drop anything else
+    # rather than letting a bare string raise on the hot path.
     if not isinstance(messages, list):
         return False
-    return bool(_messages_include_images(messages))
+    shaped = [message for message in messages if isinstance(message, dict)]
+    return bool(shaped) and _messages_include_images(shaped)
 
 
-def _bind_vision_affinity(affinity_key: str, vision_id: str, sticky_ttl_s: float) -> None:
-    if not affinity_key or not vision_id:
+def _bind_vision_affinity(affinity_key: str, instance_id: str, sticky_ttl_s: float) -> None:
+    """Pin a conversation to the instance that is carrying the projector."""
+    if not affinity_key or not instance_id:
         return
     try:
-        REPLICA_ROUTER_STATE.affinity[affinity_key] = (vision_id, time.monotonic() + max(60.0, sticky_ttl_s))
+        REPLICA_ROUTER_STATE.vision_affinity[affinity_key] = (
+            instance_id,
+            time.monotonic() + max(60.0, float(sticky_ttl_s)),
+        )
     except Exception:
         pass
 
 
-def _vision_affinity_target(model_id: str, payload: dict, headers, vision_id: str) -> str:
-    """Return ``vision_id`` when this conversation is already pinned to it."""
+def _vision_affinity_target(model_id: str, payload: dict, headers) -> str:
+    """The projector-bearing instance this conversation is already pinned to."""
     try:
         affinity_key = resolve_request_affinity_key(model_id, payload, headers)
     except Exception:
         return ""
-    now = time.monotonic()
-    if affinity_key:
+    if not affinity_key:
+        return ""
+    try:
+        entry = REPLICA_ROUTER_STATE.vision_affinity.get(affinity_key)
+    except Exception:
+        return ""
+    if not entry or float(entry[1]) <= time.monotonic():
+        return ""
+    return str(entry[0] or "")
+
+
+def _vision_mark_instance(base_id: str, instance_id: str, ttl_s: float) -> None:
+    """Record that ``instance_id``'s route now carries ``--mmproj``."""
+    if not base_id or not instance_id:
+        return
+    try:
+        with REPLICA_ROUTER_STATE.lock:
+            REPLICA_ROUTER_STATE.vision_until.setdefault(base_id, {})[instance_id] = (
+                time.monotonic() + max(60.0, float(ttl_s))
+            )
+    except Exception:
+        pass
+
+
+def _vision_forget_instance(base_id: str, instance_id: str) -> None:
+    try:
+        with REPLICA_ROUTER_STATE.lock:
+            per_base = REPLICA_ROUTER_STATE.vision_until.get(base_id)
+            if not isinstance(per_base, dict):
+                return
+            per_base.pop(instance_id, None)
+            if not per_base:
+                REPLICA_ROUTER_STATE.vision_until.pop(base_id, None)
+    except Exception:
+        pass
+
+
+def _vision_live_instances(base_id: str, now: float | None = None) -> set[str]:
+    """Instances whose projector has not lapsed yet."""
+    moment = time.monotonic() if now is None else now
+    out: set[str] = set()
+    try:
+        for instance_id, deadline in (REPLICA_ROUTER_STATE.vision_until.get(base_id) or {}).items():
+            if float(deadline) > moment:
+                out.add(instance_id)
+    except Exception:
+        return out
+    return out
+
+
+def _vision_instance_loaded(instance_id: str, base_id: str, catalog: list[ManagedModel]) -> bool:
+    if instance_id == base_id:
         try:
-            entry = REPLICA_ROUTER_STATE.affinity.get(affinity_key)
-            if entry and entry[0] == vision_id and float(entry[1]) > now:
-                return vision_id
+            return bool(get_catalog_model_process(base_id, catalog))
         except Exception:
-            pass
-    previous = str((payload or {}).get("previous_response_id") or "").strip()
-    if previous:
-        try:
-            if REPLICA_ROUTER_STATE.response_to_replica.get(previous) == vision_id:
-                return vision_id
-        except Exception:
-            pass
-    return ""
+            return False
+    try:
+        record = REPLICA_ROUTER_STATE.records.get(instance_id)
+        if record is not None and int(record.pid or 0) > 0 and str(record.status or "") == "ready":
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _vision_instance_last_used(instance_id: str) -> float:
+    try:
+        record = REPLICA_ROUTER_STATE.records.get(instance_id)
+        if record is not None and float(record.last_used or 0.0) > 0.0:
+            return float(record.last_used)
+    except Exception:
+        pass
+    try:
+        return float((REPLICA_ROUTER_STATE.base_last_used or {}).get(instance_id, 0.0))
+    except Exception:
+        return 0.0
+
+
+def _vision_candidate_gpu_set(instance_id: str, base_id: str) -> list[int]:
+    if instance_id == base_id:
+        return []
+    try:
+        record = REPLICA_ROUTER_STATE.records.get(instance_id)
+        return list(getattr(record, "gpu_set", None) or []) if record is not None else []
+    except Exception:
+        return []
+
+
+def _vision_route_args(args) -> tuple[int, dict[str, object] | None]:
+    """Resolve the arguments a projector attach needs.
+
+    Kept out of the guarded write below on purpose: a config-shape problem here
+    must not be misreported as "could not publish the vision route".
+    """
+    return int(resolve_idle_ttl(args) or 300), resolve_llama_server_defaults(args)
+
+
+def _attach_projector(
+    model_entry: ManagedModel,
+    instance_id: str,
+    catalog: list[ManagedModel],
+    args,
+    idle_ttl: int,
+    server_defaults: dict[str, object] | None,
+    enable: bool,
+) -> str:
+    return set_instance_mmproj_in_llamaswap_config(
+        model_entry,
+        instance_id,
+        catalog,
+        args.config,
+        args.llama_server,
+        idle_ttl,
+        server_defaults,
+        enable=bool(enable),
+        gpu_set=_vision_candidate_gpu_set(instance_id, model_entry.model_id),
+    )
+
+
+def reconcile_text_instance_mmproj(
+    model_entry: ManagedModel,
+    instance_id: str,
+    catalog: list[ManagedModel],
+    args,
+) -> None:
+    """Strip the projector from a route that plain text is about to use.
+
+    A route keeps ``--mmproj`` only while its vision window is open; after that,
+    and whenever a text request lands on it, the projector comes off again so
+    text traffic never pays for it. This runs before the request is forwarded,
+    so llama-swap loads the corrected command.
+    """
+    base_id = getattr(model_entry, "model_id", "")
+    if not base_id or not instance_id:
+        return
+    flagged = instance_id in ((REPLICA_ROUTER_STATE.vision_until or {}).get(base_id) or {})
+    if not flagged:
+        return
+    try:
+        idle_ttl, server_defaults = _vision_route_args(args)
+    except Exception as exc:
+        log_api_event(
+            "lazy_mmproj_text_restore_failed",
+            {"model": base_id, "instance": instance_id, "error": f"bad config: {exc}"},
+        )
+        return
+    # Forget the flag only once the route really lost the projector: if the
+    # rewrite fails the instance stays flagged so the next text request retries.
+    try:
+        _attach_projector(model_entry, instance_id, catalog, args, idle_ttl, server_defaults, enable=False)
+    except Exception as exc:
+        log_api_event(
+            "lazy_mmproj_text_restore_failed",
+            {"model": base_id, "instance": instance_id, "error": str(exc)},
+        )
+        return
+    _vision_forget_instance(base_id, instance_id)
+    log_api_event(
+        "lazy_mmproj_projector_released",
+        {"model": base_id, "instance": instance_id, "config_path": str(getattr(args, "config", ""))},
+    )
 
 
 def route_image_request_to_vision(
@@ -8759,126 +8901,108 @@ def route_image_request_to_vision(
     args,
     public_host: str,
 ) -> tuple[str | None, str | None]:
-    """Point an image-bearing request at a projector-bearing route.
+    """Point an image-bearing request at a projector-bearing instance.
 
-    Returns ``(upstream_model_id, error_message)``. ``(None, None)`` means lazy
-    mmproj does not apply and the caller should keep its normal routing. An
-    error message means the request cannot be served and should become a 503.
+    Returns ``(instance_id, error_message)``. ``(None, None)`` means lazy mmproj
+    does not apply and the caller should keep its normal routing; an error
+    message means the request cannot be served and should become a 503.
 
-    A model in ``mmproj_mode: lazy`` has a text-only base route and a vision
-    sibling. Reusing an already-published sibling keeps the conversation on one
-    warm process; otherwise the sibling is published on demand. When the sibling
-    cannot be published, an already-loaded base is reloaded in place with the
-    projector pinned on, which is the last resort before failing the request.
+    There is no dedicated vision route. The projector is bolted onto one
+    existing instance -- normally a replica that is sitting idle, so the copy
+    currently answering text is left alone -- and only that instance's rendered
+    command changes. The projector lapses on its own after
+    ``mmproj.vision_sticky_ttl_s``, and ``llm-server update`` clears it.
     """
     if not _request_carries_images(payload):
         return None, None
     if not model_lazily_loads_mmproj(model_entry):
         return None, None
+    base_id = model_entry.model_id
     mmproj_cfg = cached_mmproj_config()
-    vision_id = vision_model_id(model_entry.model_id)
-    sticky_ttl_s = float(mmproj_cfg.get("vision_sticky_ttl_s") or 1800.0)
+    sticky_ttl_s = float(mmproj_cfg.get("vision_sticky_ttl_s") or 3600.0)
     publish_timeout = float(mmproj_cfg.get("route_publish_timeout_s") or 90.0)
     try:
         public_port = int(args.public_port)
     except Exception:
         return None, "lazy mmproj: invalid public port"
-    published = set()
     try:
-        published = set(get_published_model_ids(public_host, public_port))
-    except Exception:
-        published = set()
-    affinity_key = ""
-    try:
-        affinity_key = resolve_request_affinity_key(model_entry.model_id, payload, headers)
+        affinity_key = resolve_request_affinity_key(base_id, payload, headers)
     except Exception:
         affinity_key = ""
-    pinned = _vision_affinity_target(model_entry.model_id, payload, headers, vision_id)
-    if pinned and pinned in published:
-        _bind_vision_affinity(affinity_key, vision_id, sticky_ttl_s)
+
+    # A conversation already being served with the projector stays there, so the
+    # KV cache of the warm process is reused instead of paying another load.
+    pinned = _vision_affinity_target(base_id, payload, headers)
+    if pinned and pinned in _vision_live_instances(base_id):
+        _vision_mark_instance(base_id, pinned, sticky_ttl_s)
+        _bind_vision_affinity(affinity_key, pinned, sticky_ttl_s)
         log_api_event(
             "lazy_mmproj_route_selected",
-            {"model": model_entry.model_id, "vision": vision_id, "reason": "affinity_hit", "affinity_key_hash": hashlib.sha256(affinity_key.encode("utf-8", "ignore")).hexdigest()[:16] if affinity_key else ""},
+            {"model": base_id, "instance": pinned, "reason": "affinity_hit"},
         )
-        return vision_id, None
-    if vision_id in published:
-        _bind_vision_affinity(affinity_key, vision_id, sticky_ttl_s)
-        log_api_event(
-            "lazy_mmproj_route_selected",
-            {"model": model_entry.model_id, "vision": vision_id, "reason": "already_published"},
-        )
-        return vision_id, None
-    if mmproj_cfg.get("prefer_vision_route", True):
-        # Args resolve outside the guard so a config-shape problem is not
-        # misreported as "could not publish"; only the config write is guarded.
-        try:
-            idle_ttl = int(resolve_idle_ttl(args) or 300)
-            server_defaults = resolve_llama_server_defaults(args)
-        except Exception as exc:
-            log_api_event(
-                "lazy_mmproj_route_create_failed",
-                {"model": model_entry.model_id, "vision": vision_id, "error": f"bad config: {exc}"},
-            )
-        else:
-            try:
-                ensure_vision_route_in_llamaswap_config(
-                    model_entry,
-                    catalog,
-                    args.config,
-                    args.llama_server,
-                    idle_ttl,
-                    server_defaults,
-                )
-            except Exception as exc:
-                log_api_event(
-                    "lazy_mmproj_route_create_failed",
-                    {"model": model_entry.model_id, "vision": vision_id, "error": str(exc)},
-                )
-            else:
-                if wait_for_published_model_id(
-                    vision_id, public_host, public_port, timeout_s=min(publish_timeout, 10.0)
-                ):
-                    _bind_vision_affinity(affinity_key, vision_id, sticky_ttl_s)
-                    log_api_event(
-                        "lazy_mmproj_route_selected",
-                        {"model": model_entry.model_id, "vision": vision_id, "reason": "cold_created"},
-                    )
-                    return vision_id, None
-                log_api_event(
-                    "lazy_mmproj_route_publish_timeout",
-                    {"model": model_entry.model_id, "vision": vision_id, "timeout_s": publish_timeout},
-                )
-    loaded = False
-    try:
-        loaded = bool(get_catalog_model_process(model_entry.model_id, catalog))
-    except Exception:
-        loaded = False
-    if loaded:
-        log_api_event(
-            "lazy_mmproj_base_reload_fallback",
-            {"model": model_entry.model_id, "reason": "vision_route_unavailable"},
-        )
-        if reload_model_runtime_from_catalog_config(
-            model_entry,
-            catalog,
-            args,
-            public_host,
-            public_port,
-            unload_timeout=float(mmproj_cfg.get("unload_timeout_s") or 45.0),
-            reload_timeout=float(mmproj_cfg.get("reload_timeout_s") or 45.0),
-            force_mmproj=True,
-            reason="lazy_mmproj_vision_upgrade",
-        ):
-            _bind_vision_affinity(affinity_key, vision_id, sticky_ttl_s)
-            log_api_event("lazy_mmproj_route_selected", {"model": model_entry.model_id, "vision": model_entry.model_id, "reason": "base_reloaded_with_mmproj"})
-            return model_entry.model_id, None
-        return None, (
-            f"Model {model_entry.model_id} has mmproj_mode=lazy but its vision route could not be "
-            "published and reloading the loaded process with the projector failed. Retry shortly."
-        )
-    return None, (
-        f"Model {model_entry.model_id} has mmproj_mode=lazy but its vision route could not be published."
+        return pinned, None
+
+    # Operator's rule: never disturb an instance that is already serving, and
+    # when several are free prefer the one whose projector is already warm.
+    replica_ids = [
+        rid
+        for rid, record in (REPLICA_ROUTER_STATE.records or {}).items()
+        if rid != base_id and str(getattr(record, "base_model_id", "") or "") == base_id
+    ]
+    candidates = candidate_instance_ids(base_id, sorted(replica_ids))
+    loaded = {item for item in candidates if _vision_instance_loaded(item, base_id, catalog)}
+    last_used = {item: _vision_instance_last_used(item) for item in candidates}
+    target = choose_vision_instance(
+        candidates,
+        loaded=loaded,
+        has_mmproj=_vision_live_instances(base_id),
+        last_used=last_used,
+        fallback_last_used=float(REPLICA_ROUTER_STATE.base_last_used.get(base_id, 0.0) or 0.0),
     )
+    if not target:
+        return None, f"Model {base_id} has mmproj_mode=lazy but exposes no instance to carry the projector."
+    if target != base_id and not _vision_candidate_gpu_set(target, base_id):
+        # Without a known GPU set the replica would be rendered unbound and
+        # could land on the wrong devices, so serve the image on the base.
+        target = base_id
+
+    try:
+        idle_ttl, server_defaults = _vision_route_args(args)
+    except Exception as exc:
+        log_api_event(
+            "lazy_mmproj_route_create_failed",
+            {"model": base_id, "instance": target, "error": f"bad config: {exc}"},
+        )
+        return None, (
+            f"Model {base_id} has mmproj_mode=lazy but its projector could not be attached "
+            "(invalid server configuration). Retry shortly."
+        )
+    already = target in _vision_live_instances(base_id)
+    try:
+        _attach_projector(model_entry, target, catalog, args, idle_ttl, server_defaults, enable=True)
+    except Exception as exc:
+        log_api_event(
+            "lazy_mmproj_route_create_failed",
+            {"model": base_id, "instance": target, "error": str(exc)},
+        )
+        return None, (
+            f"Model {base_id} has mmproj_mode=lazy but the projector could not be attached to "
+            f"instance '{target}'. Retry shortly."
+        )
+    if not already:
+        wait_for_published_model_id(target, public_host, public_port, timeout_s=min(publish_timeout, 10.0))
+    _vision_mark_instance(base_id, target, sticky_ttl_s)
+    _bind_vision_affinity(affinity_key, target, sticky_ttl_s)
+    log_api_event(
+        "lazy_mmproj_route_selected",
+        {
+            "model": base_id,
+            "instance": target,
+            "reason": "already_warm" if already else "attached_projector",
+            "loaded_instances": sorted(loaded),
+        },
+    )
+    return target, None
 
 
 def reload_model_runtime_from_catalog_config(
@@ -8891,8 +9015,6 @@ def reload_model_runtime_from_catalog_config(
     progress_callback=None,
     unload_timeout: float = 45.0,
     reload_timeout: float = 45.0,
-    force_mmproj: bool = False,
-    reason: str = "stale_runtime_flags",
 ) -> bool:
     """Force llama-swap to drop a stale live process and publish it again.
 
@@ -8901,10 +9023,6 @@ def reload_model_runtime_from_catalog_config(
     Temporarily removing just this model from the watched config makes
     llama-swap stop the old process; restoring the full catalog makes the next
     request load the model with the current command.
-
-    ``force_mmproj`` publishes the restored entry with the projector pinned on.
-    That is the fallback path for lazy-mmproj models when their vision sibling
-    route could not be created, and it lasts until the next render drops it.
     """
     if model is None or not getattr(model, "model_id", None):
         return False
@@ -8918,10 +9036,8 @@ def reload_model_runtime_from_catalog_config(
     replica_defaults = resolve_global_replica_config(args)
     idle_ttl = resolve_idle_ttl(args)
     reduced_catalog = [item for item in catalog if item.model_id != model_id]
-    if force_mmproj:
-        catalog = [_with_forced_mmproj(item) for item in catalog]
     try:
-        log_api_event("model_runtime_reload_begin", {"model": model_id, "reason": reason, "force_mmproj": force_mmproj})
+        log_api_event("model_runtime_reload_begin", {"model": model_id, "reason": "stale_runtime_flags"})
         render_llamaswap_config(
             reduced_catalog,
             config_path,
@@ -10382,7 +10498,7 @@ def build_openai_model_list_payload(model: ManagedModel) -> dict:
         "metadata": {
             "vision": _has_vision_runtime(model),
             "mmproj_mode": get_model_mmproj_mode(model),
-            "vision_route": vision_model_id(model.model_id) if model_lazily_loads_mmproj(model) else None,
+            "vision_instances": sorted(_vision_live_instances(model.model_id)) if model_lazily_loads_mmproj(model) else [],
             "load_capabilities": load_capabilities,
             "context_length": context_length,
             "context_window": context_length,
@@ -10419,7 +10535,7 @@ def build_openai_model_payload(model: ManagedModel) -> dict:
             "load_capabilities": load_capabilities,
             "vision": _has_vision_runtime(model),
             "mmproj_mode": get_model_mmproj_mode(model),
-            "vision_route": vision_model_id(model.model_id) if model_lazily_loads_mmproj(model) else None,
+            "vision_instances": sorted(_vision_live_instances(model.model_id)) if model_lazily_loads_mmproj(model) else [],
             "speculative": bool(getattr(model, "speculative", False)),
             "spec_variant_of": getattr(model, "spec_variant_of", None),
             **probe_metrics,
@@ -10548,7 +10664,7 @@ def build_ollama_model_payload(model: ManagedModel, loaded: bool = False, proces
         "speculative": bool(getattr(model, "speculative", False)),
         "vision": _has_vision_runtime(model),
         "mmproj_mode": get_model_mmproj_mode(model),
-        "vision_route": vision_model_id(model.model_id) if model_lazily_loads_mmproj(model) else None,
+        "vision_instances": sorted(_vision_live_instances(model.model_id)) if model_lazily_loads_mmproj(model) else [],
         **probe_metrics,
     }
     payload = {
@@ -15624,6 +15740,8 @@ def start_ctx_metadata_server(args):
                     public_host=client_host,
                     public_port=int(args.public_port),
                 )
+            if model_entry is not None and vision_target is None and upstream_model_name:
+                reconcile_text_instance_mmproj(model_entry, upstream_model_name, catalog, args)
             if model_entry is None and is_replica_model_id(model_name):
                 upstream_model_name, is_replica_request, _direct_err = _prepare_direct_replica_request(model_name, catalog, args, client_host)
                 if _direct_err is not None:
@@ -15940,6 +16058,8 @@ def start_ctx_metadata_server(args):
                         "conversation_state": CONVERSATION_SWITCH_STATE.snapshot(conversation_key) if conversation_key else {},
                     },
                 )
+            if model_entry is not None and vision_target is None and upstream_model_name:
+                reconcile_text_instance_mmproj(model_entry, upstream_model_name, catalog, args)
             if model_entry is None and is_replica_model_id(model_name):
                 upstream_model_name, is_replica_request, _direct_err = _prepare_direct_replica_request(model_name, catalog, args, client_host)
                 if _direct_err is not None:
@@ -16906,6 +17026,8 @@ def start_ctx_metadata_server(args):
                     public_host=client_host,
                     public_port=int(args.public_port),
                 )
+            if model_entry is not None and vision_target is None and upstream_model_name:
+                reconcile_text_instance_mmproj(model_entry, upstream_model_name, catalog, args)
             if model_entry is None and is_replica_model_id(model_name):
                 upstream_model_name, is_replica_request, _direct_err = _prepare_direct_replica_request(model_name, catalog, args, client_host)
                 if _direct_err is not None:
@@ -18394,6 +18516,8 @@ def start_ctx_metadata_server(args):
                     public_host=client_host,
                     public_port=int(args.public_port),
                 )
+            if model_entry is not None and vision_target is None and upstream_model_name:
+                reconcile_text_instance_mmproj(model_entry, upstream_model_name, catalog, args)
             if model_entry is None and is_replica_model_id(model_name):
                 upstream_model_name, is_replica_request, _direct_err = _prepare_direct_replica_request(model_name, catalog, args, client_host)
                 if _direct_err is not None:
@@ -22466,34 +22590,30 @@ try:
         _model_info_for_matrix_entry as _sc_minfo,
         build_replica_model as _sc_build_replica,
         ensure_replica_route_in_llamaswap_config as _sc_ensure,
-        ensure_vision_route_in_llamaswap_config as _sc_ensure_vision,
         get_model_replica_config as _sc_get_replica,
         is_replica_model_id as _sc_is_replica,
-        is_vision_model_id as _sc_is_vision,
         iter_catalog_with_replicas as _sc_iter_replica,
         replica_base_model_id as _sc_base_id,
         replica_model_id as _sc_replica_id,
         render_llamaswap_config as _sc_render,
         resolve_global_replica_config as _sc_resolve_global,
-        vision_base_model_id as _sc_vision_base,
-        vision_model_id as _sc_vision_id,
+        route_carries_mmproj as _sc_route_carries_mmproj,
+        set_instance_mmproj_in_llamaswap_config as _sc_set_instance_mmproj,
     )
     _calculate_llama_swap_matrix = _sc_calc  # type: ignore
     _model_info_for_matrix_entry = _sc_minfo  # type: ignore
     build_replica_model = _sc_build_replica  # type: ignore
     ensure_replica_route_in_llamaswap_config = _sc_ensure  # type: ignore
     ensure_replica_route = _sc_ensure  # type: ignore
-    ensure_vision_route_in_llamaswap_config = _sc_ensure_vision  # type: ignore
     get_model_replica_config = _sc_get_replica  # type: ignore
     is_replica_model_id = _sc_is_replica  # type: ignore
-    is_vision_model_id = _sc_is_vision  # type: ignore
     iter_catalog_with_replicas = _sc_iter_replica  # type: ignore
     replica_base_model_id = _sc_base_id  # type: ignore
     replica_model_id = _sc_replica_id  # type: ignore
     render_llamaswap_config = _sc_render  # type: ignore
     resolve_global_replica_config = _sc_resolve_global  # type: ignore
-    vision_base_model_id = _sc_vision_base  # type: ignore
-    vision_model_id = _sc_vision_id  # type: ignore
+    route_carries_mmproj = _sc_route_carries_mmproj  # type: ignore
+    set_instance_mmproj_in_llamaswap_config = _sc_set_instance_mmproj  # type: ignore
 except Exception:
     pass
 try:

@@ -487,27 +487,34 @@ stream interruptions, model-load failures, and tool-call repair decisions.
 ## Lazy mmproj (vision on demand)
 
 Models with a projector (`mmproj_path`) normally load it on every start, which
-costs VRAM and load time even for text-only traffic. Setting
-`mmproj_mode: lazy` in a model's `server_overrides` splits the model into two
-llama-swap routes:
+costs VRAM and load time even for text-only traffic. Setting `mmproj_mode: lazy`
+in a model's `server_overrides` renders **every** route of that model without
+`--mmproj`. The projector is then bolted onto one instance at the moment it is
+actually needed, and taken back off when it is not.
 
-| Route | Command | Purpose |
-|---|---|---|
-| `<model>` | no `--mmproj` | text-only base |
-| `<model>__vision` | `--mmproj <path>` | sibling that serves image requests |
+There is no dedicated vision route. The instances are the ones the model
+already has — the base and its `__replica_N` replicas — and the projector
+becomes a property of whichever one is free.
 
-The base also stops reserving projector headroom in its tensor split. When a
-request carrying an image (`image_url`, `input_image`, or Ollama `images`)
-arrives, the gateway points it at the vision route before replica selection, so
-a text-only replica never receives an image. The vision route is declared
-alongside the base but only loaded when an image arrives, reused while the
-conversation stays warm, and evicted by llama-swap after its idle TTL, so
-text-only traffic never pays for the projector.
+When a request carrying an image (`image_url`, `input_image`, or Ollama `images`)
+arrives, the gateway picks a target **before** replica selection, so a text-only
+instance never receives an image:
 
-If the vision route is missing or cannot be loaded and the base is already
-loaded, the loaded process is reloaded in place with the projector pinned
-on. If neither path works, the request returns `503` with a retry message
-rather than reaching a backend that would silently drop the image.
+| State of the candidates | Chosen |
+|---|---|
+| some unloaded, others loaded | an **unloaded** one, so busy instances keep serving |
+| all idle, one already carries the projector | that one, to avoid a projector reload |
+| all idle, none carries it | the one **idle longest** |
+
+The chosen route's command is rewritten to add `--mmproj`, the conversation is
+pinned to it so follow-up turns reuse the warm projector, and it gets a `ttl` of
+`mmproj.vision_sticky_ttl_s` (1 hour by default). Once that lapses llama-swap
+evicts the process, and the flag is stripped again the next time a text request
+needs that instance — or at the next `llm-server update`, which always re-renders
+text-only. If the projector cannot be attached the request returns `503` with a
+retry message rather than reaching a backend that would silently drop the image.
+
+A lazy base also stops reserving projector headroom in its tensor split.
 
 Opt in per model:
 
@@ -525,19 +532,18 @@ Or for every projector model via the global `mmproj` block in
 | Key | Default | Meaning |
 |---|---|---|
 | `mmproj.default_mode` | `always` | `always`, `lazy`, or `off`; per-model `mmproj_mode` wins |
-| `mmproj.prefer_vision_route` | `true` | publish and use the vision sibling instead of reloading the base |
-| `mmproj.allow_co_resident` | `false` | let llama-swap keep base and vision loaded together; default keeps them mutually exclusive to save VRAM |
-| `mmproj.vision_sticky_ttl_s` | `1800` | idle seconds before llama-swap evicts the vision route (rounded to whole minutes, minimum 1) |
-| `mmproj.route_publish_timeout_s` | `90.0` | wait for the vision route to appear |
-| `mmproj.unload_timeout_s` | `45.0` | unload budget for the reload fallback |
-| `mmproj.reload_timeout_s` | `45.0` | reload budget for the reload fallback |
+| `mmproj.vision_sticky_ttl_s` | `3600` | idle seconds before llama-swap evicts the projector-bearing route (rounded to whole minutes, minimum 1) |
+| `mmproj.route_publish_timeout_s` | `90.0` | wait for the rewritten route to appear in `/v1/models` |
+| `mmproj.unload_timeout_s` | `45.0` | unload budget |
+| `mmproj.reload_timeout_s` | `45.0` | reload budget |
 
 `always` keeps the previous behaviour, `off` drops `--mmproj` entirely, and
-`lazy` is the two-route split above. vLLM and the `exllama` engines are never
-lazy: vLLM has no `--mmproj` and the exllama adapter drops image parts before
-they reach the backend. `llm-server config-migrate` fills the block in without
-overwriting values you set, and `GET /v1/models` reports `mmproj_mode` and
-`vision_route` per model so the wiring is verifiable.
+`lazy` is the on-demand projector described above. vLLM and the `exllama`
+engines are never lazy: vLLM has no `--mmproj` and the exllama adapter drops
+image parts before they reach the backend. `llm-server config-migrate` fills the
+block in without overwriting values you set, and `GET /v1/models` reports
+`mmproj_mode` and `vision_instances` per model — the instances currently
+carrying the projector — so the wiring is verifiable.
 
 ## Cleanup and model lifecycle
 

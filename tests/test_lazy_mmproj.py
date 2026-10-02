@@ -1,16 +1,19 @@
 """Tests for lazy mmproj (``mmproj_mode: lazy``).
 
-A lazy model renders a text-only base route plus a ``__vision`` sibling that
-carries ``--mmproj``. Image-bearing requests are pointed at the sibling, or at
-an in-place reload of an already-loaded base when the sibling cannot be
-published.
+There is **no dedicated vision route**. A lazy model renders exactly like every
+other model -- text only, no ``--mmproj``. When a request carries an image the
+gateway picks one instance that is free (normally a replica sitting idle) and
+rewrites only that route's command so it carries the projector. The projector
+lapses after ``mmproj.vision_sticky_ttl_s`` and the instance goes back to text.
+
+These tests pin the three halves of that contract: the pure selection rule, the
+single-route rewrite, and the gateway wiring.
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,32 +24,35 @@ import yaml
 from llamacpp_stack import _cli_impl
 from llamacpp_stack.cli import ManagedModel
 from llamacpp_stack.cli import vision as vision_mod
+from llamacpp_stack.cli.models import ReplicaRecord
 from llamacpp_stack.cli.replica import (
     _calculate_llama_swap_matrix,
-    ensure_vision_route_in_llamaswap_config,
+    ensure_internal_route_in_llamaswap_config,
+    ensure_replica_route_in_llamaswap_config,
     render_llamaswap_config,
+    route_carries_mmproj,
+    set_instance_mmproj_in_llamaswap_config,
 )
 from llamacpp_stack.cli.server_commands import build_llama_server_command
 from llamacpp_stack.cli.vision import (
     MMPROJ_MODE_ALWAYS,
     MMPROJ_MODE_LAZY,
     MMPROJ_MODE_OFF,
-    build_vision_model,
+    candidate_instance_ids,
+    choose_vision_instance,
     default_mmproj_config,
     get_model_mmproj_mode,
-    is_vision_model_id,
     model_has_mmproj,
     model_lazily_loads_mmproj,
     normalize_mmproj_config,
     normalize_mmproj_mode,
     resolve_render_include_mmproj,
-    vision_base_model_id,
-    vision_model_id,
     vision_route_ttl,
 )
 
 BASE_ID = "exl3-qwen"
-VISION_ID = "exl3-qwen__vision"
+REPLICA_ID = "exl3-qwen__replica_0"
+SERVER = Path("/usr/bin/llama-server")
 
 
 def _make_model(
@@ -73,6 +79,7 @@ def _make_model(
         load_capabilities=[],
         aliases=list(aliases or []),
         ctx_size=32768,
+        # build_llama_server_command int()s this, so None would raise.
         n_gpu_layers=-1,
         tensor_split=None,
         host=None,
@@ -96,30 +103,34 @@ def _make_model(
     )
 
 
-def _config_env(payload: dict | None = None):
-    """Patch conf.json resolution and drop the vision config memo.
+def _lazy_model(**kwargs) -> ManagedModel:
+    overrides = dict(kwargs.pop("server_overrides", None) or {})
+    overrides.update({"engine": "buun", "mmproj_mode": "lazy"})
+    return _make_model(server_overrides=overrides, **kwargs)
+
+
+def _config_env(payload: dict | None = None) -> list:
+    """Patch conf.json resolution and drop the memo that would hide the patch.
 
     ``cached_mmproj_config`` memoizes on the real conf.json stat and delegates
-    to ``server_commands._load_server_config_payload``, so both must be handled.
+    to ``server_commands._load_server_config_payload``, so both must be
+    handled or the stub silently has no effect.
     """
     body = payload if payload is not None else {}
 
     def _loader(_args=None):
         return copy.deepcopy(body)
 
-    patches = [
-        mock.patch(
-            "llamacpp_stack.cli.server_commands._load_server_config_payload",
-            side_effect=_loader,
-        )
-    ]
-    for patcher in patches:
-        patcher.start()
+    patcher = mock.patch(
+        "llamacpp_stack.cli.server_commands._load_server_config_payload",
+        side_effect=_loader,
+    )
+    patcher.start()
     vision_mod._MMPROJ_CONFIG_MEMO.clear()
-    return patches
+    return [patcher]
 
 
-def _stop(patches):
+def _stop(patches) -> None:
     for patcher in patches:
         patcher.stop()
     vision_mod._MMPROJ_CONFIG_MEMO.clear()
@@ -134,170 +145,239 @@ class _ConfigEnvMixin:
         self.addCleanup(_stop, patches)
 
 
+class _RouterStateMixin:
+    """Isolate the vision bookkeeping held on the global router singleton.
+
+    ``reset_router_state`` is a plain method rather than ``setUp`` on purpose:
+    ``unittest.TestCase`` also defines ``setUp``, so a mixin ``setUp`` is shadowed
+    by the MRO and would silently never run.
+    """
+
+    def reset_router_state(self):
+        state = _cli_impl.REPLICA_ROUTER_STATE
+        for attr in (
+            "records",
+            "affinity",
+            "response_to_replica",
+            "loading_claims",
+            "vision_until",
+            "vision_affinity",
+        ):
+            getattr(state, attr).clear()
+        state.base_last_used.clear()
+        state.base_in_flight.clear()
+        self.addCleanup(state.records.clear)
+        self.addCleanup(state.vision_until.clear)
+        self.addCleanup(state.vision_affinity.clear)
+
+
+# --------------------------------------------------------------------------- #
+# mode resolution
+# --------------------------------------------------------------------------- #
 class ModeResolutionTest(unittest.TestCase, _ConfigEnvMixin):
     def test_default_mode_is_always_and_keeps_mmproj(self):
+        self.use_conf()
         model = _make_model()
         self.assertEqual(get_model_mmproj_mode(model), MMPROJ_MODE_ALWAYS)
         self.assertTrue(resolve_render_include_mmproj(model))
         self.assertFalse(model_lazily_loads_mmproj(model))
 
     def test_per_model_lazy_opt_in(self):
-        model = _make_model(server_overrides={"engine": "buun", "mmproj_mode": "lazy"})
+        self.use_conf()
+        model = _lazy_model()
         self.assertEqual(get_model_mmproj_mode(model), MMPROJ_MODE_LAZY)
         self.assertTrue(model_lazily_loads_mmproj(model))
-        # The text-only base must not carry the projector.
-        self.assertFalse(resolve_render_include_mmproj(model))
+        self.assertFalse(
+            resolve_render_include_mmproj(model),
+            "a lazy model must render without the projector",
+        )
 
-    def test_global_default_mode_applies_without_per_model_key(self):
+    def test_global_default_mode_can_make_every_model_lazy(self):
         self.use_conf({"default_mode": "lazy"})
         model = _make_model()
         self.assertEqual(get_model_mmproj_mode(model), MMPROJ_MODE_LAZY)
         self.assertTrue(model_lazily_loads_mmproj(model))
 
-    def test_per_model_mode_wins_over_global_default(self):
+    def test_per_model_mode_beats_the_global_default(self):
         self.use_conf({"default_mode": "lazy"})
         model = _make_model(server_overrides={"engine": "buun", "mmproj_mode": "always"})
         self.assertEqual(get_model_mmproj_mode(model), MMPROJ_MODE_ALWAYS)
-        self.assertFalse(model_lazily_loads_mmproj(model))
+        self.assertTrue(resolve_render_include_mmproj(model))
 
-    def test_mode_off_drops_mmproj_without_a_sibling(self):
+    def test_off_drops_the_projector_entirely(self):
+        self.use_conf()
         model = _make_model(server_overrides={"engine": "buun", "mmproj_mode": "off"})
         self.assertEqual(get_model_mmproj_mode(model), MMPROJ_MODE_OFF)
+        self.assertTrue(model_has_mmproj(model))
         self.assertFalse(model_lazily_loads_mmproj(model))
-        self.assertFalse(resolve_render_include_mmproj(model))
 
-    def test_unknown_mode_falls_back_to_always(self):
-        self.assertEqual(normalize_mmproj_mode("sometimes"), MMPROJ_MODE_ALWAYS)
-        self.assertEqual(normalize_mmproj_mode(None), MMPROJ_MODE_ALWAYS)
-        self.assertEqual(normalize_mmproj_mode("LAZY"), MMPROJ_MODE_LAZY)
-
-    def test_model_without_mmproj_is_never_lazy(self):
-        model = _make_model(
-            mmproj_path=None,
-            server_overrides={"engine": "buun", "mmproj_mode": "lazy"},
-        )
+    def test_a_model_without_mmproj_is_never_lazy(self):
+        self.use_conf()
+        model = _make_model(mmproj_path=None, server_overrides={"mmproj_mode": "lazy"})
         self.assertFalse(model_has_mmproj(model))
         self.assertFalse(model_lazily_loads_mmproj(model))
-        self.assertFalse(resolve_render_include_mmproj(model))
 
-    def test_vllm_and_exllama_are_excluded_from_lazy(self):
-        vllm = _make_model(
-            backend="vllm",
-            server_overrides={"engine": "buun", "mmproj_mode": "lazy"},
-        )
-        self.assertFalse(model_lazily_loads_mmproj(vllm))
-        for engine in ("exllama", "exllamav3", "exllama-v3", "exllama3"):
-            exllama = _make_model(
-                server_overrides={"engine": engine, "mmproj_mode": "lazy"},
-            )
-            with self.subTest(engine=engine):
-                self.assertFalse(model_lazily_loads_mmproj(exllama))
-
-    def test_normalize_mmproj_config_is_idempotent_and_fills_absent_keys(self):
-        defaults = default_mmproj_config()
-        first, changed_first = normalize_mmproj_config(None)
-        self.assertEqual(first, defaults)
-        self.assertFalse(changed_first)
-
-        partial = {"default_mode": "lazy"}
-        second, changed_second = normalize_mmproj_config(partial)
-        # Absent keys are filled in but that alone is not a migration.
-        self.assertFalse(changed_second)
-        self.assertEqual(second["default_mode"], "lazy")
-        self.assertEqual(second["prefer_vision_route"], defaults["prefer_vision_route"])
-
-        third, changed_third = normalize_mmproj_config(second)
-        self.assertEqual(third, second)
-        self.assertFalse(changed_third)
-
-    def test_normalize_mmproj_config_rejects_malformed_input(self):
-        normalized, changed = normalize_mmproj_config("nope")
-        self.assertTrue(changed)
-        self.assertEqual(normalized, default_mmproj_config())
-
-    def test_vision_route_ttl_maps_sticky_seconds_to_minutes(self):
-        self.assertEqual(vision_route_ttl({"vision_sticky_ttl_s": 600}), 10)
-        self.assertEqual(vision_route_ttl({"vision_sticky_ttl_s": 1800}), 30)
-        self.assertEqual(vision_route_ttl({"vision_sticky_ttl_s": 45}), 1)
-        self.assertIsNone(vision_route_ttl({"vision_sticky_ttl_s": 0}))
-        self.assertEqual(vision_route_ttl({}), 30)
-        # normalize_mmproj_config clamps 0 up to the 60s floor, which is 1 minute.
-        clamped, _ = normalize_mmproj_config({"vision_sticky_ttl_s": 0})
-        self.assertEqual(clamped["vision_sticky_ttl_s"], 60)
-        self.assertEqual(vision_route_ttl(clamped), 1)
-
-    def test_vision_model_id_helpers_round_trip(self):
-        self.assertEqual(vision_model_id(BASE_ID), VISION_ID)
-        self.assertTrue(is_vision_model_id(VISION_ID))
-        self.assertFalse(is_vision_model_id(BASE_ID))
-        self.assertEqual(vision_base_model_id(VISION_ID), BASE_ID)
-
-    def test_build_vision_model_forces_mmproj_and_drops_replicas(self):
-        base = _make_model(
-            aliases=["qwen"],
-            server_overrides={
-                "engine": "buun",
-                "mmproj_mode": "lazy",
-                "replicas": {"enabled": True},
-            },
-        )
-        vision = build_vision_model(base)
-        self.assertEqual(vision.model_id, VISION_ID)
-        self.assertEqual(vision.aliases, [])
-        self.assertEqual(vision.mmproj_path, base.mmproj_path)
-        self.assertEqual(get_model_mmproj_mode(vision), MMPROJ_MODE_ALWAYS)
-        self.assertTrue(resolve_render_include_mmproj(vision))
-        self.assertNotIn("replicas", vision.server_overrides)
-        # The base must not be mutated.
-        self.assertEqual(base.aliases, ["qwen"])
-        self.assertEqual(base.server_overrides["mmproj_mode"], "lazy")
-
-
-class CommandEmissionTest(unittest.TestCase, _ConfigEnvMixin):
-    def setUp(self):
+    def test_vllm_backend_is_never_lazy(self):
         self.use_conf()
+        model = _make_model(backend="vllm", server_overrides={"mmproj_mode": "lazy"})
+        self.assertFalse(
+            model_lazily_loads_mmproj(model),
+            "vllm has no --mmproj flag, so it must keep the plain path",
+        )
 
+    def test_exllama_engine_is_never_lazy(self):
+        self.use_conf()
+        for engine in ("exllama", "exllamav3", "exllama-v3"):
+            with self.subTest(engine=engine):
+                model = _make_model(server_overrides={"engine": engine, "mmproj_mode": "lazy"})
+                self.assertFalse(
+                    model_lazily_loads_mmproj(model),
+                    "the exllama adapter drops image_url parts",
+                )
+
+    def test_unknown_mode_falls_back_to_always(self):
+        self.use_conf()
+        self.assertEqual(normalize_mmproj_mode("nonsense"), MMPROJ_MODE_ALWAYS)
+        self.assertEqual(normalize_mmproj_mode(None), MMPROJ_MODE_ALWAYS)
+        self.assertEqual(normalize_mmproj_mode(MMPROJ_MODE_LAZY), MMPROJ_MODE_LAZY)
+
+    def test_mode_survives_the_override_normalizer(self):
+        self.use_conf()
+        from llamacpp_stack.cli.server_commands import normalize_server_overrides
+
+        normalized = normalize_server_overrides({"engine": "buun", "mmproj-mode": "lazy"})
+        model = _make_model(server_overrides=normalized)
+        self.assertEqual(get_model_mmproj_mode(model), MMPROJ_MODE_LAZY)
+
+
+# --------------------------------------------------------------------------- #
+# the operator's selection rule (pure)
+# --------------------------------------------------------------------------- #
+class InstanceRuleTest(unittest.TestCase):
+    """``choose_vision_instance`` encodes the rule the operator specified."""
+
+    def test_candidates_are_the_base_then_its_replicas(self):
+        self.assertEqual(candidate_instance_ids(BASE_ID, []), [BASE_ID])
+        self.assertEqual(candidate_instance_ids(BASE_ID, None), [BASE_ID])
+        self.assertEqual(
+            candidate_instance_ids(BASE_ID, [f"{BASE_ID}__replica_1", f"{BASE_ID}__replica_0"]),
+            [BASE_ID, f"{BASE_ID}__replica_1", f"{BASE_ID}__replica_0"],
+        )
+
+    def test_candidates_drop_blanks_and_duplicates(self):
+        self.assertEqual(candidate_instance_ids(BASE_ID, ["", BASE_ID, None]), [BASE_ID])
+        self.assertEqual(candidate_instance_ids("", ["x"]), ["x"])
+        self.assertEqual(candidate_instance_ids("", []), [])
+
+    def test_unloaded_instance_beats_a_loaded_one(self):
+        self.assertEqual(
+            choose_vision_instance([BASE_ID, REPLICA_ID], loaded={BASE_ID}, has_mmproj={BASE_ID}),
+            REPLICA_ID,
+        )
+
+    def test_among_idle_instances_the_warm_projector_wins(self):
+        self.assertEqual(
+            choose_vision_instance([BASE_ID, REPLICA_ID], loaded=set(), has_mmproj={REPLICA_ID}),
+            REPLICA_ID,
+        )
+
+    def test_with_nothing_warm_the_longest_idle_wins(self):
+        self.assertEqual(
+            choose_vision_instance(
+                [BASE_ID, REPLICA_ID],
+                loaded=set(),
+                has_mmproj=set(),
+                last_used={BASE_ID: 10.0, REPLICA_ID: 99.0},
+            ),
+            BASE_ID,
+        )
+
+    def test_fallback_last_used_is_used_for_the_base(self):
+        self.assertEqual(
+            choose_vision_instance(
+                [BASE_ID, REPLICA_ID],
+                loaded=set(),
+                has_mmproj=set(),
+                last_used={},
+                fallback_last_used=50.0,
+            ),
+            BASE_ID,
+        )
+
+    def test_liveness_outranks_projector_warmth(self):
+        self.assertEqual(
+            choose_vision_instance([BASE_ID, REPLICA_ID], loaded={REPLICA_ID}, has_mmproj={REPLICA_ID}),
+            BASE_ID,
+        )
+
+    def test_no_candidates_returns_none(self):
+        self.assertIsNone(choose_vision_instance([]))
+        self.assertIsNone(choose_vision_instance(None))
+
+    def test_junk_last_used_values_do_not_raise(self):
+        self.assertEqual(
+            choose_vision_instance(
+                [BASE_ID], loaded=set(), has_mmproj=set(), last_used={BASE_ID: None}
+            ),
+            BASE_ID,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# command emission
+# --------------------------------------------------------------------------- #
+class CommandEmissionTest(unittest.TestCase, _ConfigEnvMixin):
     def _cmd(self, model, **kwargs):
         return build_llama_server_command(
             model,
-            Path("/usr/bin/llama-server"),
-            port="11434",
+            SERVER,
+            port="11436",
+            server_defaults={},
             **kwargs,
         )
 
-    def test_mmproj_mode_is_never_emitted_as_a_flag(self):
-        model = _make_model(server_overrides={"engine": "buun", "mmproj_mode": "lazy"})
-        cmd = self._cmd(model)
-        self.assertNotIn("--mmproj-mode", cmd)
-        self.assertNotIn("--mmproj_mode", cmd)
-        self.assertFalse(any(part.startswith("--mmproj=") for part in cmd))
+    def test_builder_emits_mmproj_when_the_model_has_one(self):
+        self.use_conf()
+        self.assertIn("--mmproj", self._cmd(_make_model()))
 
-    def test_include_mmproj_is_the_only_render_time_switch(self):
-        # The builder itself keeps emitting --mmproj for a lazy base; dropping it
-        # is the render layer's job via include_mmproj=False.
-        model = _make_model(server_overrides={"engine": "buun", "mmproj_mode": "lazy"})
-        self.assertIn("--mmproj", self._cmd(model))
-        self.assertNotIn("--mmproj", self._cmd(model, include_mmproj=False))
-        vision = build_vision_model(model)
-        self.assertIn("--mmproj", self._cmd(vision, include_mmproj=True))
+    def test_include_mmproj_false_drops_it(self):
+        self.use_conf()
+        self.assertNotIn("--mmproj", self._cmd(_lazy_model(), include_mmproj=False))
 
-    def test_mode_off_removes_mmproj_from_the_command(self):
+    def test_mmproj_mode_never_leaks_into_the_command(self):
+        self.use_conf()
+        for mode in ("always", "lazy", "off"):
+            with self.subTest(mode=mode):
+                model = _make_model(server_overrides={"engine": "buun", "mmproj_mode": mode})
+                cmd = self._cmd(model)
+                self.assertNotIn("--mmproj-mode", cmd)
+                self.assertNotIn("--mmproj_mode", cmd)
+
+    def test_mode_off_removes_the_projector_from_the_command(self):
+        self.use_conf()
         model = _make_model(server_overrides={"engine": "buun", "mmproj_mode": "off"})
         self.assertNotIn("--mmproj", self._cmd(model))
 
-    def test_default_still_emits_mmproj(self):
-        model = _make_model()
-        cmd = self._cmd(model)
-        self.assertEqual(cmd[cmd.index("--mmproj") + 1], "/models/proj")
+    def test_mmproj_is_placed_before_jinja(self):
+        self.use_conf()
+        cmd = self._cmd(_make_model())
+        self.assertLess(cmd.index("--mmproj"), cmd.index("--jinja"))
+
+    def test_a_model_without_mmproj_never_gets_the_flag(self):
+        self.use_conf()
+        self.assertNotIn("--mmproj", self._cmd(_make_model(mmproj_path=None)))
 
 
+# --------------------------------------------------------------------------- #
+# rendering: no dedicated vision route
+# --------------------------------------------------------------------------- #
 class RenderTest(unittest.TestCase, _ConfigEnvMixin):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        # A sparse file above the 4 GiB "small model" threshold so the matrix
-        # treats the model as a large one that needs its own group.
+        # A sparse file above the small-model threshold, so the matrix treats
+        # the model as large and gives it its own group.
         self.big = self.root / "big.safetensors"
         with open(self.big, "wb") as handle:
             handle.truncate(6 * 1024 * 1024 * 1024)
@@ -308,233 +388,374 @@ class RenderTest(unittest.TestCase, _ConfigEnvMixin):
         return _make_model(**kwargs)
 
     def _render(self, catalog, idle_ttl=300):
-        render_llamaswap_config(
-            catalog,
-            self.config_path,
-            Path("/usr/bin/llama-server"),
-            11436,
-            idle_ttl,
-            {},
-            {},
-        )
+        render_llamaswap_config(catalog, self.config_path, SERVER, 11436, idle_ttl, {}, {})
         return yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
 
-    def test_lazy_render_splits_base_and_vision_sibling(self):
+    def test_a_lazy_model_publishes_exactly_one_route(self):
         self.use_conf()
         catalog = [self._model(server_overrides={"engine": "buun", "mmproj_mode": "lazy"})]
         data = self._render(catalog)
-        models = data["models"]
-        self.assertIn(BASE_ID, models)
-        self.assertIn(VISION_ID, models)
-
-        base_cmd = models[BASE_ID]["cmd"]
-        self.assertNotIn("--mmproj", base_cmd)
-        self.assertEqual(models[BASE_ID]["ttl"], 300)
-
-        vision = models[VISION_ID]
-        self.assertIn("--mmproj /models/proj", vision["cmd"])
-        self.assertEqual(vision["ttl"], 30)  # 1800s sticky
-        self.assertEqual(vision["metadata"]["internal_replica_of"], BASE_ID)
-        self.assertTrue(vision["metadata"]["vision_variant"])
-        self.assertEqual(vision["checkEndpoint"], "/health")
-        # The projector flag must stay in front of the jinja flag.
-        self.assertLess(vision["cmd"].index("--mmproj"), vision["cmd"].index("--jinja"))
-
-    def test_lazy_render_honours_vision_sticky_ttl_override(self):
-        self.use_conf({"vision_sticky_ttl_s": 600})
-        catalog = [self._model(server_overrides={"engine": "buun", "mmproj_mode": "lazy"})]
-        data = self._render(catalog)
-        self.assertEqual(data["models"][VISION_ID]["ttl"], 10)
-
-    def test_non_lazy_render_is_unchanged(self):
-        self.use_conf()
-        catalog = [self._model()]
-        data = self._render(catalog)
-        self.assertEqual(sorted(data["models"]), [BASE_ID])
-        self.assertIn("--mmproj /models/proj", data["models"][BASE_ID]["cmd"])
-
-    def test_mode_off_render_has_no_mmproj_and_no_sibling(self):
-        self.use_conf()
-        catalog = [self._model(server_overrides={"engine": "buun", "mmproj_mode": "off"})]
-        data = self._render(catalog)
-        self.assertEqual(sorted(data["models"]), [BASE_ID])
+        self.assertEqual(
+            list(data["models"]),
+            [BASE_ID],
+            "there must be no dedicated vision route",
+        )
         self.assertNotIn("--mmproj", data["models"][BASE_ID]["cmd"])
+
+    def test_no_route_anywhere_mentions_vision_for_a_lazy_model(self):
+        self.use_conf()
+        catalog = [self._model(server_overrides={"engine": "buun", "mmproj_mode": "lazy"})]
+        data = self._render(catalog)
+        for name, entry in data["models"].items():
+            with self.subTest(route=name):
+                self.assertNotIn("vision", entry.get("cmd", ""))
+                self.assertNotIn("vision", (entry.get("description") or ""))
+
+    def test_an_always_model_still_renders_the_projector(self):
+        self.use_conf()
+        data = self._render([self._model()])
+        self.assertIn("--mmproj", data["models"][BASE_ID]["cmd"])
 
     def test_lazy_and_non_lazy_models_coexist(self):
         self.use_conf()
-        catalog = [
-            self._model(server_overrides={"engine": "buun", "mmproj_mode": "lazy"}),
-            self._model(
-                model_id="plain-gguf",
-                mmproj_path="/models/plain-mmproj.gguf",
-                local_path=str(self.big),
-            ),
-        ]
-        data = self._render(catalog)
-        self.assertEqual(
-            sorted(data["models"]),
-            [BASE_ID, VISION_ID, "plain-gguf"],
+        other = self._model(model_id="q4-model", local_path=str(self.big))
+        lazy = self._model(
+            model_id="lazy-model",
+            local_path=str(self.big),
+            server_overrides={"engine": "buun", "mmproj_mode": "lazy"},
         )
-        self.assertNotIn("--mmproj", data["models"][BASE_ID]["cmd"])
-        self.assertIn("--mmproj /models/proj", data["models"][VISION_ID]["cmd"])
-        self.assertIn("--mmproj /models/plain-mmproj.gguf", data["models"]["plain-gguf"]["cmd"])
+        data = self._render([other, lazy])
+        self.assertIn("--mmproj", data["models"]["q4-model"]["cmd"])
+        self.assertNotIn("--mmproj", data["models"]["lazy-model"]["cmd"])
+        self.assertEqual(sorted(data["models"]), ["lazy-model", "q4-model"])
 
-    def test_global_lazy_default_marks_every_projector_model(self):
-        self.use_conf({"default_mode": "lazy"})
-        catalog = [self._model()]
-        data = self._render(catalog)
-        self.assertNotIn("--mmproj", data["models"][BASE_ID]["cmd"])
-        self.assertIn("--mmproj", data["models"][VISION_ID]["cmd"])
-
-    def test_render_is_deterministic(self):
+    def test_idle_ttl_is_used_for_the_base_route(self):
         self.use_conf()
-        catalog = [self._model(server_overrides={"engine": "buun", "mmproj_mode": "lazy"})]
-        self._render(catalog)
-        first = self.config_path.read_bytes()
-        self._render(catalog)
-        self.assertEqual(first, self.config_path.read_bytes())
+        data = self._render(
+            [self._model(server_overrides={"mmproj_mode": "lazy"})], idle_ttl=123
+        )
+        self.assertEqual(data["models"][BASE_ID]["ttl"], 123)
 
 
+# --------------------------------------------------------------------------- #
+# matrix
+# --------------------------------------------------------------------------- #
 class MatrixTest(unittest.TestCase, _ConfigEnvMixin):
-    def test_vision_sibling_is_mutually_exclusive_by_default(self):
-        infos = [
-            {"id": BASE_ID, "gpu_set": [0], "is_embedding": False, "is_small": False, "size_mib": 9216},
-            {"id": VISION_ID, "gpu_set": [0], "is_embedding": False, "is_small": False, "size_mib": 9216},
-        ]
+    def _matrix(self, infos):
         matrix = _calculate_llama_swap_matrix(infos)
-        self.assertEqual(len(matrix["sets"]), 2)
-        costs = {
-            model_id: matrix["evict_costs"][var]
-            for var, model_id in matrix["vars"].items()
+        inverse = matrix["vars"]
+        return {
+            "sets": {key: sorted(value.split(" & ")) for key, value in matrix["sets"].items()},
+            "evict": {inverse[name]: cost for name, cost in matrix["evict_costs"].items()},
         }
-        self.assertEqual(costs[BASE_ID], 9216 * 1.0)
-        self.assertEqual(costs[VISION_ID], 9216 * 0.5)
-        # Mutually exclusive: no group may hold both variants at once.
-        for group in matrix["sets"].values():
-            self.assertNotEqual({VISION_ID, BASE_ID}, set(group.split(" & ")))
 
-    def test_allow_co_resident_merges_the_pair(self):
-        infos = [
-            {"id": BASE_ID, "gpu_set": [0], "is_embedding": False, "is_small": False, "size_mib": 9216},
-            {"id": VISION_ID, "gpu_set": [0], "is_embedding": False, "is_small": False, "size_mib": 9216},
+    def _infos(self):
+        return [
+            {"id": BASE_ID, "gpu_set": [0], "is_embedding": False, "is_small": False, "size_mib": 6144},
+            {"id": "q4-model", "gpu_set": [1], "is_embedding": False, "is_small": False, "size_mib": 4096},
         ]
-        matrix = _calculate_llama_swap_matrix(infos, co_resident_variants=True)
-        self.assertEqual(len(matrix["sets"]), 1)
 
-    def test_disjoint_gpu_sets_merge_without_the_opt_in(self):
-        infos = [
-            {"id": BASE_ID, "gpu_set": [0], "is_embedding": False, "is_small": False, "size_mib": 9216},
-            {"id": VISION_ID, "gpu_set": [1], "is_embedding": False, "is_small": False, "size_mib": 9216},
-        ]
-        self.assertEqual(len(_calculate_llama_swap_matrix(infos)["sets"]), 1)
+    def test_lazy_makes_no_difference_to_the_matrix(self):
+        self.use_conf()
+        # The projector must not introduce groups or evict costs of its own;
+        # it rides on an instance that already exists.
+        baseline = self._matrix(self._infos())
+        self.assertEqual(self._matrix(self._infos()), baseline)
 
-    def test_replica_grouping_semantics_are_unchanged(self):
-        infos = [
-            {"id": BASE_ID, "gpu_set": [0], "is_embedding": False, "is_small": False, "size_mib": 9216},
-            {"id": "exl3-qwen__replica_0", "gpu_set": [0], "is_embedding": False, "is_small": False, "size_mib": 9216},
-        ]
-        self.assertEqual(len(_calculate_llama_swap_matrix(infos)["sets"]), 2)
+    def test_two_large_models_on_disjoint_gpus_share_one_group(self):
+        self.use_conf()
+        result = self._matrix(self._infos())
+        self.assertEqual(
+            len(result["sets"]),
+            1,
+            "disjoint larges are co-loaded on purpose",
+        )
+        self.assertEqual(sorted(result["sets"]["group_0"]), sorted(["m0", "m1"]))
+
+    def test_replicas_keep_the_half_evict_cost(self):
+        self.use_conf()
+        result = self._matrix(
+            [
+                {"id": BASE_ID, "gpu_set": [0], "is_embedding": False, "is_small": False, "size_mib": 6144},
+                {"id": REPLICA_ID, "gpu_set": [1], "is_embedding": False, "is_small": False, "size_mib": 6144},
+            ]
+        )
+        self.assertEqual(result["evict"][BASE_ID], 6144)
+        self.assertEqual(result["evict"][REPLICA_ID], 3072)
 
 
-class EnsureVisionRouteTest(unittest.TestCase, _ConfigEnvMixin):
+# --------------------------------------------------------------------------- #
+# attaching / detaching the projector on a single route
+# --------------------------------------------------------------------------- #
+class SetInstanceMmprojTest(
+    unittest.TestCase, _ConfigEnvMixin, _RouterStateMixin
+):
     def setUp(self):
+        self.reset_router_state()
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.big = self.root / "big.safetensors"
-        with open(self.big, "wb") as handle:
-            handle.truncate(6 * 1024 * 1024 * 1024)
         self.config_path = self.root / "config.yaml"
-        self.config_path.write_text(
-            yaml.safe_dump({"models": {}}, sort_keys=False), encoding="utf-8"
+        self.model = _lazy_model()
+        self.catalog = [self.model]
+
+    def _seed(self):
+        render_llamaswap_config(
+            self.catalog, self.config_path, SERVER, 11436, 300, {}, {}
         )
 
-    def _model(self, **kwargs):
-        kwargs.setdefault("local_path", str(self.big))
-        return _make_model(**kwargs)
+    def _read(self):
+        return yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
 
-    def _ensure(self, catalog):
-        return ensure_vision_route_in_llamaswap_config(
-            catalog[0],
-            catalog,
+    def _set(self, instance_id, enable, gpu_set=None):
+        return set_instance_mmproj_in_llamaswap_config(
+            self.model,
+            instance_id,
+            self.catalog,
             self.config_path,
-            Path("/usr/bin/llama-server"),
+            SERVER,
             300,
             {},
+            enable=enable,
+            gpu_set=gpu_set,
         )
 
-    def test_route_is_created_then_left_untouched(self):
+    def test_projector_lands_on_the_base_route(self):
         self.use_conf()
-        catalog = [self._model(server_overrides={"engine": "buun", "mmproj_mode": "lazy"})]
-        self.assertEqual(self._ensure(catalog), VISION_ID)
-        after_first = self.config_path.read_bytes()
-        data = yaml.safe_load(after_first.decode("utf-8"))
-        self.assertIn(VISION_ID, data["models"])
-        self.assertIn("--mmproj /models/proj", data["models"][VISION_ID]["cmd"])
-        self.assertEqual(data["models"][VISION_ID]["ttl"], 30)
-        self.assertTrue(data["models"][VISION_ID]["metadata"]["vision_variant"])
-        self.assertIn("matrix", data)
+        self._seed()
+        self.assertEqual(self._set(BASE_ID, True), BASE_ID)
+        entry = self._read()["models"][BASE_ID]
+        self.assertIn("--mmproj /models/proj", entry["cmd"])
+        self.assertTrue(route_carries_mmproj(entry))
+        self.assertTrue(entry["metadata"]["vision_variant"])
+        self.assertEqual(entry["metadata"]["internal_replica_of"], BASE_ID)
 
-        # Idempotent: a second call must not rewrite the watched config.
-        self.assertEqual(self._ensure(catalog), VISION_ID)
-        self.assertEqual(after_first, self.config_path.read_bytes())
-
-    def test_dynamic_replica_route_of_a_lazy_model_stays_text_only(self):
+    def test_projector_lands_on_a_replica_route(self):
         self.use_conf()
-        base = self._model(server_overrides={"engine": "buun", "mmproj_mode": "lazy"})
-        from llamacpp_stack.cli.replica import ensure_replica_route_in_llamaswap_config
+        self._seed()
+        self.assertEqual(self._set(REPLICA_ID, True, gpu_set=[1]), REPLICA_ID)
+        models = self._read()["models"]
+        self.assertIn("--mmproj", models[REPLICA_ID]["cmd"])
+        self.assertNotIn(
+            "--mmproj",
+            models[BASE_ID]["cmd"],
+            "the busy base must stay text-only",
+        )
+        self.assertIn("CUDA_VISIBLE_DEVICES=1", models[REPLICA_ID]["cmd"])
 
-        with mock.patch(
-            "llamacpp_stack.cli.replica._engine_binary_base",
-            return_value=Path("/nonexistent"),
-        ):
-            ensure_replica_route_in_llamaswap_config(
-                base,
-                0,
-                [1],
-                [base],
-                self.config_path,
-                Path("/usr/bin/llama-server"),
-                300,
-                {},
-            )
-        data = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
-        replica_id = f"{base.model_id}__replica_0"
-        self.assertIn(replica_id, data["models"])
-        self.assertNotIn("--mmproj", data["models"][replica_id]["cmd"])
+    def test_attaching_twice_does_not_rewrite_the_config(self):
+        self.use_conf()
+        self._seed()
+        self._set(BASE_ID, True)
+        snapshot = self.config_path.read_bytes()
+        self._set(BASE_ID, True)
+        self.assertEqual(
+            self.config_path.read_bytes(),
+            snapshot,
+            "an already-correct route must be left alone",
+        )
+
+    def test_detaching_removes_the_projector_and_the_marker(self):
+        self.use_conf()
+        self._seed()
+        self._set(BASE_ID, True)
+        self._set(BASE_ID, False)
+        entry = self._read()["models"][BASE_ID]
+        self.assertNotIn("--mmproj", entry["cmd"])
+        self.assertNotIn("vision_variant", entry.get("metadata") or {})
+        self.assertEqual(entry["metadata"]["internal_replica_of"], BASE_ID)
+
+    def test_detaching_twice_does_not_rewrite_the_config(self):
+        self.use_conf()
+        self._seed()
+        self._set(BASE_ID, False)
+        snapshot = self.config_path.read_bytes()
+        self._set(BASE_ID, False)
+        self.assertEqual(self.config_path.read_bytes(), snapshot)
+
+    def test_attaching_swaps_the_ttl_for_the_vision_window(self):
+        self.use_conf({"vision_sticky_ttl_s": 3600})
+        self._seed()
+        self.assertEqual(self._read()["models"][BASE_ID]["ttl"], 300)
+        self._set(BASE_ID, True)
+        self.assertEqual(
+            self._read()["models"][BASE_ID]["ttl"],
+            60,
+            "3600s sticky becomes a 60 minute ttl so llama-swap unloads it",
+        )
+        self._set(BASE_ID, False)
+        self.assertEqual(self._read()["models"][BASE_ID]["ttl"], 300)
+
+    def test_route_carries_mmproj_reads_the_rendered_command(self):
+        self.assertFalse(route_carries_mmproj({}))
+        self.assertFalse(route_carries_mmproj({"cmd": ["--jinja"]}))
+        self.assertFalse(route_carries_mmproj(None))
+        self.assertTrue(route_carries_mmproj({"cmd": "llama-server --mmproj /p --jinja"}))
+
+    def test_a_render_resets_the_projector(self):
+        self.use_conf()
+        self._seed()
+        self._set(BASE_ID, True)
+        self._seed()
+        self.assertNotIn("--mmproj", self._read()["models"][BASE_ID]["cmd"])
 
 
-class RouteRequestTest(unittest.TestCase, _ConfigEnvMixin):
-    """``route_image_request_to_vision`` decides where an image request goes."""
-
+class EnsureInternalRouteTest(
+    unittest.TestCase, _ConfigEnvMixin, _RouterStateMixin
+):
     def setUp(self):
+        self.reset_router_state()
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.config_path = self.root / "config.yaml"
-        self.config_path.write_text(
-            yaml.safe_dump({"models": {}}, sort_keys=False), encoding="utf-8"
+        self.model = _lazy_model()
+        self.catalog = [self.model]
+        render_llamaswap_config(
+            self.catalog, self.config_path, SERVER, 11436, 300, {}, {}
         )
-        self.model = _make_model(
-            server_overrides={"engine": "buun", "mmproj_mode": "lazy"}
+
+    def _read(self):
+        return yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+
+    def test_creates_a_missing_replica_route(self):
+        self.use_conf()
+        ensure_internal_route_in_llamaswap_config(
+            self.model,
+            REPLICA_ID,
+            self.catalog,
+            self.config_path,
+            SERVER,
+            300,
+            {},
+            gpu_set=[1],
         )
+        self.assertIn(REPLICA_ID, self._read()["models"])
+
+    def test_is_idempotent(self):
+        self.use_conf()
+        for _ in range(2):
+            ensure_internal_route_in_llamaswap_config(
+                self.model,
+                REPLICA_ID,
+                self.catalog,
+                self.config_path,
+                SERVER,
+                300,
+                {},
+                gpu_set=[1],
+            )
+        self.assertIn(REPLICA_ID, self._read()["models"])
+
+    def test_replica_routes_of_a_lazy_model_stay_text_only(self):
+        self.use_conf()
+        ensure_replica_route_in_llamaswap_config(
+            self.model, 0, [1], self.catalog, self.config_path, SERVER, 300, {}
+        )
+        self.assertNotIn("--mmproj", self._read()["models"][REPLICA_ID]["cmd"])
+
+    def test_an_explicit_mmproj_request_marks_the_replica(self):
+        self.use_conf()
+        ensure_replica_route_in_llamaswap_config(
+            self.model,
+            0,
+            [1],
+            self.catalog,
+            self.config_path,
+            SERVER,
+            300,
+            {},
+            include_mmproj=True,
+        )
+        self.assertIn("--mmproj", self._read()["models"][REPLICA_ID]["cmd"])
+
+
+# --------------------------------------------------------------------------- #
+# config block
+# --------------------------------------------------------------------------- #
+class ConfigBlockTest(unittest.TestCase):
+    def test_defaults_to_always_and_a_one_hour_window(self):
+        cfg = default_mmproj_config()
+        self.assertEqual(cfg["default_mode"], MMPROJ_MODE_ALWAYS)
+        self.assertEqual(cfg["vision_sticky_ttl_s"], 3600)
+
+    def test_absent_block_does_not_report_a_change(self):
+        cfg, changed = normalize_mmproj_config(None)
+        self.assertEqual(changed, False)
+        self.assertEqual(cfg, default_mmproj_config())
+
+    def test_filling_absent_keys_is_not_a_change(self):
+        cfg, changed = normalize_mmproj_config({"default_mode": "lazy"})
+        self.assertEqual(changed, False)
+        self.assertEqual(cfg["default_mode"], "lazy")
+        self.assertEqual(cfg["vision_sticky_ttl_s"], 3600)
+
+    def test_malformed_input_is_repaired(self):
+        _, changed = normalize_mmproj_config("nonsense")
+        self.assertEqual(changed, True)
+
+    def test_sticky_ttl_is_clamped_like_the_replica_one(self):
+        cfg, changed = normalize_mmproj_config({"vision_sticky_ttl_s": 1})
+        self.assertTrue(changed)
+        self.assertGreaterEqual(cfg["vision_sticky_ttl_s"], 60)
+
+    def test_ttl_is_rendered_in_whole_minutes(self):
+        self.assertEqual(vision_route_ttl({"vision_sticky_ttl_s": 600}), 10)
+        self.assertEqual(vision_route_ttl({"vision_sticky_ttl_s": 45}), 1)
+        self.assertEqual(vision_route_ttl({"vision_sticky_ttl_s": 90}), 2)
+        self.assertEqual(vision_route_ttl(default_mmproj_config()), 60)
+
+    def test_the_conf_block_is_written_once_and_then_stable(self):
+        payload, changed = _cli_impl.normalize_server_config_payload({})
+        self.assertTrue(changed)
+        self.assertEqual(payload["mmproj"], default_mmproj_config())
+        again, changed_again = _cli_impl.normalize_server_config_payload(payload)
+        self.assertFalse(changed_again)
+        self.assertEqual(again["mmproj"], payload["mmproj"])
+
+
+# --------------------------------------------------------------------------- #
+# request routing
+# --------------------------------------------------------------------------- #
+class RouteRequestTest(
+    unittest.TestCase, _ConfigEnvMixin, _RouterStateMixin
+):
+    """``route_image_request_to_vision`` decides which instance sees the image."""
+
+    def setUp(self):
+        self.reset_router_state()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.config_path = self.root / "config.yaml"
+        self.model = _lazy_model()
         self.catalog = [self.model]
         self.args = argparse.Namespace(
             public_port=11436,
             config=str(self.config_path),
-            llama_server="/usr/bin/llama-server",
+            llama_server=str(SERVER),
             idle_ttl=300,
             llama_server_defaults={},
             mode="user",
             state_dir=str(self.root),
             public_host="127.0.0.1",
         )
-        state = _cli_impl.REPLICA_ROUTER_STATE
-        state.affinity.clear()
-        state.response_to_replica.clear()
-        state.loading_claims.clear()
-        self.addCleanup(state.affinity.clear)
-        self.addCleanup(state.response_to_replica.clear)
+        for name in (
+            "get_catalog_model_process",
+            "wait_for_published_model_id",
+            "log_api_event",
+            "set_instance_mmproj_in_llamaswap_config",
+        ):
+            patcher = mock.patch.object(_cli_impl, name)
+            setattr(self, f"{name}_mock", patcher.start())
+            self.addCleanup(patcher.stop)
+        self.get_catalog_model_process_mock.return_value = None
+        self.wait_for_published_model_id_mock.return_value = True
+        self.set_instance_mmproj_in_llamaswap_config_mock.return_value = self.config_path
+        self.now = 1000.0
+        self.clock = mock.patch.object(_cli_impl.time, "monotonic", return_value=self.now)
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
 
     IMAGE_PAYLOAD = {
         "model": BASE_ID,
@@ -548,203 +769,346 @@ class RouteRequestTest(unittest.TestCase, _ConfigEnvMixin):
             }
         ],
     }
-    TEXT_PAYLOAD = {
-        "model": BASE_ID,
-        "messages": [{"role": "user", "content": "hello"}],
-    }
+    TEXT_PAYLOAD = {"model": BASE_ID, "messages": [{"role": "user", "content": "hello"}]}
     HEADERS = {"thread-id": "conv-1"}
 
-    def _route(self, payload, **overrides):
-        kwargs = dict(
-            published=set(),
-            ensure_ok=True,
-            wait_ok=True,
-            loaded=False,
-            reload_ok=True,
+    def _route(self, payload, headers=None):
+        return _cli_impl.route_image_request_to_vision(
+            self.model,
+            payload,
+            self.HEADERS if headers is None else headers,
+            self.catalog,
+            self.args,
+            "127.0.0.1",
         )
-        kwargs.update(overrides)
-        ensure_calls: list[str] = []
-        reload_calls: list[str] = []
 
-        def _ensure(model, *args, **kwargs2):
-            ensure_calls.append(model.model_id)
-            if kwargs["ensure_ok"]:
-                self.config_path.write_text(
-                    yaml.safe_dump({"models": {}}, sort_keys=False), encoding="utf-8"
-                )
-                with open(self.config_path, "a", encoding="utf-8") as handle:
-                    handle.write(
-                        f"# {VISION_ID} {kwargs['published'] and 'present' or 'new'}\n"
-                    )
-            return VISION_ID
+    def _attached_ids(self):
+        return [
+            call.args[1]
+            for call in self.set_instance_mmproj_in_llamaswap_config_mock.call_args_list
+        ]
 
-        def _reload(model, *args, **kwargs2):
-            reload_calls.append(str(kwargs2.get("reason")))
-            return kwargs["reload_ok"]
+    def _add_replica(
+        self, *, gpu_set=(1,), status="cold", pid=None, last_used=0.0, replica_id=REPLICA_ID
+    ):
+        _cli_impl.REPLICA_ROUTER_STATE.records[replica_id] = ReplicaRecord(
+            base_model_id=BASE_ID,
+            replica_model_id=replica_id,
+            gpu_set=list(gpu_set),
+            status=status,
+            pid=pid,
+            last_used=last_used,
+        )
+        return replica_id
 
-        with mock.patch.object(
-            _cli_impl, "get_published_model_ids", return_value=set(kwargs["published"])
-        ), mock.patch.object(
-            _cli_impl, "ensure_vision_route_in_llamaswap_config", side_effect=_ensure
-        ), mock.patch.object(
-            _cli_impl, "wait_for_published_model_id", return_value=kwargs["wait_ok"]
-        ), mock.patch.object(
-            _cli_impl, "get_catalog_model_process",
-            return_value={"pid": 4242, "cmdline": "", "port": 11436, "model_path": ""}
-            if kwargs["loaded"]
-            else None,
-        ), mock.patch.object(
-            _cli_impl, "reload_model_runtime_from_catalog_config", side_effect=_reload
-        ), mock.patch.object(
-            _cli_impl, "log_api_event", return_value=None
-        ):
-            target, error = _cli_impl.route_image_request_to_vision(
-                self.model, payload, self.HEADERS, self.catalog, self.args, "127.0.0.1"
-            )
-        return target, error, ensure_calls, reload_calls
+    # -- not applicable ----------------------------------------------------- #
+    def test_text_request_is_left_to_the_normal_router(self):
+        self.use_conf()
+        self.assertEqual(self._route(self.TEXT_PAYLOAD), (None, None))
+        self.set_instance_mmproj_in_llamaswap_config_mock.assert_not_called()
 
-    def test_text_request_is_not_applicable(self):
-        target, error, ensures, reloads = self._route(self.TEXT_PAYLOAD)
-        self.assertIsNone(target)
-        self.assertIsNone(error)
-        self.assertEqual(ensures, [])
-        self.assertEqual(reloads, [])
-
-    def test_non_lazy_model_is_not_applicable(self):
+    def test_a_non_lazy_model_is_left_to_the_normal_router(self):
         self.use_conf()
         model = _make_model(server_overrides={"engine": "buun"})
-        with mock.patch.object(
-            _cli_impl, "get_published_model_ids", return_value=set()
-        ), mock.patch.object(
-            _cli_impl, "ensure_vision_route_in_llamaswap_config"
-        ) as ensure, mock.patch.object(_cli_impl, "log_api_event", return_value=None):
-            result = _cli_impl.route_image_request_to_vision(
+        self.assertEqual(
+            _cli_impl.route_image_request_to_vision(
                 model, self.IMAGE_PAYLOAD, self.HEADERS, [model], self.args, "127.0.0.1"
-            )
-        self.assertEqual(result, (None, None))
-        ensure.assert_not_called()
-
-    def test_ollama_top_level_images_count_as_images(self):
-        self.use_conf()
-        payload = {"model": BASE_ID, "messages": [{"role": "user", "content": "hi"}],
-                   "images": ["AAA"]}
-        target, error, ensures, _ = self._route(payload)
-        self.assertEqual(target, VISION_ID)
-        self.assertIsNone(error)
-        self.assertEqual(ensures, [BASE_ID])
-
-    def test_cold_request_publishes_the_sibling(self):
-        self.use_conf()
-        target, error, ensures, reloads = self._route(self.IMAGE_PAYLOAD)
-        self.assertEqual(target, VISION_ID)
-        self.assertIsNone(error)
-        self.assertEqual(ensures, [BASE_ID])
-        self.assertEqual(reloads, [])
-
-    def test_already_published_sibling_avoids_a_config_rewrite(self):
-        self.use_conf()
-        target, error, ensures, reloads = self._route(
-            self.IMAGE_PAYLOAD, published={VISION_ID}
+            ),
+            (None, None),
         )
-        self.assertEqual(target, VISION_ID)
-        self.assertIsNone(error)
-        self.assertEqual(ensures, [])
-        self.assertEqual(reloads, [])
 
-    def test_second_request_reuses_the_affinity_pin(self):
+    def test_ollama_image_field_is_detected(self):
         self.use_conf()
-        first_target, _error, _ensures, _reloads = self._route(self.IMAGE_PAYLOAD)
-        self.assertEqual(first_target, VISION_ID)
-        pinned = dict(_cli_impl.REPLICA_ROUTER_STATE.affinity)
-        self.assertTrue(pinned)
-
-        target, error, ensures, reloads = self._route(
-            self.IMAGE_PAYLOAD, published={VISION_ID}
-        )
-        self.assertEqual(target, VISION_ID)
+        target, error = self._route({"model": BASE_ID, "prompt": "hi", "images": ["AAA"]})
         self.assertIsNone(error)
-        self.assertEqual(ensures, [])
-        self.assertEqual(reloads, [])
-
-    def test_falls_back_to_reloading_a_loaded_base(self):
-        self.use_conf()
-        target, error, ensures, reloads = self._route(
-            self.IMAGE_PAYLOAD, wait_ok=False, loaded=True
-        )
         self.assertEqual(target, BASE_ID)
-        self.assertIsNone(error)
-        self.assertEqual(ensures, [BASE_ID])
-        self.assertEqual(reloads, ["lazy_mmproj_vision_upgrade"])
 
-    def test_prefer_vision_route_disabled_uses_the_reload_fallback(self):
-        self.use_conf({"prefer_vision_route": False})
-        target, error, ensures, reloads = self._route(self.IMAGE_PAYLOAD, loaded=True)
+    def test_a_malformed_message_list_does_not_raise(self):
+        self.use_conf()
+        for payload in (
+            {"model": BASE_ID, "messages": "not-a-list"},
+            {"model": BASE_ID, "messages": ["plain string", {"content": "text"}]},
+            {"model": BASE_ID},
+            {},
+        ):
+            with self.subTest(payload=payload):
+                self.assertEqual(self._route(payload), (None, None))
+
+    # -- the rule ----------------------------------------------------------- #
+    def test_an_idle_replica_is_used_when_the_base_is_loaded(self):
+        self.use_conf()
+        self.get_catalog_model_process_mock.return_value = {"pid": 111}
+        replica = self._add_replica(status="cold")
+        target, error = self._route(self.IMAGE_PAYLOAD)
+        self.assertIsNone(error)
+        self.assertEqual(target, replica)
+        self.assertEqual(self._attached_ids(), [replica])
+
+    def test_the_base_is_used_when_it_is_the_only_instance(self):
+        self.use_conf()
+        target, error = self._route(self.IMAGE_PAYLOAD)
+        self.assertIsNone(error)
         self.assertEqual(target, BASE_ID)
+
+    def test_a_warm_projector_does_not_outrank_an_idle_instance(self):
+        self.use_conf()
+        self.get_catalog_model_process_mock.return_value = {"pid": 111}
+        _cli_impl._vision_mark_instance(BASE_ID, BASE_ID, 3600.0)
+        replica = self._add_replica()
+        target, error = self._route(self.IMAGE_PAYLOAD)
         self.assertIsNone(error)
-        self.assertEqual(ensures, [])
-        self.assertEqual(reloads, ["lazy_mmproj_vision_upgrade"])
-
-    def test_unavailable_route_without_a_loaded_base_is_an_error(self):
-        self.use_conf()
-        target, error, ensures, reloads = self._route(
-            self.IMAGE_PAYLOAD, wait_ok=False, loaded=False
+        self.assertEqual(
+            target,
+            replica,
+            "a warm projector on a busy instance is useless; the free one wins",
         )
-        self.assertIsNone(target)
-        self.assertIsNotNone(error)
-        self.assertIn("vision route could not be published", error)
-        self.assertEqual(ensures, [BASE_ID])
-        self.assertEqual(reloads, [])
 
-    def test_failed_reload_is_an_error(self):
+    def test_among_two_idle_instances_the_warm_projector_wins(self):
         self.use_conf()
-        target, error, _ensures, reloads = self._route(
-            self.IMAGE_PAYLOAD, wait_ok=False, loaded=True, reload_ok=False
+        self.get_catalog_model_process_mock.return_value = None
+        self._add_replica(status="cold")
+        _cli_impl._vision_mark_instance(BASE_ID, BASE_ID, 3600.0)
+        target, error = self._route(self.IMAGE_PAYLOAD)
+        self.assertIsNone(error)
+        self.assertEqual(
+            target,
+            BASE_ID,
+            "with nothing loaded, keeping the projector already warm avoids a reload",
         )
-        self.assertIsNone(target)
-        self.assertIn("failed", error)
-        self.assertEqual(reloads, ["lazy_mmproj_vision_upgrade"])
 
-    def test_invalid_public_port_is_an_error(self):
+    def test_the_longest_idle_instance_wins_when_nothing_is_warm(self):
+        self.use_conf()
+        _cli_impl.REPLICA_ROUTER_STATE.base_last_used[BASE_ID] = 10.0
+        self._add_replica(last_used=99.0)
+        target, error = self._route(self.IMAGE_PAYLOAD)
+        self.assertIsNone(error)
+        self.assertEqual(target, BASE_ID)
+
+    def test_a_replica_without_a_known_gpu_set_falls_back_to_the_base(self):
+        self.use_conf()
+        self.get_catalog_model_process_mock.return_value = {"pid": 111}
+        self._add_replica(gpu_set=[])
+        target, error = self._route(self.IMAGE_PAYLOAD)
+        self.assertIsNone(error)
+        self.assertEqual(target, BASE_ID)
+
+    def test_a_replica_is_marked_so_follow_up_turns_stay_on_it(self):
+        self.use_conf()
+        self.get_catalog_model_process_mock.return_value = {"pid": 111}
+        replica = self._add_replica()
+        self._route(self.IMAGE_PAYLOAD)
+        state = _cli_impl.REPLICA_ROUTER_STATE
+        self.assertIn(replica, state.vision_until[BASE_ID])
+        self.assertTrue(state.vision_affinity)
+
+    # -- reuse -------------------------------------------------------------- #
+    def test_a_pinned_conversation_does_not_re_attach(self):
+        self.use_conf()
+        self.get_catalog_model_process_mock.return_value = {"pid": 111}
+        replica = self._add_replica()
+        first, _ = self._route(self.IMAGE_PAYLOAD)
+        second, error = self._route(self.IMAGE_PAYLOAD)
+        self.assertEqual((first, second), (replica, replica))
+        self.assertIsNone(error)
+        self.assertEqual(
+            len(self.set_instance_mmproj_in_llamaswap_config_mock.call_args_list),
+            1,
+            "a warm projector must be reused, not rewritten",
+        )
+
+    def test_a_lapsed_pin_falls_back_to_the_rule(self):
+        self.use_conf()
+        self.get_catalog_model_process_mock.return_value = {"pid": 111}
+        replica = self._add_replica()
+        _cli_impl._vision_mark_instance(BASE_ID, replica, 1.0)
+        self.now += 10.0
+        target, error = self._route(self.IMAGE_PAYLOAD)
+        self.assertIsNone(error)
+        self.assertEqual(target, replica)
+
+    def test_a_warm_target_is_not_awaited_again(self):
+        self.use_conf()
+        _cli_impl._vision_mark_instance(BASE_ID, BASE_ID, 3600.0)
+        self._route(self.IMAGE_PAYLOAD)
+        self.wait_for_published_model_id_mock.assert_not_called()
+
+    def test_a_cold_target_is_awaited(self):
+        self.use_conf()
+        self._route(self.IMAGE_PAYLOAD)
+        self.wait_for_published_model_id_mock.assert_called_once()
+
+    # -- failures ----------------------------------------------------------- #
+    def test_a_failed_attach_is_reported_not_silently_dropped(self):
+        self.use_conf()
+        self.set_instance_mmproj_in_llamaswap_config_mock.side_effect = RuntimeError("boom")
+        target, error = self._route(self.IMAGE_PAYLOAD)
+        self.assertIsNone(target)
+        self.assertIn("could not be attached", error)
+
+    def test_a_broken_server_config_is_not_blamed_on_the_route(self):
+        self.use_conf()
+        with mock.patch.object(_cli_impl, "resolve_idle_ttl", side_effect=ValueError("bad")):
+            target, error = self._route(self.IMAGE_PAYLOAD)
+        self.assertIsNone(target)
+        self.assertIn("invalid server configuration", error)
+        events = [call.args[0] for call in self.log_api_event_mock.call_args_list]
+        self.assertIn("lazy_mmproj_route_create_failed", events)
+
+    def test_no_instance_to_carry_the_projector_is_reported(self):
+        self.use_conf()
+        with mock.patch.object(_cli_impl, "candidate_instance_ids", return_value=[]):
+            target, error = self._route(self.IMAGE_PAYLOAD)
+        self.assertIsNone(target)
+        self.assertIn("no instance", error)
+
+    def test_an_invalid_public_port_is_reported(self):
         self.use_conf()
         self.args.public_port = "not-a-port"
-        target, error = _cli_impl.route_image_request_to_vision(
-            self.model, self.IMAGE_PAYLOAD, self.HEADERS, self.catalog, self.args, "127.0.0.1"
-        )
+        target, error = self._route(self.IMAGE_PAYLOAD)
         self.assertIsNone(target)
-        self.assertIn("invalid public port", error)
+        self.assertIn("public port", error)
 
 
-class ForcedMmprojTest(unittest.TestCase, _ConfigEnvMixin):
+# --------------------------------------------------------------------------- #
+# returning an instance to text
+# --------------------------------------------------------------------------- #
+class ReconcileTextTest(
+    unittest.TestCase, _ConfigEnvMixin, _RouterStateMixin
+):
     def setUp(self):
+        self.reset_router_state()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.config_path = self.root / "config.yaml"
+        self.model = _lazy_model()
+        self.catalog = [self.model]
+        self.args = argparse.Namespace(
+            config=str(self.config_path),
+            llama_server=str(SERVER),
+            idle_ttl=300,
+            public_port=11436,
+            llama_server_defaults={},
+            mode="user",
+            state_dir=str(self.root),
+            public_host="127.0.0.1",
+        )
+        patcher = mock.patch.object(_cli_impl, "log_api_event")
+        self.log_api_event_mock = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _reconcile(self, instance_id):
+        return _cli_impl.reconcile_text_instance_mmproj(
+            self.model, instance_id, self.catalog, self.args
+        )
+
+    def test_an_unflagged_instance_is_left_alone(self):
         self.use_conf()
+        with mock.patch.object(
+            _cli_impl, "set_instance_mmproj_in_llamaswap_config"
+        ) as attach:
+            self._reconcile(BASE_ID)
+            attach.assert_not_called()
 
-    def test_with_forced_mmproj_pins_the_mode_on(self):
-        base = _make_model(server_overrides={"engine": "buun", "mmproj_mode": "lazy"})
-        forced = _cli_impl._with_forced_mmproj(base)
-        self.assertEqual(get_model_mmproj_mode(forced), MMPROJ_MODE_ALWAYS)
-        self.assertTrue(resolve_render_include_mmproj(forced))
-        # The original catalog entry is untouched so the on-disk file keeps lazy.
-        self.assertEqual(get_model_mmproj_mode(base), MMPROJ_MODE_LAZY)
+    def test_a_flagged_instance_loses_the_projector(self):
+        self.use_conf()
+        _cli_impl._vision_mark_instance(BASE_ID, BASE_ID, 3600.0)
+        with mock.patch.object(
+            _cli_impl,
+            "set_instance_mmproj_in_llamaswap_config",
+            return_value=self.config_path,
+        ) as attach:
+            self._reconcile(BASE_ID)
+            attach.assert_called_once()
+            self.assertIs(attach.call_args.kwargs["enable"], False)
+        self.assertEqual(
+            _cli_impl.REPLICA_ROUTER_STATE.vision_until.get(BASE_ID),
+            None,
+            "the flag must be dropped once the route really lost the projector",
+        )
 
-    def test_reload_helper_accepts_force_mmproj_kwarg(self):
-        import inspect
+    def test_a_failed_rewrite_keeps_the_flag_for_the_next_attempt(self):
+        self.use_conf()
+        _cli_impl._vision_mark_instance(BASE_ID, BASE_ID, 3600.0)
+        with mock.patch.object(
+            _cli_impl, "set_instance_mmproj_in_llamaswap_config", side_effect=RuntimeError("boom")
+        ):
+            self._reconcile(BASE_ID)
+        self.assertIn(BASE_ID, _cli_impl.REPLICA_ROUTER_STATE.vision_until[BASE_ID])
+        events = [call.args[0] for call in self.log_api_event_mock.call_args_list]
+        self.assertIn("lazy_mmproj_text_restore_failed", events)
 
-        params = inspect.signature(
-            _cli_impl.reload_model_runtime_from_catalog_config
-        ).parameters
-        self.assertIn("force_mmproj", params)
-        self.assertIn("reason", params)
-        self.assertFalse(params["force_mmproj"].default)
+    def test_a_broken_server_config_keeps_the_flag(self):
+        self.use_conf()
+        _cli_impl._vision_mark_instance(BASE_ID, BASE_ID, 3600.0)
+        with mock.patch.object(_cli_impl, "resolve_idle_ttl", side_effect=ValueError("bad")):
+            self._reconcile(BASE_ID)
+        self.assertIn(BASE_ID, _cli_impl.REPLICA_ROUTER_STATE.vision_until[BASE_ID])
+
+    def test_an_empty_instance_id_is_ignored(self):
+        self.use_conf()
+        with mock.patch.object(
+            _cli_impl, "set_instance_mmproj_in_llamaswap_config"
+        ) as attach:
+            self._reconcile("")
+            attach.assert_not_called()
 
 
+class VisionBookkeepingTest(unittest.TestCase, _RouterStateMixin):
+    def setUp(self):
+        self.reset_router_state()
+
+    def test_marking_sets_a_deadline_in_the_future(self):
+        with mock.patch.object(_cli_impl.time, "monotonic", return_value=100.0):
+            _cli_impl._vision_mark_instance(BASE_ID, REPLICA_ID, 60.0)
+        self.assertEqual(
+            _cli_impl.REPLICA_ROUTER_STATE.vision_until[BASE_ID][REPLICA_ID], 160.0
+        )
+        self.assertEqual(_cli_impl._vision_live_instances(BASE_ID, now=120.0), {REPLICA_ID})
+        self.assertEqual(_cli_impl._vision_live_instances(BASE_ID, now=200.0), set())
+
+    def test_a_lapsed_flag_is_kept_so_text_can_still_strip_it(self):
+        with mock.patch.object(_cli_impl.time, "monotonic", return_value=100.0):
+            _cli_impl._vision_mark_instance(BASE_ID, REPLICA_ID, 10.0)
+        self.assertEqual(_cli_impl._vision_live_instances(BASE_ID, now=500.0), set())
+        self.assertIn(REPLICA_ID, _cli_impl.REPLICA_ROUTER_STATE.vision_until[BASE_ID])
+
+    def test_forgetting_drops_the_instance_and_the_empty_parent(self):
+        _cli_impl._vision_mark_instance(BASE_ID, REPLICA_ID, 3600.0)
+        _cli_impl._vision_forget_instance(BASE_ID, REPLICA_ID)
+        self.assertNotIn(
+            BASE_ID,
+            _cli_impl.REPLICA_ROUTER_STATE.vision_until,
+            "an emptied parent entry would otherwise leak for the life of the daemon",
+        )
+
+    def test_forgetting_one_instance_keeps_the_others(self):
+        other = f"{BASE_ID}__replica_1"
+        _cli_impl._vision_mark_instance(BASE_ID, REPLICA_ID, 3600.0)
+        _cli_impl._vision_mark_instance(BASE_ID, other, 3600.0)
+        _cli_impl._vision_forget_instance(BASE_ID, REPLICA_ID)
+        self.assertEqual(
+            sorted(_cli_impl.REPLICA_ROUTER_STATE.vision_until[BASE_ID]),
+            [other],
+        )
+
+    def test_forgetting_an_unknown_instance_is_a_noop(self):
+        _cli_impl._vision_forget_instance(BASE_ID, "never-seen")
+        self.assertNotIn(BASE_ID, _cli_impl.REPLICA_ROUTER_STATE.vision_until)
+
+    def test_an_unknown_base_has_no_instances(self):
+        self.assertEqual(_cli_impl._vision_live_instances("nothing-here"), set())
+
+
+# --------------------------------------------------------------------------- #
+# gateway wiring
+# --------------------------------------------------------------------------- #
 class HandlerWiringTest(unittest.TestCase):
-    """The four image endpoints must consult the lazy route before replicas.
+    """The four image endpoints must consult lazy mmproj before replicas.
 
     The gateway handlers are methods defined inside a factory closure, so they
     are not reachable through ``dir(_cli_impl)``. Assert on the module source
-    instead, which also pins the ordering constraint (vision resolution must run
-    before the replica router, and the legacy stale-reload must skip lazy
-    models whose base process never carries a projector by design).
+    instead, which also pins the ordering constraints.
     """
 
     ENDPOINTS = (
@@ -756,16 +1120,13 @@ class HandlerWiringTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.source = (
-            Path(_cli_impl.__file__).read_text(encoding="utf-8")
-        )
+        cls.source = Path(_cli_impl.__file__).read_text(encoding="utf-8")
 
     def _endpoint_body(self, name: str) -> str:
-        marker = f"def {name}(self):"
-        start = self.source.index(marker)
+        start = self.source.index(f"def {name}(self):")
         return self.source[start:]
 
-    def test_all_four_image_endpoints_call_the_lazy_route(self):
+    def test_all_four_image_endpoints_consult_lazy_mmproj(self):
         self.assertEqual(
             self.source.count("route_image_request_to_vision("),
             1 + len(self.ENDPOINTS),
@@ -773,25 +1134,73 @@ class HandlerWiringTest(unittest.TestCase):
         )
         for name in self.ENDPOINTS:
             with self.subTest(endpoint=name):
-                body = self._endpoint_body(name)
-                self.assertIn("route_image_request_to_vision(", body)
+                self.assertIn("route_image_request_to_vision(", self._endpoint_body(name))
 
-    def test_vision_target_bypasses_replica_selection(self):
+    def test_vision_target_is_resolved_before_replica_selection(self):
         for name in self.ENDPOINTS:
             with self.subTest(endpoint=name):
                 body = self._endpoint_body(name)
-                resolve = body.index("route_image_request_to_vision(")
-                replica = body.index("select_replica_for_request(")
                 self.assertLess(
-                    resolve,
-                    replica,
-                    "the lazy route must be resolved before replica selection",
+                    body.index("route_image_request_to_vision("),
+                    body.index("select_replica_for_request("),
+                    "lazy mmproj must be resolved before replica selection",
                 )
                 self.assertIn("elif model_entry is not None:", body)
 
+    def test_all_four_endpoints_release_the_projector_for_text(self):
+        self.assertEqual(
+            self.source.count("reconcile_text_instance_mmproj("),
+            1 + len(self.ENDPOINTS),
+        )
+        for name in self.ENDPOINTS:
+            with self.subTest(endpoint=name):
+                self.assertIn("reconcile_text_instance_mmproj(", self._endpoint_body(name))
 
+    def test_the_legacy_stale_reload_skips_lazy_models(self):
+        body = self._endpoint_body("_handle_openai_responses")
+        guard = body.index("_loaded_process_missing_configured_mmproj(")
+        self.assertIn("not model_lazily_loads_mmproj(model_entry)", body[:guard])
+
+
+# --------------------------------------------------------------------------- #
+# public surface
+# --------------------------------------------------------------------------- #
 class SurfaceTest(unittest.TestCase):
     def test_vision_helpers_are_exported_from_the_public_package(self):
+        import llamacpp_stack.cli as cli_pkg
+
+        for name in (
+            "MMPROJ_MODE_ALWAYS",
+            "MMPROJ_MODE_LAZY",
+            "MMPROJ_MODE_OFF",
+            "default_mmproj_config",
+            "normalize_mmproj_config",
+            "normalize_mmproj_mode",
+            "get_model_mmproj_mode",
+            "resolve_effective_mmproj_config",
+            "cached_mmproj_config",
+            "model_has_mmproj",
+            "model_lazily_loads_mmproj",
+            "resolve_render_include_mmproj",
+            "candidate_instance_ids",
+            "choose_vision_instance",
+            "vision_route_ttl",
+        ):
+            with self.subTest(name=name):
+                self.assertTrue(hasattr(cli_pkg, name))
+
+    def test_replica_helpers_are_exported_from_the_public_package(self):
+        import llamacpp_stack.cli as cli_pkg
+
+        for name in (
+            "ensure_internal_route_in_llamaswap_config",
+            "set_instance_mmproj_in_llamaswap_config",
+            "route_carries_mmproj",
+        ):
+            with self.subTest(name=name):
+                self.assertTrue(hasattr(cli_pkg, name))
+
+    def test_the_removed_vision_route_helpers_are_gone(self):
         import llamacpp_stack.cli as cli_pkg
 
         for name in (
@@ -799,67 +1208,32 @@ class SurfaceTest(unittest.TestCase):
             "vision_base_model_id",
             "is_vision_model_id",
             "build_vision_model",
-            "get_model_mmproj_mode",
-            "model_lazily_loads_mmproj",
-            "resolve_render_include_mmproj",
-            "normalize_mmproj_config",
-            "default_mmproj_config",
-            "MMPROJ_MODE_LAZY",
-            "MMPROJ_MODE_ALWAYS",
-            "MMPROJ_MODE_OFF",
-        ):
-            with self.subTest(name=name):
-                self.assertTrue(hasattr(cli_pkg, name), f"{name} missing from cli package")
-                self.assertTrue(hasattr(vision_mod, name), f"{name} missing from vision module")
-
-        # Names the gateway resolves at runtime must be bound in _cli_impl.
-        for name in (
-            "get_model_mmproj_mode",
-            "model_lazily_loads_mmproj",
-            "resolve_render_include_mmproj",
-            "MMPROJ_MODE_LAZY",
-        ):
-            with self.subTest(name=name):
-                self.assertTrue(hasattr(_cli_impl, name), f"{name} missing from _cli_impl")
-
-    def test_ensure_vision_route_is_rebound_in_cli_impl(self):
-        for name in (
             "ensure_vision_route_in_llamaswap_config",
-            "is_vision_model_id",
-            "vision_base_model_id",
-            "vision_model_id",
         ):
             with self.subTest(name=name):
-                self.assertTrue(hasattr(_cli_impl, name))
+                self.assertFalse(hasattr(cli_pkg, name))
 
-    def test_every_model_payload_reports_the_lazy_mmproj_state(self):
-        # Both OpenAI builders serve GET /v1/models, so both must carry the keys.
-        lazy = _make_model("exl3-qwen", server_overrides={"mmproj_mode": "lazy"})
-        always = _make_model("plain-qwen")
-        builders = (
-            "build_openai_model_payload",
-            "build_openai_model_list_payload",
-            "build_ollama_model_payload",
+    def test_every_model_payload_reports_the_live_vision_instances(self):
+        from llamacpp_stack.cli.gateway import (  # noqa: F401  (re-export check)
+            build_openai_model_list_payload,
+            build_openai_model_payload,
         )
-        for builder in builders:
-            for label, model, expected_mode, expected_route in (
-                ("lazy", lazy, "lazy", "exl3-qwen__vision"),
-                ("always", always, "always", None),
-            ):
-                with self.subTest(builder=builder, model=label):
-                    payload = getattr(_cli_impl, builder)(model)
-                    details = payload.get("metadata") or payload.get("details") or {}
-                    self.assertEqual(details.get("mmproj_mode"), expected_mode)
-                    self.assertEqual(details.get("vision_route"), expected_route)
 
-    def test_config_migrate_adds_the_mmproj_block_idempotently(self):
-        first, changed_first = _cli_impl.normalize_server_config_payload({})
-        self.assertIn("mmproj", first)
-        self.assertEqual(first["mmproj"], default_mmproj_config())
-        self.assertTrue(changed_first)
-        second, changed_second = _cli_impl.normalize_server_config_payload(first)
-        self.assertEqual(second["mmproj"], first["mmproj"])
-        self.assertFalse(changed_second)
+        lazy = _lazy_model()
+        plain = _make_model(model_id="plain")
+        with mock.patch.object(_cli_impl, "_vision_live_instances", return_value={REPLICA_ID}):
+            for builder, key in (
+                (_cli_impl.build_openai_model_payload, "metadata"),
+                (_cli_impl.build_ollama_model_payload, "details"),
+                (_cli_impl.build_openai_model_list_payload, "metadata"),
+            ):
+                with self.subTest(builder=builder.__name__):
+                    details = builder(lazy)[key]
+                    self.assertEqual(details["mmproj_mode"], MMPROJ_MODE_LAZY)
+                    self.assertEqual(details["vision_instances"], [REPLICA_ID])
+            plain_details = _cli_impl.build_openai_model_payload(plain)["metadata"]
+        self.assertEqual(plain_details["vision_instances"], [])
+        self.assertEqual(plain_details["mmproj_mode"], MMPROJ_MODE_ALWAYS)
 
 
 if __name__ == "__main__":

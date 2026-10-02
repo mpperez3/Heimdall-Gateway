@@ -82,7 +82,9 @@ _REPLICA_EXPORTS = (
     "render_llamaswap_config",
     "ensure_replica_route_in_llamaswap_config",
     "ensure_replica_route",
-    "ensure_vision_route_in_llamaswap_config",
+    "ensure_internal_route_in_llamaswap_config",
+    "set_instance_mmproj_in_llamaswap_config",
+    "route_carries_mmproj",
     "shell_quote",
 )
 _VISION_EXPORTS = (
@@ -98,10 +100,8 @@ _VISION_EXPORTS = (
     "model_has_mmproj",
     "model_lazily_loads_mmproj",
     "resolve_render_include_mmproj",
-    "build_vision_model",
-    "is_vision_model_id",
-    "vision_base_model_id",
-    "vision_model_id",
+    "candidate_instance_ids",
+    "choose_vision_instance",
     "vision_route_ttl",
 )
 _SERVER_EXPORTS = (

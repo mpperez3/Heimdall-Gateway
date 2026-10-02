@@ -10,22 +10,23 @@ safetensors EXL3 Qwen builds) that projector is expensive in VRAM.
 ``always`` (default)
     Legacy behaviour: ``--mmproj`` is always emitted.
 ``lazy``
-    The base route is rendered WITHOUT the projector and a sibling internal
-    route ``<model_id>__vision`` is published WITH it. Image requests are
-    routed to that sibling; llama-swap evicts it on idle TTL. The text-only
-    base therefore never pays for the projector.
+    Every route of the model is rendered WITHOUT the projector. When a request
+    carries an image, the gateway picks the instance least disruptive to serve
+    (usually an idle replica, otherwise the base) and rewrites only that one
+    route so its command carries ``--mmproj``. Text-only traffic therefore
+    never pays for the projector.
 ``off``
     Never emit ``--mmproj`` (useful to pin a broken/unwanted projector).
 
-The sibling route reuses the internal-replica machinery (same
-``metadata.internal_replica_of`` convention, same matrix/evict-cost handling),
-so it is cheap to add and gets the cheaper 0.5x eviction cost of a replica.
+There is deliberately **no dedicated "vision" route**. The projector is a
+per-instance property of an ordinary base-or-replica route, and it lapses on
+its own: an instance that served an image keeps ``--mmproj`` for
+``mmproj.vision_sticky_ttl_s`` (default one hour) and is rewritten back to
+text-only afterwards. ``llm-server update`` resets every route to text-only.
 """
 
 from __future__ import annotations
 
-import re
-from dataclasses import replace
 from pathlib import Path
 
 from .constants import DEFAULT_SERVER_CONFIG_PATH
@@ -36,9 +37,6 @@ MMPROJ_MODE_LAZY = "lazy"
 MMPROJ_MODE_OFF = "off"
 MMPROJ_MODES: tuple[str, ...] = (MMPROJ_MODE_ALWAYS, MMPROJ_MODE_LAZY, MMPROJ_MODE_OFF)
 
-VISION_MODEL_SUFFIX = "__vision"
-_VISION_MODEL_RE = re.compile(re.escape(VISION_MODEL_SUFFIX) + r"$")
-
 # Override keys that must never reach llama-server as flags.
 MMPROJ_OVERRIDE_KEYS = ("mmproj_mode",)
 
@@ -48,19 +46,16 @@ __all__ = [
     "MMPROJ_MODE_LAZY",
     "MMPROJ_MODE_OFF",
     "MMPROJ_OVERRIDE_KEYS",
-    "VISION_MODEL_SUFFIX",
-    "build_vision_model",
+    "candidate_instance_ids",
+    "choose_vision_instance",
     "default_mmproj_config",
     "get_model_mmproj_mode",
-    "is_vision_model_id",
     "model_has_mmproj",
     "model_lazily_loads_mmproj",
     "normalize_mmproj_config",
     "normalize_mmproj_mode",
     "resolve_effective_mmproj_config",
     "resolve_render_include_mmproj",
-    "vision_base_model_id",
-    "vision_model_id",
     "vision_route_ttl",
 ]
 
@@ -145,34 +140,65 @@ def model_lazily_loads_mmproj(
     return True
 
 
-def vision_model_id(base_model_id: str) -> str:
-    return f"{base_model_id}{VISION_MODEL_SUFFIX}"
+def candidate_instance_ids(base_model_id: str, replica_ids: object = None) -> list[str]:
+    """Route ids that may serve an image: the base first, then its replicas."""
+    base = str(base_model_id or "").strip()
+    out = [base] if base else []
+    for rid in replica_ids or ():
+        text = str(rid or "").strip()
+        if text and text not in out:
+            out.append(text)
+    return out
 
 
-def is_vision_model_id(model_id: str) -> bool:
-    return bool(_VISION_MODEL_RE.search(str(model_id or "")))
+def choose_vision_instance(
+    candidates: object,
+    loaded: object = None,
+    has_mmproj: object = None,
+    last_used: dict[str, float] | None = None,
+    fallback_last_used: float = 0.0,
+) -> str | None:
+    """Pick which instance should carry the projector for an image request.
 
+    The operator's rule, in order:
 
-def vision_base_model_id(model_id: str) -> str:
-    return _VISION_MODEL_RE.sub("", str(model_id or ""))
+    1. An unloaded instance always beats a loaded one, so serving an image
+       never disturbs an instance that is currently serving text.
+    2. Among instances of equal liveness, one that *already* has ``--mmproj``
+       wins, which avoids reloading the projector.
+    3. Remaining ties go to the instance idle the longest.
 
-
-def build_vision_model(base: ManagedModel) -> ManagedModel:
-    """Sibling of ``base`` whose command carries ``--mmproj``.
-
-    The projector is forced on regardless of the base's ``mmproj_mode`` so the
-    vision route always renders a usable vision server.
+    Pure, so the rule is unit-testable without touching llama-swap.
     """
-    overrides = dict(getattr(base, "server_overrides", None) or {})
-    overrides["mmproj_mode"] = MMPROJ_MODE_ALWAYS
-    overrides.pop("replicas", None)
-    return replace(
-        base,
-        model_id=vision_model_id(base.model_id),
-        aliases=[],
-        description=f"lazy mmproj vision route of {base.model_id}",
-        server_overrides=overrides,
-    )
+    ids = [str(item or "").strip() for item in (candidates or ())]
+    ids = [item for item in ids if item]
+    if not ids:
+        return None
+    loaded_set = {str(item) for item in (loaded or ())}
+    mmproj_set = {str(item) for item in (has_mmproj or ())}
+    used = last_used or {}
+    default_used = float(fallback_last_used or 0.0)
+
+    def _idle(item: str) -> float:
+        try:
+            return float(used.get(item, default_used))
+        except (TypeError, ValueError):
+            return default_used
+
+    def _key(item: str) -> tuple[int, int, float]:
+        return (
+            1 if item in loaded_set else 0,
+            0 if item in mmproj_set else 1,
+            _idle(item),
+        )
+
+    best = ids[0]
+    best_key = _key(best)
+    for item in ids[1:]:
+        key = _key(item)
+        if key < best_key:
+            best, best_key = item, key
+    return best
 
 
 def resolve_render_include_mmproj(
@@ -181,8 +207,8 @@ def resolve_render_include_mmproj(
 ) -> bool:
     """Whether the llama-swap ``cmd`` for ``model`` should carry ``--mmproj``.
 
-    False for a lazy base (its vision sibling carries it instead) and for
-    ``mmproj_mode: off``.
+    False for a lazy model (its projector is attached on demand to one chosen
+    instance) and for ``mmproj_mode: off``.
     """
     if not model_has_mmproj(model):
         return False
@@ -193,9 +219,7 @@ def default_mmproj_config() -> dict[str, object]:
     """Default ``mmproj`` block for conf.json."""
     return {
         "default_mode": MMPROJ_MODE_ALWAYS,
-        "prefer_vision_route": True,
-        "allow_co_resident": False,
-        "vision_sticky_ttl_s": 1800,
+        "vision_sticky_ttl_s": 3600,
         "route_publish_timeout_s": 90.0,
         "unload_timeout_s": 45.0,
         "reload_timeout_s": 45.0,
@@ -220,20 +244,6 @@ def normalize_mmproj_config(raw: object) -> tuple[dict[str, object], bool]:
         out["default_mode"] = defaults["default_mode"]
     else:
         out["default_mode"] = normalize_mmproj_mode(mode_raw)
-
-    def _bool(key: str) -> None:
-        nonlocal changed
-        value = raw.get(key)
-        if value is None:
-            out[key] = defaults[key]
-            return
-        parsed = _coerce_bool(value, bool(defaults[key]))
-        if parsed != value:
-            changed = True
-        out[key] = parsed
-
-    _bool("prefer_vision_route")
-    _bool("allow_co_resident")
 
     def _float(key: str, low: float, high: float) -> None:
         nonlocal changed
@@ -264,29 +274,18 @@ def normalize_mmproj_config(raw: object) -> tuple[dict[str, object], bool]:
             parsed = int(value)
         except Exception:
             parsed = int(defaults["vision_sticky_ttl_s"])
+        clamped = max(60, min(86400, parsed))
+        # Compare the clamped result, not the parsed one: clamping 1 up to the
+        # 60s floor is a repair, and config-migrate only persists what we report.
+        if clamped != value:
             changed = True
-        if parsed != value:
-            changed = True
-        out["vision_sticky_ttl_s"] = max(60, min(86400, parsed))
+        out["vision_sticky_ttl_s"] = clamped
 
     for key, default_value in defaults.items():
         if key not in out:
             out[key] = default_value
             changed = True
     return out, changed
-
-
-def _coerce_bool(value: object, default: bool) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    text = str(value or "").strip().lower()
-    if text in {"1", "true", "yes", "on"}:
-        return True
-    if text in {"0", "false", "no", "off"}:
-        return False
-    return default
 
 
 def resolve_effective_mmproj_config(args: object | None = None) -> dict[str, object]:
