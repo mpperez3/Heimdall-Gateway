@@ -7,7 +7,10 @@ Imports types from .models; cross-module server helpers are imported lazily to a
 
 from __future__ import annotations
 
+import os
 import re
+import tempfile
+import threading
 import time as _time
 from dataclasses import replace
 from pathlib import Path
@@ -48,6 +51,112 @@ LLAMASWAP_CONFIG_HEADER = (
     "#       checkEndpoint: /health\n"
     "#       ttl: 300\n\n"
 )
+
+# Lock ordering: router lock -> release -> config lock. Never nest the two, and
+# never hold this one across an HTTP call. Import it from this module directly
+# (not through the lazy llamacpp_stack.cli package) so callers share one object.
+_LLAMASWAP_CONFIG_WRITE_LOCK = threading.RLock()
+
+
+class LlamaSwapConfigReadError(RuntimeError):
+    """config.yaml exists but cannot be read as a mapping of routes.
+
+    The previous behaviour was to degrade to ``{}``, which turned any parse error
+    into a single-route write: llama-swap then served a truncated catalog and
+    nothing in the manager could put the missing routes back.
+    """
+
+
+def _read_config_strict(path: Path | str) -> dict:
+    """Read a llama-swap config, raising instead of degrading to ``{}``.
+
+    Callers must run inside ``_LLAMASWAP_CONFIG_WRITE_LOCK`` and let the exception
+    propagate, which leaves the existing file untouched.
+    """
+    path = Path(path)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise LlamaSwapConfigReadError(f"cannot read {path}: {exc}") from exc
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        yaml = None  # type: ignore
+    try:
+        if yaml is not None:
+            data = yaml.safe_load(raw)
+        else:
+            import json as _json
+
+            data = _json.loads(raw)
+    except Exception as exc:
+        raise LlamaSwapConfigReadError(f"cannot parse {path}: {exc}") from exc
+    if data is None:
+        # An empty file parses to None, and treating that as "no models" would let a
+        # single-route write publish a one-route catalog with no shrink to detect.
+        raise LlamaSwapConfigReadError(f"{path} is empty")
+    if not isinstance(data, dict):
+        raise LlamaSwapConfigReadError(f"{path} is not a mapping (got {type(data).__name__})")
+    models = data.get("models")
+    if models is not None and not isinstance(models, dict):
+        raise LlamaSwapConfigReadError(f"{path} has a non-mapping 'models' section")
+    return data
+
+
+def _write_config_atomic(path: Path | str, data: dict, *, allow_shrink: bool = False) -> None:
+    """Serialise *data* to *path* atomically, refusing to truncate the catalog.
+
+    A unique temp file (never the shared ``config.tmp``) plus an fsync of both the
+    file and its directory means a reader sees either the old config or the new
+    one. ``allow_shrink`` exists only for the route-drop writer, whose purpose *is*
+    to remove one route; every other writer must keep the published model set a
+    superset of what is already on disk, which is what turns a concurrent full
+    re-render into a loud failure instead of a silent overwrite.
+    """
+    path = Path(path)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file_handle:
+            file_handle.write(LLAMASWAP_CONFIG_HEADER)
+            try:
+                import yaml  # type: ignore
+            except Exception:
+                yaml = None  # type: ignore
+            if yaml is not None:
+                yaml.safe_dump(data, file_handle, sort_keys=False)
+            else:
+                import json as _json
+
+                file_handle.write(_json.dumps(data, indent=2))
+            file_handle.flush()
+            os.fsync(file_handle.fileno())
+        if not allow_shrink:
+            before = _read_config_strict(path)
+            lost = set(before.get("models") or {}) - set(data.get("models") or {})
+            if lost:
+                raise RuntimeError(f"refusing to drop published models: {sorted(lost)}")
+            if before:
+                (path.parent / (path.name + ".pre-placement")).write_text(
+                    path.read_text(encoding="utf-8"), encoding="utf-8"
+                )
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 def _as_bool(value: object, default: bool = False) -> bool:
@@ -886,16 +995,11 @@ def render_llamaswap_config(
     matrix_config = _calculate_llama_swap_matrix(models_info_for_matrix)
     if matrix_config:
         data["matrix"] = matrix_config
-    tmp = path.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as file_handle:
-        file_handle.write(LLAMASWAP_CONFIG_HEADER)
-        if yaml is not None:
-            yaml.safe_dump(data, file_handle, sort_keys=False)
-        else:
-            import json as _json
-
-            file_handle.write(_json.dumps(data, indent=2))
-    tmp.replace(path)
+    # allow_shrink: this is the authoritative full render, so a route dropped from
+    # the catalog must disappear from the file. The single-route writers keep the
+    # superset guard instead, which is what detects them racing a re-render.
+    with _LLAMASWAP_CONFIG_WRITE_LOCK:
+        _write_config_atomic(path, data, allow_shrink=True)
 
 
 def _render_instance_command(
@@ -1004,7 +1108,7 @@ def ensure_internal_route_in_llamaswap_config(
     server_defaults: dict[str, object] | None = None,
     *,
     gpu_set: list[int] | None = None,
-    include_mmproj: bool = False,
+    include_mmproj: bool | None = False,
     metadata: dict[str, object] | None = None,
     description: str | None = None,
     ttl: int | None = None,
@@ -1015,76 +1119,69 @@ def ensure_internal_route_in_llamaswap_config(
     projector state is left untouched, so ordinary traffic never rewrites the
     watched config. The base route is rendered from ``base_model`` itself, which
     is what makes it possible to bolt the projector onto whichever instance is
-    idle at request time.
+    idle at request time. ``include_mmproj=None`` keeps whatever projector state
+    the route already has, which is what a GPU re-pin wants.
     """
-    try:
-        import yaml  # type: ignore
-    except Exception:
-        yaml = None  # type: ignore
-
     path = Path(config_path)
     route_id = str(route_id or "")
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        if yaml is not None:
-            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        else:
-            import json as _json
 
-            data = _json.loads(path.read_text(encoding="utf-8")) or {}
-    except Exception:
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    try:
-        _ls2 = _effective_llama_swap_config()
-    except Exception:
-        _ls2 = _default_llama_swap_config()
-    data.setdefault("healthCheckTimeout", 600)
-    data.setdefault("logLevel", str(_ls2.get("logLevel", "info")))
-    data.setdefault("logToStdout", str(_ls2.get("logToStdout", "both")))
-    data.setdefault("sendLoadingState", False)
-    data.setdefault("includeAliasesInList", True)
-    models = data.setdefault("models", {})
-    if not isinstance(models, dict):
-        models = {}
-        data["models"] = models
-
-    want_mmproj = bool(include_mmproj)
-    existing = models.get(route_id)
-    if isinstance(existing, dict) and route_carries_mmproj(existing) == want_mmproj:
-        return route_id
-
-    route_gpu_set: list[int] = []
     if route_id == base_model.model_id:
+        # An explicit gpu_set outranks the static assignment: that is the only way a
+        # runtime re-pin can move a base route. Without this precedence the kwarg was
+        # discarded and a route rewritten in place (e.g. bolting the projector onto
+        # the base instance) lost its CUDA_VISIBLE_DEVICES prefix and landed on
+        # physical GPU0.
+        route_gpu_set = [int(g) for g in gpu_set] if gpu_set else [
+            int(g) for g in (cached_model_gpu_sets(catalog).get(route_id) or [])
+        ]
         model_for_route = base_model
     else:
         route_gpu_set = list(gpu_set or [])
-        model_for_route = build_replica_model(base_model, _replica_index_for_model_id(route_id), route_gpu_set)
+        model_for_route = build_replica_model(
+            base_model, _replica_index_for_model_id(route_id), route_gpu_set
+        )
 
-    cmd = _render_instance_command(model_for_route, server_path, server_defaults, want_mmproj)
-    if route_gpu_set:
-        cmd = _command_with_cuda_visible_devices(cmd, route_gpu_set)
-    entry = {
-        "cmd": " ".join(shell_quote(part) for part in cmd),
-        "checkEndpoint": "/health",
-        "ttl": int(ttl if ttl else idle_ttl),
-        "metadata": dict(metadata or {"internal_replica_of": base_model.model_id}),
-        "description": description or getattr(model_for_route, "description", "") or route_id,
-    }
-    entry["capabilities"] = route_capabilities(entry)
-    models[route_id] = entry
-    _recalculate_llamaswap_matrix_from_config(data, catalog)
-    tmp = path.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as file_handle:
-        file_handle.write(LLAMASWAP_CONFIG_HEADER)
-        if yaml is not None:
-            yaml.safe_dump(data, file_handle, sort_keys=False)
+    with _LLAMASWAP_CONFIG_WRITE_LOCK:
+        data = _read_config_strict(path)
+        try:
+            _ls2 = _effective_llama_swap_config()
+        except Exception:
+            _ls2 = _default_llama_swap_config()
+        data.setdefault("healthCheckTimeout", 600)
+        data.setdefault("logLevel", str(_ls2.get("logLevel", "info")))
+        data.setdefault("logToStdout", str(_ls2.get("logToStdout", "both")))
+        data.setdefault("sendLoadingState", False)
+        data.setdefault("includeAliasesInList", True)
+        models = data.setdefault("models", {})
+        if not isinstance(models, dict):
+            raise LlamaSwapConfigReadError(f"{path} has a non-mapping 'models' section")
+        existing = models.get(route_id)
+        if include_mmproj is None:
+            want_mmproj = route_carries_mmproj(existing)
         else:
-            import json as _json
+            want_mmproj = bool(include_mmproj)
 
-            file_handle.write(_json.dumps(data, indent=2))
-    tmp.replace(path)
+        cmd = _render_instance_command(model_for_route, server_path, server_defaults, want_mmproj)
+        if route_gpu_set:
+            cmd = _set_cuda_visible_devices(cmd, route_gpu_set)
+        entry = {
+            "cmd": " ".join(shell_quote(part) for part in cmd),
+            "checkEndpoint": "/health",
+            "ttl": int(ttl if ttl else idle_ttl),
+            "metadata": dict(metadata or {"internal_replica_of": base_model.model_id}),
+            "description": description or getattr(model_for_route, "description", "") or route_id,
+        }
+        entry["capabilities"] = route_capabilities(entry)
+
+        # Subset compare over every field this function owns. Comparing only the
+        # mmproj state would silently drop a CVD-only or ttl-only edit.
+        if isinstance(existing, dict) and all(existing.get(k) == v for k, v in entry.items()):
+            return route_id
+
+        models[route_id] = entry
+        _recalculate_llamaswap_matrix_from_config(data, catalog)
+        _write_config_atomic(path, data)
     try:
         cli_file3 = _get_cli_file()
         _log = getattr(cli_file3, "log_api_event", None)
@@ -1108,13 +1205,19 @@ def drop_internal_route_from_llamaswap_config(
 ) -> bool:
     """Remove one internal route so llama-swap stops the process serving it.
 
-    Returns ``True`` when the config was rewritten. This exists because
-    llama-swap applies a changed ``cmd`` only the *next* time a route is loaded:
-    it does not restart an already-running process. So bolting the projector onto
-    an instance that is currently serving means the running copy keeps its old,
-    projector-less argv. Dropping the route and then re-adding it (see
-    ``ensure_internal_route_in_llamaswap_config``) is what forces the reload, so
-    the caller MUST re-add the route afterwards or the model goes unpublished.
+    Returns ``True`` when the config was rewritten.
+
+    Measured on this host: llama-swap runs ``--watch-config``, so **any** write
+    to config.yaml tears down *every* loaded model and destroys every KV cache --
+    including routes this function never touched. Verified by rewriting a single
+    route while two models were resident: both processes died and only the route
+    that had been rewritten came back. Do not read a config write as a cheap
+    per-route edit.
+
+    Drop-and-re-add is still how the projector is (re)attached: the route has to
+    leave the file before it can come back with a different ``cmd``, so the
+    caller MUST re-add it (see ``ensure_internal_route_in_llamaswap_config``) or
+    the model goes unpublished.
 
     The base route needs ``allow_base=True`` because it is the one route that is
     not recreated on demand; the default keeps it safe against accidental loss.
@@ -1124,37 +1227,20 @@ def drop_internal_route_from_llamaswap_config(
         return False
     if route_id == getattr(base_model, "model_id", "") and not allow_base:
         return False
-    try:
-        import yaml  # type: ignore
-    except Exception:
-        yaml = None  # type: ignore
-
     path = Path(config_path)
-    try:
-        if yaml is not None:
-            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        else:
-            import json as _json
+    with _LLAMASWAP_CONFIG_WRITE_LOCK:
+        try:
+            data = _read_config_strict(path)
+        except LlamaSwapConfigReadError:
+            return False
+        models = data.get("models")
+        if not isinstance(models, dict) or route_id not in models:
+            return False
 
-            data = _json.loads(path.read_text(encoding="utf-8")) or {}
-    except Exception:
-        return False
-    models = (data or {}).get("models") if isinstance(data, dict) else None
-    if not isinstance(models, dict) or route_id not in models:
-        return False
-
-    models.pop(route_id, None)
-    _recalculate_llamaswap_matrix_from_config(data, catalog)
-    tmp = path.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as file_handle:
-        file_handle.write(LLAMASWAP_CONFIG_HEADER)
-        if yaml is not None:
-            yaml.safe_dump(data, file_handle, sort_keys=False)
-        else:
-            import json as _json
-
-            file_handle.write(_json.dumps(data, indent=2))
-    tmp.replace(path)
+        models.pop(route_id, None)
+        _recalculate_llamaswap_matrix_from_config(data, catalog)
+        # allow_shrink: removing a route is this writer's entire purpose.
+        _write_config_atomic(path, data, allow_shrink=True)
     try:
         cli_file3 = _get_cli_file()
         _log = getattr(cli_file3, "log_api_event", None)

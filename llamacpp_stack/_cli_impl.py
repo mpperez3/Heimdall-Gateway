@@ -317,6 +317,12 @@ DEFAULT_CTX_SIZE = 8192
 REASONING_BUDGET_HALF_CONTEXT = "half_context"
 DEFAULT_REASONING_VISIBLE_RESERVE = 1024
 CHAT_TOOL_CONTINUE_REPAIR_THINKING_BUDGET_TOKENS = 512
+#: Commit point for the streaming repair buffer. Once this many characters of
+#: visible assistant content have streamed, stop second-guessing the answer and
+#: pass the remainder through live. It bounds repair latency without losing the
+#: truncated-tool-call repair, because a tool-only answer emits little or no
+#: visible content and therefore stays buffered until ``finish_reason`` arrives.
+CHAT_TOOL_CONTINUE_REPAIR_PASSTHROUGH_VISIBLE_CHARS = 256
 MODEL_PROBE_REASONING_MAX_TOKENS = 128
 try:
     DEFAULT_API_CTX_FACTOR = float(
@@ -1360,6 +1366,35 @@ def _resolve_model_probe_autoload_config(args=None) -> dict[str, object]:
         return _default_model_probe_autoload_config()
     except Exception:
         return _default_model_probe_autoload_config()
+
+
+_RUNTIME_PLACEMENT_MODES = ("off", "retire_only", "repin")
+
+
+def _resolve_runtime_placement_config(args=None) -> dict[str, object]:
+    cfg = {"enabled": False, "mode": "off"}
+    try:
+        payload = _load_server_config_payload(args)
+        exp = payload.get("experimental") if isinstance(payload.get("experimental"), dict) else {}
+        raw = exp.get("runtime_placement") if isinstance(exp, dict) else None
+        if isinstance(raw, dict):
+            cfg["enabled"] = _as_bool(raw.get("enabled"), False)
+            mode = str(raw.get("mode") or "off").strip().lower()
+            cfg["mode"] = mode if mode in _RUNTIME_PLACEMENT_MODES else "off"
+    except Exception:
+        pass
+    if not cfg["enabled"]:
+        cfg["mode"] = "off"
+    return cfg
+
+
+def _runtime_placement_enabled(args=None, *, mode: str | None = None) -> bool:
+    cfg = _resolve_runtime_placement_config(args)
+    return cfg["mode"] != "off" and (mode is None or cfg["mode"] == mode)
+
+
+def _placement_repin_enabled(args=None) -> bool:
+    return _runtime_placement_enabled(args, mode="repin")
 
 
 def _dedup_extract_principal(handler_self) -> str:
@@ -5580,6 +5615,22 @@ LOADING_CLAIM_TTL_S = 900.0
 #: card is still blocked.
 GPU_DEMAND_TTL_S = 120.0
 
+#: Lifetime of a runtime GPU re-pin, in seconds. It must outlast the process it
+#: created so the model cannot ping-pong across an expiry, and it must expire
+#: before an `update` re-renders config.yaml from the static assignment.
+PLACEMENT_OVERRIDE_TTL_S = 1800.0
+
+#: Floor between two re-pin writes for the same model. Writes are the expensive
+#: operation here (llama-swap reloads), so the second one inside this window is
+#: refused outright rather than spaced out.
+PLACEMENT_OVERRIDE_MIN_INTERVAL_S = 900.0
+
+#: Rolling ceiling on re-pin writes for the whole process, so an alternating
+#: request pattern cannot turn the per-model interval into a write stream.
+PLACEMENT_MAX_WRITES_PER_HOUR = 4
+
+_PLACEMENT_WRITE_LOG: list[float] = []
+
 
 class ReplicaRouterState:
     def __init__(self):
@@ -5596,6 +5647,8 @@ class ReplicaRouterState:
         self.loading_claims: dict[str, float] = {}
         self.loading_claim_aliases: dict[str, str] = {}
         self.gpu_demand: dict[int, float] = {}
+        self.gpu_override: dict[str, tuple[list[int], float]] = {}
+        self.gpu_override_written_at: dict[str, float] = {}
         self.policy: object = _AffinityPolicy()
         self.affinity_budget: dict[str, _TransferBudget] = {}
         self._health_cache: dict[str, tuple[float, _TargetHealth]] = {}
@@ -5791,6 +5844,10 @@ class ReplicaRouterState:
             for gpu, expires in list(self.gpu_demand.items()):
                 if expires <= now:
                     self.gpu_demand.pop(gpu, None)
+            for model_id, (_, expires) in list(self.gpu_override.items()):
+                if expires <= now:
+                    self.gpu_override.pop(model_id, None)
+                    self.gpu_override_written_at.pop(model_id, None)
 
     def note_gpu_demand(self, gpu_set, *, ttl_s: float = GPU_DEMAND_TTL_S, now: float | None = None) -> None:
         """Record that a model was refused a load and wants these GPUs back."""
@@ -5810,6 +5867,43 @@ class ReplicaRouterState:
         moment = time.monotonic() if now is None else now
         with self.lock:
             return {gpu for gpu, expires in self.gpu_demand.items() if expires > moment}
+
+    def live_gpu_override(self, model_id: str, now: float | None = None) -> list[int] | None:
+        moment = time.monotonic() if now is None else now
+        with self.lock:
+            entry = self.gpu_override.get(model_id)
+            if entry is None or entry[1] <= moment:
+                return None
+            return list(entry[0])
+
+    def claim_gpu_override(
+        self,
+        model_id: str,
+        gpu_set: list[int],
+        *,
+        ttl_s: float = PLACEMENT_OVERRIDE_TTL_S,
+        min_interval_s: float = PLACEMENT_OVERRIDE_MIN_INTERVAL_S,
+        now: float | None = None,
+    ) -> bool:
+        """Reserve a GPU set for `model_id`; False if one is live or too recent.
+
+        Snapshot both maps under the router lock and write in one shot so two
+        racing requests cannot both see the slot as free.
+        """
+        moment = time.monotonic() if now is None else now
+        with self.lock:
+            live = self.gpu_override.get(model_id)
+            if live is not None and live[1] > moment:
+                return False
+            last = self.gpu_override_written_at.get(model_id)
+            if last is not None and moment - last < min_interval_s:
+                return False
+            self.gpu_override[model_id] = (
+                [int(g) for g in gpu_set],
+                moment + max(1.0, float(ttl_s)),
+            )
+            self.gpu_override_written_at[model_id] = moment
+            return True
 
     def bind_response(self, response_id: str, replica_id: str, ttl_s: int = 3600) -> None:
         if not response_id or not replica_id:
@@ -10534,13 +10628,15 @@ def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DE
     gpu_process_map = get_gpu_process_map()
     if not gpu_process_map:
         return None
+    # Populated for every request, not just replicas: this map is what keeps a load
+    # into an empty GPU from being refused because a model sits on the *other* card,
+    # so it must not be treated as a replica-only cost.
     proc_gpus_by_pid: dict[int, set[int]] = {}
-    if replica_gpu_set is not None:
-        try:
-            for pid, per_gpu in (get_gpu_process_memory_by_pid() or {}).items():
-                proc_gpus_by_pid[int(pid)] = set(per_gpu.keys())
-        except Exception:
-            proc_gpus_by_pid = {}
+    try:
+        for pid, per_gpu in (get_gpu_process_memory_by_pid() or {}).items():
+            proc_gpus_by_pid[int(pid)] = set(per_gpu.keys())
+    except Exception:
+        proc_gpus_by_pid = {}
     # A base and its replicas run the SAME weights file, so a path->id map
     # collapses every instance of a model onto a single id and the replicas can
     # never be named as eviction victims (only the base ever shows up in
@@ -10567,9 +10663,13 @@ def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DE
         process = process_by_pid.get(pid)
         if process is None:
             continue
-        if replica_gpu_set is not None:
+        # target_gpu_set is the replica's own set for a replica and the static pin for a
+        # base, i.e. exactly the card(s) this launch will use. An unresolvable pid stays
+        # a conflict: when unsure, refusing is the safe direction.
+        conflict_scope = target_gpu_set or []
+        if conflict_scope:
             gpus = proc_gpus_by_pid.get(pid, set())
-            if gpus and gpus.isdisjoint(set(replica_gpu_set)):
+            if gpus and gpus.isdisjoint(set(conflict_scope)):
                 continue
         running_model = instance_id_by_pid.get(pid) or model_by_path.get(process.get("model_path") or "")
         if not running_model or running_model == model_id:
@@ -10644,7 +10744,7 @@ def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DE
                     f"already streaming on {named}. Retry when it finishes, or run "
                     "'llm-server unload <model>' to force it."
                 )
-            fits, fit_info = model_has_enough_vram_capacity(target_model, gpu_set=replica_gpu_set)
+            fits, fit_info = model_has_enough_vram_capacity(target_model, gpu_set=target_gpu_set)
             if fits:
                 log_api_event(
                     "model_load_allowed_matrix_evict",
@@ -10690,6 +10790,288 @@ def get_gpu_conflict_message(model_id: str, catalog: list[ManagedModel], host=DE
         f"Cannot load model '{model_id}' because the GPU is already in use: {joined}. "
         "Use 'llm-server unload <model>' to free resources, or wait for those workloads to finish."
     )
+
+
+PLACEMENT_SAFETY_VRAM_MIB = 2048
+PLACEMENT_PER_GPU_OVERHEAD_MIB = 1024.0
+
+
+@dataclass(frozen=True)
+class PlacementPlan:
+    """Where a model that is about to be loaded should run, and what stands in the way."""
+
+    action: str
+    pinned: list[int]
+    occupant: tuple[str, int, int] | None
+    occupied_mib: float
+    needed_mib: float
+    alt_gpu_set: list[int] | None
+    alt_free_mib: float
+    short_by_mib: float
+    message: str | None
+
+
+def _forward_placement(pinned: list[int] | None = None) -> PlacementPlan:
+    return PlacementPlan("forward", [int(g) for g in (pinned or [])], None, 0.0, 0.0, None, 0.0, 0.0, None)
+
+
+def effective_model_gpu_set(model_id: str, catalog: list[ManagedModel]) -> list[int]:
+    """GPU set a base route launches on. A live placement override outranks the static map."""
+    override = REPLICA_ROUTER_STATE.live_gpu_override(model_id)
+    if override:
+        return [int(g) for g in override]
+    return [int(g) for g in (cached_model_gpu_sets(catalog or []).get(model_id) or [])]
+
+
+def _gpu_occupants(model_id: str, catalog: list[ManagedModel]) -> dict[int, list[tuple[str, int, int]]]:
+    """Map GPU index -> [(running_model, pid, used_mib)] for every other live llama-server.
+
+    Resolution order is load-bearing: router records first, weights path only as a
+    fallback, because a base and its replicas read the very same weights file.
+    """
+    process_by_pid = {int(proc["pid"]): proc for proc in get_llama_server_processes()}
+    model_by_path = {_safe_realpath(model.local_path): model.model_id for model in catalog}
+    with REPLICA_ROUTER_STATE.lock:
+        records = list(REPLICA_ROUTER_STATE.records.items())
+    instance_id_by_pid: dict[int, str] = {}
+    for rid, rec in records:
+        pid = int(getattr(rec, "pid", 0) or 0)
+        if pid > 0:
+            instance_id_by_pid[pid] = str(rid)
+    target_base_id = replica_base_model_id(model_id) if is_replica_model_id(model_id) else str(model_id)
+    occupants: dict[int, list[tuple[str, int, int]]] = {}
+    for raw_pid, per_gpu in (get_gpu_process_memory_by_pid() or {}).items():
+        pid = int(raw_pid)
+        if _is_ollama_process(pid):
+            continue
+        process = process_by_pid.get(pid)
+        if process is None:
+            continue
+        running = instance_id_by_pid.get(pid) or model_by_path.get(process.get("model_path") or "")
+        if not running or running == model_id:
+            continue
+        running_base = replica_base_model_id(running) if is_replica_model_id(running) else running
+        if running_base == target_base_id:
+            continue
+        for gpu, used_mib in (per_gpu or {}).items():
+            occupants.setdefault(int(gpu), []).append((running, pid, int(used_mib or 0)))
+    return occupants
+
+
+def best_alternative_gpu(
+    pinned: list[int],
+    occupants: dict[int, list[tuple[str, int, int]]],
+) -> tuple[list[int] | None, float]:
+    """First completely idle GPU, plus how much room it has."""
+    snapshot = _query_gpu_memory_snapshot_cached() or {}
+    for raw_gpu in sorted(int(key) for key in snapshot):
+        if int(raw_gpu) in {int(g) for g in pinned} or occupants.get(int(raw_gpu)):
+            continue
+        return [int(raw_gpu)], float(snapshot[raw_gpu].get("free_mib", 0.0))
+    return None, 0.0
+
+
+def _claim_placement_write(model_id: str, gpu_set: list[int]) -> bool:
+    """Reserve this model's one allowed config rewrite for the next interval."""
+    now = time.monotonic()
+    cutoff = now - 3600.0
+    while _PLACEMENT_WRITE_LOG and _PLACEMENT_WRITE_LOG[0] <= cutoff:
+        _PLACEMENT_WRITE_LOG.pop(0)
+    if len(_PLACEMENT_WRITE_LOG) >= PLACEMENT_MAX_WRITES_PER_HOUR:
+        return False
+    if not REPLICA_ROUTER_STATE.claim_gpu_override(model_id, gpu_set, now=now):
+        return False
+    _PLACEMENT_WRITE_LOG.append(now)
+    return True
+
+
+def plan_runtime_placement(
+    model_name: str,
+    catalog: list[ManagedModel],
+    args=None,
+    client_host: str = DEFAULT_PUBLIC_HOST,
+    public_port: int = DEFAULT_PUBLIC_PORT,
+) -> PlacementPlan:
+    """Decide whether a pending load can avoid disturbing whatever owns its pinned GPU.
+
+    Purely read-only. The GPU a route launches on is baked into its command by
+    ``assign_model_gpu_sets``, so the only ways around a busy pin are rewriting that
+    command (which llama-swap applies as a reload) or retiring the occupant; the caller
+    acts on ``action``.
+    """
+    if not _runtime_placement_enabled(args):
+        return _forward_placement()
+
+    model_entry = next((model for model in catalog if model.model_id == model_name), None)
+    if model_entry is None or is_replica_model_id(model_name):
+        return _forward_placement()
+    if get_catalog_model_process(model_name, catalog) is not None:
+        return _forward_placement()
+
+    try:
+        replica_cfg = get_model_replica_config(model_entry, resolve_global_replica_config())
+        # Mirror select_replica_for_request: the replica slots only exist once the
+        # static assignment is fed in, otherwise every single-GPU base looks like it
+        # has a free card and this guard would short-circuit every plan.
+        replica_slots = _replica_gpu_sets(
+            model_entry,
+            replica_cfg,
+            base_gpu_set=cached_model_gpu_sets(catalog or []).get(model_entry.model_id),
+            reserved_gpu_set=reserved_base_gpus(catalog or [], model_entry.model_id),
+        )
+        if replica_cfg.enabled and replica_slots:
+            # Replica pins come from _replica_gpu_sets and reserved_base_gpus is derived
+            # from the static map, so re-pinning a base here would desynchronise them.
+            return _forward_placement()
+    except Exception:
+        return _forward_placement()
+
+    pinned = effective_model_gpu_set(model_name, catalog)
+    if len(pinned) != 1:
+        return _forward_placement()
+
+    occupants = _gpu_occupants(model_name, catalog)
+    pinned_occupants = occupants.get(pinned[0], [])
+    if not pinned_occupants:
+        return _forward_placement(pinned)
+
+    needed_mib = float(estimate_model_runtime_mib(model_entry) or 0.0)
+    required_mib = needed_mib + PLACEMENT_PER_GPU_OVERHEAD_MIB + PLACEMENT_SAFETY_VRAM_MIB
+    idle = [entry for entry in pinned_occupants if instance_in_flight(entry[0]) <= 0]
+    busy = [entry for entry in pinned_occupants if instance_in_flight(entry[0]) > 0]
+    occupant = (busy or idle)[0]
+    occupied_mib = float(max(entry[2] for entry in pinned_occupants))
+    alt_gpu_set, alt_free_mib = best_alternative_gpu(pinned, occupants)
+    fits_alt = False
+    if alt_gpu_set is not None:
+        fits_alt, _fit_info = model_has_enough_free_vram_to_load(model_entry, gpu_set=alt_gpu_set)
+    short_by_mib = max(0.0, required_mib - alt_free_mib)
+
+    held = (
+        f"{occupied_mib:.0f} MiB is held by '{occupant[0]}' (pid {occupant[1]}, "
+        f"{instance_in_flight(occupant[0])} requests in flight)"
+    )
+    need = (
+        f"{required_mib:.0f} MiB there ({needed_mib:.0f} estimated + "
+        f"{PLACEMENT_PER_GPU_OVERHEAD_MIB:.0f} per-GPU + {PLACEMENT_SAFETY_VRAM_MIB} safety)"
+    )
+
+    if busy:
+        if alt_gpu_set is None:
+            detail = (
+                f"Needs {required_mib:.0f} MiB and no other GPU is free. Wait for '{occupant[0]}' "
+                f"to finish, or run 'llm-server unload {occupant[0]}' to free the card."
+            )
+        else:
+            detail = (
+                f"GPU {alt_gpu_set[0]} has {alt_free_mib:.0f} MiB free but '{model_name}' needs {need} "
+                f"- short by {short_by_mib:.0f} MiB. Wait for '{occupant[0]}' to finish, or run "
+                f"'llm-server unload {occupant[0]}' to free the card."
+            )
+        return PlacementPlan(
+            "reject", pinned, occupant, occupied_mib, needed_mib,
+            alt_gpu_set, alt_free_mib, short_by_mib,
+            f"Cannot load model '{model_name}': its pinned GPU {pinned[0]} holds {held}. {detail}",
+        )
+
+    if fits_alt and _placement_repin_enabled(args):
+        if _claim_placement_write(model_name, alt_gpu_set):
+            return PlacementPlan(
+                "repin_then_forward", pinned, occupant, occupied_mib, needed_mib,
+                alt_gpu_set, alt_free_mib, short_by_mib,
+                f"Cannot load model '{model_name}' on its pinned GPU {pinned[0]}: {held}, and the model "
+                f"needs {need}. GPU {alt_gpu_set[0]} has {alt_free_mib:.0f} MiB free, which is enough. "
+                f"Moved the model to GPU {alt_gpu_set[0]} instead of unloading '{occupant[0]}'.",
+            )
+        log_api_event(
+            "placement_override_refused",
+            {"model": model_name, "pinned": pinned, "requested": alt_gpu_set},
+        )
+
+    if idle:
+        return PlacementPlan(
+            "retire_then_forward", pinned, occupant, occupied_mib, needed_mib,
+            alt_gpu_set, alt_free_mib, short_by_mib,
+            f"Cannot load model '{model_name}' on its pinned GPU {pinned[0]}: {held}, and the model needs "
+            f"{need}. Unloaded idle '{occupant[0]}' to free the card.",
+        )
+    return _forward_placement(pinned)
+
+
+def retire_idle_occupants(
+    plan: PlacementPlan,
+    model_name: str,
+    catalog: list[ManagedModel],
+    *,
+    client_host: str = DEFAULT_PUBLIC_HOST,
+    public_port: int = DEFAULT_PUBLIC_PORT,
+) -> bool:
+    """Unload whatever idle model owns the plan's pinned GPU, then let the load proceed."""
+    from llamacpp_stack.cli.daemon import unload_replica_via_llamaswap
+
+    if not plan.pinned:
+        return False
+    retired: list[str] = []
+    for instance_id, _pid, _used_mib in _gpu_occupants(model_name, catalog).get(plan.pinned[0], []):
+        if instance_in_flight(instance_id) > 0:
+            continue
+        if unload_replica_via_llamaswap(instance_id, client_host, public_port):
+            retired.append(instance_id)
+    log_api_event(
+        "placement_decision",
+        {
+            "model": model_name,
+            "action": "retire_then_forward",
+            "pinned": plan.pinned,
+            "retired": retired,
+            "needed_mib": plan.needed_mib,
+        },
+    )
+    return bool(retired)
+
+
+def apply_repin(
+    plan: PlacementPlan,
+    model_name: str,
+    catalog: list[ManagedModel],
+    args=None,
+) -> bool:
+    """Rewrite this model's route so it launches on the GPU the planner picked."""
+    from llamacpp_stack.cli.replica import ensure_internal_route_in_llamaswap_config
+
+    model_entry = next((model for model in catalog if model.model_id == model_name), None)
+    if model_entry is None or not plan.alt_gpu_set:
+        return False
+    config_path = Path(args.config)
+    try:
+        ensure_internal_route_in_llamaswap_config(
+            model_entry,
+            model_entry.model_id,
+            catalog,
+            config_path,
+            str(args.llama_server),
+            get_configured_idle_ttl(config_path),
+            resolve_llama_server_defaults(args),
+            gpu_set=list(plan.alt_gpu_set),
+            include_mmproj=None,
+        )
+    except Exception as exc:
+        log_api_event(
+            "placement_repin_failed",
+            {"model": model_name, "gpu_set": plan.alt_gpu_set, "error": repr(exc)},
+        )
+        return False
+    log_api_event(
+        "placement_decision",
+        {
+            "model": model_name,
+            "action": "repin_then_forward",
+            "pinned": plan.pinned,
+            "gpu_set": plan.alt_gpu_set,
+            "occupant": plan.occupant[0] if plan.occupant else None,
+        },
+    )
+    return True
 
 
 def get_configured_idle_ttl(config_path: Path | None = None, fallback: int = DEFAULT_IDLE_TTL) -> int:
@@ -14199,15 +14581,9 @@ def _buffer_openai_chat_sse_with_keepalive(
             with write_lock:
                 notice = str(visible_status.get("content") or "").strip()
                 if notice:
-                    # Emit the status as thinking text, not as normal assistant text.
-                    # Some clients hide <think> blocks, and we also strip this marker
-                    # from future inbound history before forwarding to the model.
-                    _send_openai_chat_sse_status(
-                        handler,
-                        request_id=str(visible_status.get("request_id") or request_id),
-                        model=str(visible_status.get("model") or ""),
-                        content=f"\n<think>\n{notice}\n</think>\n",
-                    )
+                    comment = " ".join(notice.split())
+                    handler.wfile.write(f": {comment}\n\n".encode("utf-8"))
+                    handler.wfile.flush()
                 log_api_event(
                     "openai_chat_tool_continue_repair_user_notice",
                     {
@@ -15675,6 +16051,9 @@ def start_ctx_metadata_server(args):
                                     public_host=client_host,
                                     public_port=int(args.public_port),
                                 )
+                                if not is_replica_request and model_entry is not None:
+                                    if self._reject_if_gpu_busy(activity_model, catalog, api_style="openai"):
+                                        return
                                 if upstream_model_name:
                                     if is_replica_request:
                                         proxy_payload["model"] = upstream_model_name
@@ -15986,7 +16365,16 @@ def start_ctx_metadata_server(args):
                             else:
                                 self._send_json({"error": message}, status=503)
                             return True
-            gpu_conflict = get_gpu_conflict_message(model_name, catalog, client_host, int(args.public_port), args.config)
+            plan = plan_runtime_placement(model_name, catalog, args, client_host, int(args.public_port))
+            if plan.action == "retire_then_forward":
+                retire_idle_occupants(plan, model_name, catalog, client_host=client_host, public_port=int(args.public_port))
+                return False
+            if plan.action == "repin_then_forward":
+                apply_repin(plan, model_name, catalog, args)
+                return False
+            gpu_conflict = plan.message if plan.action == "reject" else get_gpu_conflict_message(
+                model_name, catalog, client_host, int(args.public_port), args.config
+            )
             if not gpu_conflict:
                 return False
             log_api_event("model_load_blocked_gpu_busy", {"model": model_name, "message": gpu_conflict, "api_style": api_style})
@@ -16676,7 +17064,9 @@ def start_ctx_metadata_server(args):
                 CONVERSATION_SWITCH_STATE.finish(conversation_token)
                 self._send_json({"error": {"message": "messages is required", "type": "invalid_request_error"}}, status=400)
                 return
-            messages = _sanitize_chat_tool_repair_notices_in_messages([_normalize_openai_message(item) for item in raw_messages if isinstance(item, dict)])
+            messages = [_normalize_openai_message(item) for item in raw_messages if isinstance(item, dict)]
+            if bool(resolve_chat_tool_continue_repair_config(args).get("enabled")):
+                messages = _sanitize_chat_tool_repair_notices_in_messages(messages)
             normalized_system_messages = _normalize_system_messages_for_llamacpp(messages)
             if len(normalized_system_messages) != len(messages):
                 log_api_event(
@@ -16910,6 +17300,7 @@ def start_ctx_metadata_server(args):
                                 write_lock=repair_write_lock,
                                 visible_status=pending_visible_status,
                                 visible_notice_after_seconds=repair_visible_notice_after_seconds,
+                                passthrough_visible_chars=CHAT_TOOL_CONTINUE_REPAIR_PASSTHROUGH_VISIBLE_CHARS,
                                 loop_guard=repair_loop_guard,
                                 cancel_check=_conversation_cancel_reason,
                                 thinking_budget_tokens=current_payload.get("thinking_budget_tokens"),
@@ -16936,16 +17327,10 @@ def start_ctx_metadata_server(args):
                                 )
                                 with repair_write_lock:
                                     if not is_conversation_cancel:
-                                        _send_openai_chat_sse_status(
-                                            self,
-                                            request_id=request_id,
-                                            model=model_name,
-                                            content=(
-                                                "\n<think>\n"
-                                                "Tool-call repair loop detected; stopping this response instead of consuming more tokens.\n"
-                                                "</think>\n"
-                                            ),
+                                        self.wfile.write(
+                                            b": Tool-call repair loop detected; stopping this response instead of consuming more tokens.\n\n"
                                         )
+                                        self.wfile.flush()
                                     self.wfile.write(b"data: [DONE]\n\n")
                                     self.wfile.flush()
                                 mark_model_activity(model_name, "openai_chat", "stream_conversation_cancelled" if is_conversation_cancel else "stream_repair_loop_detected")
